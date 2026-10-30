@@ -8,13 +8,35 @@
 # or the host's services, and every process dies with the rehearsal.
 #
 #   local_devnet.sh --nodes 7 --work DIR [--steps "keys genesis-fill distribute start smoke"]
-#                   [--gate-minutes N] [--skip CHECKS] [--fill-cmd CMD] [--min-chain-rev SHA]
+#                   [--gate-minutes N] [--skip CHECKS] [--fill-cmd CMD] [--min-chain-rev SHA] [--keep]
+#
+# Steps run in order and the run stops at the first failed step (its rc is the exit code).
+# `wipe-keys-refused` passes when the bring-up REFUSES `wipe --wipe-keys` (no terminal).
 #
 # --min-chain-rev: passed to `start` (its pre-join build-rev floor; see r1006_bringup.sh).
 #
+# --keep: after the steps, keep the devnet (nodes, tunnels, namespaces) running. The
+# namespaces live as long as this script, which is their PID 1: with --keep it ends in a
+# wait loop that reaps exited processes, until Ctrl-C, or SIGTERM to its process group
+# (`kill -TERM -- -PGID`; the outer `unshare` itself does not pass SIGTERM on, but its own
+# end takes the namespace with it, --kill-child). Without
+# --keep every node dies when the steps finish. Reach a kept node from another terminal
+# through the tunnels' state (DIR/state/tunnels) or with nsenter on the namespace.
+#
 # --fill-cmd: the genesis-fill command ({producers} {stakes} {out} as in r1006_bringup.sh);
-# default: the rehearsal stand-in (tests/fixtures/rehearsal_fill.py). For the real fill:
-#   --fill-cmd 'python3 scripts/genesis/r1006/fill_producers.py {producers} {stakes} {out}' 
+# default: the rehearsal stand-in (tests/fixtures/rehearsal_fill.py), which keeps the
+# compiled r1006 profile's validator set: the devnet producers are NOT registered, so the
+# chain halts at the validator activation height (block 1000; the last block is 999).
+# To run past activation, use the real fill and rebuild at a throwaway commit pinning it:
+#   1. --steps keys
+#   2. --steps genesis-fill --fill-cmd 'python3 scripts/genesis/r1006/fill_producers.py {producers} {stakes} {out}'
+#      (the real fill re-pins R1006_GENESIS; the bring-up refuses the fill against the
+#      current build: "rebuild at the commit that pins it")
+#   3. in a throwaway clone, commit what the fill changed (the r1006 validators.json and
+#      core/consensus/src/hardening.rs) on a local branch, never pushed; build it:
+#      r1006_bringup.sh build --sha <that commit> --local-repo <clone> --allow-non-main --state DIR/state
+#   4. --steps "genesis-fill distribute start smoke" with the same --fill-cmd
+# Never commit a devnet genesis to a shared branch.
 #
 # DIR/state must already hold a build (r1006_bringup.sh build --local-repo … --state DIR/state).
 # Timings go to DIR/rehearsal-timings.txt; the orchestrator's own log to DIR/rehearsal.log.
@@ -31,6 +53,7 @@ GATE=10
 SKIP="orangeseed,admins"
 FILL_CMD=""
 MIN_REV=()
+KEEP=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --nodes) NODES="$2"; shift 2 ;;
@@ -40,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --skip) SKIP="$2"; shift 2 ;;
     --fill-cmd) FILL_CMD="$2"; shift 2 ;;
     --min-chain-rev) MIN_REV=(--min-chain-rev "$2"); shift 2 ;;
+    --keep) KEEP=1; shift ;;
     *) echo "local_devnet: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -48,9 +72,13 @@ done
 WORK="$(cd "$WORK" && pwd)"
 
 if [[ "${R1006_IN_NS:-}" != 1 ]]; then
-  exec unshare --user --map-root-user --net --mount --pid --fork --mount-proc \
+  # Every option is forwarded to the copy inside the namespace. --kill-child: when unshare
+  # ends (Ctrl-C, SIGTERM), its child, PID 1 of the namespace, ends too, and with it the devnet.
+  keep=()
+  [[ $KEEP -eq 1 ]] && keep=(--keep)
+  exec unshare --user --map-root-user --net --mount --pid --fork --kill-child --mount-proc \
     env R1006_IN_NS=1 bash "$0" --nodes "$NODES" --work "$WORK" --steps "$STEPS" --gate-minutes "$GATE" --skip "$SKIP" \
-    --fill-cmd "$FILL_CMD"
+    --fill-cmd "$FILL_CMD" "${MIN_REV[@]}" "${keep[@]}"
 fi
 
 # ---- inside the namespaces ---------------------------------------------------
@@ -100,23 +128,54 @@ run_step() {
   set -e
   local ms=$((($(date +%s%N) - t0) / 1000000))
   printf '%-14s rc=%s %4d.%01ds\n' "$step" "$rc" $((ms / 1000)) $((ms % 1000 / 100)) | tee -a "$TIMES"
-  return 0
+  return "$rc"
 }
 
-for s in $STEPS; do
-  case "$s" in
+# one_step STEP: run it; its rc is the step's result.
+one_step() {
+  case "$1" in
     genesis-fill)
-      fc="$FILL_CMD"
-      [[ -n "$fc" ]] || fc="python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node"
+      local fc="$FILL_CMD"
+      if [[ -z "$fc" ]]; then
+        fc="python3 $FILL --producers {producers} --stakes {stakes} --out {out} --bin $WORK/state/bin/citrate-node"
+        echo "devnet: WARNING: the rehearsal stand-in fill keeps the compiled profile's validator set; these producers are not registered and the chain halts at the validator activation height (block 1000). To run past it, see --fill-cmd in this script's header." | tee -a "$LOG" >&2
+      fi
       run_step genesis-fill --fill-cmd "$fc" ;;
     distribute) run_step distribute ;;
     start) run_step start --mining on --gate-minutes "$GATE" "${MIN_REV[@]}" ;;
     smoke) run_step smoke --skip "$SKIP" ;;
-    wipe-keys-refused) run_step wipe --wipe-keys ;;
+    wipe-keys-refused)
+      # passes only when the bring-up refuses the key wipe
+      if run_step wipe --wipe-keys; then
+        echo "devnet: wipe --wipe-keys was NOT refused" | tee -a "$LOG"
+        return 1
+      fi
+      return 0 ;;
     stop) run_step stop ;;
     wipe) run_step wipe ;;
-    *) run_step "$s" ;;
+    *) run_step "$1" ;;
   esac
+}
+
+for s in $STEPS; do
+  rc=0
+  one_step "$s" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "devnet: step $s failed (rc=$rc); stopping, later steps not run; timings:" | tee -a "$LOG"
+    cat "$TIMES"
+    exit "$rc"
+  fi
 done
 echo "devnet: done; timings:"
 cat "$TIMES"
+
+if [[ $KEEP -eq 1 ]]; then
+  # This shell is PID 1 of the namespace: when it exits, every devnet process dies. Wait,
+  # reaping whatever exits (bash reaps any child on SIGCHLD), until told to stop.
+  trap 'echo "devnet: ending (signal); the namespace and every node go with it"; exit 0' TERM INT HUP
+  echo "devnet: kept running (--keep): $NODES hosts, inventory $INV; Ctrl-C (or SIGTERM to the process group) ends it"
+  while :; do
+    sleep 3600 &
+    wait $! || true
+  done
+fi

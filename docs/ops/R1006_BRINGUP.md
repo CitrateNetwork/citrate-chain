@@ -3,7 +3,7 @@ created: 2026-10-26T20:45:00Z
 branch: ops/r1006-bringup
 author: Larry Klosowski (chain team; DGX session, Claude Opus 5.5)
 status: active
-updated: 2026-10-27 (host allowlist, release-genesis refusal, mining gate, output containment; MIN_CHAIN_REV pre-join, smoke admins in genesis-chain mode; operator endpoint for forge reads, smoke --logs-since)
+updated: 2026-10-29 (FLEET AGREE checks execution; smoke log scan exemptions, hard lines and read errors; forge pinned below the head; start re-arms the height watchdog; committed min_chain_rev; local devnet --keep, option forwarding, stop at the first failed step, rehearsal past activation). Earlier: 2026-10-27 (host allowlist, release-genesis refusal, mining gate, output containment; MIN_CHAIN_REV pre-join, smoke admins in genesis-chain mode; operator endpoint for forge reads, smoke --logs-since)
 supersedes: the fleet steps (S1, S3, S5-S7) of citrate-federation R1006_REROLL_RUNBOOK.md (fed#399) for r1006
 ---
 
@@ -39,9 +39,9 @@ SHA=$(git rev-parse origin/main); $B build --sha "$SHA"
 $B genesis-fill --fill-cmd 'python3 scripts/genesis/r1006/fill_producers.py {producers} {stakes} {out}'
 #   kept only if its block 0 is the R1006_GENESIS committed in this checkout AND the build's
 $B distribute                              # binary hash-checked; node.toml (r1006 profile, mining off); block 0 probed per host
-#   MIN_CHAIN_REV: the full sha of chain#398's merge commit on main (or later), in the
-#   reviewed one-line file scripts/ops/r1006/min_chain_rev or passed as --min-chain-rev
-$B start --mining on                       # pre-join build-rev check; all nodes up with mining off; block 0 checked on every host; then mining on
+#   MIN_CHAIN_REV: the reviewed floor committed in scripts/ops/r1006/min_chain_rev
+#   (56cc2bc8, 2026-10-29), or --min-chain-rev with the same sha
+$B start --mining on                       # pre-join build-rev check; all nodes up with mining off; block 0 checked on every host; then mining on; watchdog re-armed
 $B smoke                                   # must end SMOKE PASS
 ```
 
@@ -56,8 +56,47 @@ typed confirmation.
 | keys | each host also runs `citrate registration-proof --registry <the committed r1006 book's ValidatorRegistry>`; the proof must be exactly the public object for that host's staker and proposer key, and goes into `r1006-registration-proofs.json` (the fill's input). Each host re-serialises its checked public identity; the orchestrator checks it again in memory and writes only that object; any key or password pattern in the host's stdout or stderr fails the step (rc 3) with nothing written or echoed |
 | genesis-fill | the fill lists exactly the producers with their stakes; activation height ≥ 800 (r1006: 1000; the node refuses less, also for a genesis validator set); profile `r1006`; no genesis file; registry = the committed book's; block 0 = the `R1006_GENESIS` committed in `core/consensus/src/hardening.rs`, read at run time, which the build must also compile, and never a release network's (r1005 `0x1dcfc490…75f1`, team testnet, mainnet); otherwise the fill is discarded |
 | distribute | the same genesis checks, before any host is touched; staged and installed binary sha256 match; every host's isolated probe gives that block 0 (recorded on the host) |
-| start | pre-join, before any host starts: MIN_CHAIN_REV is set (`--min-chain-rev` or the reviewed `scripts/ops/r1006/min_chain_rev`; both set must agree; a full sha in this checkout), and each host's installed binary reports (`consensus --json`) a clean `git_sha` that resolves in this checkout and contains MIN_CHAIN_REV (`git merge-base --is-ancestor`). A binary from before chain#398 does not know the r1006 genesis and would run it with every rule off, so it is refused here. Then the same genesis checks; every node starts with mining off and its block 0 must be the r1006 genesis (else every started node is stopped); only then, host by host, the host re-checks its own node's block 0 and switches mining on; ≥6 peers each; blocks from all 7 coinbases within 10 min |
-| smoke | every head past block 60; FLEET AGREE; chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; `CheckDeployedAdmins` in chain#398's genesis-chain mode (`GENESIS_CHAIN=1`, `GENESIS_ALLOC` = the fill's block-0 alloc) passes (forge rc 0) with FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS and GENESIS-FLOOR each reported once as 0 (the fill's book and alloc are staged under `contracts/addresses/` for forge and removed after; a fill without an alloc fails; forge reads through the operator endpoint, see below, and with no operator host the check fails naming `serve_recent_state_tags`); no CONFLICT / fork / deep reorg in logs since the start record or `--logs-since EPOCH` (the window is printed in the PASS/FAIL line); finality answers; no contribution recorder configured; RSS < 3 GiB |
+| start | pre-join, before any host starts: MIN_CHAIN_REV is set (`--min-chain-rev` or the reviewed `scripts/ops/r1006/min_chain_rev`; both set must agree; a full sha in this checkout), and each host's installed binary reports (`consensus --json`) a clean `git_sha` that resolves in this checkout and contains MIN_CHAIN_REV (`git merge-base --is-ancestor`). A binary from before chain#398 does not know the r1006 genesis and would run it with every rule off, so it is refused here. Then the same genesis checks; every node starts with mining off and its block 0 must be the r1006 genesis (else every started node is stopped); only then, host by host, the host re-checks its own node's block 0 and switches mining on; ≥6 peers each; blocks from all 7 coinbases within 10 min. After the gates (also with `--skip-producing-gate`), every started host re-arms the height watchdog that `stop` paused for 12 h (`citrate-watchdog-ctl.sh resume`, only where the watchdog is installed; a failed resume fails the step and leaves the nodes running) |
+| smoke | every head past block 60; FLEET AGREE, which also requires every node to have **executed** the majority block at the common height and its own block 10 below its head (`citrate_isExecuted`; see below); chain id 40204; `eth_getCode` = genesis alloc; OrangeSeed `story()`; `CheckDeployedAdmins` in chain#398's genesis-chain mode (`GENESIS_CHAIN=1`, `GENESIS_ALLOC` = the fill's block-0 alloc) passes (forge rc 0) with FACTORY-ADMIN, DEPLOYER-ADMIN, NO-CODE, TIMELOCK-HOLDERS and GENESIS-FLOOR each reported once as 0 (the fill's book and alloc are staged under `contracts/addresses/` for forge and removed after; a fill without an alloc fails; forge reads through the operator endpoint, see below, pinned with `--fork-block-number` 10 blocks below that host's head, and with no operator host the check fails naming `serve_recent_state_tags`); no CONFLICT / fork / deep reorg in logs since the start record or `--logs-since EPOCH` (the window is printed in the PASS/FAIL line; see "Log scan" below); finality answers; no contribution recorder configured; RSS < 3 GiB |
+
+## FLEET AGREE checks execution
+
+`eth_getBlockByNumber` and `eth_getBlockByHash` serve stored blocks. A node whose applied
+tip is stuck still stores, and so walks, the network's chain: by blocks alone it "agrees"
+(seen on 2026-10-29). `scripts/genesis/fleet_agree.sh` therefore also asks every endpoint
+`citrate_isExecuted` (params: the bare block hash): for the majority hash at the common
+height H the answer must be `{"executed": true, "number": H}`, and for the endpoint's own
+block `OWN_BACK` (10) below its head it must be executed at that height. An unreachable
+node, an RPC error or an answer that does not parse fails the check.
+
+## Log scan
+
+`host_agent.sh logs-scan` fails a host on any line naming a CONFLICT or a fork except the
+known notices. Exempt, because a healthy multi-producer start logs them while each node's
+applied tip catches up with fork choice (`node/src/canonical_apply.rs`, `node/src/main.rs`):
+
+- a fork activation (`… fork ACTIVE from height …`), and a converged fork choice
+  (`… converged to the fork-choice head`, `rebuilt applied state to the fork-choice head`,
+  `canonical recovery: converged to fork-choice head H @ N`);
+- `canonical recovery: applied tip … is behind the fork-choice head … on the same chain;
+  the drain advances it (no rebuild)` and `periodic drain: … stepped toward it via …`;
+- counted and shown as NOTE lines: fork-choice reorgs up to `R1006_MAX_REORG` (6) blocks
+  deep, start-up recovery toward a heavier head (`… outranks the applied tip …; fork point
+  … (K applied block(s) abandoned)`) with K up to `R1006_MAX_RECOVERY_ABANDON` (100), and
+  MP-S1 skipped production rounds.
+
+Always a failure, whatever else the line says: `NOT rebuilding from genesis` and
+`CONSENSUS ALARM`. A log the agent cannot read (no log file, a `journalctl` error) fails
+that host's scan; it is never counted as 0 matches, and smoke goes on to its other checks.
+
+## Forge pinned below the head
+
+The admins check reads the chain through forge pinned to one block. Pinned to the head, a
+one-block sibling reorg (normal with 7 producers) replaces that block, and the node then
+correctly refuses state for a block it no longer executes (`historical state not available
+… is not the executed`), failing smoke for no fault. Smoke pins forge
+(`--fork-block-number`) `R1006_ADMINS_PIN_BACK` (10) blocks below the operator host's
+head instead.
 
 ## Operator endpoint for forge reads
 
@@ -93,6 +132,31 @@ A node built without the r1006 profile refuses `genesis_profile = "r1006"` at st
 
 The keys step also writes `r1006-public-bootnodes.json` (the producers' `noise_<id>@<ip>:30303`
 list) for the network profile at cutover.
+
+## Local rehearsal (`scripts/ops/r1006/local_devnet.sh`)
+
+The rehearsal runs the bring-up on N local hosts in network namespaces inside one
+unprivileged user namespace (the script's header has the options). Its steps run in order
+and the run stops at the first failed step, with that step's rc. `--min-chain-rev` is
+passed to `start`. The namespaces live as long as the script, their PID 1: without
+`--keep` the devnet ends when the steps finish; with `--keep` it stays up (a wait loop that
+reaps exited processes) until Ctrl-C or SIGTERM to its process group.
+
+**Past activation.** The default fill is a stand-in (`scripts/ops/tests/fixtures/
+rehearsal_fill.py`) that keeps the compiled profile's validator set, so the devnet
+producers are not registered and the chain halts at the validator activation height
+(block 1000; the last block is 999). Both the stand-in and the devnet print a warning. To
+run past activation (as done on 2026-10-29):
+
+1. `keys`;
+2. `genesis-fill --fill-cmd 'python3 scripts/genesis/r1006/fill_producers.py {producers} {stakes} {out}'`:
+   the real fill re-pins `R1006_GENESIS` and is refused against the current build;
+3. in a throwaway clone, commit what the fill changed (the r1006 `validators.json` and
+   `core/consensus/src/hardening.rs`) on a local branch that is never pushed, and build it
+   (`build --sha <that commit> --local-repo <clone> --allow-non-main`);
+4. `genesis-fill` again with the same command (now accepted), then `distribute`, `start`, `smoke`.
+
+No devnet genesis is ever committed to a shared branch.
 
 ## End-to-end with chain#398, 2026-10-27 (local; nothing on the fleet)
 

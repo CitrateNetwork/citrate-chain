@@ -76,7 +76,7 @@ Values not yet decided are **OPEN**. Nothing in this repo carries allocation amo
 |---|---|---|
 | `genesis_ceremony.sh` | Only with `--confirm` | The contract ceremony P0–P7 (with P3L, the library, after P4) with a gate after each phase. Default is an offline dry run. `--simulate` runs against an RPC without broadcasting. `--from Pn` resumes and `--only Pn` runs one phase |
 | `keep_check.sh` | No | Address-book freeze gate. `keys` lists book entries, `pin` records code hashes and proxy implementations from a chain, `verify` checks a chain against the pinned list. `--dry-run` needs no RPC |
-| `fleet_agree.sh` | No | Every endpoint on the same chain id, the same block-0 hash and the same block hash at a common height |
+| `fleet_agree.sh` | No | Every endpoint on the same chain id, the same block-0 hash and the same block hash at a common height, and every endpoint has executed that block and its own block 10 below its head (`citrate_isExecuted`) |
 | `reset_node.sh` | Only with `--confirm` | Per-node reset: watchdog off, node stopped, binary swapped (sha256-checked; installed root-owned, mode 0755), data dir **archived** and recreated mode 0700, identity carried, coinbase and registry set. Never starts the node |
 
 Ported from DGX-local tooling of the R2 redeploy (`keep_check.sh`, `sample_height.sh`) and the r1005 reroll (per-node reset, deploy driver). The older `scripts/ops/reroll-orchestrate.sh` and `fleet-surgical-wipe.sh` are not on `main`; this set replaces them for the genesis.

@@ -25,7 +25,9 @@
 #                                                  before any host starts); then start in inventory
 #                                                  order, mining off, with health gates; then
 #                                                  (--mining on) switch mining on, host by host, only
-#                                                  once EVERY host shows the r1006 block 0
+#                                                  once EVERY host shows the r1006 block 0;
+#                                                  after its gates, re-arm the height watchdog
+#                                                  `stop` paused (where one is installed)
 #   r1006_bringup.sh smoke                         FLEET AGREE, chain id, code vs genesis alloc,
 #                                                  OrangeSeed story(), CheckDeployedAdmins in
 #                                                  genesis-chain mode (GENESIS_CHAIN=1, GENESIS_ALLOC
@@ -34,6 +36,8 @@
 #                                                  GENESIS-FLOOR all 0, no CONFLICT/
 #                                                  fork in logs, finality status, no contribution
 #                                                  recorder configured, memory per host
+#                                                  (FLEET AGREE also needs every node to have
+#                                                  EXECUTED the common block, citrate_isExecuted)
 #   r1006_bringup.sh stop                          stop every node (reverse order)
 #   r1006_bringup.sh wipe [--wipe-keys]            delete r1006 chain data only; keys kept unless
 #                                                  --wipe-keys (asks for the typed confirmation)
@@ -84,7 +88,10 @@
 #                 · --min-height N (60): wait (up to --gate-minutes) until every head is past N, so
 #                   FLEET AGREE compares a real common block, not block 0
 #                 · --logs-since EPOCH: the log scan's window start (unix seconds; default the
-#                   start record $STATE/started_at); the PASS/FAIL line always names the window
+#                   start record $STATE/started_at); the PASS/FAIL line always names the window;
+#                   a host whose node log cannot be read fails the scan
+#                 · forge (admins) is pinned (--fork-block-number) R1006_ADMINS_PIN_BACK (10) blocks
+#                   below the operator host's head, so a sibling reorg of the head cannot fail it
 #                 forge (admins) reads through the OPERATOR host's tunnel: the first inventory
 #                 host with "serve_recent_state_tags": N (r1006: citrate-prod-1, 64), whose
 #                 node.toml distribute writes with [rpc] serve_recent_state_tags = N. forge pins
@@ -93,7 +100,7 @@
 #   wipe:         --wipe-keys (destroys noise.key, proposer.key and the staker keystore)
 #
 # Env: R1006_SSH_KEY (inventory ssh_key) · CAST, FORGE (cast, forge) · R1006_TUNNEL_BASE (18545)
-#      DOCTL (doctl)
+#      DOCTL (doctl) · R1006_ADMINS_PIN_BACK (10)
 #
 # Exit: 0 ok · 1 a gate failed · 2 usage or refused
 set -euo pipefail
@@ -106,6 +113,7 @@ GUARD="$HERE/r1006/guard.py"
 CAST="${CAST:-cast}"
 FORGE="${FORGE:-forge}"
 TUNNEL_BASE="${R1006_TUNNEL_BASE:-18545}"
+ADMINS_PIN_BACK="${R1006_ADMINS_PIN_BACK:-10}"
 
 INVENTORY="$HERE/r1006/inventory.r1006.json"
 STATE="$HOME/r1006-state"
@@ -164,6 +172,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+[[ "$ADMINS_PIN_BACK" =~ ^[0-9]{1,4}$ ]] || die "R1006_ADMINS_PIN_BACK must be a whole number of blocks, got '$ADMINS_PIN_BACK'"
 [[ $LOGS_SINCE_SET -eq 0 || "$LOGS_SINCE" =~ ^[0-9]{1,12}$ ]] || die "--logs-since needs a unix time in seconds, got '$LOGS_SINCE'"
 [[ -f "$INVENTORY" ]] || die "no inventory at $INVENTORY"
 # Names, IPs and the host allowlist, before anything reads a host name.
@@ -758,6 +767,7 @@ step_start() {
   if [[ $DRY -eq 1 ]]; then
     echo "  [dry-run] gate: every node net_peerCount >= $MIN_PEERS within $GATE_MIN min (tcp-check 30303 between producers on failure)"
     echo "  [dry-run] gate: blocks with each of the ${#ALL_HOSTS[@]} producers' coinbases within $GATE_MIN min"
+    echo "  [dry-run] then: host_agent watchdog-rearm on every started host (resumes the height watchdog stop paused; no-op without one)"
     return 0
   fi
   local limit=$((GATE_MIN * 60))
@@ -770,6 +780,7 @@ step_start() {
   done
   if [[ $SKIP_PRODUCING -eq 1 ]]; then
     log "SKIP producing gate (--skip-producing-gate)"
+    rearm_watchdogs
     return 0
   fi
   rm -f -- "$STATE/miners.seen"
@@ -783,6 +794,19 @@ step_start() {
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print(f"  coinbase {m}: {c} block(s)") for m,c in sorted(d["miners"].items())]' "$STATE/miners.seen" || true
   ((got >= want)) || gate_fail "only $got of $want producers have blocks after $GATE_MIN min"
   log "  ok: all $want producers have produced blocks (${t}s)"
+  rearm_watchdogs
+}
+
+# rearm_watchdogs: `stop` pauses an installed height watchdog for 12 h and the pause does
+# not expire by itself, so a successful start re-arms it on every host it started (a no-op
+# on a host without one). A failed resume fails the step; the nodes keep running.
+rearm_watchdogs() {
+  local h out
+  for h in "${HOSTS[@]}"; do
+    out=$(agent "$h" watchdog-rearm) ||
+      gate_fail "$h: the height watchdog was not re-armed (see above); the nodes keep running; re-arm it on $h with citrate-watchdog-ctl.sh resume"
+    log "  $h: ${out//$'\n'/; }"
+  done
 }
 
 # ---- smoke -------------------------------------------------------------------
@@ -807,7 +831,8 @@ step_smoke() {
   if [[ $DRY -eq 1 ]]; then
     for h in "${HOSTS[@]}"; do tunnel_up "$h"; done
     echo "  [dry-run] wait until every head is past block $MIN_HEIGHT (up to $GATE_MIN min)"
-    echo "  [dry-run] fleet_agree.sh over the ${#HOSTS[@]} tunnels, EXPECTED_GENESIS_HASH = fill genesis_hash"
+    echo "  [dry-run] fleet_agree.sh over the ${#HOSTS[@]} tunnels, EXPECTED_GENESIS_HASH = fill genesis_hash; every node must"
+    echo "            have EXECUTED the common block (citrate_isExecuted) and its own block 10 below its head"
     echo "  [dry-run] eth_chainId == 40204 on every host"
     echo "  [dry-run] eth_getCode(addr) == alloc[addr].code for every coded alloc entry (fill alloc_file), on every host"
     echo "  [dry-run] OrangeSeed (fill orangeseed): story() returns a non-empty string"
@@ -816,7 +841,8 @@ step_smoke() {
     echo "            NO-CODE, TIMELOCK-HOLDERS, GENESIS-FLOOR each reported once as 0"
     if [[ -n "$OPERATOR_HOST" ]]; then
       tunnel_up "$OPERATOR_HOST"
-      echo "            forge via $OPERATOR_HOST (serve_recent_state_tags = $OPERATOR_WINDOW): $(rpc_url "$OPERATOR_HOST")"
+      echo "            forge via $OPERATOR_HOST (serve_recent_state_tags = $OPERATOR_WINDOW): $(rpc_url "$OPERATOR_HOST"),"
+      echo "            pinned (--fork-block-number) $ADMINS_PIN_BACK blocks below that host's head"
     else
       echo "            FAIL: $OPERATOR_KEY_MSG"
     fi
@@ -929,15 +955,27 @@ PY
     tunnel_up "$OPERATOR_HOST"
     local op_url
     op_url=$(rpc_url "$OPERATOR_HOST")
-    log "  admins: forge via $OPERATOR_HOST ($op_url, serve_recent_state_tags = $OPERATOR_WINDOW)"
+    # forge is pinned (--fork-block-number) ADMINS_PIN_BACK blocks below the operator host's
+    # head, not to the head: with several producers a one-block sibling reorg replaces the
+    # head block, and the node then refuses state for a block it no longer executes.
+    local op_head pin=""
+    op_head=$(hexnum "$(rpc "$OPERATOR_HOST" eth_blockNumber '[]')")
+    [[ -n "$op_head" ]] && pin=$((op_head > ADMINS_PIN_BACK ? op_head - ADMINS_PIN_BACK : 0))
+    log "  admins: forge via $OPERATOR_HOST ($op_url, serve_recent_state_tags = $OPERATOR_WINDOW), pinned to block ${pin:-?} (head ${op_head:-?} - $ADMINS_PIN_BACK)"
     # forge may read only under contracts/ (fs_permissions: ./addresses), and the state dir
     # is outside the checkout: stage the fill's (public) book and alloc there for this run only.
     local report frc=0 c n bad_classes="" staged="addresses/.r1006-smoke-$$.json" staged_alloc="addresses/.r1006-smoke-$$-alloc.json"
-    cp -f -- "$STATE/genesis/$book" "$REPO/contracts/$staged"
-    cp -f -- "$STATE/genesis/$admins_alloc" "$REPO/contracts/$staged_alloc"
-    report=$(cd "$REPO/contracts" && ADDRESS_BOOK="$staged" REQUIRE_ALL_CODE=true GENESIS_CHAIN=1 \
-      GENESIS_ALLOC="$staged_alloc" "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "$op_url" 2>&1) || frc=$?
-    rm -f -- "$REPO/contracts/$staged" "$REPO/contracts/$staged_alloc"
+    if [[ -z "$pin" ]]; then
+      report="  $OPERATOR_HOST did not answer eth_blockNumber: no block to pin forge to"
+      frc=1
+    else
+      cp -f -- "$STATE/genesis/$book" "$REPO/contracts/$staged"
+      cp -f -- "$STATE/genesis/$admins_alloc" "$REPO/contracts/$staged_alloc"
+      report=$(cd "$REPO/contracts" && ADDRESS_BOOK="$staged" REQUIRE_ALL_CODE=true GENESIS_CHAIN=1 \
+        GENESIS_ALLOC="$staged_alloc" "$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "$op_url" \
+        --fork-block-number "$pin" 2>&1) || frc=$?
+      rm -f -- "$REPO/contracts/$staged" "$REPO/contracts/$staged_alloc"
+    fi
     # The whole checker must pass (rc 0), and report each class exactly once, as 0.
     for c in "FACTORY-ADMIN failures" "DEPLOYER-ADMIN failures" "NO-CODE entries (reported)" \
       "TIMELOCK-HOLDERS failures" "GENESIS-FLOOR failures"; do
@@ -950,7 +988,7 @@ PY
       printf '%s\n' "$report" | tail -15 | sed 's/^/  | /'
       if grep -q 'historical state not available' <<<"$report"; then
         log "  $OPERATOR_HOST refused forge's pinned reads: check that its running node.toml has [rpc] serve_recent_state_tags = $OPERATOR_WINDOW"
-        log "  (else: stop, distribute, start --only $OPERATOR_HOST); a forge run longer than $OPERATOR_WINDOW blocks also ends here"
+        log "  (else: stop, distribute, start --only $OPERATOR_HOST); a forge run longer than $OPERATOR_WINDOW - $ADMINS_PIN_BACK blocks also ends here"
       fi
       fail "admins (genesis-chain mode) via $OPERATOR_HOST: forge rc=$frc;${bad_classes:- every class 0}"
     fi
@@ -964,10 +1002,18 @@ PY
     log "SKIP  log scan (--skip logs)"
   else
     bad=0
+    local unread=""
     for h in "${HOSTS[@]}"; do
       local scan
-      scan=$(agent "$h" logs-scan "$since")
+      # A host whose log the agent cannot read fails the scan (never "0 matches").
+      if ! scan=$(agent "$h" logs-scan "$since"); then
+        unread+=" $h"
+        continue
+      fi
       if [[ "$(sed -n 's/^matches //p' <<<"$scan")" != 0 ]]; then bad=1; log "  $h:"; sed -n '/^  |/p' <<<"$scan"; fi
+      local rr
+      rr=$(sed -n 's/^recovery_reorgs //p' <<<"$scan")
+      [[ "${rr:-0}" != 0 ]] && log "  NOTE $h: $rr start-up recovery reorg(s) toward the fork-choice head (each within R1006_MAX_RECOVERY_ABANDON blocks)"
       local sr dr
       sr=$(sed -n 's/^shallow_reorgs //p' <<<"$scan")
       dr=$(sed -n 's/^deepest_reorg //p' <<<"$scan")
@@ -976,7 +1022,13 @@ PY
       ps=$(sed -n 's/^producer_skips //p' <<<"$scan")
       [[ "${ps:-0}" != 0 ]] && log "  NOTE $h: $ps production round(s) skipped by the MP-S1 guard (parent not yet applied)"
     done
-    [[ $bad -eq 0 ]] && pass "no CONFLICT / fork lines in any node log $window" || fail "CONFLICT / fork lines in node logs $window"
+    if [[ -n "$unread" ]]; then
+      fail "log scan: the node log could not be read on$unread (not scanned) $window"
+    elif [[ $bad -eq 0 ]]; then
+      pass "no CONFLICT / fork lines in any node log $window"
+    else
+      fail "CONFLICT / fork lines in node logs $window"
+    fi
   fi
 
   # 7. finality status

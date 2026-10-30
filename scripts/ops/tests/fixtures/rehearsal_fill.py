@@ -8,6 +8,10 @@ CITRATE_R1006_REHEARSAL=1, in an isolated network namespace) and writes a
 fill-result.json selecting that profile. A binary without the r1006 profile refuses it,
 so the stand-in fails closed. The validator list echoes the producer set so the bring-up's
 consistency check has something to compare; this stand-in does not change the genesis.
+So the devnet producers are NOT registered, and a rehearsal chain halts at the validator
+activation height (block 1000; the last block is 999). It says so on stderr. To run past
+activation, use the real fill and a throwaway rebuild that pins its genesis
+(scripts/ops/r1006/local_devnet.sh header, docs/ops/R1006_BRINGUP.md).
 With --genesis-hash it skips the probe and writes that hash with --profile (default
 r1006): the unit tests use it to plant a fill.
 
@@ -36,6 +40,8 @@ ARACHNID_CODE = ("0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
                  "3601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3")
 # The committed r1006 book's ValidatorRegistry (the bring-up runs the fill from the repo root).
 BOOK = Path("contracts/addresses/r1006/40204.json")
+# The r1006 validator activation height the fill result records.
+ACTIVATION = 1000
 
 
 def probe_block0(binary: str) -> str:
@@ -123,7 +129,7 @@ def main() -> int:
         "address_book": "book.json" if a.address_book else None,
         "orangeseed": None,
         "validator_registry": a.registry or json.loads(BOOK.read_text())["contracts"]["ValidatorRegistry"].lower(),
-        "validator_activation_height": 1000,
+        "validator_activation_height": ACTIVATION,
         "validators_at_genesis": True,
         "validators": [{"proposer_pubkey": p["proposer_pubkey"], "staker": p["staker_address"],
                         "stake_wei": stakes[p["staker_address"].lower()]["stake_wei"]} for p in prod["producers"]],
@@ -134,6 +140,11 @@ def main() -> int:
         (a.out / "book.json").write_text(BOOK.read_text())
     (a.out / "fill-result.json").write_text(json.dumps(fill, indent=2) + "\n")
     print(f"rehearsal_fill: block 0 {gh} (profile {fill['genesis_profile']})")
+    print(f"rehearsal_fill: WARNING: REHEARSAL STAND-IN: the genesis keeps the compiled profile's validator set, "
+          f"not these {len(prod['producers'])} producers; they are not registered, so the chain halts at block "
+          f"{ACTIVATION} (the validator activation height; the last block is {ACTIVATION - 1}). To run past it use the "
+          "real fill (python3 scripts/genesis/r1006/fill_producers.py {producers} {stakes} {out}) and rebuild at a "
+          "throwaway commit that pins its genesis (docs/ops/R1006_BRINGUP.md).", file=sys.stderr)
     return 0
 
 

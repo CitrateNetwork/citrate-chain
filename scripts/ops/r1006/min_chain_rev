@@ -1,0 +1,4 @@
+# MIN_CHAIN_REV: the oldest chain commit an r1006 producer binary may be built from.
+# Read by scripts/ops/r1006_bringup.sh start (lines starting with # are comments).
+# 56cc2bc8: main with split-healing and the restart-safe reorg window (2026-10-29).
+56cc2bc80439c350dd9eca8817f173c1986096e6

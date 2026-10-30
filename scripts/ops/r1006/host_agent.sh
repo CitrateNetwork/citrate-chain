@@ -43,6 +43,9 @@
 #                              restarted
 #   stop | status              the node service (systemd, or a plain process when R1006_SERVICE=proc)
 #   logs-scan SINCE_EPOCH      count CONFLICT / fork lines in the node log since a unix time
+#                              (a log it cannot read fails the command; see cmd_logs_scan)
+#   watchdog-rearm             resume the height watchdog `stop` paused, where one is installed
+#                              (citrate-watchdog-ctl.sh + an enabled timer); otherwise a no-op
 #   wipe [--wipe-keys]         stopped node only: delete the r1006 chain data, keep the keys
 #                              (with --wipe-keys, the keys and keystore too)
 #   sha FILE                   sha256 of a staged file (for the orchestrator's checks)
@@ -59,6 +62,8 @@
 #
 # Env: R1006_ROOT ("") · R1006_SERVICE (systemd|proc) · R1006_RUN_AS (citrate; "" = no switch)
 #      R1006_NODE_ENV_PASSTHRU (proc mode only) · R1006_NODE_RPC (http://127.0.0.1:8545)
+#      R1006_WATCHDOG_CTL (citrate-watchdog-ctl.sh) · R1006_MAX_REORG (6)
+#      R1006_MAX_RECOVERY_ABANDON (100)
 set -euo pipefail
 
 ROOT="${R1006_ROOT:-}"
@@ -81,6 +86,9 @@ R1006_PROFILE=r1006
 RELEASE_GENESIS_HASHES=(0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1 0x90044175c36a6491309d769bd0fa684afbf7b90b64136446db8e2e6ff0927553 0xba93d716ab8b005f1d7e61d369a65fc1d6a358d6a479e11b640815c74388ab01)
 LOGFILE="$ROOT/var/log/citrate-node.log"
 PIDFILE="$ROOT/run/citrate-node.pid"
+# The height watchdog's control script (scripts/ops/watchdog/); installed on PATH on a host
+# that runs the watchdog.
+WD_CTL="${R1006_WATCHDOG_CTL:-citrate-watchdog-ctl.sh}"
 # The only files `wipe` (without --wipe-keys) keeps in the data dir.
 KEEP_IN_DATA=(noise.key proposer.key)
 
@@ -420,8 +428,9 @@ cmd_enable_mining() {
 cmd_stop() {
   if [[ "$SERVICE" == systemd ]]; then
     # A watchdog would restart a stopped node; pause it first where one is installed.
-    if command -v citrate-watchdog-ctl.sh >/dev/null && systemctl is-enabled --quiet citrate-height-watchdog.timer 2>/dev/null; then
-      citrate-watchdog-ctl.sh pause 12 "r1006 bring-up stop"
+    # A successful start re-arms it (watchdog-rearm).
+    if watchdog_installed; then
+      "$WD_CTL" pause 12 "r1006 bring-up stop"
     fi
     if systemctl is-active --quiet citrate-node; then systemctl stop citrate-node; fi
     systemctl is-active --quiet citrate-node && die "citrate-node still active"
@@ -436,6 +445,22 @@ cmd_stop() {
     rm -f -- "$PIDFILE"
   fi
   say "stopped"
+}
+
+watchdog_installed() {
+  command -v "$WD_CTL" >/dev/null 2>&1 && systemctl is-enabled --quiet citrate-height-watchdog.timer 2>/dev/null
+}
+
+# watchdog-rearm: `stop` pauses an installed height watchdog for 12 h, and a pause does not
+# expire by itself, so the orchestrator calls this at the end of a successful `start`. A
+# failed resume (e.g. the host is contained) fails the command; no watchdog: nothing to do.
+cmd_watchdog_rearm() {
+  if ! watchdog_installed; then
+    say "no height watchdog installed; nothing to re-arm"
+    return 0
+  fi
+  "$WD_CTL" resume || die "watchdog-rearm: $WD_CTL resume failed; the watchdog stays paused"
+  say "height watchdog re-armed"
 }
 
 cmd_status() {
@@ -462,29 +487,49 @@ cmd_status() {
 cmd_logs_scan() {
   local since="${1:-}"
   [[ "$since" =~ ^[0-9]+$ ]] || die "logs-scan needs a unix time"
-  local text
+  # A log the scan cannot read fails the scan: an unread log is never "0 matches".
+  local text rc=0
   if [[ "$SERVICE" == systemd ]]; then
-    text=$(journalctl -u citrate-node --since "@$since" --no-pager -o cat 2>/dev/null || true)
+    text=$(journalctl -u citrate-node --since "@$since" --no-pager -o cat 2>/dev/null) || rc=$?
+    [[ $rc -eq 0 ]] || die "logs-scan: journalctl -u citrate-node failed (rc $rc); the log was not scanned"
   else
-    text=$(cat -- "$LOGFILE" 2>/dev/null || true)
+    [[ -f "$LOGFILE" && -r "$LOGFILE" ]] || die "logs-scan: cannot read $LOGFILE; the log was not scanned"
+    text=$(cat -- "$LOGFILE") || die "logs-scan: reading $LOGFILE failed; the log was not scanned"
   fi
   # Colour codes off; then every CONFLICT / fork line counts except the known notices that
-  # only use the word: a fork ACTIVATION ("… fork ACTIVE from height …") and a converged
-  # fork choice ("… to the fork-choice head"). A real fork logs "deep-fork self-heal",
-  # "runtime reorg" or a state-root BOOT HALT, none of which is exempt.
+  # only use the word: a fork ACTIVATION ("… fork ACTIVE from height …"), a converged fork
+  # choice ("… to the fork-choice head"), and the start-up recovery notices of a healthy
+  # node catching its applied tip up with fork choice (node/src/canonical_apply.rs,
+  # node/src/main.rs): "converged to fork-choice head H @ N", "… is behind the fork-choice
+  # head … on the same chain; the drain advances it (no rebuild)", "… beyond the forward
+  # cap; stepped toward it via …". A real fork logs "deep-fork self-heal", "runtime reorg"
+  # or a state-root BOOT HALT, none of which is exempt.
+  # Hard lines, never exempt and counted whatever they say: a refused from-genesis rebuild
+  # ("NOT rebuilding from genesis") and a consensus alarm ("CONSENSUS ALARM").
   text=$(printf '%s\n' "$text" | sed 's/\x1b\[[0-9;]*m//g')
-  local all hits benign
-  all=$(printf '%s\n' "$text" | grep -E -i '(^|[^a-z])(conflict|fork)([^a-z]|$)' || true)
+  local all hits benign hard hardl
+  hard='NOT rebuilding from genesis|CONSENSUS ALARM'
+  hardl=$(printf '%s\n' "$text" | grep -E "$hard" || true)
+  all=$(printf '%s\n' "$text" | grep -E -i '(^|[^a-z])(conflict|fork)([^a-z]|$)' | grep -v -E "$hard" || true)
   benign='fork ACTIVE from height|converged to the fork-choice head|rebuilt applied state to the fork-choice head'
+  benign+='|canonical recovery: converged to fork-choice head [^ ]+ @ [0-9]+$'
+  benign+='|canonical recovery: applied tip [^ ]+ @ [0-9]+ is behind the fork-choice head [^ ]+ @ [0-9]+ on the same chain; the drain advances it \(no rebuild\)$'
+  benign+='|periodic drain: fork-choice head [^ ]+ extends the applied chain beyond the forward cap; stepped toward it via '
   hits=$(printf '%s\n' "$all" | grep -v -E "$benign" | grep . || true)
   # Fork-choice reorgs: competing tips while several producers mine. One no deeper than
   # R1006_MAX_REORG blocks (default 6, fleet_agree's LAG) is counted and shown, not
   # failed; a deeper one is a hit like any other fork line.
+  # Start-up recovery toward a heavier fork-choice head ("… outranks the applied tip …; fork
+  # point … (K applied block(s) abandoned)"): counted and shown while K is at most
+  # R1006_MAX_RECOVERY_ABANDON (default 100); a deeper one is a hit.
   # MP-S1 skipped rounds: the producer declines to seal on a fork-choice parent its executor
   # has not applied yet (that would commit a state root no peer reproduces) and skips the
   # round. The guard working, not a fork: counted and shown. Only its exact form is exempt.
   local mp='MP-S1: fork-choice selected parent [0-9a-f]+ but this node.s applied tip is [0-9a-f]+ @ [0-9]+ .*Skipping this production round; the execute-on-receive drain/reorg will converge the applied tip\.$'
-  local max="${R1006_MAX_REORG:-6}" shallow=0 deepest=0 skips=0 line n keep=""
+  local ro='canonical recovery: fork-choice head [^ ]+ outranks the applied tip [^ ]+ @ [0-9]+; fork point [^ ]+ @ [0-9]+ \(([0-9]+) applied block\(s\) abandoned\)$'
+  local max="${R1006_MAX_REORG:-6}" maxab="${R1006_MAX_RECOVERY_ABANDON:-100}"
+  local shallow=0 deepest=0 skips=0 recov=0 line n keep=""
+  [[ "$max" =~ ^[0-9]+$ && "$maxab" =~ ^[0-9]+$ ]] || die "R1006_MAX_REORG and R1006_MAX_RECOVERY_ABANDON are whole numbers"
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     if [[ "$line" =~ $mp ]]; then skips=$((skips + 1)); continue; fi
@@ -493,12 +538,18 @@ cmd_logs_scan() {
       ((n > deepest)) && deepest=$n
       if ((n <= max)); then shallow=$((shallow + 1)); continue; fi
     fi
+    if [[ "$line" =~ $ro ]]; then
+      n=${BASH_REMATCH[1]}
+      if ((n <= maxab)); then recov=$((recov + 1)); continue; fi
+    fi
     keep+="$line"$'\n'
   done <<<"$hits"
-  hits="$keep"
-  printf 'lines %s\nmatches %s\nexempt %s\nshallow_reorgs %s\ndeepest_reorg %s\nproducer_skips %s\n' "$(printf '%s\n' "$text" | grep -c . || true)" \
-    "$(printf '%s' "$hits" | grep -c . || true)" "$(printf '%s\n' "$all" | grep -c -E "$benign" || true)" "$shallow" "$deepest" "$skips"
-  printf '%s\n' "$hits" | head -5 | sed 's/^/  | /'
+  hits="$(printf '%s' "$hardl" | grep . || true)"$'\n'"$keep"
+  printf 'lines %s\nmatches %s\nexempt %s\nshallow_reorgs %s\ndeepest_reorg %s\nproducer_skips %s\nrecovery_reorgs %s\nhard_fails %s\n' \
+    "$(printf '%s\n' "$text" | grep -c . || true)" "$(printf '%s' "$hits" | grep -c . || true)" \
+    "$(printf '%s\n' "$all" | grep -c -E "$benign" || true)" "$shallow" "$deepest" "$skips" "$recov" \
+    "$(printf '%s' "$hardl" | grep -c . || true)"
+  printf '%s\n' "$hits" | grep . | head -5 | sed 's/^/  | /' || true
 }
 
 cmd_wipe() {
@@ -652,6 +703,7 @@ case "$c" in
   stop) cmd_stop ;;
   status) cmd_status ;;
   logs-scan) cmd_logs_scan "$@" ;;
+  watchdog-rearm) cmd_watchdog_rearm ;;
   wipe) cmd_wipe "$@" ;;
   sha) cmd_sha "$@" ;;
   build-rev) cmd_build_rev ;;
