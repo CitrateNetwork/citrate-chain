@@ -256,6 +256,9 @@ pub struct Executor {
     /// (`citrate_consensus::hardening`); tests override it with
     /// [`Executor::set_pba_hardening`].
     pba_hardening_height: std::sync::atomic::AtomicU64,
+    /// RCAP: height from which the vested share is clamped to the epoch's
+    /// emission headroom. See [`REWARD_HEADROOM_CLAMP_ACTIVATION_HEIGHT`].
+    reward_headroom_clamp_height: std::sync::atomic::AtomicU64,
 }
 
 /// Height at which contract-initiated native value transfers start working.
@@ -362,6 +365,36 @@ pub fn create_nonce_fix_activation_height() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(CREATE_NONCE_FIX_ACTIVATION_HEIGHT)
+}
+
+/// RCAP: per-epoch emission headroom clamp — activation height.
+///
+/// `ValidatorRegistry.creditReward` reverts `EmissionCapped` when a credit would
+/// take `emittedInEpoch[epoch]` past `maxEpochEmission`, and the executor then
+/// burns the block's WHOLE vested share. At/above this height the executor
+/// first clamps the share to `maxEpochEmission - emittedInEpoch[epoch]`, read
+/// from the registry's storage exactly as REVM would read it, so the cap still
+/// holds but the block vests what fits and only the excess is burned.
+///
+/// **Consensus rule** (it changes the state root of a block that would have hit
+/// the cap), so it switches on at one fleet-wide height. `u64::MAX`: not
+/// scheduled. While every credit fits (no priority fees: the share is the flat
+/// subsidy and `blockSubsidy * EPOCH <= maxEpochEmission`), the clamp changes
+/// nothing, so any height above a history with no capped credit is safe.
+pub const REWARD_HEADROOM_CLAMP_ACTIVATION_HEIGHT: u64 = u64::MAX;
+
+/// Devnet-only override for [`REWARD_HEADROOM_CLAMP_ACTIVATION_HEIGHT`]. Never
+/// set this on a node that talks to 40204 unless the whole fleet sets the
+/// identical value.
+pub const REWARD_HEADROOM_CLAMP_ACTIVATION_ENV: &str =
+    "CITRATE_REWARD_HEADROOM_CLAMP_ACTIVATION_HEIGHT";
+
+/// Resolve the RCAP activation height, honouring the devnet override.
+pub fn reward_headroom_clamp_activation_height() -> u64 {
+    std::env::var(REWARD_HEADROOM_CLAMP_ACTIVATION_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(REWARD_HEADROOM_CLAMP_ACTIVATION_HEIGHT)
 }
 
 /// Whether a block at `height` persists contract-account nonces per EIP-161.
@@ -960,6 +993,9 @@ impl Executor {
             pba_hardening_height: std::sync::atomic::AtomicU64::new(
                 citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
             ),
+            reward_headroom_clamp_height: std::sync::atomic::AtomicU64::new(
+                reward_headroom_clamp_activation_height(),
+            ),
         }
     }
 
@@ -1105,6 +1141,9 @@ impl Executor {
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
             pba_hardening_height: std::sync::atomic::AtomicU64::new(
                 citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
+            ),
+            reward_headroom_clamp_height: std::sync::atomic::AtomicU64::new(
+                reward_headroom_clamp_activation_height(),
             ),
         }
     }
@@ -1960,6 +1999,42 @@ impl Executor {
             .store(height, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// RCAP: override the emission-headroom clamp activation for this executor
+    /// (tests / isolated devnets). Production reads the process-wide value at
+    /// construction.
+    pub fn set_reward_headroom_clamp_height(&self, height: u64) {
+        self.reward_headroom_clamp_height
+            .store(height, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// RCAP: what is left of the per-epoch emission cap for a block at
+    /// `height`: `maxEpochEmission - emittedInEpoch[height / EPOCH]`, both read
+    /// from `registry`'s storage the way REVM's `storage()` reads them (resident
+    /// state first, then the persistent store, absent = 0), without warming the
+    /// cache, so the read changes no state.
+    fn emission_headroom(&self, registry: [u8; 20], height: u64) -> U256 {
+        let addr = Address(registry);
+        let read = |key: &[u8; 32]| -> U256 {
+            let bytes = match self.state_db.get_storage(&addr, key) {
+                Some(v) => Some(v),
+                None => self
+                    .state_store
+                    .as_ref()
+                    .and_then(|store| store.get_storage(&addr, key).ok().flatten()),
+            };
+            match bytes {
+                Some(v) => {
+                    let start = v.len().saturating_sub(32);
+                    U256::from_big_endian(v.get(start..).unwrap_or(&[]))
+                }
+                None => U256::zero(),
+            }
+        };
+        let cap = read(&crate::block_rewards::MAX_EPOCH_EMISSION_SLOT);
+        let emitted = read(&crate::block_rewards::emitted_in_epoch_slot(height));
+        cap.saturating_sub(emitted)
+    }
+
     /// PBA-R2: override the block-validity hardening activation for this
     /// executor (tests / isolated devnets). Production reads the process-wide
     /// value at construction.
@@ -2219,6 +2294,30 @@ impl Executor {
         // no fees: nothing to vest, no system-call, no state change.
         let pool = br::compute_priority_pool(txs, receipts, base_fee_per_gas)?;
         let share = br::total_vested(pool, policy.priority_fee_share_bps, policy.block_subsidy);
+        if share.is_zero() {
+            return Ok(());
+        }
+
+        // (3e') RCAP: clamp to the epoch's remaining emission headroom, so a
+        // block that would cross `maxEpochEmission` vests what fits instead of
+        // reverting and burning its whole share. Below activation: unchanged.
+        let share = if height
+            >= self
+                .reward_headroom_clamp_height
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let headroom = self.emission_headroom(policy.registry, height);
+            if share > headroom {
+                warn!(
+                    "§R' RCAP: share {} at height {} exceeds the epoch's emission headroom {}; \
+                     vesting {} and burning the rest",
+                    share, height, headroom, headroom
+                );
+            }
+            share.min(headroom)
+        } else {
+            share
+        };
         if share.is_zero() {
             return Ok(());
         }
@@ -2778,6 +2877,10 @@ impl Executor {
             ),
             pba_hardening_height: std::sync::atomic::AtomicU64::new(
                 self.pba_hardening_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            reward_headroom_clamp_height: std::sync::atomic::AtomicU64::new(
+                self.reward_headroom_clamp_height
                     .load(std::sync::atomic::Ordering::SeqCst),
             ),
         }
