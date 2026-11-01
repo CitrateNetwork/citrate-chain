@@ -825,8 +825,23 @@ impl TipReask {
     }
 
     /// Fold in an answer: `applied_tip` is the applied tip after admitting it.
+    ///
+    /// Any `Blocks` message reaches here, unsolicited ones included, so a
+    /// held-ahead answer never extends a live hold on the same tip: its start
+    /// is kept, and the tick re-asks at most [`HELD_AHEAD_REASK_AFTER`] after
+    /// it began however often a peer replays held blocks. Only an expired hold
+    /// or a different tip starts a new one.
     pub fn note_answer(&mut self, applied_tip: Hash, held_ahead: bool, now: Instant) {
-        self.held = held_ahead.then_some((applied_tip, now));
+        if !held_ahead {
+            self.held = None;
+            return;
+        }
+        let live = self.held.is_some_and(|(tip, at)| {
+            tip == applied_tip && now.saturating_duration_since(at) < HELD_AHEAD_REASK_AFTER
+        });
+        if !live {
+            self.held = Some((applied_tip, now));
+        }
     }
 
     /// Whether the sync tick should skip a `GetBlocks` anchored at `anchor`:
