@@ -1,7 +1,7 @@
 // citrate/core/network/src/peer.rs
 
 // Peer connection and management
-use crate::inbound::{self, InboundDrops, ServeBudget};
+use crate::inbound::{self, InboundDrops};
 use crate::protocol::MAX_INBOUND_MESSAGE_BYTES;
 use crate::{NetworkError, NetworkMessage, ProtocolVersion};
 use citrate_consensus::types::Hash;
@@ -360,10 +360,6 @@ pub struct PeerManager {
     /// When each connected peer's last message reached `forward_incoming`
     /// (queued or shed): proof its connection delivers. Cleared on removal.
     last_inbound: Arc<DashMap<PeerId, Instant>>,
-    /// Each peer's serve-request budget (see `inbound::ServeBudget`).
-    serve_budget: Arc<ServeBudget>,
-    /// Serve requests shed for being over their peer's budget.
-    serve_budget_drops: Arc<InboundDrops>,
 }
 
 #[derive(Debug, Clone)]
@@ -410,10 +406,6 @@ impl PeerManager {
             inbound_drops: Arc::new(AtomicU64::new(0)),
             inbound_drops_by_kind: Arc::new(InboundDrops::default()),
             last_inbound: Arc::new(DashMap::new()),
-            serve_budget: Arc::new(ServeBudget::default()),
-            serve_budget_drops: Arc::new(InboundDrops::with_reason(
-                "inbound serve request over this peer's budget",
-            )),
         }
     }
 
@@ -443,11 +435,6 @@ impl PeerManager {
         }
         if let Some(tx) = self.incoming.read().await.clone() {
             let kind = message.kind();
-            // Serve requests over this peer's budget never reach the queue.
-            if inbound::serve_request(&message) && !self.serve_budget.allow(&peer_id, now) {
-                self.serve_budget_drops.record(kind, &peer_id, now);
-                return;
-            }
             // Only block gossip and sync answers may take the reserved part.
             let reserved = tx
                 .max_capacity()
@@ -488,12 +475,6 @@ impl PeerManager {
     /// The same drops as `(message type, count)`, sorted by type.
     pub fn inbound_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
         self.inbound_drops_by_kind.by_kind()
-    }
-
-    /// Serve requests shed for being over their peer's budget, by type. Not
-    /// part of [`Self::inbound_drops`]: they say nothing about the loop.
-    pub fn serve_budget_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
-        self.serve_budget_drops.by_kind()
     }
 
     /// Get max peers configuration
@@ -1553,38 +1534,27 @@ mod tests {
         }
     }
 
-    /// RED. One peer cannot fill the queue with serve requests: past its budget
-    /// its `GetBlocks` are shed at the reader, and another peer's still get in.
-    /// (The transport allows 200 messages a second per connection; each
-    /// `GetBlocks` costs the single message loop a storage read of up to a full
-    /// response.)
+    /// A burst of serve requests from one peer (a missing-parent walk or a
+    /// catch-up, answer-paced) is never shed while the queue has room: a
+    /// request shed without an answer stalls the requester's walk for the
+    /// 30 s request timeout and kept partitions from healing (split-heal
+    /// harness, rvSPLIT review of 42feb32c).
     #[tokio::test]
-    async fn rcseal_red_one_peer_cannot_flood_serve_requests() {
+    async fn rcseal_a_burst_of_serve_requests_from_one_peer_is_not_shed() {
         let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
         let (tx, mut rx) = mpsc::channel(512);
         pm.set_incoming(tx).await;
         for _ in 0..200 {
-            pm.forward_incoming(PeerId::new("flooder".into()), get_blocks_req())
+            pm.forward_incoming(PeerId::new("walker".into()), get_blocks_req())
                 .await;
         }
-        pm.forward_incoming(PeerId::new("honest".into()), get_blocks_req())
-            .await;
         let got = drain(&mut rx);
-        let from_flooder = got.iter().filter(|(p, _)| p == "flooder").count();
-        // Literal on purpose: a burst of 16, refilled at 4 a second.
-        assert!(
-            (16..=24).contains(&from_flooder),
-            "{from_flooder} of 200 serve requests from one peer reached the loop"
-        );
-        assert!(
-            got.iter().any(|(p, _)| p == "honest"),
-            "another peer's request was shed"
-        );
         assert_eq!(
-            pm.inbound_drops(),
-            0,
-            "budget sheds are not queue-full drops (the stall detector reads this)"
+            got.len(),
+            200,
+            "serve requests were shed with room in the queue"
         );
+        assert_eq!(pm.inbound_drops(), 0);
     }
 
     /// CONNECTION DEDUP (fleet incident 2026-07-29).

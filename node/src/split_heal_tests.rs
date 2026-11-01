@@ -27,6 +27,11 @@
 // child process so no other test in this binary sees them. Checkpoint finality
 // is not wired: its voting pin is off for every chain in this release.
 //
+// Every message a node receives first goes through its own
+// `PeerManager::forward_incoming` (the production inbound admission), so a
+// rule there that sheds a message the walk or sync needs fails these
+// scenarios.
+//
 // `main_loop_mirrors_the_harness` fails if main.rs stops making the calls the
 // harness makes.
 
@@ -152,8 +157,12 @@ struct Node {
     rejoin: parking_lot::Mutex<sync_rejoin::RejoinTracker>,
     sel: sync_peer::SyncPeerSelector,
     walk: sync_recovery::ParentWalks,
-    /// This process's peer table (the walk sends through it).
+    /// This process's peer table (the walk sends through it). Every message
+    /// this node receives goes through its `forward_incoming` into `inbound`,
+    /// the production admission path, so a message it sheds is lost here too.
     pm: Arc<citrate_network::PeerManager>,
+    /// The node's inbound queue (main.rs: 512 slots).
+    inbound: mpsc::Receiver<(PeerId, NetworkMessage)>,
     orphans: Vec<Block>,
     attested: AttestedNetworkHead,
     max_seen: AtomicU64,
@@ -200,6 +209,8 @@ pub(crate) struct Fleet {
     slot_no: u64,
     /// Messages lost on down links (diagnostics).
     pub lost: usize,
+    /// Messages a node's inbound admission shed (diagnostics).
+    pub shed: usize,
 }
 
 fn genesis_block(root: Hash) -> Block {
@@ -346,6 +357,11 @@ impl Node {
         let sync = SyncManager::new(SyncConfig::default())
             .with_local_height(app.applied_height_handle())
             .with_clock_offset(clock_ms);
+        let pm = Arc::new(citrate_network::PeerManager::new(
+            citrate_network::PeerManagerConfig::default(),
+        ));
+        let (in_tx, inbound) = mpsc::channel(512);
+        pm.set_incoming(in_tx).await;
         Self {
             name: format!("p{i}"),
             storage,
@@ -358,9 +374,8 @@ impl Node {
             rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
             sel: sync_peer::SyncPeerSelector::new(),
             walk: sync_recovery::ParentWalks::new(clock, SyncConfig::default().request_timeout),
-            pm: Arc::new(citrate_network::PeerManager::new(
-                citrate_network::PeerManagerConfig::default(),
-            )),
+            pm,
+            inbound,
             orphans: Vec::new(),
             attested,
             max_seen: AtomicU64::new(0),
@@ -436,6 +451,7 @@ impl Fleet {
             clock_ms,
             slot_no: 0,
             lost: 0,
+            shed: 0,
         };
         fleet.set_links(|_, _| true);
         for i in 0..n {
@@ -650,6 +666,19 @@ impl Fleet {
     /// One message, through the steps `start_node`'s receive loop runs for it.
     async fn receive(&mut self, at: usize, from: usize, msg: NetworkMessage) {
         let pid = PeerId::new(self.nodes[from].name.clone());
+        // Production admission (`PeerManager::forward_incoming`): anything it
+        // sheds never reaches the handlers, exactly as on a node.
+        let msg = {
+            let node = &mut self.nodes[at];
+            node.pm.forward_incoming(pid.clone(), msg).await;
+            match node.inbound.try_recv() {
+                Ok((_, msg)) => msg,
+                Err(_) => {
+                    self.shed += 1;
+                    return;
+                }
+            }
+        };
         let peer = self.peer(at, from);
         let node = &mut self.nodes[at];
         match msg {
@@ -1255,8 +1284,9 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
         };
     }
     let mut detail = format!(
-        "pre={pre} split={split_heights:?} lost={} last_sealed={last_sealed:?} {}",
+        "pre={pre} split={split_heights:?} lost={} shed={} last_sealed={last_sealed:?} {}",
         fleet.lost,
+        fleet.shed,
         fleet.describe().await
     );
     for i in 0..n {
