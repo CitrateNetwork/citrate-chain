@@ -20,19 +20,26 @@
 // node's `store_block` of a pruned height fails (strict VRF: its parent is gone),
 // so this test does not re-store those heights either.
 
-use citrate_consensus::dag_store::{KvOp, KvStore};
+use citrate_consensus::dag_store::{cf, KvOp, KvStore};
 use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash};
 use citrate_consensus::{DagStore, GhostDag};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct MemKv {
     inner: Mutex<HashMap<(String, Vec<u8>), Vec<u8>>>,
+    /// Reads of block bodies (`DAG_BLOCKS`): every one is a backend read plus
+    /// a full-block decode on a live node.
+    body_reads: AtomicUsize,
 }
 
 impl KvStore for MemKv {
     fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        if cf == cf::DAG_BLOCKS {
+            self.body_reads.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(self
             .inner
             .lock()
@@ -232,5 +239,85 @@ async fn restart_of_a_pruned_node_keeps_fork_choice_and_admits_peer_blocks() {
         gd.get_blue_score(&p2.hash()).await.ok(),
         Some(before[&tip.hash()] + 1 + 1 + 1),
         "the side tip is blue (anticone within k) and counts once"
+    );
+}
+
+/// After a restart every block loaded from the backend is a header-only
+/// skeleton (bodies reload on demand), and `relations` holds only what the
+/// eager load registered: the canonical chain. Pre-restart siblings inside the
+/// merge-score window are in neither. Rehydration and the next admission must
+/// not reload block bodies to score blocks: on a fleet that merges at every
+/// height that is hundreds of backend reads and full decodes per block, which
+/// stalls the eager load (the producer starts only after it) and the receive
+/// path behind it.
+#[tokio::test]
+async fn restart_rehydration_and_the_next_admission_do_not_reload_block_bodies() {
+    const N: u64 = 320;
+    const PRUNE_AT: u64 = 60;
+    const SIDE_H: u64 = N - 3;
+
+    let kv = Arc::new(MemKv::default());
+    let (canon, sibs, side) = build_dag(N, SIDE_H);
+    let tip_score;
+    {
+        let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("store"));
+        let gd = GhostDag::new(GhostDagParams::default(), dag.clone());
+        admit(&dag, &gd, &canon[0]).await;
+        for h in 1..=N {
+            admit(&dag, &gd, &canon[h as usize]).await;
+            if h < N {
+                admit(&dag, &gd, &sibs[(h - 1) as usize]).await;
+            }
+            if h == SIDE_H {
+                admit(&dag, &gd, &side).await;
+            }
+        }
+        tip_score = gd
+            .get_blue_score(&canon[N as usize].hash())
+            .await
+            .expect("tip score");
+        dag.update_pruning_point(canon[PRUNE_AT as usize].hash())
+            .await
+            .expect("pruning point");
+        assert!(dag.prune().await.expect("prune") > 0);
+    }
+
+    let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("reload"));
+    let gd = GhostDag::new(GhostDagParams::default(), dag.clone());
+
+    kv.body_reads.store(0, Ordering::SeqCst);
+    gd.reconcile_tips_from_dag_store().await;
+    for b in &canon {
+        let _ = gd.register_existing_block(b).await;
+    }
+    gd.reconcile_tips_from_dag_store().await;
+    let rehydration_reads = kv.body_reads.load(Ordering::SeqCst);
+    assert!(
+        rehydration_reads <= 8,
+        "rehydrating {} canonical blocks reloaded {} block bodies; it must read the \
+         durable score, not walk the merge-score window",
+        canon.len(),
+        rehydration_reads
+    );
+
+    // The next peer block merges the side tip, so its score walks the window.
+    let tip = &canon[N as usize];
+    let p1 = block(PEER, N + 1, tip.hash(), vec![side.hash()]);
+    kv.body_reads.store(0, Ordering::SeqCst);
+    gd.validate_block_consistency(&p1)
+        .await
+        .expect("consistency gate after a restart");
+    admit(&dag, &gd, &p1).await;
+    let admission_reads = kv.body_reads.load(Ordering::SeqCst);
+    assert_eq!(
+        gd.get_blue_score(&p1.hash()).await.ok(),
+        Some(tip_score + 1 + 1),
+        "scored on the pre-restart scale, the side tip blue"
+    );
+    assert!(
+        admission_reads <= 8,
+        "admitting one block after a restart reloaded {} block bodies; scoring reads \
+         parent links, which every skeleton holds",
+        admission_reads
     );
 }
