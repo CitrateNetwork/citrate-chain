@@ -181,6 +181,13 @@ pub struct ProduceCatchupGate {
     /// Per-round scratch: the deferred-evidence watermark (heard-but-unadmitted signed
     /// blocks, see [`AttestedNetworkHead::observe_deferred`]). Wired with the F2 gate.
     deferred_ahead: Option<Arc<AtomicU64>>,
+    /// Per-round scratch: the tip height of the one branch a strict majority of the
+    /// producer set is extending with blocks this node cannot admit (0: no such branch;
+    /// see [`AttestedInner::majority_branch`]). Wired with the F2 gate.
+    deferred_majority_ahead: Option<Arc<AtomicU64>>,
+    /// Raised while the split guard holds production off (see
+    /// [`ProduceCatchupGate::deferred_for_round`]); read by the status surface.
+    split_guard: Arc<AtomicBool>,
     /// Set by the sync driver once this node's initial sync after start has completed
     /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
     initial_sync_done: Option<Arc<AtomicBool>>,
@@ -202,6 +209,8 @@ struct CatchupBehindState {
     deferred_only_since: Option<Instant>,
     /// Last time the "sealing despite deferred evidence" warning was logged.
     deferred_only_warned: Option<Instant>,
+    /// Last time the split-guard alarm was logged.
+    split_guard_alarmed: Option<Instant>,
 }
 
 impl Default for CatchupBehindState {
@@ -213,6 +222,7 @@ impl Default for CatchupBehindState {
             stalled_latch: false,
             deferred_only_since: None,
             deferred_only_warned: None,
+            split_guard_alarmed: None,
         }
     }
 }
@@ -271,10 +281,40 @@ pub struct AttestedInner {
     /// proposer resets the time; a repeat or a lower height never does, so the same
     /// evidence counts for at most [`DEFERRED_EVIDENCE_TTL`]. Bounded.
     deferred: Mutex<HashMap<PublicKey, (u64, Instant)>>,
+    /// The same deferred blocks one by one, with the parents they name, so the gate
+    /// can tell proposers that extend ONE branch from proposers that each extend their
+    /// own: `block_hash -> DeferredBlock`. First-heard time only; a repeat never
+    /// renews it. Bounded to [`DEFERRED_BLOCK_CAP`] by evicting the oldest.
+    deferred_blocks: Mutex<HashMap<Hash, DeferredBlock>>,
     /// Test clock offset (both the monotonic and the wall clock), so tests can age
     /// evidence without sleeping.
     #[cfg(test)]
     clock_skew: Mutex<Duration>,
+}
+
+/// One heard-but-unadmitted signed block in [`AttestedInner::deferred_blocks`].
+struct DeferredBlock {
+    /// Its selected parent and merge parents (bounded by [`DEFERRED_BLOCK_PARENTS`]).
+    parents: Vec<Hash>,
+    height: u64,
+    proposer: PublicKey,
+    first_heard: Instant,
+}
+
+/// Cap on [`AttestedInner::deferred_blocks`]. At one block per producer per slot this
+/// is minutes of a large producer set; only the last [`DEFERRED_EVIDENCE_TTL`] counts.
+const DEFERRED_BLOCK_CAP: usize = 2048;
+/// Parents kept per deferred block (the selected parent first).
+const DEFERRED_BLOCK_PARENTS: usize = 16;
+
+/// The branch a strict majority of the producer set is extending with blocks this
+/// node cannot admit ([`AttestedInner::majority_branch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MajorityBranch {
+    /// Highest block height heard on the branch.
+    pub height: u64,
+    /// Distinct proposers with a fresh block on it (equivocators excluded).
+    pub proposers: usize,
 }
 
 /// Deferred ("heard but not admitted") evidence counts only while this fresh.
@@ -298,6 +338,14 @@ pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
 pub fn deferred_quorum_size(known: usize) -> usize {
     let producers = known.saturating_add(1);
     DEFERRED_EVIDENCE_MIN_PROPOSERS.max(producers.checked_div(3).unwrap_or(0).saturating_add(1))
+}
+/// Distinct proposers that must agree on ONE branch this node cannot admit before the
+/// gate refuses past [`DEFERRED_ONLY_REFUSE_MAX`]: a strict majority of the producer
+/// set (`known` plus this node). Two disjoint branches can never both have one, and
+/// with 2 producers it is unreachable (the other alone is not a majority).
+pub fn deferred_majority_size(known: usize) -> usize {
+    let producers = known.saturating_add(1);
+    producers.checked_div(2).unwrap_or(0).saturating_add(1)
 }
 /// Deferred evidence counts only when its header timestamp is within the TTL plus this
 /// clock allowance of local wall time (and not more than this allowance in the future),
@@ -410,7 +458,44 @@ impl AttestedNetworkHead {
                 deferred.insert(proposer, (block.header.height, now));
             }
         }
+        drop(deferred);
+        self.record_deferred_block(block, now);
         true
+    }
+
+    /// Keep `block` (already checked by [`Self::observe_deferred`]) in the per-block
+    /// record the majority-branch check reads. A block already recorded keeps its
+    /// first-heard time. On overflow the oldest entry goes; a re-delivered evicted
+    /// block is bounded by the header-timestamp check, which rejects it once its
+    /// header is older than the TTL plus the clock allowance.
+    fn record_deferred_block(&self, block: &Block, now: Instant) {
+        let hash = block.header.block_hash;
+        let mut blocks = self.inner.deferred_blocks.lock();
+        if blocks.contains_key(&hash) {
+            return;
+        }
+        if blocks.len() >= DEFERRED_BLOCK_CAP {
+            if let Some(oldest) = blocks
+                .iter()
+                .min_by_key(|(_, b)| b.first_heard)
+                .map(|(h, _)| *h)
+            {
+                blocks.remove(&oldest);
+            }
+        }
+        let parents = std::iter::once(block.header.selected_parent_hash)
+            .chain(block.header.merge_parent_hashes.iter().copied())
+            .take(DEFERRED_BLOCK_PARENTS)
+            .collect();
+        blocks.insert(
+            hash,
+            DeferredBlock {
+                parents,
+                height: block.header.height,
+                proposer: block.header.proposer_pubkey,
+                first_heard: now,
+            },
+        );
     }
 
     /// Advance this record's clock (tests only): ages deferred evidence and moves the
@@ -487,6 +572,82 @@ impl AttestedInner {
         let quorum = deferred_quorum_size(self.known_proposers.lock().len());
         heights.get(quorum.saturating_sub(1)).copied().unwrap_or(0)
     }
+
+    /// The branch a strict majority of the producer set ([`deferred_majority_size`])
+    /// is extending with blocks this node cannot admit, if there is one.
+    ///
+    /// Only blocks first heard within [`DEFERRED_EVIDENCE_TTL`] take part. Two of them
+    /// are on one branch when one names the other as a parent, directly or through
+    /// other such blocks: a producer can only name a block it holds, so a link is that
+    /// producer's own statement that it follows the other's history. Producers that
+    /// each extend their own branch never link, so a total split has no majority
+    /// branch. A proposer with fresh blocks on two branches (it signed both, an
+    /// equivocation) counts on neither, so one key cannot complete a majority on each
+    /// side and stop both.
+    pub(crate) fn majority_branch(&self, now: Instant) -> Option<MajorityBranch> {
+        let needed = deferred_majority_size(self.known_proposers.lock().len());
+        let blocks = self.deferred_blocks.lock();
+        let fresh: HashMap<Hash, &DeferredBlock> = blocks
+            .iter()
+            .filter(|(_, b)| now.saturating_duration_since(b.first_heard) < DEFERRED_EVIDENCE_TTL)
+            .map(|(h, b)| (*h, b))
+            .collect();
+        // Undirected parent links between fresh blocks.
+        let mut links: HashMap<Hash, Vec<Hash>> = HashMap::new();
+        for (hash, b) in &fresh {
+            for parent in &b.parents {
+                if fresh.contains_key(parent) {
+                    links.entry(*hash).or_default().push(*parent);
+                    links.entry(*parent).or_default().push(*hash);
+                }
+            }
+        }
+        // Connected components: (proposers, highest height).
+        let mut component_of: HashMap<Hash, usize> = HashMap::new();
+        let mut components: Vec<(HashSet<PublicKey>, u64)> = Vec::new();
+        for start in fresh.keys() {
+            if component_of.contains_key(start) {
+                continue;
+            }
+            let id = components.len();
+            let mut proposers = HashSet::new();
+            let mut top = 0u64;
+            let mut queue = std::collections::VecDeque::from([*start]);
+            component_of.insert(*start, id);
+            while let Some(h) = queue.pop_front() {
+                if let Some(b) = fresh.get(&h) {
+                    proposers.insert(b.proposer);
+                    top = top.max(b.height);
+                }
+                for next in links.get(&h).map(Vec::as_slice).unwrap_or(&[]) {
+                    if !component_of.contains_key(next) {
+                        component_of.insert(*next, id);
+                        queue.push_back(*next);
+                    }
+                }
+            }
+            components.push((proposers, top));
+        }
+        // A proposer on more than one branch counts on none.
+        let mut branches_of: HashMap<PublicKey, usize> = HashMap::new();
+        for (proposers, _) in &components {
+            for p in proposers {
+                let n = branches_of.entry(*p).or_insert(0);
+                *n = n.saturating_add(1);
+            }
+        }
+        components
+            .iter()
+            .map(|(proposers, top)| MajorityBranch {
+                height: *top,
+                proposers: proposers
+                    .iter()
+                    .filter(|p| branches_of.get(*p).copied().unwrap_or(0) == 1)
+                    .count(),
+            })
+            .filter(|b| b.proposers >= needed)
+            .max_by_key(|b| (b.proposers, b.height))
+    }
 }
 
 /// M1 (VERIFY-255-F2-M1): read-only snapshot of the F2 catch-up gate for the node's
@@ -509,6 +670,9 @@ pub struct CatchupGateStatus {
     pub applied_tip: u64,
     /// `attested_ahead - applied_tip` (0 when caught up).
     pub gap: u64,
+    /// True while the split guard holds production off: a majority of producers keep
+    /// extending a branch this node cannot admit, and sealing would fork it off.
+    pub split_guard: bool,
 }
 
 impl ProduceCatchupGate {
@@ -548,6 +712,9 @@ impl ProduceCatchupGate {
                 if let Some(d) = self.deferred_ahead.as_ref() {
                     d.store(0, Ordering::SeqCst);
                 }
+                if let Some(m) = self.deferred_majority_ahead.as_ref() {
+                    m.store(0, Ordering::SeqCst);
+                }
                 return;
             }
         };
@@ -558,6 +725,19 @@ impl ProduceCatchupGate {
             let quorum = observed.deferred_quorum_height(observed.now_instant());
             let bounded = quorum.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
             d.store(
+                if bounded > sel_height { bounded } else { 0 },
+                Ordering::SeqCst,
+            );
+        }
+        // The same evidence when a majority of producers agree on one branch: clamped
+        // the same way.
+        if let Some(m) = self.deferred_majority_ahead.as_ref() {
+            let top = observed
+                .majority_branch(observed.now_instant())
+                .map(|b| b.height)
+                .unwrap_or(0);
+            let bounded = top.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
+            m.store(
                 if bounded > sel_height { bounded } else { 0 },
                 Ordering::SeqCst,
             );
@@ -696,6 +876,7 @@ impl ProduceCatchupGate {
             attested_ahead: attested,
             applied_tip: st.last_applied_tip,
             gap: attested.saturating_sub(st.last_applied_tip),
+            split_guard: self.split_guard.load(Ordering::SeqCst),
         }
     }
 
@@ -710,16 +891,39 @@ impl ProduceCatchupGate {
             .unwrap_or(0)
     }
 
-    /// The deferred watermark this round may use. While deferred evidence ALONE would
-    /// make the producer refuse, that is allowed for [`DEFERRED_ONLY_REFUSE_MAX`]; after
-    /// it the evidence is ignored (the producer seals) with a rate-limited warning, until
-    /// it stops being the only reason to refuse.
+    /// The majority-branch watermark of the last recompute (0 when not wired or none).
+    fn majority_watermark(&self) -> u64 {
+        self.deferred_majority_ahead
+            .as_ref()
+            .map(|m| m.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// The deferred watermark this round may use.
+    ///
+    /// While deferred evidence ALONE would make the producer refuse, that is allowed
+    /// for [`DEFERRED_ONLY_REFUSE_MAX`]. After it:
+    ///   * if a strict majority of the producer set is extending ONE branch this node
+    ///     cannot admit (the majority watermark), the producer keeps refusing and
+    ///     raises the split guard. Sealing would only put a block on a branch of its
+    ///     own, which the majority will never build on: that is how one node's
+    ///     admission failure turns into a permanent split. Refusing costs the network
+    ///     nothing, because that majority is producing; and since refusing producers
+    ///     produce nothing, a guard that held every producer off would lose its own
+    ///     evidence within [`DEFERRED_EVIDENCE_TTL`]. Sync keeps running meanwhile,
+    ///     and the guard ends when the branch is admitted or goes quiet;
+    ///   * otherwise (a total split, a minority, unlinked blocks) the evidence is
+    ///     ignored and the producer seals, with a rate-limited warning, until it stops
+    ///     being the only reason to refuse. This is the 10-29 bound: evidence that no
+    ///     majority stands behind must not idle producers network-wide.
     fn deferred_for_round(&self, st: &mut CatchupBehindState, local_tip: u64, held: u64) -> u64 {
-        let raw = self.deferred_watermark();
+        let majority = self.majority_watermark();
+        let raw = self.deferred_watermark().max(majority);
         let deferred_only = raw.saturating_sub(local_tip) > CATCHUP_RESUME_GAP
             && held.saturating_sub(local_tip) <= CATCHUP_RESUME_GAP;
         if !deferred_only {
             st.deferred_only_since = None;
+            self.split_guard.store(false, Ordering::SeqCst);
             return raw;
         }
         let now = self
@@ -731,6 +935,25 @@ impl ProduceCatchupGate {
         if now.saturating_duration_since(since) < DEFERRED_ONLY_REFUSE_MAX {
             return raw;
         }
+        if majority.saturating_sub(local_tip) > CATCHUP_RESUME_GAP {
+            self.split_guard.store(true, Ordering::SeqCst);
+            let due = st
+                .split_guard_alarmed
+                .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+            if due {
+                st.split_guard_alarmed = Some(now);
+                error!(
+                    "F2/#126 SPLIT GUARD: a majority of producers keep extending a branch this \
+                     node cannot admit (evidence at {majority}, applied tip {local_tip}) for over \
+                     {}s. NOT sealing on this node's own tip: that would fork it off the network. \
+                     Sync keeps trying; production resumes by itself once this node admits that \
+                     branch or it goes quiet. Check this node's admission errors, peers and sync.",
+                    DEFERRED_ONLY_REFUSE_MAX.as_secs()
+                );
+            }
+            return majority;
+        }
+        self.split_guard.store(false, Ordering::SeqCst);
         let due = st
             .deferred_only_warned
             .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
@@ -1838,6 +2061,8 @@ impl BlockProducer {
             // candidate below finality is never treated as "ahead".
             finalized_floor: Some(app.finalized_height_handle()),
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
         });
         self
@@ -1859,6 +2084,7 @@ impl BlockProducer {
             gate.attested_ahead = Some(Arc::new(AtomicU64::new(0)));
             gate.attested_observed = Some(attested.handle());
             gate.deferred_ahead = Some(Arc::new(AtomicU64::new(0)));
+            gate.deferred_majority_ahead = Some(Arc::new(AtomicU64::new(0)));
         }
         self
     }
@@ -2197,6 +2423,9 @@ impl BlockProducer {
                     attested_now.saturating_sub(local_tip),
                     attested_now,
                     local_tip,
+                );
+                citrate_api::metrics_server::update_producer_split_guard(
+                    gate.split_guard.load(Ordering::SeqCst),
                 );
             }
             gate_result?;
@@ -6613,6 +6842,8 @@ mod tests {
             attested_observed: None,
             finalized_floor: None,
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
         }
     }
@@ -7132,6 +7363,8 @@ mod tests {
             attested_observed: Some(att.handle()),
             finalized_floor: floor.map(|f| Arc::new(AtomicU64::new(f))),
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
         }
     }
@@ -8209,6 +8442,15 @@ mod tests {
             }
         }
 
+        fn split_guard_on(b: &N) -> bool {
+            b.producer
+                .produce_gate
+                .as_ref()
+                .expect("gate wired")
+                .status_snapshot()
+                .split_guard
+        }
+
         /// RED at fe5e82b3. Four of seven producers keep extending ONE branch that B
         /// cannot admit (B never got its first block). The gate refuses for 60 s and
         /// then seals on B's own tip every round: B builds a solo branch while a
@@ -8238,6 +8480,7 @@ mod tests {
                 "B sealed on its own tip while 4 of 7 producers extend a branch it cannot admit"
             );
             assert_eq!(applied(&b), start, "B extended a solo branch");
+            assert!(split_guard_on(&b), "the split guard is not raised");
         }
 
         /// The guard is bounded by the evidence: once the majority stops producing,
@@ -8255,6 +8498,7 @@ mod tests {
                 assert!(b.producer.produce_block().await.is_err());
                 b.attested.advance_clock_for_test(Duration::from_secs(10));
             }
+            assert!(split_guard_on(&b));
             // The majority goes quiet.
             let mut resumed_after = None;
             for step in 1..=6u64 {
@@ -8267,6 +8511,7 @@ mod tests {
             let after = resumed_after.expect("B never resumed after the majority stopped");
             // Literal on purpose: 30 s window + one 10 s round.
             assert!(after <= 40, "resumed only after {after}s");
+            assert!(!split_guard_on(&b), "the split guard stayed raised");
         }
 
         /// Seven solo branches (every producer in the same state): no branch has a
@@ -8293,6 +8538,7 @@ mod tests {
             }
             let at = first_seal.expect("a total split must not idle B past the cap");
             assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
         }
 
         /// Three of seven agreeing (more than a third, not a majority): the cap
@@ -8319,6 +8565,7 @@ mod tests {
             }
             let at = first_seal.expect("a minority held B off past the cap");
             assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
         }
 
         /// A proposer that signs on two branches is not counted on either: with it,
@@ -8370,6 +8617,18 @@ mod tests {
             }
             let at = first_seal.expect("unlinked blocks held B off past the cap");
             assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// The quorum sizes the guard uses: a strict majority of the producer set
+        /// (the node itself plus the known proposers), never satisfiable alone.
+        #[test]
+        fn rcseal_majority_quorum_sizes() {
+            // known proposers -> needed agreeing others (producers = known + 1)
+            assert_eq!(deferred_majority_size(1), 2); // 2 producers: unreachable
+            assert_eq!(deferred_majority_size(2), 2); // 3 producers
+            assert_eq!(deferred_majority_size(3), 3); // 4 producers
+            assert_eq!(deferred_majority_size(6), 4); // 7 producers
+            assert_eq!(deferred_majority_size(7), 5); // 8 producers
         }
     }
 }
