@@ -1434,10 +1434,7 @@ impl GhostDag {
         // recomputed score sits exactly one above the header's, which is what
         // `validate_block_consistency`'s score band already pins for a linear
         // block. Anything else is a genuine inconsistency worth a warning.
-        if !block.is_genesis()
-            && block.header.merge_parent_hashes.is_empty()
-            && block.header.blue_score.checked_add(1) != Some(blue_set.score)
-        {
+        if blue_score_inconsistent(block, blue_set.score) {
             warn!(
                 "blue_score inconsistency on {}: recomputed {} but header claims {} \
                  (expected recomputed == header + 1 for a linear block)",
@@ -1601,6 +1598,15 @@ impl GhostDag {
         let from_cache: usize = cache.values().map(|b| b.blocks.len()).sum();
         from_relations.saturating_add(from_cache)
     }
+}
+
+/// Whether `block`'s locally derived fork-choice score is inconsistent with
+/// its header's `blue_score` (logged by [`GhostDag::add_block`]; never a
+/// validity rule).
+fn blue_score_inconsistent(block: &Block, fork_choice_score: u64) -> bool {
+    !block.is_genesis()
+        && block.header.merge_parent_hashes.is_empty()
+        && block.header.blue_score.checked_add(1) != Some(fork_choice_score)
 }
 
 /// PANIC-S1: a blue score is bounded by chain height, so these sums cannot
@@ -2239,6 +2245,71 @@ mod tests {
         dag_store.store_block(b.clone()).await.unwrap();
         ghostdag.add_block(b).await.unwrap();
         ghostdag.get_blue_score(&b.hash()).await.unwrap()
+    }
+
+    /// The fork-choice score counts blue merge parents and the producer writes
+    /// `parent + 1` into headers, so on a DAG that merges, a linear block's
+    /// fork-choice score sits ABOVE header + 1 by the blue merge parents of its
+    /// ancestry. That is the live r1006 shape (about 1.5 merge parents per
+    /// block) and is not an inconsistency.
+    #[tokio::test]
+    async fn blue_score_check_accepts_a_linear_block_whose_ancestry_merged() {
+        let (dag_store, ghostdag, genesis) = ms_bound_fixture(18).await;
+        let a = create_test_block_with_parents([0xA1; 32], genesis.hash(), vec![], 1);
+        let b = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
+        ms_bound_admit(&dag_store, &ghostdag, &a).await;
+        ms_bound_admit(&dag_store, &ghostdag, &b).await;
+        let c = create_test_block_with_parents([0xC2; 32], a.hash(), vec![b.hash()], 2);
+        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &c).await, 4);
+        let d = create_test_block_with_parents([0xD3; 32], c.hash(), vec![], 3);
+        let score = ms_bound_admit(&dag_store, &ghostdag, &d).await;
+        assert_eq!(score, 5, "genesis, a, b, c, d");
+        assert!(
+            !blue_score_inconsistent(&d, score),
+            "a linear block above a merge scores header + 1 + 1 blue merge parent: consistent"
+        );
+        assert!(!blue_score_inconsistent(&c, 4), "the merge block itself");
+    }
+
+    /// The real inconsistency: a fork-choice score BELOW header + 1. Honest
+    /// headers (`parent + 1`) can never produce one, so it means this node lost
+    /// score it should hold (the restart score-scale class) or a header claimed
+    /// more than its blue merge parents. Flagged for merge blocks too.
+    #[test]
+    fn blue_score_check_flags_a_score_below_header_plus_one() {
+        let linear = create_test_block_with_parents([0x71; 32], Hash::new([0x70; 32]), vec![], 7);
+        assert!(
+            blue_score_inconsistent(&linear, 7),
+            "linear: score == header"
+        );
+        assert!(
+            !blue_score_inconsistent(&linear, 8),
+            "linear: score == header + 1"
+        );
+        let merge = create_test_block_with_parents(
+            [0x51; 32],
+            Hash::new([0x50; 32]),
+            vec![Hash::new([0x4F; 32])],
+            5,
+        );
+        assert!(
+            blue_score_inconsistent(&merge, 5),
+            "merge block: score below header + 1"
+        );
+        assert!(!blue_score_inconsistent(&merge, 6));
+        assert!(!blue_score_inconsistent(&merge, 7), "one blue merge parent");
+        let genesis = create_test_block_with_parents([0x01; 32], Hash::default(), vec![], 0);
+        assert!(!blue_score_inconsistent(&genesis, 1));
+        assert!(
+            blue_score_inconsistent(&linear, 0),
+            "a lost score is flagged even at 0"
+        );
+        let top =
+            create_test_block_with_parents([0x7F; 32], Hash::new([0x7E; 32]), vec![], u64::MAX);
+        assert!(
+            blue_score_inconsistent(&top, u64::MAX),
+            "header + 1 overflows: no score can be consistent"
+        );
     }
 
     /// MS-BOUND: the bounded fork-choice score matches the full k-cluster union

@@ -155,7 +155,11 @@ async fn restart_of_a_pruned_node_keeps_fork_choice_and_admits_peer_blocks() {
                 admit(&dag, &gd, &side).await;
             }
         }
-        for b in canon.iter().chain(sibs.iter()).chain(std::iter::once(&side)) {
+        for b in canon
+            .iter()
+            .chain(sibs.iter())
+            .chain(std::iter::once(&side))
+        {
             if b.header.height >= PRUNE_AT {
                 before.insert(b.hash(), gd.get_blue_score(&b.hash()).await.expect("score"));
             }
@@ -214,7 +218,10 @@ async fn restart_of_a_pruned_node_keeps_fork_choice_and_admits_peer_blocks() {
         .await
         .expect("peer block passes the consistency gate after a restart");
     admit(&dag, &gd, &p1).await;
-    assert_eq!(gd.get_blue_score(&p1.hash()).await.ok(), Some(before[&tip.hash()] + 1));
+    assert_eq!(
+        gd.get_blue_score(&p1.hash()).await.ok(),
+        Some(before[&tip.hash()] + 1)
+    );
 
     let p2 = block(PEER + 1, N + 2, p1.hash(), vec![side.hash()]);
     gd.validate_block_consistency(&p2)
