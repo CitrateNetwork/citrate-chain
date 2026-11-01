@@ -1861,14 +1861,25 @@ impl BlockProducer {
         dag_store: Arc<DagStore>,
         ghostdag: Arc<GhostDag>,
     ) -> Self {
-        // Load existing chain data into DAG so we continue from last tip
+        // Load existing chain data into DAG so we continue from last tip.
+        //
+        // From the DAG pruning floor, not from genesis: below it the DAG store
+        // dropped the blocks on purpose (genesis included). Re-offering them put
+        // them back on a permissive store and, on the strict production store,
+        // failed once per pruned height (no parent to verify the VRF against),
+        // with a warn line each and a fallback-scored fork-choice entry for a
+        // block the DAG no longer holds.
         let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
+        let floor = crate::dag_prune::pruned_below(&dag_store).await;
         if latest_height > 0 {
             info!(
-                "Loading {} blocks from storage into DAG...",
-                latest_height.saturating_add(1)
+                "Loading {} blocks from storage into DAG (heights {}..={}, DAG pruned below {})...",
+                latest_height.saturating_sub(floor).saturating_add(1),
+                floor,
+                latest_height,
+                floor
             );
-            for height in 0..=latest_height {
+            for height in floor..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
                         // SYNC-S1 D2.3 (R3): a discarded DAG write here left the

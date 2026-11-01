@@ -587,7 +587,19 @@ impl Fleet {
                     .await
                     .expect("pruning point");
                 let dropped = old.dag.prune().await.expect("prune");
-                assert!(dropped > 0, "fixture: {} pruned below {point}", old.name);
+                // A node restarted again without moving past its previous
+                // pruning point has nothing new to drop: the eager load no
+                // longer puts pruned blocks back into the DAG store.
+                assert!(
+                    crate::dag_prune::pruned_below(&old.dag).await == point,
+                    "fixture: {} pruned below {point} (dropped {dropped})",
+                    old.name
+                );
+                assert!(
+                    old.dag.get_blocks_at_height(point - 1).await.is_empty(),
+                    "fixture: {} still holds blocks below {point}",
+                    old.name
+                );
             }
         }
         let boot = old.executor.state_snapshot();
