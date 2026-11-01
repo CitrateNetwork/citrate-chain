@@ -155,6 +155,7 @@ struct Node {
     producer: BlockProducer,
     sync: SyncManager,
     rejoin: parking_lot::Mutex<sync_rejoin::RejoinTracker>,
+    tip_reask: sync_recovery::TipReask,
     sel: sync_peer::SyncPeerSelector,
     walk: sync_recovery::ParentWalks,
     /// This process's peer table (the walk sends through it). Every message
@@ -372,6 +373,7 @@ impl Node {
             producer,
             sync,
             rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
+            tip_reask: sync_recovery::TipReask::new(),
             sel: sync_peer::SyncPeerSelector::new(),
             walk: sync_recovery::ParentWalks::new(clock, SyncConfig::default().request_timeout),
             pm,
@@ -957,6 +959,7 @@ impl Node {
         let answer_hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash).collect();
         let _ = self.sync.handle_blocks(pid, blocks).await;
         let mut pending = self.sync.drain_validated_blocks().await;
+        let answer_top = pending.iter().map(|b| b.header.height).max();
         let verified: HashSet<Hash> = pending.iter().map(|b| b.header.block_hash).collect();
         let answers_rejoin = self
             .rejoin
@@ -1007,14 +1010,22 @@ impl Node {
         if reprocessed {
             self.orphans = admission::bound_orphan_buffer(fx.deferred);
         }
-        let applied_now = self.applied().1;
+        let (applied_hash_now, applied_now) = self.applied();
         let target = self.max_seen.load(Ordering::Relaxed);
         let gap = target.saturating_sub(applied_now);
+        let held_ahead = sync_recovery::answer_is_held_ahead(
+            answer_top,
+            newly_admitted,
+            deferred_from_answer,
+            applied_now,
+        );
+        self.tip_reask
+            .note_answer(applied_hash_now, held_ahead, self.clock);
         let stale_anchor = sync_recovery::answer_anchor_was_stale(
             self.sync.last_block_anchor_height(),
             applied_now,
             answer_hashes.len(),
-        );
+        ) || held_ahead;
         {
             let now = self.clock;
             let step = self.walk.next(
@@ -1131,7 +1142,8 @@ impl Node {
             if ph < 8 {
                 let _ = self.sync.request_headers(&peer, applied_tip.0).await;
             }
-            if pb < sync_recovery::TICK_PENDING_GATE {
+            let held_tip = self.tip_reask.hold(from, applied_tip.0, self.clock);
+            if pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
                 let sent = self.sync.request_blocks(&peer, from, height).await;
                 if matches!(sent, Ok(false)) {
                     let pid = peer.info.read().await.id.clone();
@@ -1636,7 +1648,10 @@ mod tests {
             "parent_walks.note_stuck(&stuck_roots, &pid.0, now)",
             "sync_recovery::deferred_roots(&fixpoint)",
             "rejoin_for_loop.lock().note_unsent(&pid.0)",
-            "pb < sync_recovery::TICK_PENDING_GATE",
+            "pb < sync_recovery::TICK_PENDING_GATE && !held_tip",
+            "sync_recovery::answer_is_held_ahead(",
+            "tip_reask_for_rx.lock().note_answer(",
+            "tip_reask_for_loop.lock().hold(",
             "|h| held_heads.contains(h)",
             "sync_rejoin::classify(",
             "sel.record_serve(",

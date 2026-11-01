@@ -798,14 +798,17 @@ pub const HELD_AHEAD_REASK_AFTER: Duration = Duration::from_secs(30);
 /// Whether an answer admitted nothing because this node already holds every
 /// block it served above its applied tip (admission is ahead of apply).
 /// `answer_top` is the highest verified block height in the answer.
+///
+/// Such an answer is the peer serving exactly what was asked; the question was
+/// the problem (rcBLUE-2 (g)). One that serves nothing above the applied tip is
+/// a peer at or behind us (#153), and one with deferred blocks did not connect.
 pub fn answer_is_held_ahead(
     answer_top: Option<u64>,
     newly_admitted: usize,
     deferred: usize,
     applied_now: u64,
 ) -> bool {
-    let _ = (answer_top, newly_admitted, deferred, applied_now);
-    false
+    newly_admitted == 0 && deferred == 0 && answer_top.is_some_and(|top| top > applied_now)
 }
 
 /// Holds back re-asking the applied-tip anchor after an answer that was
@@ -823,13 +826,23 @@ impl TipReask {
 
     /// Fold in an answer: `applied_tip` is the applied tip after admitting it.
     pub fn note_answer(&mut self, applied_tip: Hash, held_ahead: bool, now: Instant) {
-        let _ = (applied_tip, held_ahead, now);
+        self.held = held_ahead.then_some((applied_tip, now));
     }
 
-    /// Whether the sync tick should skip a `GetBlocks` anchored at `anchor`.
+    /// Whether the sync tick should skip a `GetBlocks` anchored at `anchor`:
+    /// only the applied-tip anchor, only while the tip is the one the
+    /// held-ahead answer was judged against, and for at most
+    /// [`HELD_AHEAD_REASK_AFTER`]. Fork-point probes and follow cursors anchor
+    /// elsewhere and are never held.
     pub fn hold(&self, anchor: Hash, applied_tip: Hash, now: Instant) -> bool {
-        let _ = (anchor, applied_tip, now, self.held);
-        false
+        match self.held {
+            Some((tip, at)) => {
+                anchor == applied_tip
+                    && tip == applied_tip
+                    && now.saturating_duration_since(at) < HELD_AHEAD_REASK_AFTER
+            }
+            None => false,
+        }
     }
 }
 

@@ -3034,6 +3034,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // the message handler, which judges the answers.
         let rejoin = Arc::new(parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()));
         let rejoin_for_rx = rejoin.clone();
+        // sync_recovery.rs: hold back re-asking the applied-tip anchor while
+        // admission is ahead of apply (its last answer held nothing new).
+        let tip_reask = Arc::new(parking_lot::Mutex::new(sync_recovery::TipReask::new()));
+        let tip_reask_for_rx = tip_reask.clone();
 
         // Periodic sync tick: request headers/blocks and check timeouts
         let pm_for_sync = pm_for_rx.clone();
@@ -3042,6 +3046,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
         let rejoin_for_loop = rejoin.clone();
+        let tip_reask_for_loop = tip_reask.clone();
         let initial_sync_for_sync = initial_sync_done.clone();
         tokio::spawn(async move {
             // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
@@ -3342,7 +3347,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     {
                         send_failed = true;
                     }
-                    if pb < sync_recovery::TICK_PENDING_GATE {
+                    // Admission ahead of apply: the last answer to this same
+                    // applied-tip anchor held nothing new, so asking again
+                    // re-imports the same range (rcBLUE-2 (g)). Skip until the
+                    // tip moves; it is not a silent peer, so nothing is noted.
+                    let held_tip = tip_reask_for_loop.lock().hold(
+                        block_from,
+                        applied_tip.0,
+                        std::time::Instant::now(),
+                    );
+                    if pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
                         // Only a request that was actually SENT is recorded as
                         // asked (Ok(false): anchor already pending, or the
                         // in-flight cap; nothing went on the wire).
@@ -3956,6 +3970,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
                         let mut pending = sync_for_rx.drain_validated_blocks().await;
+                        let answer_top = pending.iter().map(|b| b.header.height).max();
                         // sync_rejoin.rs: is this the asked peer's answer to the
                         // anchor the sync tick asked for? Judged on the blocks that
                         // passed validation (their hashes recompute).
@@ -4107,13 +4122,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // us. Judging it absolutely is what produced two successive
                         // dead bands; the gap is the yardstick.
                         {
-                            let applied_now = storage_for_handler
+                            let (applied_hash_now, applied_now) = storage_for_handler
                                 .blocks
                                 .get_applied_tip()
                                 .ok()
                                 .flatten()
-                                .map(|(_, h)| h)
-                                .unwrap_or(0);
+                                .unwrap_or((citrate_consensus::types::Hash::default(), 0));
                             let target = max_seen_for_rx.load(std::sync::atomic::Ordering::Relaxed);
                             let gap = target.saturating_sub(applied_now);
                             // #156: did our own applied tip pass the anchor we
@@ -4125,11 +4139,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // An EMPTY answer is never stale: on a sealing node the tip
                             // moves between request and answer, and calling "the peer has
                             // nothing for my anchor" Redundant hid that signal.
+                            // Admission ahead of apply (rcBLUE-2 (g)): every block it
+                            // served above the applied tip is already held. The peer
+                            // answered what was asked; score it Redundant, and hold
+                            // the tick off re-asking that anchor.
+                            let held_ahead = sync_recovery::answer_is_held_ahead(
+                                answer_top,
+                                newly_admitted,
+                                deferred_from_answer,
+                                applied_now,
+                            );
+                            tip_reask_for_rx.lock().note_answer(
+                                applied_hash_now,
+                                held_ahead,
+                                std::time::Instant::now(),
+                            );
                             let stale_anchor = sync_recovery::answer_anchor_was_stale(
                                 sync_for_rx.last_block_anchor_height(),
                                 applied_now,
                                 answer_hashes.len(),
-                            );
+                            ) || held_ahead;
                             // Missing-parent recovery continues by hash, within this
                             // peer's walk budget (sync_recovery.rs).
                             {
