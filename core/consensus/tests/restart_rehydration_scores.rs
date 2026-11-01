@@ -321,3 +321,114 @@ async fn restart_rehydration_and_the_next_admission_do_not_reload_block_bodies()
         admission_reads
     );
 }
+
+/// Per-block admission cost after a restart, at the shape of a fleet that
+/// seals two siblings beside every canonical block (3 blocks per height, each
+/// canonical block merging the previous height's two siblings), for both a
+/// follower (only the tips are re-registered at boot) and a producer (the eager
+/// load re-registers the canonical chain). Counts backend body reloads per
+/// admitted block over the first window after the restart, and prints the
+/// cost so a devnet apply rate can be compared against it.
+#[tokio::test]
+async fn admission_after_a_restart_costs_no_body_reloads_per_block() {
+    const PRE: u64 = 900;
+    const PRUNE_AT: u64 = 300;
+    const POST: u64 = 250;
+
+    fn sib(tag: u8, h: u64, sp: Hash) -> Block {
+        block(tag, h, sp, vec![])
+    }
+
+    for producer_style in [false, true] {
+        let kv = Arc::new(MemKv::default());
+        let mut canon: Vec<Block> = vec![block(CANON, 0, Hash::default(), vec![])];
+        let mut prev_sibs: Vec<Hash> = Vec::new();
+        {
+            let dag =
+                Arc::new(DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("store"));
+            let gd = GhostDag::new(GhostDagParams::default(), dag.clone());
+            admit(&dag, &gd, &canon[0]).await;
+            for h in 1..=PRE {
+                let sp = canon[(h - 1) as usize].hash();
+                let c = block(CANON, h, sp, std::mem::take(&mut prev_sibs));
+                let s1 = sib(SIBLING, h, sp);
+                let s2 = sib(SIDE, h, sp);
+                for b in [&c, &s1, &s2] {
+                    admit(&dag, &gd, b).await;
+                }
+                prev_sibs = vec![s1.hash(), s2.hash()];
+                canon.push(c);
+            }
+            dag.update_pruning_point(canon[PRUNE_AT as usize].hash())
+                .await
+                .expect("pruning point");
+            assert!(dag.prune().await.expect("prune") > 0);
+        }
+
+        let dag =
+            Arc::new(DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("reload"));
+        let gd = GhostDag::new(GhostDagParams::default(), dag.clone());
+        let boot = std::time::Instant::now();
+        kv.body_reads.store(0, Ordering::SeqCst);
+        gd.reconcile_tips_from_dag_store().await;
+        if producer_style {
+            for b in &canon {
+                let _ = gd.register_existing_block(b).await;
+            }
+            gd.reconcile_tips_from_dag_store().await;
+        }
+        let boot_reads = kv.body_reads.load(Ordering::SeqCst);
+        let boot_time = boot.elapsed();
+
+        let mut first_window_reads = 0usize;
+        let mut first_window_blocks = 0usize;
+        let started = std::time::Instant::now();
+        let mut first_window_time = std::time::Duration::ZERO;
+        for h in (PRE + 1)..=(PRE + POST) {
+            let sp = canon[(h - 1) as usize].hash();
+            let c = block(PEER, h, sp, std::mem::take(&mut prev_sibs));
+            let s1 = sib(PEER + 1, h, sp);
+            let s2 = sib(PEER + 2, h, sp);
+            kv.body_reads.store(0, Ordering::SeqCst);
+            for b in [&c, &s1, &s2] {
+                gd.validate_block_consistency(b)
+                    .await
+                    .expect("consistency gate");
+                admit(&dag, &gd, b).await;
+            }
+            if h <= PRE + 200 {
+                first_window_reads += kv.body_reads.load(Ordering::SeqCst);
+                first_window_blocks += 3;
+                first_window_time = started.elapsed();
+            }
+            prev_sibs = vec![s1.hash(), s2.hash()];
+            canon.push(c);
+        }
+        let total = started.elapsed();
+        let per_block_reads = first_window_reads as f64 / first_window_blocks as f64;
+        eprintln!(
+            "restart cost ({}): boot {} body reloads in {:?}; first 200 heights after the \
+             restart: {:.1} body reloads/block, {:?}/block; all {} heights: {:?}/block",
+            if producer_style {
+                "producer"
+            } else {
+                "follower"
+            },
+            boot_reads,
+            boot_time,
+            per_block_reads,
+            first_window_time / first_window_blocks as u32,
+            POST,
+            total / (POST * 3) as u32
+        );
+        assert!(
+            per_block_reads <= 4.0,
+            "{}: {per_block_reads:.1} body reloads per admitted block after a restart",
+            if producer_style {
+                "producer"
+            } else {
+                "follower"
+            }
+        );
+    }
+}
