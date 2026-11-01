@@ -8111,6 +8111,267 @@ mod tests {
             );
         }
     }
+
+    /// The seal gate when producers this node cannot follow keep extending a branch.
+    ///
+    /// The 60 s cap on deferred-only refusal (`DEFERRED_ONLY_REFUSE_MAX`) exists so
+    /// that unadmittable evidence cannot idle producers network-wide. These tests pin
+    /// where the cap must still apply (no single branch backed by a majority of the
+    /// producer set: a total split, a minority, an equivocating proposer) and where it
+    /// must not (a majority of producers agree on one branch this node cannot admit:
+    /// sealing then only forks this node off, and refusing cannot stall the network,
+    /// because that majority is producing).
+    mod split_guard {
+        use super::seal_gate_and_parent_walk::{applied, gossip, node, produce, N};
+        use super::*;
+
+        /// Seven producers: B (node 7) and six others, all on one chain of 12 blocks
+        /// that B admitted, so all six are known proposers on B. Returns one block
+        /// by each other producer (index `i - 1` for node `i`) as a template.
+        async fn seven() -> (Vec<N>, N, Vec<Block>) {
+            let mut others = Vec::new();
+            for i in 1..=6u8 {
+                others.push(node(i, false).await);
+            }
+            let mut b = node(7, true).await;
+            let mut by: Vec<Option<Block>> = vec![None; 6];
+            for r in 0..12usize {
+                let p = r % 6;
+                let blk = produce(&others[p]).await;
+                for (q, o) in others.iter_mut().enumerate() {
+                    if q != p {
+                        assert_eq!(gossip(o, None, &blk).await, "admitted");
+                    }
+                }
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+                by[p] = Some(blk);
+            }
+            let templates = by.into_iter().map(|t| t.expect("template")).collect();
+            (others, b, templates)
+        }
+
+        /// A signed block by node `i` at `height` on top of `parent`, with a header
+        /// time `skew_secs` after real time (matching the test clock). Each one is a
+        /// real, hash-bound, signed block; B cannot admit any of them because the
+        /// first parent of each branch is a block B never received.
+        fn signed(templates: &[Block], i: u8, height: u64, parent: Hash, skew_secs: u64) -> Block {
+            let mut x = templates[usize::from(i) - 1].clone();
+            x.header.height = height;
+            x.header.selected_parent_hash = parent;
+            x.header.merge_parent_hashes = Vec::new();
+            x.header.timestamp =
+                (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(skew_secs);
+            x.header.block_hash = x.compute_hash();
+            x.signature = crypto::sign_block(
+                &x.header.block_hash,
+                &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+            );
+            x
+        }
+
+        /// One branch B cannot admit, extended by a fixed set of proposers.
+        struct Branch {
+            proposers: Vec<u8>,
+            tip: Hash,
+            height: u64,
+            turn: usize,
+        }
+
+        impl Branch {
+            fn new(proposers: &[u8], root: u8, height: u64) -> Self {
+                Self {
+                    proposers: proposers.to_vec(),
+                    tip: Hash::new([root; 32]),
+                    height,
+                    turn: 0,
+                }
+            }
+
+            /// `k` new blocks on this branch, by its proposers in turn.
+            fn extend(&mut self, templates: &[Block], k: usize, skew: u64) -> Vec<Block> {
+                (0..k)
+                    .map(|_| {
+                        let i = self.proposers[self.turn % self.proposers.len()];
+                        self.turn += 1;
+                        self.height += 1;
+                        let blk = signed(templates, i, self.height, self.tip, skew);
+                        self.tip = blk.header.block_hash;
+                        blk
+                    })
+                    .collect()
+            }
+        }
+
+        /// Deliver blocks to B as gossip; every one must defer (B lacks the parent).
+        async fn hear(b: &mut N, blocks: &[Block]) {
+            for blk in blocks {
+                assert_eq!(gossip(b, None, blk).await, "deferred");
+            }
+        }
+
+        /// RED at fe5e82b3. Four of seven producers keep extending ONE branch that B
+        /// cannot admit (B never got its first block). The gate refuses for 60 s and
+        /// then seals on B's own tip every round: B builds a solo branch while a
+        /// majority of the producer set is live on another, which is how one admission
+        /// failure becomes a permanent split. The fix keeps refusing for as long as
+        /// that majority keeps producing, and raises the split guard.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_majority_branch_it_cannot_admit_never_seals_solo() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA1, start.1 + 10);
+            let mut sealed = Vec::new();
+            for step in 0..=18u64 {
+                let t = step * 10;
+                // One block from each proposer first, then two per 10 s: within
+                // the 30 s window all four proposers stay fresh on the branch.
+                let blocks = branch.extend(&templates, if step == 0 { 4 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                if b.producer.produce_block().await.is_ok() {
+                    sealed.push(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                sealed,
+                Vec::<u64>::new(),
+                "B sealed on its own tip while 4 of 7 producers extend a branch it cannot admit"
+            );
+            assert_eq!(applied(&b), start, "B extended a solo branch");
+        }
+
+        /// The guard is bounded by the evidence: once the majority stops producing,
+        /// B seals again within the 30 s evidence window (plus one round). Refusing
+        /// producers produce nothing, so if every producer were refusing, the
+        /// evidence would lapse the same way: the guard cannot stall the network.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_split_guard_resumes_when_the_majority_stops() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA2, start.1 + 10);
+            for step in 0..=9u64 {
+                let blocks = branch.extend(&templates, if step == 0 { 4 } else { 2 }, step * 10);
+                hear(&mut b, &blocks).await;
+                assert!(b.producer.produce_block().await.is_err());
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            // The majority goes quiet.
+            let mut resumed_after = None;
+            for step in 1..=6u64 {
+                if b.producer.produce_block().await.is_ok() {
+                    resumed_after = Some(step * 10);
+                    break;
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let after = resumed_after.expect("B never resumed after the majority stopped");
+            // Literal on purpose: 30 s window + one 10 s round.
+            assert!(after <= 40, "resumed only after {after}s");
+        }
+
+        /// Seven solo branches (every producer in the same state): no branch has a
+        /// majority behind it, so the 10-29 cap still applies and B seals after 60 s.
+        /// Refusing here would idle every producer at once.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_total_split_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut solos: Vec<Branch> = (1..=6u8)
+                .map(|i| Branch::new(&[i], 0xB0 + i, start + 10))
+                .collect();
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                for s in solos.iter_mut() {
+                    let blocks = s.extend(&templates, 1, t);
+                    hear(&mut b, &blocks).await;
+                }
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a total split must not idle B past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// Three of seven agreeing (more than a third, not a majority): the cap
+        /// applies. This is the 10-29 stranded-minority case: the majority must not
+        /// be held off by a minority it cannot follow.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_minority_branch_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut branch = Branch::new(&[1, 2, 3], 0xA3, start + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks = branch.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                let r = b.producer.produce_block().await;
+                if t == 0 {
+                    assert!(r.is_err(), "3 of 7 count as evidence at first");
+                }
+                if r.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a minority held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// A proposer that signs on two branches is not counted on either: with it,
+        /// each branch would show four proposers (a "majority" each), and both sides
+        /// would stop. Without it each shows three, so the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_equivocating_proposer_counts_on_no_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut p = Branch::new(&[1, 2, 3, 4], 0xA4, start + 10);
+            let mut q = Branch::new(&[4, 5, 6], 0xA5, start + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks = p.extend(&templates, if step == 0 { 4 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                let blocks = q.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("an equivocator made a majority");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// Blocks from four proposers that do not link to each other (same height
+        /// band, unrelated parents) are not one branch: the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_unlinked_blocks_from_a_majority_are_not_a_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                for i in 1..=4u8 {
+                    let mut root = [0xC0u8; 32];
+                    root[0] = i;
+                    root[1] = step as u8;
+                    let parent = Hash::new(root);
+                    let blk = signed(&templates, i, start + 20 + step, parent, t);
+                    hear(&mut b, std::slice::from_ref(&blk)).await;
+                }
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("unlinked blocks held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+    }
 }
 
 #[cfg(test)]

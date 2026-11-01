@@ -171,6 +171,26 @@ pub fn should_attempt_ancestry_recovery(block_height: u64, applied_height: u64) 
 /// This is a preference, not a ban — see I2 and [`SyncPeerSelector::select`].
 pub const DEPREFER_AT_FAILURES: u32 = 3;
 
+/// Sync-request timeouts after which the sync driver drops a peer so it
+/// re-handshakes (main.rs).
+pub const DROP_AFTER_TIMEOUTS: u32 = 5;
+
+/// Whether the sync driver should drop `peer` after a sync timeout. `failures`
+/// is its timeout count, `total_peers` the connected count, `still_mapped`
+/// whether the peer is still in the peer map, and `last_inbound_age` how long
+/// ago the node last received any message from it (`None`: never).
+///
+/// Never drops the only peer: that strands a fresh node with zero peers.
+pub fn drop_after_timeouts(
+    failures: u32,
+    total_peers: usize,
+    still_mapped: bool,
+    last_inbound_age: Option<Duration>,
+) -> bool {
+    let _ = last_inbound_age;
+    failures >= DROP_AFTER_TIMEOUTS && total_peers > 1 && still_mapped
+}
+
 /// PBA-L1b-006: the most an UNVERIFIED height claim may raise the node's
 /// network-height evidence (`max_seen_height`, which drives the sync target
 /// and `eth_syncing.highestBlock`) above its own applied tip. Matches the
@@ -749,6 +769,43 @@ mod tests {
             assert!(ticks < 50, "counter must escalate, not plateau");
         }
         assert_eq!(sel.failures("dead"), DROP_AT);
+    }
+
+    /// RED (r1006 2026-11-01, prod-3 after the reseed: "6 Dropped peer … after
+    /// repeated sync timeouts" while it served six catching-up nodes). A peer
+    /// whose messages are still arriving has a working connection; its timeouts
+    /// mean the request or the answer was shed under load (often in this node's
+    /// own inbound queue). Dropping it costs its block gossip and a re-handshake
+    /// and fixes nothing. Timeouts still de-prefer it as a sync source.
+    #[test]
+    fn rcseal_red_a_peer_still_talking_is_not_dropped_for_timeouts() {
+        let heard = Some(Duration::from_secs(1));
+        assert!(
+            !drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, true, heard),
+            "dropped a peer heard from 1 s ago"
+        );
+        assert!(
+            !drop_after_timeouts(50, 7, true, Some(Duration::from_secs(29))),
+            "dropped a peer heard from within the 30 s request timeout"
+        );
+    }
+
+    /// The drop still happens where it is the fix: a silent connection (nothing
+    /// received for longer than the request timeout, or ever), never for the
+    /// only peer, never below the threshold, never for an unmapped peer.
+    #[test]
+    fn rcseal_silent_peers_are_still_dropped() {
+        let silent = Some(Duration::from_secs(31));
+        assert!(drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, true, silent));
+        assert!(drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, true, None));
+        assert!(!drop_after_timeouts(
+            DROP_AFTER_TIMEOUTS - 1,
+            7,
+            true,
+            silent
+        ));
+        assert!(!drop_after_timeouts(DROP_AFTER_TIMEOUTS, 1, true, silent));
+        assert!(!drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, false, silent));
     }
 
     /// `reset` is the drop-path clear; it must behave as a clean slate so the
