@@ -8705,6 +8705,80 @@ mod tests {
             assert!(!split_guard_on(&b));
         }
 
+        /// RED at 42feb32c (rvSPLIT probe). A 3-of-7 minority branch plus one key
+        /// (node 4) whose block each round names the branch tip as its selected
+        /// parent AND this node's own tip as a merge parent. Linking through any
+        /// parent counted key 4 on the branch, which made it a "majority" here,
+        /// while the same block also follows this node's own history. A block
+        /// that names a parent this node holds is not evidence that this node
+        /// is behind, and only selected-parent links make a branch.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_bridging_key_does_not_complete_a_majority() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut branch = Branch::new(&[1, 2, 3], 0xA7, start + 10);
+            let mut first_seal = None;
+            for step in 0..=18u64 {
+                let t = step * 10;
+                let blocks = branch.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                // Key 4 bridges: selected parent = the branch tip, merge parent =
+                // B's own applied tip (which B holds).
+                branch.height += 1;
+                let mut x = signed(&templates, 4, branch.height, branch.tip, t);
+                x.header.merge_parent_hashes = vec![applied(&b).0];
+                x.header.block_hash = x.compute_hash();
+                x.signature = crypto::sign_block(
+                    &x.header.block_hash,
+                    &Ed25519SigningKey::from_bytes(&[0x64; 32]),
+                );
+                branch.tip = x.header.block_hash;
+                hear(&mut b, std::slice::from_ref(&x)).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a bridging key held a minority node off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// Merge-parent links alone do not make a branch: four producers whose
+        /// blocks name each other only as merge parents (each selected parent
+        /// is its own unknown block) are four branches, so the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_merge_parent_links_alone_are_not_a_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut prev: Vec<Hash> = Vec::new();
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let mut now_round = Vec::new();
+                for i in 1..=4u8 {
+                    let mut root = [0xD0u8; 32];
+                    root[0] = i;
+                    root[1] = step as u8;
+                    let mut x = signed(&templates, i, start + 20 + step, Hash::new(root), t);
+                    x.header.merge_parent_hashes = prev.clone();
+                    x.header.block_hash = x.compute_hash();
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    hear(&mut b, std::slice::from_ref(&x)).await;
+                    now_round.push(x.header.block_hash);
+                }
+                prev = now_round;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("merge-parent links held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
         /// The quorum sizes the guard uses: a strict majority of the producer set
         /// (the node itself plus the known proposers), never satisfiable alone.
         #[test]
