@@ -3452,10 +3452,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // sole source, and never recovered). Only prune when another peer
                     // can take over; otherwise keep retrying against the one we have.
                     let (total_peers, _, _) = pm_for_sync.get_peer_counts().await;
+                    let mapped = pm_for_sync.get_peer(&pid).is_some();
                     if sync_peer::drop_after_timeouts(
                         pf,
                         total_peers,
-                        pm_for_sync.get_peer(&pid).is_some(),
+                        mapped,
                         pm_for_sync.last_inbound_age(&pid),
                     ) {
                         pm_for_sync.remove_peer(&pid).await;
@@ -3464,9 +3465,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             "Dropped peer {} after repeated sync timeouts (will re-handshake)",
                             pid.0
                         );
-                    } else if pf >= sync_peer::DROP_AFTER_TIMEOUTS {
+                    } else if pf >= sync_peer::DROP_AFTER_TIMEOUTS && (total_peers <= 1 || !mapped)
+                    {
                         // Sole peer: reset the counter so we keep trying it rather
-                        // than freezing after 5 timeouts.
+                        // than freezing after 5 timeouts. A peer kept because it is
+                        // still talking keeps its count, so it stays de-preferred
+                        // until it answers.
                         sync_peers_for_loop.lock().await.reset(&pid.0);
                     }
                 }

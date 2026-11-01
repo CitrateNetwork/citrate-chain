@@ -1,7 +1,7 @@
 // citrate/core/network/src/peer.rs
 
 // Peer connection and management
-use crate::inbound::InboundDrops;
+use crate::inbound::{self, InboundDrops, ServeBudget};
 use crate::protocol::MAX_INBOUND_MESSAGE_BYTES;
 use crate::{NetworkError, NetworkMessage, ProtocolVersion};
 use citrate_consensus::types::Hash;
@@ -360,6 +360,10 @@ pub struct PeerManager {
     /// When each connected peer's last message reached `forward_incoming`
     /// (queued or shed): proof its connection delivers. Cleared on removal.
     last_inbound: Arc<DashMap<PeerId, Instant>>,
+    /// Each peer's serve-request budget (see `inbound::ServeBudget`).
+    serve_budget: Arc<ServeBudget>,
+    /// Serve requests shed for being over their peer's budget.
+    serve_budget_drops: Arc<InboundDrops>,
 }
 
 #[derive(Debug, Clone)]
@@ -406,6 +410,10 @@ impl PeerManager {
             inbound_drops: Arc::new(AtomicU64::new(0)),
             inbound_drops_by_kind: Arc::new(InboundDrops::default()),
             last_inbound: Arc::new(DashMap::new()),
+            serve_budget: Arc::new(ServeBudget::default()),
+            serve_budget_drops: Arc::new(InboundDrops::with_reason(
+                "inbound serve request over this peer's budget",
+            )),
         }
     }
 
@@ -435,6 +443,21 @@ impl PeerManager {
         }
         if let Some(tx) = self.incoming.read().await.clone() {
             let kind = message.kind();
+            // Serve requests over this peer's budget never reach the queue.
+            if inbound::serve_request(&message) && !self.serve_budget.allow(&peer_id, now) {
+                self.serve_budget_drops.record(kind, &peer_id, now);
+                return;
+            }
+            // Only block gossip and sync answers may take the reserved part.
+            let reserved = tx
+                .max_capacity()
+                .checked_div(inbound::RESERVED_SHARE_DIVISOR)
+                .unwrap_or(0);
+            if !inbound::reserved_lane(&message) && tx.capacity() <= reserved {
+                self.inbound_drops.fetch_add(1, Ordering::Relaxed);
+                self.inbound_drops_by_kind.record(kind, &peer_id, now);
+                return;
+            }
             if let Err(mpsc::error::TrySendError::Full((peer_id, _))) =
                 tx.try_send((peer_id, message))
             {
@@ -465,6 +488,12 @@ impl PeerManager {
     /// The same drops as `(message type, count)`, sorted by type.
     pub fn inbound_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
         self.inbound_drops_by_kind.by_kind()
+    }
+
+    /// Serve requests shed for being over their peer's budget, by type. Not
+    /// part of [`Self::inbound_drops`]: they say nothing about the loop.
+    pub fn serve_budget_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
+        self.serve_budget_drops.by_kind()
     }
 
     /// Get max peers configuration

@@ -8631,6 +8631,118 @@ mod tests {
             assert_eq!(deferred_majority_size(7), 5); // 8 producers
         }
     }
+
+    /// r1006 2026-11-01, prod-3 after the reseed: one node serving catch-up
+    /// `GetBlocks` to six peers for ten minutes shed `NewBlock` (inbound queue
+    /// full), its own sync requests timed out, it dropped six peers for those
+    /// timeouts, and it forked off alone. This runs that load through the
+    /// node's inbound path (`PeerManager::forward_incoming` into the production
+    /// 512-slot queue), drains it the way the message loop does (each
+    /// `GetBlocks` served by `block_serve::serve_blocks`, the `NewBlock`
+    /// admitted by `BlockAdmission::admit`), and applies the sync driver's
+    /// timeout-drop rule to the producer whose block just arrived.
+    mod serving_load {
+        use super::seal_gate_and_parent_walk::{applied, gossip, node, produce};
+        use super::*;
+        use citrate_network::peer::{Direction, Peer, PeerInfo, PeerManagerConfig};
+        use citrate_network::PeerId;
+        use tokio::sync::mpsc;
+
+        /// The far ends of a test connection, held open for the test's length.
+        type Ends = (mpsc::Receiver<NetworkMessage>, mpsc::Sender<NetworkMessage>);
+
+        async fn connect(pm: &PeerManager, id: &str, ip: u8, ends: &mut Vec<Ends>) -> PeerId {
+            let pid = PeerId::new(id.to_string());
+            let addr = std::net::SocketAddr::from(([10, 0, 0, ip], 30303));
+            let (send_tx, send_rx) = mpsc::channel(256);
+            let (recv_tx, recv_rx) = mpsc::channel(1);
+            let peer = Peer::new(
+                PeerInfo::new(pid.clone(), addr, Direction::Inbound),
+                send_tx,
+                recv_rx,
+            );
+            ends.push((send_rx, recv_tx));
+            pm.add_peer(Arc::new(peer)).await.expect("add peer");
+            pid
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_node_serving_six_catchups_still_admits_gossip_and_keeps_its_peers() {
+            let a = node(1, false).await;
+            let mut server = node(3, false).await;
+            for _ in 0..20 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut server, None, &blk).await, "admitted");
+            }
+            let pm = PeerManager::new(PeerManagerConfig::default());
+            let (tx, mut rx) = mpsc::channel(512); // main.rs inbound queue
+            pm.set_incoming(tx).await;
+            let mut ends = Vec::new();
+            let producer = connect(&pm, "prod-1", 1, &mut ends).await;
+            let mut catchups = Vec::new();
+            for i in 0..6u8 {
+                catchups.push(connect(&pm, &format!("catchup-{i}"), 10 + i, &mut ends).await);
+            }
+            // The six catching-up nodes ask faster than one loop serves.
+            let genesis = server
+                .storage
+                .blocks
+                .get_block_by_height(0)
+                .expect("read")
+                .expect("genesis");
+            for _ in 0..100 {
+                for c in &catchups {
+                    pm.forward_incoming(
+                        c.clone(),
+                        NetworkMessage::GetBlocks {
+                            from: genesis,
+                            count: 32,
+                            step: 1,
+                        },
+                    )
+                    .await;
+                }
+            }
+            // The producer seals and gossips its block into that queue.
+            let blk = produce(&a).await;
+            pm.forward_incoming(producer.clone(), NetworkMessage::NewBlock { block: blk })
+                .await;
+            // The message loop drains in arrival order.
+            let mut served = 0usize;
+            let mut admitted = false;
+            while let Ok((_pid, msg)) = rx.try_recv() {
+                match msg {
+                    NetworkMessage::GetBlocks { from, count, .. } => {
+                        let _ = crate::block_serve::serve_blocks(&server.storage, &from, count);
+                        served += 1;
+                    }
+                    NetworkMessage::NewBlock { block } => {
+                        admitted = gossip(&mut server, None, &block).await == "admitted";
+                    }
+                    _ => {}
+                }
+            }
+            assert!(served > 0, "the catch-up requests were served");
+            assert!(
+                admitted,
+                "the serving node never admitted the gossiped block ({:?} shed)",
+                pm.inbound_drops_by_kind()
+            );
+            assert_eq!(applied(&server), applied(&a), "the server fell behind");
+            // Its own sync requests to the producer timed out under that load; the
+            // producer's connection just delivered a block, so it is kept.
+            let (total, _, _) = pm.get_peer_counts().await;
+            assert!(
+                !crate::sync_peer::drop_after_timeouts(
+                    crate::sync_peer::DROP_AFTER_TIMEOUTS,
+                    total,
+                    pm.get_peer(&producer).is_some(),
+                    pm.last_inbound_age(&producer),
+                ),
+                "dropped the producer that just gossiped a block, for timeouts caused by load"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

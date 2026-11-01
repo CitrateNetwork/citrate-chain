@@ -175,20 +175,31 @@ pub const DEPREFER_AT_FAILURES: u32 = 3;
 /// re-handshakes (main.rs).
 pub const DROP_AFTER_TIMEOUTS: u32 = 5;
 
+/// A peer that delivered any message within this long has a working connection,
+/// whatever its sync timeouts say. Equal to the sync request timeout
+/// (`SyncConfig::request_timeout`), so a peer is dropped only after a request
+/// timed out with nothing at all heard from it since the request went out.
+pub const HEARD_RECENTLY: Duration = Duration::from_secs(30);
+
 /// Whether the sync driver should drop `peer` after a sync timeout. `failures`
 /// is its timeout count, `total_peers` the connected count, `still_mapped`
 /// whether the peer is still in the peer map, and `last_inbound_age` how long
 /// ago the node last received any message from it (`None`: never).
 ///
 /// Never drops the only peer: that strands a fresh node with zero peers.
+/// Never drops a peer heard from within [`HEARD_RECENTLY`]: its timeouts mean a
+/// request or an answer was shed under load (often in this node's own inbound
+/// queue, r1006 2026-11-01), and a re-handshake costs its block gossip while
+/// fixing nothing. Its timeouts still de-prefer it as a sync source. The drop is
+/// for connections that deliver nothing (#149, #151).
 pub fn drop_after_timeouts(
     failures: u32,
     total_peers: usize,
     still_mapped: bool,
     last_inbound_age: Option<Duration>,
 ) -> bool {
-    let _ = last_inbound_age;
-    failures >= DROP_AFTER_TIMEOUTS && total_peers > 1 && still_mapped
+    let talking = last_inbound_age.is_some_and(|age| age < HEARD_RECENTLY);
+    failures >= DROP_AFTER_TIMEOUTS && total_peers > 1 && still_mapped && !talking
 }
 
 /// PBA-L1b-006: the most an UNVERIFIED height claim may raise the node's
