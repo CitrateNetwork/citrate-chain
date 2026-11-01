@@ -581,26 +581,33 @@ impl AttestedInner {
     /// The branch a strict majority of the producer set ([`deferred_majority_size`])
     /// is extending with blocks this node cannot admit, if there is one.
     ///
-    /// Only blocks first heard within [`DEFERRED_EVIDENCE_TTL`] take part. Two of them
-    /// are on one branch when one names the other as a parent, directly or through
-    /// other such blocks: a producer can only name a block it holds, so a link is that
-    /// producer's own statement that it follows the other's history. Producers that
-    /// each extend their own branch never link, so a total split has no majority
-    /// branch. A proposer with fresh blocks on two branches (it signed both, an
-    /// equivocation) counts on neither, so one key cannot complete a majority on each
-    /// side and stop both.
-    pub(crate) fn majority_branch(&self, now: Instant) -> Option<MajorityBranch> {
+    /// Only blocks first heard within [`DEFERRED_EVIDENCE_TTL`] take part, and only
+    /// those that name no parent this node `holds`: a block that builds on this node's
+    /// own history (even as a merge parent) is no evidence that this node is behind,
+    /// and counting it would let one bridging key count on both sides of a split. Two
+    /// of the remaining blocks are on one branch when one is the other's SELECTED
+    /// parent, directly or through other such blocks: that is the chain fork choice
+    /// follows, and a producer can only build on a block it holds. Merge parents never
+    /// link branches. Producers that each extend their own branch never link, so a
+    /// total split has no majority branch. A proposer with fresh blocks on two
+    /// branches (it signed both, an equivocation) counts on neither.
+    pub(crate) fn majority_branch(
+        &self,
+        now: Instant,
+        holds: impl Fn(&Hash) -> bool,
+    ) -> Option<MajorityBranch> {
         let needed = deferred_majority_size(self.known_proposers.lock().len());
         let blocks = self.deferred_blocks.lock();
         let fresh: HashMap<Hash, &DeferredBlock> = blocks
             .iter()
             .filter(|(_, b)| now.saturating_duration_since(b.first_heard) < DEFERRED_EVIDENCE_TTL)
+            .filter(|(_, b)| !b.parents.iter().any(&holds))
             .map(|(h, b)| (*h, b))
             .collect();
-        // Undirected parent links between fresh blocks.
+        // Undirected selected-parent links between fresh blocks.
         let mut links: HashMap<Hash, Vec<Hash>> = HashMap::new();
         for (hash, b) in &fresh {
-            for parent in &b.parents {
+            if let Some(parent) = b.parents.first() {
                 if fresh.contains_key(parent) {
                     links.entry(*hash).or_default().push(*parent);
                     links.entry(*parent).or_default().push(*hash);
@@ -753,7 +760,9 @@ impl ProduceCatchupGate {
                 .map(|b| b.header.blue_score)
                 .unwrap_or(u64::MAX);
             let top = observed
-                .majority_branch(observed.now_instant())
+                .majority_branch(observed.now_instant(), |h| {
+                    storage.blocks.has_block(h).unwrap_or(false)
+                })
                 .filter(|b| b.blue_score > sel_blue)
                 .map(|b| b.height)
                 .unwrap_or(0);
