@@ -297,6 +297,8 @@ struct DeferredBlock {
     /// Its selected parent and merge parents (bounded by [`DEFERRED_BLOCK_PARENTS`]).
     parents: Vec<Hash>,
     height: u64,
+    /// The blue score its producer claims (the measure fork choice ranks tips by).
+    blue_score: u64,
     proposer: PublicKey,
     first_heard: Instant,
 }
@@ -313,6 +315,8 @@ const DEFERRED_BLOCK_PARENTS: usize = 16;
 pub struct MajorityBranch {
     /// Highest block height heard on the branch.
     pub height: u64,
+    /// Highest blue score claimed on the branch (signed by its producer).
+    pub blue_score: u64,
     /// Distinct proposers with a fresh block on it (equivocators excluded).
     pub proposers: usize,
 }
@@ -492,6 +496,7 @@ impl AttestedNetworkHead {
             DeferredBlock {
                 parents,
                 height: block.header.height,
+                blue_score: block.header.blue_score,
                 proposer: block.header.proposer_pubkey,
                 first_heard: now,
             },
@@ -602,9 +607,9 @@ impl AttestedInner {
                 }
             }
         }
-        // Connected components: (proposers, highest height).
+        // Connected components: (proposers, highest height, highest blue score).
         let mut component_of: HashMap<Hash, usize> = HashMap::new();
-        let mut components: Vec<(HashSet<PublicKey>, u64)> = Vec::new();
+        let mut components: Vec<(HashSet<PublicKey>, u64, u64)> = Vec::new();
         for start in fresh.keys() {
             if component_of.contains_key(start) {
                 continue;
@@ -612,12 +617,14 @@ impl AttestedInner {
             let id = components.len();
             let mut proposers = HashSet::new();
             let mut top = 0u64;
+            let mut blue = 0u64;
             let mut queue = std::collections::VecDeque::from([*start]);
             component_of.insert(*start, id);
             while let Some(h) = queue.pop_front() {
                 if let Some(b) = fresh.get(&h) {
                     proposers.insert(b.proposer);
                     top = top.max(b.height);
+                    blue = blue.max(b.blue_score);
                 }
                 for next in links.get(&h).map(Vec::as_slice).unwrap_or(&[]) {
                     if !component_of.contains_key(next) {
@@ -626,11 +633,11 @@ impl AttestedInner {
                     }
                 }
             }
-            components.push((proposers, top));
+            components.push((proposers, top, blue));
         }
         // A proposer on more than one branch counts on none.
         let mut branches_of: HashMap<PublicKey, usize> = HashMap::new();
-        for (proposers, _) in &components {
+        for (proposers, _, _) in &components {
             for p in proposers {
                 let n = branches_of.entry(*p).or_insert(0);
                 *n = n.saturating_add(1);
@@ -638,8 +645,9 @@ impl AttestedInner {
         }
         components
             .iter()
-            .map(|(proposers, top)| MajorityBranch {
+            .map(|(proposers, top, blue)| MajorityBranch {
                 height: *top,
+                blue_score: *blue,
                 proposers: proposers
                     .iter()
                     .filter(|p| branches_of.get(*p).copied().unwrap_or(0) == 1)
@@ -729,11 +737,24 @@ impl ProduceCatchupGate {
                 Ordering::SeqCst,
             );
         }
-        // The same evidence when a majority of producers agree on one branch: clamped
-        // the same way.
+        // The same evidence when a majority of producers agree on one branch, clamped
+        // the same way. It counts only while that branch also claims more blue score
+        // than the selected head carries: fork choice ranks tips by blue score, not
+        // height, and on a merging DAG the heavier branch can be the shorter one. A
+        // branch fork choice would not prefer is not one this node is behind on. Both
+        // sides are header values (the branch cannot be recomputed without its
+        // ancestry), so the comparison is like for like.
         if let Some(m) = self.deferred_majority_ahead.as_ref() {
+            let sel_blue = storage
+                .blocks
+                .get_block(&sel_hash)
+                .ok()
+                .flatten()
+                .map(|b| b.header.blue_score)
+                .unwrap_or(u64::MAX);
             let top = observed
                 .majority_branch(observed.now_instant())
+                .filter(|b| b.blue_score > sel_blue)
                 .map(|b| b.height)
                 .unwrap_or(0);
             let bounded = top.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
@@ -8390,6 +8411,8 @@ mod tests {
         fn signed(templates: &[Block], i: u8, height: u64, parent: Hash, skew_secs: u64) -> Block {
             let mut x = templates[usize::from(i) - 1].clone();
             x.header.height = height;
+            // A linear branch: one blue block per height, as fork choice scores it.
+            x.header.blue_score = height;
             x.header.selected_parent_hash = parent;
             x.header.merge_parent_hashes = Vec::new();
             x.header.timestamp =
@@ -8617,6 +8640,69 @@ mod tests {
             }
             let at = first_seal.expect("unlinked blocks held B off past the cap");
             assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// Fork choice ranks by blue score, not height. A majority branch that is
+        /// taller than B's chain but claims LESS blue score than B's selected head
+        /// (B's chain merged more) is not a branch B is behind on: the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_majority_branch_lighter_by_blue_score_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let b_blue = b
+                .storage
+                .blocks
+                .get_block(&start.0)
+                .expect("read")
+                .expect("tip")
+                .header
+                .blue_score;
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA6, start.1 + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks: Vec<Block> = branch
+                    .extend(&templates, if step == 0 { 4 } else { 2 }, t)
+                    .into_iter()
+                    .map(|mut x| {
+                        // Taller, but lighter than B's head by fork choice's measure.
+                        x.header.blue_score = b_blue.saturating_sub(1);
+                        x
+                    })
+                    .collect();
+                // Re-link and re-sign after the edit (the branch stays one branch).
+                let mut prev: Option<Hash> = None;
+                let mut relinked = Vec::new();
+                for mut x in blocks {
+                    if let Some(p) = prev {
+                        x.header.selected_parent_hash = p;
+                    }
+                    x.header.block_hash = x.compute_hash();
+                    let i = (1..=6u8)
+                        .find(|i| {
+                            templates[usize::from(*i) - 1].header.proposer_pubkey
+                                == x.header.proposer_pubkey
+                        })
+                        .expect("proposer");
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    prev = Some(x.header.block_hash);
+                    relinked.push(x);
+                }
+                if let Some(p) = prev {
+                    branch.tip = p;
+                }
+                hear(&mut b, &relinked).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a lighter branch held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
         }
 
         /// The quorum sizes the guard uses: a strict majority of the producer set
