@@ -1426,18 +1426,20 @@ impl GhostDag {
         // OOM that froze every non-producing node in the 9k-15k range.
         let blue_set = self.derive_score_and_work(block).await?;
 
-        // Invariant check replacing the old "blue_score drift" telemetry. That
-        // warning compared a set-cardinality score (counts genesis and self, so
-        // height + 1) against a header convention of `height`, so it fired on
-        // EVERY block of a linear chain and reported a definitional off-by-one
-        // as if it were consensus drift. The real invariant is that the locally
-        // recomputed score sits exactly one above the header's, which is what
-        // `validate_block_consistency`'s score band already pins for a linear
-        // block. Anything else is a genuine inconsistency worth a warning.
+        // Log check (never a validity rule): the fork-choice score must not sit
+        // BELOW the header's score + 1. Fork choice counts blue merge parents
+        // (MS-BOUND) while the producer writes `parent + 1` into headers, so on
+        // a DAG that merges the fork-choice score runs ahead of the header by
+        // the blue merge parents of the whole ancestry. That gap is expected
+        // (about 1.5 per block on r1006) and is not reported. A score below
+        // header + 1 cannot come from honest headers: it means this node holds
+        // less score than it should (a restart or registration path that lost
+        // its scale) or a header claimed more than its blue merge parents.
         if blue_score_inconsistent(block, blue_set.score) {
             warn!(
-                "blue_score inconsistency on {}: recomputed {} but header claims {} \
-                 (expected recomputed == header + 1 for a linear block)",
+                "blue_score inconsistency on {}: fork-choice score {} is below header \
+                 blue_score {} + 1 (honest headers carry parent + 1, so the local \
+                 score can only meet or exceed that)",
                 block.hash(),
                 blue_set.score,
                 block.header.blue_score
@@ -1600,13 +1602,22 @@ impl GhostDag {
     }
 }
 
-/// Whether `block`'s locally derived fork-choice score is inconsistent with
-/// its header's `blue_score` (logged by [`GhostDag::add_block`]; never a
-/// validity rule).
+/// Whether `block`'s locally derived fork-choice score is BELOW its header's
+/// `blue_score + 1` (logged by [`GhostDag::add_block`]; never a validity rule).
+///
+/// Honest headers carry `parent + 1` (the band minimum) and fork choice adds 1
+/// plus the blue merge parents per block from genesis = 1, so by induction the
+/// fork-choice score is at least header + 1 on every block, merge blocks
+/// included. Exceeding it is the normal merging-DAG case. A header whose
+/// `+ 1` overflows can never be met and is flagged.
 fn blue_score_inconsistent(block: &Block, fork_choice_score: u64) -> bool {
-    !block.is_genesis()
-        && block.header.merge_parent_hashes.is_empty()
-        && block.header.blue_score.checked_add(1) != Some(fork_choice_score)
+    if block.is_genesis() {
+        return false;
+    }
+    match block.header.blue_score.checked_add(1) {
+        Some(floor) => fork_choice_score < floor,
+        None => true,
+    }
 }
 
 /// PANIC-S1: a blue score is bounded by chain height, so these sums cannot
