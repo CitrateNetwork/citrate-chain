@@ -8923,6 +8923,82 @@ mod tests {
             );
         }
     }
+
+    /// rcBLUE-2 (g), r1006 2026-11-01: "Validated and imported 32/32
+    /// (305850-305881)" three times in 12 s, and SYNCSCORE Barren on every peer.
+    /// Blocks this node admitted are stored above its applied tip while apply
+    /// lags (the drain is held). The 2 s tick anchors at the applied tip, so
+    /// every tick asked for the same range, admitted nothing and scored the
+    /// peer Barren. This runs the tick's anchor decision and the Blocks arm's
+    /// scoring against real storage, `serve_blocks` and `admit_to_fixpoint`.
+    mod admission_ahead_of_apply {
+        use super::seal_gate_and_parent_walk::{applied, node, produce};
+        use super::*;
+        use crate::admission::BlockAdmission;
+        use crate::sync_peer::{classify_serve, ServeQuality};
+        use crate::sync_recovery::{answer_anchor_was_stale, answer_is_held_ahead, TipReask};
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_admission_ahead_of_apply_does_not_reask_or_score_barren() {
+            let a = node(1, false).await;
+            let b = node(7, false).await;
+            let mut chain = Vec::new();
+            for _ in 0..64 {
+                chain.push(produce(&a).await);
+            }
+            // B admits all 64 (stored, in its DAG) but applies none: an
+            // admission path with no applicator, as when the drain is held.
+            let held_drain = BlockAdmission::new(
+                b.storage.clone(),
+                b.producer.dag_store.clone(),
+                b.producer.ghostdag.clone(),
+                None,
+            );
+            let fp = held_drain.admit_to_fixpoint(chain, |_, _| {}).await;
+            assert_eq!(fp.newly_admitted, 64);
+            let start = applied(&b);
+            assert_eq!(start.1, 0, "precondition: nothing applied");
+
+            let mut reask = TipReask::new();
+            let mut now = std::time::Instant::now();
+            let mut sent = Vec::new();
+            let mut qualities = Vec::new();
+            for _tick in 0..6 {
+                let (tip_hash, tip_height) = applied(&b);
+                // Mode::Tip: the anchor is the applied tip.
+                let anchor = tip_hash;
+                if !reask.hold(anchor, tip_hash, now) {
+                    sent.push(anchor);
+                    let resp = crate::block_serve::serve_blocks(&a.storage, &anchor, 32);
+                    let served = resp.len();
+                    let top = resp.iter().map(|x| x.header.height).max();
+                    let fp = b.adm.admit_to_fixpoint(resp, |_, _| {}).await;
+                    let (now_hash, applied_now) = applied(&b);
+                    let held = answer_is_held_ahead(
+                        top,
+                        fp.newly_admitted,
+                        fp.deferred.len(),
+                        applied_now,
+                    );
+                    reask.note_answer(now_hash, held, now);
+                    let stale = answer_anchor_was_stale(tip_height, applied_now, served) || held;
+                    qualities.push(classify_serve(fp.newly_admitted, 64, 32, stale));
+                }
+                now += Duration::from_secs(2);
+            }
+            assert_eq!(applied(&b), start, "precondition: apply never moved");
+            assert_eq!(
+                sent.len(),
+                1,
+                "the same GetBlocks range was asked {} times in 12 s",
+                sent.len()
+            );
+            assert!(
+                !qualities.contains(&ServeQuality::Barren),
+                "a peer serving exactly what was asked was scored Barren: {qualities:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

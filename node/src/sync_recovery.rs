@@ -791,6 +791,48 @@ pub fn answer_anchor_was_stale(anchor_height: u64, applied_now: u64, served: usi
     served > 0 && anchor_height < applied_now
 }
 
+/// A tip-anchored `GetBlocks` whose last answer held nothing new is re-asked
+/// after this long even if the applied tip has not moved.
+pub const HELD_AHEAD_REASK_AFTER: Duration = Duration::from_secs(30);
+
+/// Whether an answer admitted nothing because this node already holds every
+/// block it served above its applied tip (admission is ahead of apply).
+/// `answer_top` is the highest verified block height in the answer.
+pub fn answer_is_held_ahead(
+    answer_top: Option<u64>,
+    newly_admitted: usize,
+    deferred: usize,
+    applied_now: u64,
+) -> bool {
+    let _ = (answer_top, newly_admitted, deferred, applied_now);
+    false
+}
+
+/// Holds back re-asking the applied-tip anchor after an answer that was
+/// entirely held ahead of apply (see [`answer_is_held_ahead`]).
+#[derive(Debug, Default)]
+pub struct TipReask {
+    /// The applied tip the held-ahead answer was judged against, and when.
+    held: Option<(Hash, Instant)>,
+}
+
+impl TipReask {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold in an answer: `applied_tip` is the applied tip after admitting it.
+    pub fn note_answer(&mut self, applied_tip: Hash, held_ahead: bool, now: Instant) {
+        let _ = (applied_tip, held_ahead, now);
+    }
+
+    /// Whether the sync tick should skip a `GetBlocks` anchored at `anchor`.
+    pub fn hold(&self, anchor: Hash, applied_tip: Hash, now: Instant) -> bool {
+        let _ = (anchor, applied_tip, now, self.held);
+        false
+    }
+}
+
 /// The producer's one-time initial-sync condition, evaluated on every sync tick
 /// until it first holds.
 pub fn initial_sync_complete(
@@ -811,6 +853,62 @@ pub fn initial_sync_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RED (rcBLUE-2 (g)). Admission ahead of apply: the answer to the
+    /// applied-tip anchor serves blocks above the tip that this node already
+    /// holds. Nothing the peer could do would add more, so the answer is
+    /// Redundant, not Barren (Barren drove every peer to -8). An answer that
+    /// serves nothing above the applied tip (the peer is at or behind us,
+    /// #153's boot3) is still Barren.
+    #[test]
+    fn rcseal_red_held_ahead_answer_is_redundant_not_barren() {
+        use crate::sync_peer::{classify_serve, ServeQuality};
+        let applied = 305_849;
+        let held = answer_is_held_ahead(Some(applied + 32), 0, 0, applied);
+        assert!(held, "32 held blocks above the applied tip");
+        let stale = answer_anchor_was_stale(applied, applied, 32) || held;
+        assert_eq!(classify_serve(0, 135, 32, stale), ServeQuality::Redundant);
+        // Controls: the anchor group only, deferred blocks, or progress.
+        assert!(!answer_is_held_ahead(Some(applied), 0, 0, applied));
+        assert!(!answer_is_held_ahead(Some(applied + 32), 0, 1, applied));
+        assert!(!answer_is_held_ahead(Some(applied + 32), 1, 0, applied));
+        assert!(!answer_is_held_ahead(None, 0, 0, applied));
+        assert_eq!(classify_serve(0, 135, 32, false), ServeQuality::Barren);
+    }
+
+    /// RED (rcBLUE-2 (g)). After a held-ahead answer the tick does not re-ask
+    /// the same applied-tip anchor until the tip moves (or 30 s pass). Other
+    /// anchors (a fork-point probe, a follow cursor) are never held.
+    #[test]
+    fn rcseal_red_tip_anchor_is_not_reasked_until_the_tip_moves() {
+        let tip = Hash::new([1; 32]);
+        let moved = Hash::new([2; 32]);
+        let probe = Hash::new([3; 32]);
+        let t0 = Instant::now();
+        let mut r = TipReask::new();
+        assert!(!r.hold(tip, tip, t0), "nothing held yet");
+        r.note_answer(tip, true, t0);
+        assert!(
+            r.hold(tip, tip, t0 + Duration::from_secs(2)),
+            "re-asked at the next tick"
+        );
+        assert!(r.hold(tip, tip, t0 + Duration::from_secs(29)));
+        assert!(
+            !r.hold(tip, tip, t0 + Duration::from_secs(30)),
+            "re-ask after 30 s"
+        );
+        assert!(
+            !r.hold(moved, moved, t0 + Duration::from_secs(2)),
+            "the tip moved"
+        );
+        assert!(
+            !r.hold(probe, tip, t0 + Duration::from_secs(2)),
+            "a probe anchor"
+        );
+        // An answer that added something clears the hold.
+        r.note_answer(tip, false, t0 + Duration::from_secs(4));
+        assert!(!r.hold(tip, tip, t0 + Duration::from_secs(6)));
+    }
 
     /// The sync manager's default request timeout (`SyncConfig`).
     const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
