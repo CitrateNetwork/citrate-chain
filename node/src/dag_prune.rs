@@ -204,6 +204,126 @@ pub fn spawn(storage: Arc<StorageManager>, dag_store: Arc<DagStore>) {
 mod tests {
     use super::*;
 
+    /// A producer restarted on a pruned store must not reload the pruned range.
+    ///
+    /// The eager load in `BlockProducer::with_shared_dag` walks every canonical
+    /// height from 0 out of the chain store. Below the pruning point the DAG
+    /// store no longer holds the blocks (genesis included), so each one is
+    /// offered to `store_block` again (re-growing exactly what pruning bounds on
+    /// a permissive store, refused with a warn line per height on the strict
+    /// production store) and registered with GhostDag under a fallback score.
+    /// On r1006 that is ~294k heights and tens of thousands of warn lines per
+    /// restart. The load must start at the pruning floor and still register
+    /// the retained chain with its pre-restart scores.
+    #[tokio::test]
+    async fn producer_eager_load_starts_at_the_pruning_floor() {
+        use crate::persistent_dag::RocksDbKvStore;
+        use crate::producer::BlockProducer;
+        use citrate_consensus::crypto::Ed25519SigningKey;
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, PublicKey, VrfProof};
+        use citrate_execution::{Executor, StateDB};
+        use citrate_sequencer::mempool::{Mempool, MempoolConfig};
+        use citrate_storage::pruning::PruningConfig;
+
+        fn mk(height: u64, parent: Hash) -> citrate_consensus::types::Block {
+            let mut b = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .coinbase([0x33; 20])
+                .timestamp(1000)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x5A; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            b.header.block_hash = b.compute_hash();
+            b
+        }
+
+        const N: u64 = 1_500;
+        const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let mut chain = Vec::new();
+        let tip_score;
+        {
+            let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+            let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag"));
+            let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+            let mut parent = Hash::default();
+            for h in 0..=N {
+                let b = mk(h, parent);
+                parent = b.header.block_hash;
+                dag.store_block(b.clone()).await.expect("dag");
+                ghostdag.add_block(&b).await.expect("admit");
+                storage.blocks.put_block(&b).expect("chain");
+                chain.push(b);
+            }
+            storage.blocks.put_applied_tip(&parent, N).expect("tip");
+            tip_score = ghostdag.get_blue_score(&parent).await.expect("tip score");
+            assert_eq!(prune_once(&storage, &dag, N, RETAIN).await, 500);
+        }
+
+        // Restart: a fresh DAG store and GhostDag over the same database, then
+        // the producer's eager load.
+        let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+        let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("reload"));
+        dag.set_configured_genesis(chain[0].header.block_hash);
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let floor = pruned_below(&dag).await;
+        assert_eq!(floor, 500, "the pruning point survives the restart");
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let _producer = BlockProducer::with_shared_dag(
+            storage.clone(),
+            executor,
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            None,
+            PublicKey::new([0x10; 32]),
+            Ed25519SigningKey::from_bytes(&[0x60; 32]),
+            2,
+            Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                citrate_economics::UnifiedEconomicsConfig::default(),
+            )),
+            dag.clone(),
+            ghostdag.clone(),
+        )
+        .await;
+
+        for b in &chain[..floor as usize] {
+            assert!(
+                !dag.has_block(&b.header.block_hash).await,
+                "pruned block @ {} was put back into the DAG store by the eager load",
+                b.header.height
+            );
+            assert_eq!(
+                ghostdag.get_block_height(&b.header.block_hash).await,
+                None,
+                "pruned block @ {} was registered with fork choice by the eager load",
+                b.header.height
+            );
+        }
+        let tip = chain[N as usize].header.block_hash;
+        assert_eq!(
+            ghostdag.get_blue_score(&tip).await.ok(),
+            Some(tip_score),
+            "the retained chain is registered with its pre-restart score"
+        );
+        assert_eq!(ghostdag.select_tip().await.ok(), Some(tip));
+    }
+
     #[test]
     fn nothing_to_prune_on_a_short_chain() {
         // Applied tip below the window: the whole chain is inside it.
