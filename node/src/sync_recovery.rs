@@ -889,6 +889,39 @@ mod tests {
         assert_eq!(classify_serve(0, 135, 32, false), ServeQuality::Barren);
     }
 
+    /// RED (review of 48844386, P2). Every `Blocks` message, unsolicited ones
+    /// included, is judged against the hold. A peer replaying one held block
+    /// every tick renewed the hold's start each time, so the tip request never
+    /// went out again (1 request in 120 s). The hold's start is kept while the
+    /// tip is unchanged and the hold is live, so the tick re-asks within 30 s.
+    #[test]
+    fn rcseal_red_replayed_held_answers_do_not_extend_the_hold() {
+        let tip = Hash::new([1; 32]);
+        let t0 = Instant::now();
+        let mut r = TipReask::new();
+        let mut asked_at = Vec::new();
+        for tick in 0..=60u64 {
+            let now = t0 + Duration::from_secs(tick * 2);
+            if !r.hold(tip, tip, now) {
+                asked_at.push(tick * 2);
+            }
+            // The answer (or a replay) holds nothing new.
+            r.note_answer(tip, true, now);
+        }
+        assert!(
+            asked_at.len() >= 4,
+            "the tip request went out {} time(s) in 120 s: {asked_at:?}",
+            asked_at.len()
+        );
+        for w in asked_at.windows(2) {
+            assert!(
+                w[1] - w[0] <= 30,
+                "a {}s gap between tip requests",
+                w[1] - w[0]
+            );
+        }
+    }
+
     /// RED (rcBLUE-2 (g)). After a held-ahead answer the tick does not re-ask
     /// the same applied-tip anchor until the tip moves (or 30 s pass). Other
     /// anchors (a fork-point probe, a follow cursor) are never held.
