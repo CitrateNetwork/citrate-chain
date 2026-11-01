@@ -1,6 +1,6 @@
 // citrate/core/consensus/src/dag_store.rs
 
-use crate::types::{Block, Hash, Tip};
+use crate::types::{Block, BlockHeader, Hash, Tip};
 use crate::vrf::VrfProposerSelector;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1153,6 +1153,21 @@ impl DagStore {
             .get(hash)
             .ok_or(DagStoreError::BlockNotFound(*hash))?;
         self.full_block(hash, entry)
+    }
+
+    /// The header of a stored block, without its body.
+    ///
+    /// Every in-memory entry keeps its full header (a stripped skeleton drops
+    /// only the body), so this never reads the backend. Readers that need
+    /// parent links, height or score fields use it instead of [`Self::get_block`],
+    /// which reloads and decodes a skeleton's whole body.
+    pub async fn get_header(&self, hash: &Hash) -> Result<BlockHeader, DagStoreError> {
+        self.blocks
+            .read()
+            .await
+            .get(hash)
+            .map(|b| b.header.clone())
+            .ok_or(DagStoreError::BlockNotFound(*hash))
     }
 
     /// Check if a block exists

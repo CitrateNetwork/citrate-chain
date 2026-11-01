@@ -1295,20 +1295,17 @@ impl GhostDag {
         if let Some(r) = self.relations.read().await.get(hash) {
             return Ok((r.selected_parent, r.merge_parents.clone(), r.height));
         }
-        let block = self
+        // Header only: after a restart every stored block is a skeleton, and
+        // `get_block` would reload and decode its whole body for three fields.
+        let header = self
             .dag_store
-            .get_block(hash)
+            .get_header(hash)
             .await
             .map_err(|_| GhostDagError::BlockNotFound(*hash))?;
-        let sp = if block.is_genesis() {
-            Hash::default()
-        } else {
-            block.selected_parent()
-        };
         Ok((
-            sp,
-            block.header.merge_parent_hashes.clone(),
-            block.header.height,
+            header.selected_parent_hash,
+            header.merge_parent_hashes,
+            header.height,
         ))
     }
 
