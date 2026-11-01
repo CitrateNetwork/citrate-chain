@@ -181,6 +181,13 @@ pub struct ProduceCatchupGate {
     /// Per-round scratch: the deferred-evidence watermark (heard-but-unadmitted signed
     /// blocks, see [`AttestedNetworkHead::observe_deferred`]). Wired with the F2 gate.
     deferred_ahead: Option<Arc<AtomicU64>>,
+    /// Per-round scratch: the tip height of the one branch a strict majority of the
+    /// producer set is extending with blocks this node cannot admit (0: no such branch;
+    /// see [`AttestedInner::majority_branch`]). Wired with the F2 gate.
+    deferred_majority_ahead: Option<Arc<AtomicU64>>,
+    /// Raised while the split guard holds production off (see
+    /// [`ProduceCatchupGate::deferred_for_round`]); read by the status surface.
+    split_guard: Arc<AtomicBool>,
     /// Set by the sync driver once this node's initial sync after start has completed
     /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
     initial_sync_done: Option<Arc<AtomicBool>>,
@@ -202,6 +209,8 @@ struct CatchupBehindState {
     deferred_only_since: Option<Instant>,
     /// Last time the "sealing despite deferred evidence" warning was logged.
     deferred_only_warned: Option<Instant>,
+    /// Last time the split-guard alarm was logged.
+    split_guard_alarmed: Option<Instant>,
 }
 
 impl Default for CatchupBehindState {
@@ -213,6 +222,7 @@ impl Default for CatchupBehindState {
             stalled_latch: false,
             deferred_only_since: None,
             deferred_only_warned: None,
+            split_guard_alarmed: None,
         }
     }
 }
@@ -271,10 +281,44 @@ pub struct AttestedInner {
     /// proposer resets the time; a repeat or a lower height never does, so the same
     /// evidence counts for at most [`DEFERRED_EVIDENCE_TTL`]. Bounded.
     deferred: Mutex<HashMap<PublicKey, (u64, Instant)>>,
+    /// The same deferred blocks one by one, with the parents they name, so the gate
+    /// can tell proposers that extend ONE branch from proposers that each extend their
+    /// own: `block_hash -> DeferredBlock`. First-heard time only; a repeat never
+    /// renews it. Bounded to [`DEFERRED_BLOCK_CAP`] by evicting the oldest.
+    deferred_blocks: Mutex<HashMap<Hash, DeferredBlock>>,
     /// Test clock offset (both the monotonic and the wall clock), so tests can age
     /// evidence without sleeping.
     #[cfg(test)]
     clock_skew: Mutex<Duration>,
+}
+
+/// One heard-but-unadmitted signed block in [`AttestedInner::deferred_blocks`].
+struct DeferredBlock {
+    /// Its selected parent and merge parents (bounded by [`DEFERRED_BLOCK_PARENTS`]).
+    parents: Vec<Hash>,
+    height: u64,
+    /// The blue score its producer claims (the measure fork choice ranks tips by).
+    blue_score: u64,
+    proposer: PublicKey,
+    first_heard: Instant,
+}
+
+/// Cap on [`AttestedInner::deferred_blocks`]. At one block per producer per slot this
+/// is minutes of a large producer set; only the last [`DEFERRED_EVIDENCE_TTL`] counts.
+const DEFERRED_BLOCK_CAP: usize = 2048;
+/// Parents kept per deferred block (the selected parent first).
+const DEFERRED_BLOCK_PARENTS: usize = 16;
+
+/// The branch a strict majority of the producer set is extending with blocks this
+/// node cannot admit ([`AttestedInner::majority_branch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MajorityBranch {
+    /// Highest block height heard on the branch.
+    pub height: u64,
+    /// Highest blue score claimed on the branch (signed by its producer).
+    pub blue_score: u64,
+    /// Distinct proposers with a fresh block on it (equivocators excluded).
+    pub proposers: usize,
 }
 
 /// Deferred ("heard but not admitted") evidence counts only while this fresh.
@@ -298,6 +342,14 @@ pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
 pub fn deferred_quorum_size(known: usize) -> usize {
     let producers = known.saturating_add(1);
     DEFERRED_EVIDENCE_MIN_PROPOSERS.max(producers.checked_div(3).unwrap_or(0).saturating_add(1))
+}
+/// Distinct proposers that must agree on ONE branch this node cannot admit before the
+/// gate refuses past [`DEFERRED_ONLY_REFUSE_MAX`]: a strict majority of the producer
+/// set (`known` plus this node). Two disjoint branches can never both have one, and
+/// with 2 producers it is unreachable (the other alone is not a majority).
+pub fn deferred_majority_size(known: usize) -> usize {
+    let producers = known.saturating_add(1);
+    producers.checked_div(2).unwrap_or(0).saturating_add(1)
 }
 /// Deferred evidence counts only when its header timestamp is within the TTL plus this
 /// clock allowance of local wall time (and not more than this allowance in the future),
@@ -410,7 +462,45 @@ impl AttestedNetworkHead {
                 deferred.insert(proposer, (block.header.height, now));
             }
         }
+        drop(deferred);
+        self.record_deferred_block(block, now);
         true
+    }
+
+    /// Keep `block` (already checked by [`Self::observe_deferred`]) in the per-block
+    /// record the majority-branch check reads. A block already recorded keeps its
+    /// first-heard time. On overflow the oldest entry goes; a re-delivered evicted
+    /// block is bounded by the header-timestamp check, which rejects it once its
+    /// header is older than the TTL plus the clock allowance.
+    fn record_deferred_block(&self, block: &Block, now: Instant) {
+        let hash = block.header.block_hash;
+        let mut blocks = self.inner.deferred_blocks.lock();
+        if blocks.contains_key(&hash) {
+            return;
+        }
+        if blocks.len() >= DEFERRED_BLOCK_CAP {
+            if let Some(oldest) = blocks
+                .iter()
+                .min_by_key(|(_, b)| b.first_heard)
+                .map(|(h, _)| *h)
+            {
+                blocks.remove(&oldest);
+            }
+        }
+        let parents = std::iter::once(block.header.selected_parent_hash)
+            .chain(block.header.merge_parent_hashes.iter().copied())
+            .take(DEFERRED_BLOCK_PARENTS)
+            .collect();
+        blocks.insert(
+            hash,
+            DeferredBlock {
+                parents,
+                height: block.header.height,
+                blue_score: block.header.blue_score,
+                proposer: block.header.proposer_pubkey,
+                first_heard: now,
+            },
+        );
     }
 
     /// Advance this record's clock (tests only): ages deferred evidence and moves the
@@ -487,6 +577,85 @@ impl AttestedInner {
         let quorum = deferred_quorum_size(self.known_proposers.lock().len());
         heights.get(quorum.saturating_sub(1)).copied().unwrap_or(0)
     }
+
+    /// The branch a strict majority of the producer set ([`deferred_majority_size`])
+    /// is extending with blocks this node cannot admit, if there is one.
+    ///
+    /// Only blocks first heard within [`DEFERRED_EVIDENCE_TTL`] take part. Two of them
+    /// are on one branch when one names the other as a parent, directly or through
+    /// other such blocks: a producer can only name a block it holds, so a link is that
+    /// producer's own statement that it follows the other's history. Producers that
+    /// each extend their own branch never link, so a total split has no majority
+    /// branch. A proposer with fresh blocks on two branches (it signed both, an
+    /// equivocation) counts on neither, so one key cannot complete a majority on each
+    /// side and stop both.
+    pub(crate) fn majority_branch(&self, now: Instant) -> Option<MajorityBranch> {
+        let needed = deferred_majority_size(self.known_proposers.lock().len());
+        let blocks = self.deferred_blocks.lock();
+        let fresh: HashMap<Hash, &DeferredBlock> = blocks
+            .iter()
+            .filter(|(_, b)| now.saturating_duration_since(b.first_heard) < DEFERRED_EVIDENCE_TTL)
+            .map(|(h, b)| (*h, b))
+            .collect();
+        // Undirected parent links between fresh blocks.
+        let mut links: HashMap<Hash, Vec<Hash>> = HashMap::new();
+        for (hash, b) in &fresh {
+            for parent in &b.parents {
+                if fresh.contains_key(parent) {
+                    links.entry(*hash).or_default().push(*parent);
+                    links.entry(*parent).or_default().push(*hash);
+                }
+            }
+        }
+        // Connected components: (proposers, highest height, highest blue score).
+        let mut component_of: HashMap<Hash, usize> = HashMap::new();
+        let mut components: Vec<(HashSet<PublicKey>, u64, u64)> = Vec::new();
+        for start in fresh.keys() {
+            if component_of.contains_key(start) {
+                continue;
+            }
+            let id = components.len();
+            let mut proposers = HashSet::new();
+            let mut top = 0u64;
+            let mut blue = 0u64;
+            let mut queue = std::collections::VecDeque::from([*start]);
+            component_of.insert(*start, id);
+            while let Some(h) = queue.pop_front() {
+                if let Some(b) = fresh.get(&h) {
+                    proposers.insert(b.proposer);
+                    top = top.max(b.height);
+                    blue = blue.max(b.blue_score);
+                }
+                for next in links.get(&h).map(Vec::as_slice).unwrap_or(&[]) {
+                    if !component_of.contains_key(next) {
+                        component_of.insert(*next, id);
+                        queue.push_back(*next);
+                    }
+                }
+            }
+            components.push((proposers, top, blue));
+        }
+        // A proposer on more than one branch counts on none.
+        let mut branches_of: HashMap<PublicKey, usize> = HashMap::new();
+        for (proposers, _, _) in &components {
+            for p in proposers {
+                let n = branches_of.entry(*p).or_insert(0);
+                *n = n.saturating_add(1);
+            }
+        }
+        components
+            .iter()
+            .map(|(proposers, top, blue)| MajorityBranch {
+                height: *top,
+                blue_score: *blue,
+                proposers: proposers
+                    .iter()
+                    .filter(|p| branches_of.get(*p).copied().unwrap_or(0) == 1)
+                    .count(),
+            })
+            .filter(|b| b.proposers >= needed)
+            .max_by_key(|b| (b.proposers, b.height))
+    }
 }
 
 /// M1 (VERIFY-255-F2-M1): read-only snapshot of the F2 catch-up gate for the node's
@@ -509,6 +678,9 @@ pub struct CatchupGateStatus {
     pub applied_tip: u64,
     /// `attested_ahead - applied_tip` (0 when caught up).
     pub gap: u64,
+    /// True while the split guard holds production off: a majority of producers keep
+    /// extending a branch this node cannot admit, and sealing would fork it off.
+    pub split_guard: bool,
 }
 
 impl ProduceCatchupGate {
@@ -548,6 +720,9 @@ impl ProduceCatchupGate {
                 if let Some(d) = self.deferred_ahead.as_ref() {
                     d.store(0, Ordering::SeqCst);
                 }
+                if let Some(m) = self.deferred_majority_ahead.as_ref() {
+                    m.store(0, Ordering::SeqCst);
+                }
                 return;
             }
         };
@@ -558,6 +733,32 @@ impl ProduceCatchupGate {
             let quorum = observed.deferred_quorum_height(observed.now_instant());
             let bounded = quorum.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
             d.store(
+                if bounded > sel_height { bounded } else { 0 },
+                Ordering::SeqCst,
+            );
+        }
+        // The same evidence when a majority of producers agree on one branch, clamped
+        // the same way. It counts only while that branch also claims more blue score
+        // than the selected head carries: fork choice ranks tips by blue score, not
+        // height, and on a merging DAG the heavier branch can be the shorter one. A
+        // branch fork choice would not prefer is not one this node is behind on. Both
+        // sides are header values (the branch cannot be recomputed without its
+        // ancestry), so the comparison is like for like.
+        if let Some(m) = self.deferred_majority_ahead.as_ref() {
+            let sel_blue = storage
+                .blocks
+                .get_block(&sel_hash)
+                .ok()
+                .flatten()
+                .map(|b| b.header.blue_score)
+                .unwrap_or(u64::MAX);
+            let top = observed
+                .majority_branch(observed.now_instant())
+                .filter(|b| b.blue_score > sel_blue)
+                .map(|b| b.height)
+                .unwrap_or(0);
+            let bounded = top.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
+            m.store(
                 if bounded > sel_height { bounded } else { 0 },
                 Ordering::SeqCst,
             );
@@ -696,6 +897,7 @@ impl ProduceCatchupGate {
             attested_ahead: attested,
             applied_tip: st.last_applied_tip,
             gap: attested.saturating_sub(st.last_applied_tip),
+            split_guard: self.split_guard.load(Ordering::SeqCst),
         }
     }
 
@@ -710,16 +912,39 @@ impl ProduceCatchupGate {
             .unwrap_or(0)
     }
 
-    /// The deferred watermark this round may use. While deferred evidence ALONE would
-    /// make the producer refuse, that is allowed for [`DEFERRED_ONLY_REFUSE_MAX`]; after
-    /// it the evidence is ignored (the producer seals) with a rate-limited warning, until
-    /// it stops being the only reason to refuse.
+    /// The majority-branch watermark of the last recompute (0 when not wired or none).
+    fn majority_watermark(&self) -> u64 {
+        self.deferred_majority_ahead
+            .as_ref()
+            .map(|m| m.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// The deferred watermark this round may use.
+    ///
+    /// While deferred evidence ALONE would make the producer refuse, that is allowed
+    /// for [`DEFERRED_ONLY_REFUSE_MAX`]. After it:
+    ///   * if a strict majority of the producer set is extending ONE branch this node
+    ///     cannot admit (the majority watermark), the producer keeps refusing and
+    ///     raises the split guard. Sealing would only put a block on a branch of its
+    ///     own, which the majority will never build on: that is how one node's
+    ///     admission failure turns into a permanent split. Refusing costs the network
+    ///     nothing, because that majority is producing; and since refusing producers
+    ///     produce nothing, a guard that held every producer off would lose its own
+    ///     evidence within [`DEFERRED_EVIDENCE_TTL`]. Sync keeps running meanwhile,
+    ///     and the guard ends when the branch is admitted or goes quiet;
+    ///   * otherwise (a total split, a minority, unlinked blocks) the evidence is
+    ///     ignored and the producer seals, with a rate-limited warning, until it stops
+    ///     being the only reason to refuse. This is the 10-29 bound: evidence that no
+    ///     majority stands behind must not idle producers network-wide.
     fn deferred_for_round(&self, st: &mut CatchupBehindState, local_tip: u64, held: u64) -> u64 {
-        let raw = self.deferred_watermark();
+        let majority = self.majority_watermark();
+        let raw = self.deferred_watermark().max(majority);
         let deferred_only = raw.saturating_sub(local_tip) > CATCHUP_RESUME_GAP
             && held.saturating_sub(local_tip) <= CATCHUP_RESUME_GAP;
         if !deferred_only {
             st.deferred_only_since = None;
+            self.split_guard.store(false, Ordering::SeqCst);
             return raw;
         }
         let now = self
@@ -731,6 +956,25 @@ impl ProduceCatchupGate {
         if now.saturating_duration_since(since) < DEFERRED_ONLY_REFUSE_MAX {
             return raw;
         }
+        if majority.saturating_sub(local_tip) > CATCHUP_RESUME_GAP {
+            self.split_guard.store(true, Ordering::SeqCst);
+            let due = st
+                .split_guard_alarmed
+                .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+            if due {
+                st.split_guard_alarmed = Some(now);
+                error!(
+                    "F2/#126 SPLIT GUARD: a majority of producers keep extending a branch this \
+                     node cannot admit (evidence at {majority}, applied tip {local_tip}) for over \
+                     {}s. NOT sealing on this node's own tip: that would fork it off the network. \
+                     Sync keeps trying; production resumes by itself once this node admits that \
+                     branch or it goes quiet. Check this node's admission errors, peers and sync.",
+                    DEFERRED_ONLY_REFUSE_MAX.as_secs()
+                );
+            }
+            return majority;
+        }
+        self.split_guard.store(false, Ordering::SeqCst);
         let due = st
             .deferred_only_warned
             .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
@@ -1838,6 +2082,8 @@ impl BlockProducer {
             // candidate below finality is never treated as "ahead".
             finalized_floor: Some(app.finalized_height_handle()),
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
         });
         self
@@ -1859,6 +2105,7 @@ impl BlockProducer {
             gate.attested_ahead = Some(Arc::new(AtomicU64::new(0)));
             gate.attested_observed = Some(attested.handle());
             gate.deferred_ahead = Some(Arc::new(AtomicU64::new(0)));
+            gate.deferred_majority_ahead = Some(Arc::new(AtomicU64::new(0)));
         }
         self
     }
@@ -2197,6 +2444,9 @@ impl BlockProducer {
                     attested_now.saturating_sub(local_tip),
                     attested_now,
                     local_tip,
+                );
+                citrate_api::metrics_server::update_producer_split_guard(
+                    gate.split_guard.load(Ordering::SeqCst),
                 );
             }
             gate_result?;
@@ -6613,6 +6863,8 @@ mod tests {
             attested_observed: None,
             finalized_floor: None,
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
         }
     }
@@ -7132,6 +7384,8 @@ mod tests {
             attested_observed: Some(att.handle()),
             finalized_floor: floor.map(|f| Arc::new(AtomicU64::new(f))),
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
         }
     }
@@ -8108,6 +8362,470 @@ mod tests {
             assert!(
                 !b.orphans.is_empty(),
                 "the unconnectable orphans are still buffered"
+            );
+        }
+    }
+
+    /// The seal gate when producers this node cannot follow keep extending a branch.
+    ///
+    /// The 60 s cap on deferred-only refusal (`DEFERRED_ONLY_REFUSE_MAX`) exists so
+    /// that unadmittable evidence cannot idle producers network-wide. These tests pin
+    /// where the cap must still apply (no single branch backed by a majority of the
+    /// producer set: a total split, a minority, an equivocating proposer) and where it
+    /// must not (a majority of producers agree on one branch this node cannot admit:
+    /// sealing then only forks this node off, and refusing cannot stall the network,
+    /// because that majority is producing).
+    mod split_guard {
+        use super::seal_gate_and_parent_walk::{applied, gossip, node, produce, N};
+        use super::*;
+
+        /// Seven producers: B (node 7) and six others, all on one chain of 12 blocks
+        /// that B admitted, so all six are known proposers on B. Returns one block
+        /// by each other producer (index `i - 1` for node `i`) as a template.
+        async fn seven() -> (Vec<N>, N, Vec<Block>) {
+            let mut others = Vec::new();
+            for i in 1..=6u8 {
+                others.push(node(i, false).await);
+            }
+            let mut b = node(7, true).await;
+            let mut by: Vec<Option<Block>> = vec![None; 6];
+            for r in 0..12usize {
+                let p = r % 6;
+                let blk = produce(&others[p]).await;
+                for (q, o) in others.iter_mut().enumerate() {
+                    if q != p {
+                        assert_eq!(gossip(o, None, &blk).await, "admitted");
+                    }
+                }
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+                by[p] = Some(blk);
+            }
+            let templates = by.into_iter().map(|t| t.expect("template")).collect();
+            (others, b, templates)
+        }
+
+        /// A signed block by node `i` at `height` on top of `parent`, with a header
+        /// time `skew_secs` after real time (matching the test clock). Each one is a
+        /// real, hash-bound, signed block; B cannot admit any of them because the
+        /// first parent of each branch is a block B never received.
+        fn signed(templates: &[Block], i: u8, height: u64, parent: Hash, skew_secs: u64) -> Block {
+            let mut x = templates[usize::from(i) - 1].clone();
+            x.header.height = height;
+            // A linear branch: one blue block per height, as fork choice scores it.
+            x.header.blue_score = height;
+            x.header.selected_parent_hash = parent;
+            x.header.merge_parent_hashes = Vec::new();
+            x.header.timestamp =
+                (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(skew_secs);
+            x.header.block_hash = x.compute_hash();
+            x.signature = crypto::sign_block(
+                &x.header.block_hash,
+                &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+            );
+            x
+        }
+
+        /// One branch B cannot admit, extended by a fixed set of proposers.
+        struct Branch {
+            proposers: Vec<u8>,
+            tip: Hash,
+            height: u64,
+            turn: usize,
+        }
+
+        impl Branch {
+            fn new(proposers: &[u8], root: u8, height: u64) -> Self {
+                Self {
+                    proposers: proposers.to_vec(),
+                    tip: Hash::new([root; 32]),
+                    height,
+                    turn: 0,
+                }
+            }
+
+            /// `k` new blocks on this branch, by its proposers in turn.
+            fn extend(&mut self, templates: &[Block], k: usize, skew: u64) -> Vec<Block> {
+                (0..k)
+                    .map(|_| {
+                        let i = self.proposers[self.turn % self.proposers.len()];
+                        self.turn += 1;
+                        self.height += 1;
+                        let blk = signed(templates, i, self.height, self.tip, skew);
+                        self.tip = blk.header.block_hash;
+                        blk
+                    })
+                    .collect()
+            }
+        }
+
+        /// Deliver blocks to B as gossip; every one must defer (B lacks the parent).
+        async fn hear(b: &mut N, blocks: &[Block]) {
+            for blk in blocks {
+                assert_eq!(gossip(b, None, blk).await, "deferred");
+            }
+        }
+
+        fn split_guard_on(b: &N) -> bool {
+            b.producer
+                .produce_gate
+                .as_ref()
+                .expect("gate wired")
+                .status_snapshot()
+                .split_guard
+        }
+
+        /// RED at fe5e82b3. Four of seven producers keep extending ONE branch that B
+        /// cannot admit (B never got its first block). The gate refuses for 60 s and
+        /// then seals on B's own tip every round: B builds a solo branch while a
+        /// majority of the producer set is live on another, which is how one admission
+        /// failure becomes a permanent split. The fix keeps refusing for as long as
+        /// that majority keeps producing, and raises the split guard.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_majority_branch_it_cannot_admit_never_seals_solo() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA1, start.1 + 10);
+            let mut sealed = Vec::new();
+            for step in 0..=18u64 {
+                let t = step * 10;
+                // One block from each proposer first, then two per 10 s: within
+                // the 30 s window all four proposers stay fresh on the branch.
+                let blocks = branch.extend(&templates, if step == 0 { 4 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                if b.producer.produce_block().await.is_ok() {
+                    sealed.push(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                sealed,
+                Vec::<u64>::new(),
+                "B sealed on its own tip while 4 of 7 producers extend a branch it cannot admit"
+            );
+            assert_eq!(applied(&b), start, "B extended a solo branch");
+            assert!(split_guard_on(&b), "the split guard is not raised");
+        }
+
+        /// The guard is bounded by the evidence: once the majority stops producing,
+        /// B seals again within the 30 s evidence window (plus one round). Refusing
+        /// producers produce nothing, so if every producer were refusing, the
+        /// evidence would lapse the same way: the guard cannot stall the network.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_split_guard_resumes_when_the_majority_stops() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA2, start.1 + 10);
+            for step in 0..=9u64 {
+                let blocks = branch.extend(&templates, if step == 0 { 4 } else { 2 }, step * 10);
+                hear(&mut b, &blocks).await;
+                assert!(b.producer.produce_block().await.is_err());
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert!(split_guard_on(&b));
+            // The majority goes quiet.
+            let mut resumed_after = None;
+            for step in 1..=6u64 {
+                if b.producer.produce_block().await.is_ok() {
+                    resumed_after = Some(step * 10);
+                    break;
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let after = resumed_after.expect("B never resumed after the majority stopped");
+            // Literal on purpose: 30 s window + one 10 s round.
+            assert!(after <= 40, "resumed only after {after}s");
+            assert!(!split_guard_on(&b), "the split guard stayed raised");
+        }
+
+        /// Seven solo branches (every producer in the same state): no branch has a
+        /// majority behind it, so the 10-29 cap still applies and B seals after 60 s.
+        /// Refusing here would idle every producer at once.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_total_split_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut solos: Vec<Branch> = (1..=6u8)
+                .map(|i| Branch::new(&[i], 0xB0 + i, start + 10))
+                .collect();
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                for s in solos.iter_mut() {
+                    let blocks = s.extend(&templates, 1, t);
+                    hear(&mut b, &blocks).await;
+                }
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a total split must not idle B past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
+        }
+
+        /// Three of seven agreeing (more than a third, not a majority): the cap
+        /// applies. This is the 10-29 stranded-minority case: the majority must not
+        /// be held off by a minority it cannot follow.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_minority_branch_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut branch = Branch::new(&[1, 2, 3], 0xA3, start + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks = branch.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                let r = b.producer.produce_block().await;
+                if t == 0 {
+                    assert!(r.is_err(), "3 of 7 count as evidence at first");
+                }
+                if r.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a minority held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
+        }
+
+        /// A proposer that signs on two branches is not counted on either: with it,
+        /// each branch would show four proposers (a "majority" each), and both sides
+        /// would stop. Without it each shows three, so the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_equivocating_proposer_counts_on_no_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut p = Branch::new(&[1, 2, 3, 4], 0xA4, start + 10);
+            let mut q = Branch::new(&[4, 5, 6], 0xA5, start + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks = p.extend(&templates, if step == 0 { 4 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                let blocks = q.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("an equivocator made a majority");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// Blocks from four proposers that do not link to each other (same height
+        /// band, unrelated parents) are not one branch: the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_unlinked_blocks_from_a_majority_are_not_a_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                for i in 1..=4u8 {
+                    let mut root = [0xC0u8; 32];
+                    root[0] = i;
+                    root[1] = step as u8;
+                    let parent = Hash::new(root);
+                    let blk = signed(&templates, i, start + 20 + step, parent, t);
+                    hear(&mut b, std::slice::from_ref(&blk)).await;
+                }
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("unlinked blocks held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// Fork choice ranks by blue score, not height. A majority branch that is
+        /// taller than B's chain but claims LESS blue score than B's selected head
+        /// (B's chain merged more) is not a branch B is behind on: the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_majority_branch_lighter_by_blue_score_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let b_blue = b
+                .storage
+                .blocks
+                .get_block(&start.0)
+                .expect("read")
+                .expect("tip")
+                .header
+                .blue_score;
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA6, start.1 + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks: Vec<Block> = branch
+                    .extend(&templates, if step == 0 { 4 } else { 2 }, t)
+                    .into_iter()
+                    .map(|mut x| {
+                        // Taller, but lighter than B's head by fork choice's measure.
+                        x.header.blue_score = b_blue.saturating_sub(1);
+                        x
+                    })
+                    .collect();
+                // Re-link and re-sign after the edit (the branch stays one branch).
+                let mut prev: Option<Hash> = None;
+                let mut relinked = Vec::new();
+                for mut x in blocks {
+                    if let Some(p) = prev {
+                        x.header.selected_parent_hash = p;
+                    }
+                    x.header.block_hash = x.compute_hash();
+                    let i = (1..=6u8)
+                        .find(|i| {
+                            templates[usize::from(*i) - 1].header.proposer_pubkey
+                                == x.header.proposer_pubkey
+                        })
+                        .expect("proposer");
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    prev = Some(x.header.block_hash);
+                    relinked.push(x);
+                }
+                if let Some(p) = prev {
+                    branch.tip = p;
+                }
+                hear(&mut b, &relinked).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a lighter branch held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
+        }
+
+        /// The quorum sizes the guard uses: a strict majority of the producer set
+        /// (the node itself plus the known proposers), never satisfiable alone.
+        #[test]
+        fn rcseal_majority_quorum_sizes() {
+            // known proposers -> needed agreeing others (producers = known + 1)
+            assert_eq!(deferred_majority_size(1), 2); // 2 producers: unreachable
+            assert_eq!(deferred_majority_size(2), 2); // 3 producers
+            assert_eq!(deferred_majority_size(3), 3); // 4 producers
+            assert_eq!(deferred_majority_size(6), 4); // 7 producers
+            assert_eq!(deferred_majority_size(7), 5); // 8 producers
+        }
+    }
+
+    /// r1006 2026-11-01, prod-3 after the reseed: one node serving catch-up
+    /// `GetBlocks` to six peers for ten minutes shed `NewBlock` (inbound queue
+    /// full), its own sync requests timed out, it dropped six peers for those
+    /// timeouts, and it forked off alone. This runs that load through the
+    /// node's inbound path (`PeerManager::forward_incoming` into the production
+    /// 512-slot queue), drains it the way the message loop does (each
+    /// `GetBlocks` served by `block_serve::serve_blocks`, the `NewBlock`
+    /// admitted by `BlockAdmission::admit`), and applies the sync driver's
+    /// timeout-drop rule to the producer whose block just arrived.
+    mod serving_load {
+        use super::seal_gate_and_parent_walk::{applied, gossip, node, produce};
+        use super::*;
+        use citrate_network::peer::{Direction, Peer, PeerInfo, PeerManagerConfig};
+        use citrate_network::PeerId;
+        use tokio::sync::mpsc;
+
+        /// The far ends of a test connection, held open for the test's length.
+        type Ends = (mpsc::Receiver<NetworkMessage>, mpsc::Sender<NetworkMessage>);
+
+        async fn connect(pm: &PeerManager, id: &str, ip: u8, ends: &mut Vec<Ends>) -> PeerId {
+            let pid = PeerId::new(id.to_string());
+            let addr = std::net::SocketAddr::from(([10, 0, 0, ip], 30303));
+            let (send_tx, send_rx) = mpsc::channel(256);
+            let (recv_tx, recv_rx) = mpsc::channel(1);
+            let peer = Peer::new(
+                PeerInfo::new(pid.clone(), addr, Direction::Inbound),
+                send_tx,
+                recv_rx,
+            );
+            ends.push((send_rx, recv_tx));
+            pm.add_peer(Arc::new(peer)).await.expect("add peer");
+            pid
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_node_serving_six_catchups_still_admits_gossip_and_keeps_its_peers() {
+            let a = node(1, false).await;
+            let mut server = node(3, false).await;
+            for _ in 0..20 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut server, None, &blk).await, "admitted");
+            }
+            let pm = PeerManager::new(PeerManagerConfig::default());
+            let (tx, mut rx) = mpsc::channel(512); // main.rs inbound queue
+            pm.set_incoming(tx).await;
+            let mut ends = Vec::new();
+            let producer = connect(&pm, "prod-1", 1, &mut ends).await;
+            let mut catchups = Vec::new();
+            for i in 0..6u8 {
+                catchups.push(connect(&pm, &format!("catchup-{i}"), 10 + i, &mut ends).await);
+            }
+            // The six catching-up nodes ask faster than one loop serves.
+            let genesis = server
+                .storage
+                .blocks
+                .get_block_by_height(0)
+                .expect("read")
+                .expect("genesis");
+            for _ in 0..100 {
+                for c in &catchups {
+                    pm.forward_incoming(
+                        c.clone(),
+                        NetworkMessage::GetBlocks {
+                            from: genesis,
+                            count: 32,
+                            step: 1,
+                        },
+                    )
+                    .await;
+                }
+            }
+            // The producer seals and gossips its block into that queue.
+            let blk = produce(&a).await;
+            pm.forward_incoming(producer.clone(), NetworkMessage::NewBlock { block: blk })
+                .await;
+            // The message loop drains in arrival order.
+            let mut served = 0usize;
+            let mut admitted = false;
+            while let Ok((_pid, msg)) = rx.try_recv() {
+                match msg {
+                    NetworkMessage::GetBlocks { from, count, .. } => {
+                        let _ = crate::block_serve::serve_blocks(&server.storage, &from, count);
+                        served += 1;
+                    }
+                    NetworkMessage::NewBlock { block } => {
+                        admitted = gossip(&mut server, None, &block).await == "admitted";
+                    }
+                    _ => {}
+                }
+            }
+            assert!(served > 0, "the catch-up requests were served");
+            assert!(
+                admitted,
+                "the serving node never admitted the gossiped block ({:?} shed)",
+                pm.inbound_drops_by_kind()
+            );
+            assert_eq!(applied(&server), applied(&a), "the server fell behind");
+            // Its own sync requests to the producer timed out under that load; the
+            // producer's connection just delivered a block, so it is kept.
+            let (total, _, _) = pm.get_peer_counts().await;
+            assert!(
+                !crate::sync_peer::drop_after_timeouts(
+                    crate::sync_peer::DROP_AFTER_TIMEOUTS,
+                    total,
+                    pm.get_peer(&producer).is_some(),
+                    pm.last_inbound_age(&producer),
+                ),
+                "dropped the producer that just gossiped a block, for timeouts caused by load"
             );
         }
     }

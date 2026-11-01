@@ -1,7 +1,7 @@
 // citrate/core/network/src/peer.rs
 
 // Peer connection and management
-use crate::inbound::InboundDrops;
+use crate::inbound::{self, InboundDrops, ServeBudget};
 use crate::protocol::MAX_INBOUND_MESSAGE_BYTES;
 use crate::{NetworkError, NetworkMessage, ProtocolVersion};
 use citrate_consensus::types::Hash;
@@ -357,6 +357,13 @@ pub struct PeerManager {
     pub(crate) inbound_drops: Arc<AtomicU64>,
     /// The same drops by message type, with a rate-limited warning.
     inbound_drops_by_kind: Arc<InboundDrops>,
+    /// When each connected peer's last message reached `forward_incoming`
+    /// (queued or shed): proof its connection delivers. Cleared on removal.
+    last_inbound: Arc<DashMap<PeerId, Instant>>,
+    /// Each peer's serve-request budget (see `inbound::ServeBudget`).
+    serve_budget: Arc<ServeBudget>,
+    /// Serve requests shed for being over their peer's budget.
+    serve_budget_drops: Arc<InboundDrops>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +409,11 @@ impl PeerManager {
             incoming: Arc::new(RwLock::new(None)),
             inbound_drops: Arc::new(AtomicU64::new(0)),
             inbound_drops_by_kind: Arc::new(InboundDrops::default()),
+            last_inbound: Arc::new(DashMap::new()),
+            serve_budget: Arc::new(ServeBudget::default()),
+            serve_budget_drops: Arc::new(InboundDrops::with_reason(
+                "inbound serve request over this peer's budget",
+            )),
         }
     }
 
@@ -425,18 +437,43 @@ impl PeerManager {
     /// the 2s tick and gossip is redundant by construction, so a dropped message
     /// costs a round trip. Blocking cost the entire fleet thirty hours.
     pub async fn forward_incoming(&self, peer_id: PeerId, message: NetworkMessage) {
+        let now = Instant::now();
+        if self.peers.contains_key(&peer_id) {
+            self.last_inbound.insert(peer_id.clone(), now);
+        }
         if let Some(tx) = self.incoming.read().await.clone() {
             let kind = message.kind();
+            // Serve requests over this peer's budget never reach the queue.
+            if inbound::serve_request(&message) && !self.serve_budget.allow(&peer_id, now) {
+                self.serve_budget_drops.record(kind, &peer_id, now);
+                return;
+            }
+            // Only block gossip and sync answers may take the reserved part.
+            let reserved = tx
+                .max_capacity()
+                .checked_div(inbound::RESERVED_SHARE_DIVISOR)
+                .unwrap_or(0);
+            if !inbound::reserved_lane(&message) && tx.capacity() <= reserved {
+                self.inbound_drops.fetch_add(1, Ordering::Relaxed);
+                self.inbound_drops_by_kind.record(kind, &peer_id, now);
+                return;
+            }
             if let Err(mpsc::error::TrySendError::Full((peer_id, _))) =
                 tx.try_send((peer_id, message))
             {
                 self.inbound_drops.fetch_add(1, Ordering::Relaxed);
                 // Shedding stays silent no longer: counted by type, warned
                 // about at most once per window.
-                self.inbound_drops_by_kind
-                    .record(kind, &peer_id, Instant::now());
+                self.inbound_drops_by_kind.record(kind, &peer_id, now);
             }
         }
+    }
+
+    /// How long ago `peer_id`'s last message arrived (`None`: nothing since it
+    /// connected). A peer whose messages keep arriving has a working
+    /// connection, whatever its sync timeouts say.
+    pub fn last_inbound_age(&self, peer_id: &PeerId) -> Option<Duration> {
+        self.last_inbound.get(peer_id).map(|t| t.elapsed())
     }
 
     /// Total inbound messages shed because the message loop was behind (#149).
@@ -451,6 +488,12 @@ impl PeerManager {
     /// The same drops as `(message type, count)`, sorted by type.
     pub fn inbound_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
         self.inbound_drops_by_kind.by_kind()
+    }
+
+    /// Serve requests shed for being over their peer's budget, by type. Not
+    /// part of [`Self::inbound_drops`]: they say nothing about the loop.
+    pub fn serve_budget_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
+        self.serve_budget_drops.by_kind()
     }
 
     /// Get max peers configuration
@@ -592,6 +635,7 @@ impl PeerManager {
     // LOCK ORDERING: acquires Peer.info (read) then PeerManager.stats (write) — Level 1
     pub async fn remove_peer(&self, peer_id: &PeerId) -> Option<Arc<Peer>> {
         let peer = self.peers.remove(peer_id).map(|(_, p)| p);
+        self.last_inbound.remove(peer_id);
 
         if let Some(ref p) = peer {
             // Drop the SOCKET, not just the map entry. Without this a dropped
@@ -1434,6 +1478,113 @@ mod tests {
             vec![("GetBlocks", 3), ("GetPeers", 1)]
         );
         assert_eq!(pm.inbound_drops(), 4, "the total the stall detector reads");
+    }
+
+    fn get_blocks_req() -> NetworkMessage {
+        NetworkMessage::GetBlocks {
+            from: Hash::default(),
+            count: 32,
+            step: 1,
+        }
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<(PeerId, NetworkMessage)>) -> Vec<(String, &'static str)> {
+        let mut out = Vec::new();
+        while let Ok((pid, msg)) = rx.try_recv() {
+            out.push((pid.0, msg.kind()));
+        }
+        out
+    }
+
+    /// RED (r1006 2026-11-01, prod-3 after the reseed). A node serving catch-up
+    /// to six peers at once fills its one inbound queue with their `GetBlocks`.
+    /// The block gossip and the answers to its OWN sync requests then arrive at
+    /// a full queue and are shed like any other message: it stops hearing new
+    /// blocks, its requests time out, and it drops the peers that answered them.
+    /// Serve requests must be shed first; `NewBlock` and `Blocks`/`Headers`
+    /// answers keep a reserved part of the queue.
+    #[tokio::test]
+    async fn rcseal_red_serving_load_does_not_shed_block_gossip_or_answers() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let (tx, mut rx) = mpsc::channel(64);
+        pm.set_incoming(tx).await;
+        // Six catching-up peers, twelve requests each: more than the queue holds.
+        for _ in 0..12 {
+            for p in 0..6 {
+                pm.forward_incoming(PeerId::new(format!("catchup-{p}")), get_blocks_req())
+                    .await;
+            }
+        }
+        pm.forward_incoming(
+            PeerId::new("producer".into()),
+            NetworkMessage::NewBlock {
+                block: citrate_consensus::types::BlockBuilder::new()
+                    .parent(Hash::new([7u8; 32]))
+                    .height(1)
+                    .build_unhashed(),
+            },
+        )
+        .await;
+        pm.forward_incoming(
+            PeerId::new("server".into()),
+            NetworkMessage::Blocks { blocks: Vec::new() },
+        )
+        .await;
+        pm.forward_incoming(
+            PeerId::new("server".into()),
+            NetworkMessage::Headers {
+                headers: Vec::new(),
+            },
+        )
+        .await;
+        let dropped: Vec<&'static str> =
+            pm.inbound_drops_by_kind().iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            dropped,
+            vec!["GetBlocks"],
+            "only serve requests may be shed under serving load"
+        );
+        let got = drain(&mut rx);
+        for kind in ["NewBlock", "Blocks", "Headers"] {
+            assert!(
+                got.iter().any(|(_, k)| *k == kind),
+                "{kind} was not delivered"
+            );
+        }
+    }
+
+    /// RED. One peer cannot fill the queue with serve requests: past its budget
+    /// its `GetBlocks` are shed at the reader, and another peer's still get in.
+    /// (The transport allows 200 messages a second per connection; each
+    /// `GetBlocks` costs the single message loop a storage read of up to a full
+    /// response.)
+    #[tokio::test]
+    async fn rcseal_red_one_peer_cannot_flood_serve_requests() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let (tx, mut rx) = mpsc::channel(512);
+        pm.set_incoming(tx).await;
+        for _ in 0..200 {
+            pm.forward_incoming(PeerId::new("flooder".into()), get_blocks_req())
+                .await;
+        }
+        pm.forward_incoming(PeerId::new("honest".into()), get_blocks_req())
+            .await;
+        let got = drain(&mut rx);
+        let from_flooder = got.iter().filter(|(p, _)| p == "flooder").count();
+        // Literal on purpose: a burst of 16, refilled at 4 a second.
+        assert!(
+            (16..=24).contains(&from_flooder),
+            "{from_flooder} of 200 serve requests from one peer reached the loop"
+        );
+        assert!(
+            got.iter().any(|(p, _)| p == "honest"),
+            "another peer's request was shed"
+        );
+        assert_eq!(
+            pm.inbound_drops(),
+            0,
+            "budget sheds are not queue-full drops (the stall detector reads this)"
+        );
     }
 
     /// CONNECTION DEDUP (fleet incident 2026-07-29).

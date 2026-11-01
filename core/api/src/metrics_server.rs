@@ -170,7 +170,8 @@ pub static NETWORK_BYTES_SENT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
 });
 
 // Producer F2 catch-up gate (VERIFY-255-F2-M1: read-only ops status the fleet monitor
-// scrapes off the loopback-bound metrics server). `state` is producing|refusing|latched.
+// scrapes off the loopback-bound metrics server). `state` is producing|refusing|latched,
+// plus split_guard (see `update_producer_split_guard`).
 pub static PRODUCER_CATCHUP_STATE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     crate::metrics::must(
         register_gauge_vec!(
@@ -346,6 +347,15 @@ pub fn update_producer_catchup_status(
     PRODUCER_CATCHUP_HEIGHTS
         .with_label_values(&["applied_tip"])
         .set(applied_tip as f64);
+}
+
+/// Publish the producer split guard (`citrate_producer_catchup_state{state="split_guard"}`):
+/// 1 while a majority of producers keep extending a branch this node cannot admit and
+/// the producer holds off sealing rather than fork itself off. Page on it.
+pub fn update_producer_split_guard(active: bool) {
+    PRODUCER_CATCHUP_STATE
+        .with_label_values(&["split_guard"])
+        .set(active as u8 as f64);
 }
 
 /// Record RPC request
