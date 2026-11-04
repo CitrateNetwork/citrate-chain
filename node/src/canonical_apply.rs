@@ -13755,6 +13755,64 @@ pub(crate) mod tests {
             );
         }
 
+        /// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2, root cause H6): the
+        /// undo window equals the DAG prune retention. A running node forked
+        /// `retention - 1` blocks below its tip (far below the in-memory
+        /// snapshot ring) switches to the heavier branch in place, from the
+        /// undo records on disk: the durable tip never goes below the fork
+        /// point (no rebuild from genesis, which a pruned node refuses), and
+        /// memory and the durable store end on the winner's state root.
+        #[tokio::test]
+        async fn reorg_at_retention_minus_one_succeeds() {
+            let retain = crate::dag_prune::DEFAULT_RETAIN_BLOCKS;
+            let tip_height = retain + 50;
+            let depth = retain - 1;
+            let fork = tip_height - depth;
+            let (main, snaps) = rsr_main(tip_height).await;
+            let side = rsr_fork(&main, &snaps, fork, depth + 1, [0x5B; 32], CAROL).await;
+            drop(snaps);
+            let head = side.last().expect("side").clone();
+
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                assert!(
+                    matches!(app.apply_received(b).await, ApplyOutcome::Applied { .. }),
+                    "fixture: block {} applies",
+                    b.header.height
+                );
+            }
+            assert_eq!(app.applied_tip().await.height, tip_height, "fixture: tip");
+            for b in &side {
+                persist(&storage, b);
+            }
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            let watch = LowestTip::start(storage.clone());
+            app.drive_drain().await;
+            let lowest = watch.finish();
+
+            assert_eq!(
+                app.applied_tip().await,
+                AppliedTip {
+                    hash: head.header.block_hash,
+                    height: head.header.height
+                },
+                "a fork {depth} below the tip (retention {retain} minus one) is switched in place"
+            );
+            assert!(
+                lowest >= fork,
+                "the switch went below the fork point {fork} (lowest durable tip {lowest})"
+            );
+            assert_eq!(exec.calculate_state_root(), head.state_root, "memory");
+            assert_eq!(
+                rsr_hydrated(&storage).calculate_state_root(),
+                head.state_root,
+                "durable state"
+            );
+        }
+
         /// The store keeps undo records for exactly the last MAX_REORG_DEPTH
         /// applied heights, through linear growth and through a reorg.
         #[tokio::test]

@@ -1395,6 +1395,66 @@ mod tests {
         );
     }
 
+    /// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2): an undo record is never
+    /// dropped for its size. A missing record inside the window is a
+    /// permanent wedge (H6), so a block whose pre-images encode to more than
+    /// 8 MiB keeps its record, linear and reorg alike.
+    #[test]
+    fn an_undo_record_over_8_mib_is_kept() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
+        let a = Address([1; 20]);
+        let none = ReceiptIndexBatch::default();
+        let big = vec![0xAB; 8 * 1024 * 1024 + 1];
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(1))],
+                &[slot(a, b"big", Some(&big))],
+                Some((block_hash(1), 1)),
+                &none,
+                None,
+            )
+            .expect("block 1");
+        store
+            .write_state_batch_with_applied_tip(
+                &[(a, acct(2))],
+                &[slot(a, b"big", Some(b"small"))],
+                Some((block_hash(2), 2)),
+                &none,
+                None,
+            )
+            .expect("block 2 commits");
+        let rec = store
+            .get_reorg_undo(2)
+            .expect("read")
+            .expect("a record over 8 MiB is kept");
+        assert_eq!(rec.storage, vec![(a, b"big".to_vec(), Some(big.clone()))]);
+        let records = [BlockUndo {
+            height: 3,
+            hash: block_hash(3),
+            parent: Some((block_hash(2), 2)),
+            accounts: vec![(a, Some(acct(2)))],
+            storage: vec![(a, b"big".to_vec(), Some(big.clone()))],
+            models_jobs: Some(Default::default()),
+        }];
+        store
+            .write_reorg_batch_sync(
+                &[(a, acct(3))],
+                &[],
+                &[],
+                &[],
+                Some((block_hash(3), 3)),
+                &none,
+                &records,
+            )
+            .expect("reorg commits");
+        assert_eq!(
+            store.get_reorg_undo(3).expect("read").map(|r| r.storage),
+            Some(vec![(a, b"big".to_vec(), Some(big))]),
+            "a winning record over 8 MiB is kept"
+        );
+    }
+
     #[test]
     fn test_storage_operations() {
         let temp_dir = TempDir::new().unwrap();

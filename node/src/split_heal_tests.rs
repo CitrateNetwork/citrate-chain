@@ -2346,9 +2346,8 @@ mod tests {
     /// (`RebuildDecision::RefusePruned`) and the switch needs undo records
     /// for the whole depth. Red on r1007/candidate: the three fetch the four's
     /// whole chain (stored tip 1597) but the applied tip stays on their branch
-    /// at 1192. Ignored until S3-4 (undo window = prune retention, CV-7a).
+    /// at 1192. S3-4 (undo window = prune retention, CV-7a) makes it green.
     #[tokio::test(flavor = "current_thread")]
-    #[ignore = "needs S3-4 (CV-7a undo window = prune retention); red on r1007/candidate"]
     async fn pruned_stopped_side_forked_beyond_the_reorg_window_rejoins() {
         if !in_child() {
             return run_in_child(

@@ -954,6 +954,29 @@ mod tests {
         );
     }
 
+    /// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2, root cause H6): the undo
+    /// window is the prune retention. The default retention equals the
+    /// reorg window (`MAX_REORG_DEPTH`), and no accepted retention is
+    /// shorter than it, so a fork the DAG store still holds is always one the
+    /// applied chain can be switched across in place.
+    #[test]
+    fn undo_window_equals_the_prune_retention() {
+        assert_eq!(
+            crate::canonical_apply::MAX_REORG_DEPTH,
+            DEFAULT_RETAIN_BLOCKS,
+            "undo window != prune retention"
+        );
+        assert!(
+            MIN_RETAIN_BLOCKS >= crate::canonical_apply::MAX_REORG_DEPTH,
+            "a retention shorter than the undo window is accepted ({MIN_RETAIN_BLOCKS})"
+        );
+        assert_eq!(
+            citrate_storage::state::REORG_UNDO_DEPTH,
+            DEFAULT_RETAIN_BLOCKS,
+            "the store keeps undo records for less than the retention"
+        );
+    }
+
     #[test]
     fn disabled_unless_the_env_var_is_set() {
         // The test process may run in any order, so assert the parse rules
