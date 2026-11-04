@@ -88,6 +88,8 @@ mod registration_proof;
 mod registry_sync;
 mod rollback;
 #[cfg(test)]
+mod serve_plane_tests;
+#[cfg(test)]
 mod split_heal_tests;
 mod startup_guards;
 mod sync_peer;

@@ -1557,6 +1557,65 @@ mod tests {
         assert_eq!(pm.inbound_drops(), 0);
     }
 
+    /// RED (planset H3, ADR CV-6). Catching-up peers flood the node with
+    /// history requests while producers gossip blocks and transactions. Every
+    /// `NewBlock` and every `NewTransaction` must reach the consensus loop:
+    /// history requests never take their place in its queue.
+    #[tokio::test]
+    async fn newblock_never_shed_under_serve_load() {
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        // main.rs: the 512-slot consensus queue, not drained while the flood
+        // arrives (the loop is busy).
+        let (tx, mut rx) = mpsc::channel(512);
+        pm.set_incoming(tx).await;
+        let mut sent_blocks = 0usize;
+        let mut sent_txs = 0usize;
+        for i in 0..4_000u32 {
+            let catchup = PeerId::new(format!("catchup-{}", i % 8));
+            let request = if i % 2 == 0 {
+                get_blocks_req()
+            } else {
+                NetworkMessage::GetHeaders {
+                    from: Hash::default(),
+                    count: 2048,
+                }
+            };
+            pm.forward_incoming(catchup, request).await;
+            if i % 40 == 0 {
+                let producer = PeerId::new(format!("producer-{}", i % 7));
+                pm.forward_incoming(
+                    producer.clone(),
+                    NetworkMessage::NewBlock {
+                        block: citrate_consensus::types::BlockBuilder::new()
+                            .parent(Hash::new([7u8; 32]))
+                            .height(u64::from(i) + 1)
+                            .build_unhashed(),
+                    },
+                )
+                .await;
+                sent_blocks += 1;
+                pm.forward_incoming(
+                    producer,
+                    NetworkMessage::NewTransaction {
+                        transaction: citrate_consensus::types::Transaction::default(),
+                    },
+                )
+                .await;
+                sent_txs += 1;
+            }
+        }
+        let got = drain(&mut rx);
+        let delivered = |kind: &str| got.iter().filter(|(_, k)| *k == kind).count();
+        assert_eq!(delivered("NewBlock"), sent_blocks, "NewBlock was shed");
+        assert_eq!(delivered("NewTransaction"), sent_txs, "tx gossip was shed");
+        for (kind, n) in pm.inbound_drops_by_kind() {
+            assert!(
+                kind != "NewBlock" && kind != "NewTransaction",
+                "{n} {kind} shed under serve load"
+            );
+        }
+    }
+
     /// CONNECTION DEDUP (fleet incident 2026-07-29).
     ///
     /// `add_peer` already deduped the MAP by peer id — a reconnect replaced the

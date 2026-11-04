@@ -1078,4 +1078,134 @@ mod tests {
 
         assert_eq!(store.get_tips().unwrap(), vec![child.header.block_hash]);
     }
+
+    /// Write `n` chain blocks (plus two side tips) as `put_block` lays them out,
+    /// in one unsynced batch (setup speed only), then open a `BlockStore` on the
+    /// result: a data dir written by an earlier binary.
+    fn store_of(n: u64) -> (TempDir, BlockStore, Vec<Hash>) {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let mk = |tag: u8, height: u64, parent: Hash| {
+            let mut h = [tag; 32];
+            h[..8].copy_from_slice(&height.to_be_bytes());
+            BlockBuilder::new()
+                .hash(Hash::new(h))
+                .parent(parent)
+                .height(height)
+                .timestamp(1_000_000 + height)
+                .blue_score(height)
+                .blue_work(u128::from(height))
+                .proposer(PublicKey::new([1; 32]))
+                .build_unhashed()
+        };
+        let mut batch = db.batch();
+        let mut write = |b: &Block, batch: &mut rocksdb::WriteBatch| {
+            let hash = b.hash();
+            db.batch_put_cf(
+                batch,
+                CF_BLOCKS,
+                hash.as_bytes(),
+                &bincode::serialize(b).unwrap(),
+            )
+            .unwrap();
+            db.batch_put_cf(
+                batch,
+                CF_HEADERS,
+                hash.as_bytes(),
+                &bincode::serialize(&b.header).unwrap(),
+            )
+            .unwrap();
+            db.batch_put_cf(
+                batch,
+                CF_METADATA,
+                &height_to_key(b.header.height),
+                hash.as_bytes(),
+            )
+            .unwrap();
+        };
+        let mut parent = Hash::default();
+        let mut chain = Vec::new();
+        for h in 0..n {
+            let b = mk(0x11, h, parent);
+            write(&b, &mut batch);
+            if h > 0 {
+                db.batch_put_cf(
+                    &mut batch,
+                    CF_DAG_RELATIONS,
+                    &parent_children_key(&parent),
+                    &bincode::serialize(&vec![b.hash()]).unwrap(),
+                )
+                .unwrap();
+            }
+            parent = b.hash();
+            chain.push(b);
+        }
+        let mut tips = vec![parent];
+        // Two side tips off the middle of the chain.
+        let mid = chain[(n / 2) as usize].clone();
+        let s1 = mk(0x22, mid.header.height + 1, mid.hash());
+        let s2 = mk(0x33, mid.header.height + 1, mid.hash());
+        write(&s1, &mut batch);
+        write(&s2, &mut batch);
+        let mid_child = chain[(n / 2 + 1) as usize].hash();
+        db.batch_put_cf(
+            &mut batch,
+            CF_DAG_RELATIONS,
+            &parent_children_key(&mid.hash()),
+            &bincode::serialize(&vec![mid_child, s1.hash(), s2.hash()]).unwrap(),
+        )
+        .unwrap();
+        db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            LATEST_HEIGHT_KEY,
+            &(n - 1).to_be_bytes(),
+        )
+        .unwrap();
+        db.write_batch(batch).unwrap();
+        tips.push(s1.hash());
+        tips.push(s2.hash());
+        (temp_dir, BlockStore::new(db), tips)
+    }
+
+    fn fastest_get_tips(store: &BlockStore) -> std::time::Duration {
+        (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(store.get_tips().unwrap());
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    /// RED (planset H7, ADR CV-6). `get_tips` read every key of CF_BLOCKS and
+    /// CF_DAG_RELATIONS on every call, and `citrate_getDagStats` (polled by the
+    /// indexer ~1.4/s) calls it, so its cost grew with the whole store. With
+    /// the same three tips, a store 100x larger must not make it measurably
+    /// slower.
+    #[test]
+    fn get_tips_cost_is_independent_of_store_size() {
+        let (_small_dir, small, small_tips) = store_of(200);
+        let (_big_dir, big, big_tips) = store_of(20_000);
+        let mut want = small_tips.clone();
+        want.sort();
+        let mut got = small.get_tips().unwrap();
+        got.sort();
+        assert_eq!(got, want, "small store tips");
+        let mut want = big_tips.clone();
+        want.sort();
+        let mut got = big.get_tips().unwrap();
+        got.sort();
+        assert_eq!(got, want, "big store tips");
+
+        let t_small = fastest_get_tips(&small);
+        let t_big = fastest_get_tips(&big);
+        eprintln!("GETTIPS 3 tips: 200 blocks {t_small:?}, 20,000 blocks {t_big:?}");
+        assert!(
+            t_big <= t_small * 4 + std::time::Duration::from_millis(1),
+            "get_tips on 20,000 blocks took {t_big:?} vs {t_small:?} on 200: it scales with \
+             the store, not with the tips"
+        );
+    }
 }
