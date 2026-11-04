@@ -207,6 +207,9 @@ pub(crate) struct Fleet {
     peers: Vec<Vec<Option<PeerLink>>>,
     /// links[i][j]: messages from i reach j.
     links: Vec<Vec<bool>>,
+    /// serve_cut[i][j]: of what i sends j, only gossip (`NewBlock`) arrives;
+    /// requests and answers are lost (serving starved, H1/H3).
+    serve_cut: Vec<Vec<bool>>,
     /// sybils[i]: node i's handles on the silent hostile peers, and what it
     /// sent them (dropped unanswered).
     sybils: Vec<Vec<PeerLink>>,
@@ -495,6 +498,7 @@ impl Fleet {
             nodes,
             peers,
             links: vec![vec![false; n]; n],
+            serve_cut: vec![vec![false; n]; n],
             sybils: (0..n).map(|_| Vec::new()).collect(),
             sybils_active: false,
             down: HashSet::new(),
@@ -714,7 +718,8 @@ impl Fleet {
                     continue;
                 };
                 while let Ok(m) = rx.try_recv() {
-                    if up {
+                    let cut = self.serve_cut[i][j] && !matches!(m, NetworkMessage::NewBlock { .. });
+                    if up && !cut {
                         out.push((i, j, m));
                     } else {
                         self.lost += 1;
@@ -1822,5 +1827,79 @@ mod tests {
                 "main.rs no longer contains `{needle}`"
             );
         }
+    }
+
+    /// H1 (lead, from the CHAIN-SAFETY lane): a 4v3 split, then the sides hear
+    /// each other's new blocks but serving between them is starved, and the
+    /// three have stopped sealing (held quiet, as a producer that cannot
+    /// reconcile does). When serving returns, the stopped side must rejoin the
+    /// four's chain as a follower within 60 slots, without sealing first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_side_rejoins_after_serving_returns() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::stopped_side_rejoins_after_serving_returns",
+            );
+        }
+        let n = 7;
+        let side_a = [0usize, 1, 2, 3];
+        let side_b = [4usize, 5, 6];
+        let in_a = |i: usize| i < 4;
+        let mut fleet = Fleet::new(n).await;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..ACT + 4 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // Partition: both sides build their own branch.
+        fleet.set_links(|i, j| in_a(i) == in_a(j));
+        for _ in 0..10 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // Links back, but across the split only gossip arrives; the three stop
+        // sealing.
+        fleet.set_links(|_, _| true);
+        for i in 0..n {
+            for j in 0..n {
+                fleet.serve_cut[i][j] = in_a(i) != in_a(j);
+            }
+        }
+        fleet.quiet.extend(side_b);
+        for _ in 0..30 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // Serving returns. The three stay stopped: they must follow.
+        fleet.serve_cut = vec![vec![false; n]; n];
+        let heights = fleet.applied_heights().await;
+        let (top_node, top) = side_a
+            .iter()
+            .map(|i| (*i, heights[*i]))
+            .max_by_key(|(_, h)| *h)
+            .expect("side a");
+        let target = *fleet.chain(top_node).await.get(&top).expect("a's head");
+        let mut rejoined_at = None;
+        for slot in 1..=60u64 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            let mut all = true;
+            for i in side_b {
+                if fleet.chain(i).await.get(&top) != Some(&target) {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                rejoined_at = Some(slot);
+                break;
+            }
+        }
+        assert!(
+            rejoined_at.is_some(),
+            "the stopped side did not rejoin within 60 slots of serving returning \
+             (target height {top}): {}",
+            fleet.describe().await
+        );
     }
 }
