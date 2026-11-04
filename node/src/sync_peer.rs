@@ -679,6 +679,51 @@ mod tests {
         assert_eq!(sel.select(&only_a, 50).map(|c| c.id.as_str()), Some("a"));
     }
 
+    /// The r1006 bootnodes, 2026-11-03 (boot journals, read-only): boot-2's
+    /// peers were boot-1 and boot-3, each on its own dead fork, and rpc-1 on
+    /// the network's chain, far ahead. boot-1 and boot-3 had carried boot-2
+    /// along the shared history before the split, so their served watermark
+    /// was high; since the split every answer from any of them admitted
+    /// nothing (each node's tip anchor is unknown to the others). Once the
+    /// scores bottom out equal, the watermark decides, and it names a
+    /// dead-fork peer forever: `SYNCPEER switched` between the dead forks,
+    /// never to rpc-1.
+    ///
+    /// A watermark at or below our applied tip says nothing about whether a
+    /// peer can carry us now. Among equally barren peers, the one that is
+    /// actually ahead must be chosen.
+    #[test]
+    fn sync_peer_choice_converges_on_the_far_ahead_peer_over_dead_forks() {
+        let applied = 303_704u64;
+        let mut sel = SyncPeerSelector::new();
+        for p in ["boot-1", "boot-3"] {
+            for _ in 0..SCORE_MAX {
+                sel.record_serve(p, 32, 298_000, 1_000, 32, false);
+            }
+        }
+        let peers = [
+            cand("boot-1", 303_900),
+            cand("boot-3", 304_100),
+            cand("rpc-1", 312_000),
+        ];
+        // Every answer since the split admits nothing.
+        let mut chosen = Vec::new();
+        for _ in 0..60 {
+            let pick = sel
+                .select(&peers, applied)
+                .expect("a peer is ahead")
+                .id
+                .clone();
+            sel.record_serve(&pick, 0, 0, 312_000 - applied, 32, false);
+            chosen.push(pick);
+        }
+        let tail = &chosen[chosen.len() - 20..];
+        assert!(
+            tail.iter().all(|p| p == "rpc-1"),
+            "the selector settled on a dead-fork peer: last picks {tail:?}"
+        );
+    }
+
     fn cand(id: &str, head_height: u64) -> SyncCandidate {
         SyncCandidate {
             id: id.to_string(),

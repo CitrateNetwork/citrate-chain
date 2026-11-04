@@ -4269,6 +4269,111 @@ mod tests {
         assert_eq!(t.search_peer(), None);
     }
 
+    /// The r1006 bootnodes, 2026-11-03 20:00Z to 11-04 01:30Z (boot journals,
+    /// read-only): `SYNCREJOIN GaveUp { at: 298381 } (re-sends to a silent
+    /// peer)` 11x on boot-1, 33x on boot-2, 8x on boot-3, each followed by a
+    /// `SYNCPEER switched`. A fork-point search pinned to a peer that stops
+    /// answering gave up with the rejoin backoff, so the next search, against
+    /// any peer, first had to sit out the cooldown, and the strikes that
+    /// start it had to come from one peer twice in a row.
+    ///
+    /// A silent peer is not evidence about the fork point. While another
+    /// connected peer is ahead, the search must move to it on the next tick,
+    /// with no backoff, and must not go back to the silent peer.
+    #[test]
+    fn a_search_pinned_to_a_silent_peer_fails_over_to_another_peer_ahead() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let applied = (hx(1), 1_000u64);
+        let cands = [
+            SyncCandidate {
+                id: "silent".into(),
+                head_height: 1_200,
+            },
+            SyncCandidate {
+                id: "live".into(),
+                head_height: 1_200,
+            },
+        ];
+        t.note_sync_target(1_200, applied.1);
+        // Two unconnected tip answers from "silent" start a search pinned to it.
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        assert_eq!(t.search_peer(), Some("silent"));
+        let now = Instant::now();
+        let (src, _) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(src, Source::Pinned("silent".into()));
+        let a = t.anchor(applied, |_| Some(hx(2)));
+        assert_eq!(t.note_asked("silent", a), None);
+        // It never answers: every later tick its anchor is still pending.
+        let mut ended = None;
+        for _ in 0..MAX_UNANSWERED {
+            if let Some(tr) = t.note_unsent("silent") {
+                ended = Some(tr);
+                break;
+            }
+        }
+        assert!(ended.is_some(), "a silent pin must end: {:?}", t.mode());
+        assert_eq!(
+            t.cooldown(),
+            0,
+            "a silent peer is not a failed search: no rejoin backoff"
+        );
+        // The next tick carries the search to the other peer ahead, at once.
+        let (src, tr) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(
+            src,
+            Source::Pinned("live".into()),
+            "the search did not fail over: {tr:?} mode={:?}",
+            t.mode()
+        );
+        assert!(matches!(t.mode(), Mode::Probe { .. }), "{:?}", t.mode());
+        // Ending that search never re-pins the silent peer while "live" is
+        // still ahead.
+        let _ = t.abandon();
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        assert_ne!(t.search_peer(), Some("silent"), "{:?}", t.mode());
+    }
+
+    /// With no other peer ahead, a silent pin ends with the ordinary backoff.
+    #[test]
+    fn a_silent_pin_with_no_other_peer_ahead_backs_off() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let applied = (hx(1), 1_000u64);
+        let cands = [SyncCandidate {
+            id: "silent".into(),
+            head_height: 1_200,
+        }];
+        t.note_sync_target(1_200, applied.1);
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        let now = Instant::now();
+        let a = t.anchor(applied, |_| Some(hx(2)));
+        t.note_asked("silent", a);
+        for _ in 0..MAX_UNANSWERED {
+            if t.note_unsent("silent").is_some() {
+                break;
+            }
+        }
+        let (src, _) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(src, Source::Ahead("silent".into()));
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+        assert_eq!(t.cooldown(), BACKOFF_BASE_ANSWERS);
+    }
+
     /// P1-2: a slow peer answering one request in seven keeps `unanswered`
     /// below its limit forever. The search still ends within its request cap,
     /// which is sized to the search's own log bound.
