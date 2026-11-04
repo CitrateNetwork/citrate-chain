@@ -114,6 +114,7 @@ fn config(chain_id: u64) -> CheckpointConfig {
         committee_size: 100,
         quorum_threshold: 67,
         chain_id,
+        genesis_hash: Hash::default(),
         vote_depth: 3,
     }
 }
@@ -263,7 +264,14 @@ async fn outsider_flood_cannot_block_the_slow_node() {
         for hash in [hash_at(h), seed_at(h)] {
             let res = slow
                 .gadget
-                .on_inbound_vote(sign_checkpoint_vote(CHAIN, h, hash, &attacker))
+                .on_inbound_vote(sign_checkpoint_vote(
+                    CHAIN,
+                    &citrate_consensus::types::Hash::default(),
+                    h,
+                    hash,
+                    &tb(),
+                    &attacker,
+                ))
                 .await;
             assert!(matches!(res, InboundOutcome::Rejected(_)), "{res:?}");
             assert!(res.relay().is_none(), "outsider votes are never relayed");
@@ -357,7 +365,14 @@ async fn switch_off_network_does_nothing() {
         assert_eq!(node.gadget.manager().pending_hash(10).await, None);
     }
     let k = nodes.first().expect("node 0");
-    let vote = sign_checkpoint_vote(CHAIN, 10, hash_at(10), &k.key);
+    let vote = sign_checkpoint_vote(
+        CHAIN,
+        &citrate_consensus::types::Hash::default(),
+        10,
+        hash_at(10),
+        &tb(),
+        &k.key,
+    );
     let other = nodes.get(1).expect("node 1");
     let res = other.gadget.on_inbound_vote(vote).await;
     assert!(matches!(res, InboundOutcome::Rejected(_)), "{res:?}");
@@ -387,7 +402,14 @@ async fn devnet_chain_id_is_bound_into_votes() {
         .on_buried_checkpoint(12, hash_at(12), &seed_at(12), None)
         .await;
     let k1 = foreign_net.get(1).expect("node 1");
-    let foreign = sign_checkpoint_vote(CHAIN, 12, hash_at(12), &k1.key);
+    let foreign = sign_checkpoint_vote(
+        CHAIN,
+        &citrate_consensus::types::Hash::default(),
+        12,
+        hash_at(12),
+        &tb(),
+        &k1.key,
+    );
     assert!(matches!(
         n0.gadget.on_inbound_vote(foreign).await,
         InboundOutcome::Rejected(_)
@@ -412,13 +434,24 @@ async fn finalized_memory_is_bounded_and_trimmed_entries_stay_readable() {
     );
     for i in 1..=total {
         let h = i.saturating_mul(2);
-        mgr.ensure_proposed(h, hash_at(h), committee.clone())
-            .await
-            .expect("propose");
+        mgr.ensure_proposed(
+            h,
+            hash_at(h),
+            citrate_consensus::checkpoint::Committee::equal_stake(0, committee.clone()),
+        )
+        .await
+        .expect("propose");
         for k in keys.iter().take(3) {
-            mgr.submit_vote(sign_checkpoint_vote(CHAIN, h, hash_at(h), k))
-                .await
-                .expect("vote");
+            mgr.submit_vote(sign_checkpoint_vote(
+                CHAIN,
+                &citrate_consensus::types::Hash::default(),
+                h,
+                hash_at(h),
+                &tb(),
+                k,
+            ))
+            .await
+            .expect("vote");
         }
         mgr.finalize_checkpoint(h).await.expect("finalize");
     }
@@ -557,5 +590,16 @@ async fn finality_prunes_durable_signed_records_on_every_node() {
         let meta = n.gadget.signed_vote_meta().expect("meta");
         assert_eq!(meta.floor, 12, "node {i}");
         assert_eq!(meta.highest, 12, "node {i}");
+    }
+}
+
+/// S3-5 (spec 06 §7): the binding a vote for a test block carries: epoch 0,
+/// the default state root test blocks have, the empty accepted root.
+#[allow(dead_code)]
+fn tb() -> citrate_consensus::checkpoint::VoteBinding {
+    citrate_consensus::checkpoint::VoteBinding {
+        epoch: 0,
+        state_root: citrate_consensus::types::Hash::default(),
+        accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
     }
 }

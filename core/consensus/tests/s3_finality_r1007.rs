@@ -12,8 +12,8 @@
 
 use citrate_consensus::checkpoint::{
     canonical_vote_message, checkpoint_accepted_root, empty_accepted_root, sign_checkpoint_vote,
-    CheckpointConfig, CheckpointManager, CheckpointVote, Committee, CommitteeSelector,
-    VoteBinding, CITRATE_VOTE_DOMAIN_SEPARATOR,
+    CheckpointConfig, CheckpointManager, CheckpointVote, Committee, CommitteeSelector, VoteBinding,
+    CITRATE_VOTE_DOMAIN_SEPARATOR,
 };
 use citrate_consensus::checkpoint_gadget::{
     checkpoint_enforcement_on_for, checkpoint_enforcement_pinned, checkpoint_voting_active,
@@ -399,13 +399,21 @@ fn enforcement_off_by_default_until_governance_flip() {
 
     // The flip mechanism: a listed (chain, genesis) pair, and only that pair.
     let flipped = [(CHAIN, [0x07u8; 32])];
-    assert!(checkpoint_enforcement_on_for(&flipped, CHAIN, &genesis_hash()));
+    assert!(checkpoint_enforcement_on_for(
+        &flipped,
+        CHAIN,
+        &genesis_hash()
+    ));
     assert!(!checkpoint_enforcement_on_for(
         &flipped,
         CHAIN,
         &Hash::new([0x08; 32])
     ));
-    assert!(!checkpoint_enforcement_on_for(&flipped, 1337, &genesis_hash()));
+    assert!(!checkpoint_enforcement_on_for(
+        &flipped,
+        1337,
+        &genesis_hash()
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +446,11 @@ fn spec_pp(h: u64) -> Hash {
 fn linear(h: u64, pp: Hash) -> Block {
     BlockBuilder::new()
         .hash(chain_id(h))
-        .parent(if h == 0 { Hash::default() } else { chain_id(h - 1) })
+        .parent(if h == 0 {
+            Hash::default()
+        } else {
+            chain_id(h - 1)
+        })
         .height(h)
         .blue_score(h)
         .blue_work(blue_work_for_score(h))
@@ -485,7 +497,7 @@ async fn pruning_point_committed_and_checkpoint_aligned() {
     let store = Arc::new(DagStore::with_permissive_vrf_for_testing());
     let gd = GhostDag::new(GhostDagParams::default(), store.clone());
     const TOP: u64 = SPEC_PRUNING_DEPTH + 2 * SPEC_CHECKPOINT_INTERVAL; // 10,100
-    // Below the boundary: any non-genesis value is invalid.
+                                                                        // Below the boundary: any non-genesis value is invalid.
     let early = linear(1, chain_id(0));
     build_linear(&store, &gd, 0).await;
     assert!(
@@ -542,17 +554,12 @@ async fn pruned_node_validates_pruning_point_commitment() {
         let gd = GhostDag::new(GhostDagParams::default(), store.clone());
         build_linear(&store, &gd, TOP).await;
         // The node prunes up to its tip's pruning point, never above it.
-        store
-            .update_pruning_point(spec_pp(TOP))
-            .await
-            .expect("pp");
+        store.update_pruning_point(spec_pp(TOP)).await.expect("pp");
         assert!(store.prune().await.expect("prune") > 0);
         assert!(!store.has_block(&chain_id(99)).await, "pruned below 100");
     }
 
-    let store = Arc::new(
-        DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("reopen"),
-    );
+    let store = Arc::new(DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("reopen"));
     let gd = GhostDag::new(GhostDagParams::default(), store.clone());
     for h in spec_pp_height(TOP)..=TOP {
         let b = linear(h, spec_pp(h));

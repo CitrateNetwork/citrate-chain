@@ -131,12 +131,13 @@ use std::sync::Weak;
 
 use citrate_api::finalized_tag::{FinalizedTagSource, VerifiedFinalized};
 use citrate_consensus::checkpoint::{
-    Checkpoint, CheckpointManager, FinalizationGuard, VerifiedCertificate,
+    checkpoint_accepted_root, Checkpoint, CheckpointManager, Committee, FinalizationGuard,
+    VerifiedCertificate, VoteBinding,
 };
 use citrate_consensus::checkpoint_gadget::{
-    checkpoint_enforcement_pinned, checkpoint_voting_pinned, FinalityGadget, SafetyStop,
+    checkpoint_enforcement_pinned, checkpoint_voting_active, FinalityGadget, SafetyStop,
 };
-use citrate_consensus::types::{Hash, PublicKey};
+use citrate_consensus::types::Hash;
 use citrate_storage::StorageManager;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -170,13 +171,15 @@ impl FloorMode {
         }
     }
 
-    /// Mode for `chain_id` from the compiled pins
-    /// (`checkpoint_gadget::CHECKPOINT_VOTING_PINS` /
-    /// `CHECKPOINT_ENFORCEMENT_PINS`).
-    pub fn for_chain(chain_id: u64) -> Self {
+    /// Mode for the node on `chain_id` whose loaded genesis is `genesis`, from
+    /// the compiled switches: voting on from genesis in this build
+    /// (`checkpoint_gadget::CHECKPOINT_VOTING_FROM_GENESIS`, ADR CV-8) and
+    /// enforcement keyed by genesis (`CHECKPOINT_ENFORCEMENT_GENESES`, empty
+    /// until the governance flip). So r1007 runs Observed until then.
+    pub fn for_genesis(chain_id: u64, genesis: &Hash) -> Self {
         Self::from_switches(
-            checkpoint_voting_pinned(chain_id),
-            checkpoint_enforcement_pinned(chain_id),
+            checkpoint_voting_active(),
+            checkpoint_enforcement_pinned(chain_id, genesis),
         )
     }
 
@@ -268,12 +271,14 @@ impl CertificateCommittees {
         Self { gadget, storage }
     }
 
-    /// The committee for a certificate of `block_hash` at `height`.
+    /// The committee for a certificate of `block_hash` at `height`, and the
+    /// binding (epoch, state root, accepted root) every vote in it must carry,
+    /// read from this node's own copy of the block (spec 06 §7).
     pub async fn derive(
         &self,
         height: u64,
         block_hash: Hash,
-    ) -> Result<Vec<PublicKey>, CommitteeUnavailable> {
+    ) -> Result<(Committee, VoteBinding), CommitteeUnavailable> {
         let seed = match self.storage.blocks.get_header(&block_hash) {
             Ok(Some(h)) if h.height == height => h.vrf_reveal.output,
             Ok(Some(h)) => {
@@ -289,10 +294,28 @@ impl CertificateCommittees {
             }
             Err(e) => return Err(CommitteeUnavailable::Header(e.to_string())),
         };
-        self.gadget
+        let committee = self
+            .gadget
             .committee_for(height, &seed)
             .await
-            .ok_or(CommitteeUnavailable::NoSnapshot)
+            .ok_or(CommitteeUnavailable::NoSnapshot)?;
+        // The binding is read from the same chain store as the header: this
+        // node's own copy of the certified block (spec 06 §7).
+        let block = match self.storage.blocks.get_block(&block_hash) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                return Err(CommitteeUnavailable::Header(format!(
+                    "block {block_hash} not stored"
+                )))
+            }
+            Err(e) => return Err(CommitteeUnavailable::Header(e.to_string())),
+        };
+        let binding = VoteBinding {
+            epoch: committee.epoch,
+            state_root: block.state_root,
+            accepted_root: checkpoint_accepted_root(&block),
+        };
+        Ok((committee, binding))
     }
 }
 
@@ -340,6 +363,8 @@ struct VerifierState {
 pub struct FloorVerifier {
     mode: FloorMode,
     chain_id: u64,
+    /// The genesis this node runs (bound into every vote, spec 06 §7).
+    genesis_hash: Hash,
     /// Data source of certificates: `CheckpointManager::latest_finalized_certificate`
     /// (memory, else `DAG_METADATA` `checkpoint:{height}`).
     manager: Arc<CheckpointManager>,
@@ -380,9 +405,11 @@ impl FloorVerifier {
         committees: CertificateCommittees,
     ) -> Self {
         let chain_id = manager.config().chain_id;
+        let genesis_hash = manager.config().genesis_hash;
         Self {
             mode,
             chain_id,
+            genesis_hash,
             manager,
             applicator,
             gadget_halt,
@@ -403,11 +430,16 @@ impl FloorVerifier {
     /// consistency is checked first (a record that is not even a well-formed
     /// certificate is invalid whether or not a committee can be derived).
     async fn check_certificate(&self, cert: &Checkpoint) -> CertCheck {
-        if let Err(e) = cert.verify_certificate(self.chain_id) {
+        if let Err(e) = cert.verify_certificate(self.chain_id, &self.genesis_hash) {
             return CertCheck::Invalid(e.to_string());
         }
         match self.committees.derive(cert.height, cert.block_hash).await {
-            Ok(committee) => match cert.verify_certificate_against(self.chain_id, &committee) {
+            Ok((committee, expected)) => match cert.verify_certificate_against(
+                self.chain_id,
+                &self.genesis_hash,
+                &committee,
+                &expected,
+            ) {
                 Ok(()) => CertCheck::Valid,
                 Err(e) => CertCheck::Invalid(e.to_string()),
             },
@@ -875,7 +907,7 @@ impl FloorVerifier {
         if st.halt.is_some() {
             return Some(self.still_halted(&st).await);
         }
-        if let Err(e) = cert.verify_certificate(self.chain_id) {
+        if let Err(e) = cert.verify_certificate(self.chain_id, &self.genesis_hash) {
             // Left to the poll, which halts on it.
             return Some(FloorTick::Unverifiable(e.to_string()));
         }
@@ -1106,6 +1138,27 @@ mod tests {
 
     const CHAIN: u64 = 40204;
 
+    /// The binding a vote for the test block at `height` carries: epoch S(1) =
+    /// 1 (the test schedule, EPOCH 1000 / LAG 999), the cumulative reward-only
+    /// state root every test branch shares at that height, the empty
+    /// accepted root (spec 06 §7).
+    fn tb(height: u64) -> VoteBinding {
+        VoteBinding {
+            epoch: 1,
+            state_root: {
+                // Computed once: the reward-only chain's roots up to 512.
+                static ROOTS: std::sync::OnceLock<Vec<Hash>> = std::sync::OnceLock::new();
+                let roots = ROOTS.get_or_init(|| crate::canonical_apply::tests::roots(512));
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|h| h.checked_sub(1))
+                    .and_then(|i| roots.get(i).copied())
+                    .unwrap_or_default()
+            },
+            accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+        }
+    }
+
     fn signer(i: u8) -> Ed25519SigningKey {
         Ed25519SigningKey::from_bytes(&[i.saturating_add(1); 32])
     }
@@ -1120,13 +1173,16 @@ mod tests {
             .collect();
         let mut sigs = HashMap::new();
         for k in keys.iter().take(usize::from(votes)) {
-            let v = sign_checkpoint_vote(CHAIN, height, hash, k);
+            let v = sign_checkpoint_vote(CHAIN, &Hash::default(), height, hash, &tb(height), k);
             sigs.insert(v.voter, v.signature);
         }
+        let stakes = vec![1000; committee.len()];
         Checkpoint {
             height,
             block_hash: hash,
+            binding: tb(height),
             committee,
+            stakes,
             votes: sigs,
             status: CheckpointStatus::Finalized,
         }
@@ -1153,7 +1209,7 @@ mod tests {
         let blk = crate::canonical_apply::tests::mk_block_vrf(
             height,
             Hash::new([0xEF; 32]),
-            Hash::default(),
+            tb(height).state_root,
             tag,
         );
         crate::canonical_apply::tests::persist(storage, &blk);
@@ -1168,6 +1224,7 @@ mod tests {
             committee_size: 100,
             quorum_threshold: 67,
             chain_id: CHAIN,
+            genesis_hash: Hash::default(),
             vote_depth: 3,
         };
         Arc::new(CheckpointManager::with_persistence(
@@ -1237,8 +1294,17 @@ mod tests {
 
     #[test]
     fn both_pins_off_is_legacy_and_modes_follow_the_switches() {
-        assert_eq!(FloorMode::for_chain(40204), FloorMode::Legacy);
-        assert_eq!(FloorMode::for_chain(1337), FloorMode::Legacy);
+        // r1007 (CV-8): voting on from genesis, enforcement off until the
+        // governance flip, so every chain and genesis runs Observed (was:
+        // both pins off, Legacy).
+        assert_eq!(
+            FloorMode::for_genesis(40204, &Hash::default()),
+            FloorMode::Observed
+        );
+        assert_eq!(
+            FloorMode::for_genesis(1337, &Hash::new([1; 32])),
+            FloorMode::Observed
+        );
         assert_eq!(FloorMode::from_switches(false, false), FloorMode::Legacy);
         assert_eq!(
             FloorMode::from_switches(false, true),
@@ -1765,18 +1831,21 @@ mod tests {
             .collect();
         let mut votes = HashMap::new();
         for k in &outsiders {
-            let v = sign_checkpoint_vote(CHAIN, 2, h, k);
+            let v = sign_checkpoint_vote(CHAIN, &Hash::default(), 2, h, &tb(2), k);
             votes.insert(v.voter, v.signature);
         }
+        let stakes = vec![1000; committee.len()];
         let foreign = Checkpoint {
             height: 2,
             block_hash: h,
+            binding: tb(2),
             committee,
+            stakes,
             votes,
             status: CheckpointStatus::Finalized,
         };
         foreign
-            .verify_certificate(CHAIN)
+            .verify_certificate(CHAIN, &Hash::default())
             .expect("internally consistent");
         persist_certificate(&storage, &foreign);
         let r = rig(

@@ -53,6 +53,11 @@ fn certificate() -> NetworkMessage {
     NetworkMessage::CheckpointCertificate {
         height: 40,
         block_hash: Hash::new([4; 32]),
+        binding: citrate_consensus::checkpoint::VoteBinding {
+            epoch: 1,
+            state_root: Hash::new([0x51; 32]),
+            accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+        },
         signatures: vec![CheckpointSignature {
             voter: PublicKey::new([1; 32]),
             signature: Signature::new([2; 64]),
@@ -136,6 +141,11 @@ fn wire_discriminants_are_stable_and_new_variants_round_trip() {
     let vote = NetworkMessage::CheckpointVote {
         height: 2,
         block_hash: Hash::default(),
+        binding: citrate_consensus::checkpoint::VoteBinding {
+            epoch: 1,
+            state_root: Hash::new([0x51; 32]),
+            accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+        },
         voter_pubkey: vec![],
         signature: vec![],
     };

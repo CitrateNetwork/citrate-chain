@@ -86,7 +86,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use citrate_consensus::checkpoint::{SyncedInstall, VerifiedCertificate};
+use citrate_consensus::checkpoint::{SyncedInstall, VerifiedCertificate, VoteBinding};
 use citrate_consensus::checkpoint_gadget::FinalityGadget;
 use citrate_consensus::types::{Hash, PublicKey, Signature};
 use citrate_network::peer::PeerManager;
@@ -315,6 +315,7 @@ impl CertificateSync {
         let msg = NetworkMessage::CheckpointCertificate {
             height: cp.height,
             block_hash: cp.block_hash,
+            binding: cp.binding,
             signatures,
         };
         match bincode::serialized_size(&msg) {
@@ -365,10 +366,11 @@ impl CertificateSync {
         peer: &str,
         height: u64,
         block_hash: Hash,
+        binding: VoteBinding,
         signatures: Vec<CheckpointSignature>,
     ) -> SyncOutcome {
         let out = self
-            .verify_and_install(height, block_hash, &signatures)
+            .verify_and_install(height, block_hash, binding, &signatures)
             .await;
         self.state.lock().await.verifying = false;
         match &out {
@@ -417,6 +419,7 @@ impl CertificateSync {
         let NetworkMessage::CheckpointCertificate {
             height,
             block_hash,
+            binding,
             signatures,
         } = msg
         else {
@@ -426,13 +429,15 @@ impl CertificateSync {
             self.accept_response_at(peer, now).await,
             "response from {peer} not solicited"
         );
-        self.process(peer, height, block_hash, signatures).await
+        self.process(peer, height, block_hash, binding, signatures)
+            .await
     }
 
     async fn verify_and_install(
         &self,
         height: u64,
         block_hash: Hash,
+        binding: VoteBinding,
         signatures: &[CheckpointSignature],
     ) -> SyncOutcome {
         // 1. size, before any other work.
@@ -477,7 +482,7 @@ impl CertificateSync {
         };
         // 4. committee, derived here: governing epoch snapshot + this node's
         // copy of the certified block's VRF beacon.
-        let committee = match self.floor.committees().derive(height, block_hash).await {
+        let (committee, expected) = match self.floor.committees().derive(height, block_hash).await {
             Ok(c) => c,
             Err(why) => {
                 if let Some(canonical) = sibling_of {
@@ -499,7 +504,8 @@ impl CertificateSync {
         // 5. quorum + signatures against that committee.
         let sigs: Vec<(PublicKey, Signature)> =
             signatures.iter().map(|s| (s.voter, s.signature)).collect();
-        let verified = match manager.verify_synced_certificate(height, block_hash, &sigs, committee)
+        let verified = match manager
+            .verify_synced_certificate(height, block_hash, binding, &sigs, &committee, &expected)
         {
             Ok(v) => v,
             Err(e) => {
@@ -642,7 +648,28 @@ mod tests {
             committee_size: 100,
             quorum_threshold: 67,
             chain_id: CHAIN,
+            genesis_hash: Hash::default(),
             vote_depth: 3,
+        }
+    }
+
+    /// The binding a vote for the test block at `height` carries: epoch S(1)
+    /// = 1 (schedule EPOCH 1000 / LAG 999), the reward-only state root every
+    /// test branch shares at that height, the empty accepted root.
+    fn tb(height: u64) -> VoteBinding {
+        VoteBinding {
+            epoch: 1,
+            state_root: {
+                // Computed once: the reward-only chain's roots up to 512.
+                static ROOTS: std::sync::OnceLock<Vec<Hash>> = std::sync::OnceLock::new();
+                let roots = ROOTS.get_or_init(|| crate::canonical_apply::tests::roots(512));
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|h| h.checked_sub(1))
+                    .and_then(|i| roots.get(i).copied())
+                    .unwrap_or_default()
+            },
+            accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
         }
     }
 
@@ -650,7 +677,14 @@ mod tests {
     fn signed(ids: &[u8], height: u64, hash: Hash) -> Vec<CheckpointSignature> {
         ids.iter()
             .map(|&i| {
-                let v = sign_checkpoint_vote(CHAIN, height, hash, &key(i));
+                let v = sign_checkpoint_vote(
+                    CHAIN,
+                    &Hash::default(),
+                    height,
+                    hash,
+                    &tb(height),
+                    &key(i),
+                );
                 CheckpointSignature {
                     voter: v.voter,
                     signature: v.signature,
@@ -663,6 +697,7 @@ mod tests {
         NetworkMessage::CheckpointCertificate {
             height,
             block_hash: hash,
+            binding: tb(height),
             signatures,
         }
     }
@@ -807,14 +842,19 @@ mod tests {
         ));
         let gadget = Arc::new(FinalityGadget::new(mgr.clone(), None));
         let floor = Arc::new(FloorVerifier::new(
-            FloorMode::for_chain(CHAIN),
+            FloorMode::Legacy,
             mgr,
             app.clone(),
             gadget.safety_stop(),
             Arc::new(AtomicU64::new(0)),
             CertificateCommittees::new(gadget.clone(), storage),
         ));
-        assert_eq!(FloorMode::for_chain(CHAIN), FloorMode::Legacy, "pins OFF");
+        // (r1007 runs Observed: voting on from genesis, enforcement off. This
+        // test pins that Legacy, the voting-off mode, still has no sync.)
+        assert_eq!(
+            FloorMode::for_genesis(CHAIN, &Hash::default()),
+            FloorMode::Observed
+        );
         assert!(CertificateSync::new(gadget, app, floor).is_none());
     }
 
@@ -1100,13 +1140,13 @@ mod tests {
         let (n, (_a1, a2, _b2, _b3)) = node(FloorMode::Enforced).await;
         let h = a2.header.block_hash;
         let mgr = n.gadget.manager();
-        let committee = n.floor.committees().derive(2, h).await.expect("committee");
+        let (committee, expected) = n.floor.committees().derive(2, h).await.expect("committee");
         let sigs: Vec<(PublicKey, Signature)> = signed(&[0, 1, 2], 2, h)
             .into_iter()
             .map(|s| (s.voter, s.signature))
             .collect();
         let cert = mgr
-            .verify_synced_certificate(2, h, &sigs, committee)
+            .verify_synced_certificate(2, h, tb(2), &sigs, &committee, &expected)
             .expect("verifies");
         // Watch the latest finalized height and the floor while installing.
         let floor_handle = n.app.finalized_height_handle();
@@ -1198,7 +1238,7 @@ mod tests {
             .map(|s| (s.voter, s.signature))
             .collect();
         let local = mgr
-            .verify_synced_certificate(2, h, &sigs, committee)
+            .verify_synced_certificate(2, h, tb(2), &sigs, &committee, &tb(2))
             .expect("verifies");
         mgr.install_synced_certificate(local)
             .await
@@ -1319,6 +1359,8 @@ mod tests {
         let cp = Checkpoint {
             height: 2,
             block_hash: h,
+            binding: tb(2),
+            stakes: vec![1000; committee.len()],
             committee,
             votes: signed(&[0, 1, 2], 2, h)
                 .into_iter()
@@ -1414,7 +1456,9 @@ mod tests {
         let a_cert = Checkpoint {
             height: 2,
             block_hash: h,
-            committee,
+            binding: tb(2),
+            stakes: committee.stakes(),
+            committee: committee.pubkeys(),
             votes: signed(&[0, 1, 2], 2, h)
                 .into_iter()
                 .map(|s| (s.voter, s.signature))

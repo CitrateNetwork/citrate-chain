@@ -107,6 +107,7 @@ mod tests {
             committee_size: 100,
             quorum_threshold: 67,
             chain_id: 40204,
+            genesis_hash: Hash::default(),
             vote_depth: 3,
         };
         let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 999);

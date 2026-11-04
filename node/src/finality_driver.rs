@@ -73,7 +73,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use citrate_consensus::checkpoint::CheckpointVote;
+use citrate_api::finality_status::{CheckpointView, FinalityStatusCell, FinalityStatusView};
+use citrate_consensus::checkpoint::{Checkpoint, CheckpointVote};
 use citrate_consensus::checkpoint_gadget::{
     FinalityGadget, FinalizeRetryOutcome, SignRefusal, SkipReason, EARLY_VOTE_HORIZON_BLOCKS,
 };
@@ -85,6 +86,7 @@ use citrate_storage::StorageManager;
 use tracing::{debug, info, warn};
 
 use crate::canonical_apply::CanonicalApplicator;
+use crate::finality_floor::FloorMode;
 
 /// How many boundary heights one pass may process. Bounds the selected-parent
 /// walk after a pause (e.g. a long catch-up): older boundaries are skipped, not
@@ -391,6 +393,7 @@ fn to_message(vote: &CheckpointVote) -> NetworkMessage {
     NetworkMessage::CheckpointVote {
         height: vote.height,
         block_hash: vote.block_hash,
+        binding: vote.binding,
         voter_pubkey: vote.voter.as_bytes().to_vec(),
         signature: vote.signature.as_bytes().to_vec(),
     }
@@ -414,6 +417,8 @@ pub fn spawn(
     storage: Arc<StorageManager>,
     peers: Arc<PeerManager>,
     signer: Option<Ed25519SigningKey>,
+    status: Arc<FinalityStatusCell>,
+    mode: FloorMode,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = gadget.manager().config().interval;
@@ -459,12 +464,63 @@ pub fn spawn(
             // engaged; this node's own already-signed votes are held and
             // re-broadcast after it clears.
             let outbound = gate_outbound(&gadget, signer.as_ref(), &mut retries, outbound);
+            // `citrate_getFinalityStatus`: what the manager holds after this pass.
+            status.publish(status_view(&gadget, mode).await);
             if outbound.is_empty() {
                 continue;
             }
             broadcast_votes(&peers, &outbound).await;
         }
     })
+}
+
+/// One checkpoint as `citrate_getFinalityStatus` reports it.
+fn checkpoint_view(cp: &Checkpoint) -> CheckpointView {
+    CheckpointView {
+        height: cp.height,
+        block_hash: cp.block_hash,
+        epoch: cp.binding.epoch,
+        state_root: cp.binding.state_root,
+        accepted_root: cp.binding.accepted_root,
+        committee_size: cp.committee.len(),
+        voters: cp.votes.len(),
+        voted_stake: cp.voted_stake(),
+        total_stake: cp.total_stake(),
+    }
+}
+
+/// The finality status this node reports over RPC. Data source: the
+/// gadget's `CheckpointManager` (latest finalized certificate, from memory or
+/// `DAG_METADATA` `checkpoint:{height}`; pending checkpoints and their votes),
+/// the gadget's switch and safety stop, and the floor mode from the compiled
+/// switches.
+pub async fn status_view(gadget: &FinalityGadget, mode: FloorMode) -> FinalityStatusView {
+    let mgr = gadget.manager();
+    let finalized = mgr
+        .latest_finalized_certificate()
+        .await
+        .map(|cp| checkpoint_view(&cp));
+    let pending = mgr
+        .pending_snapshot()
+        .await
+        .iter()
+        .map(checkpoint_view)
+        .collect();
+    FinalityStatusView {
+        voting: gadget.enabled(),
+        enforcement: mode.raises_floor(),
+        mode: match mode {
+            FloorMode::Legacy => "legacy",
+            FloorMode::Observed => "observed",
+            FloorMode::Enforced => "enforced",
+        }
+        .to_string(),
+        interval: mgr.config().interval,
+        vote_depth: mgr.config().vote_depth,
+        finalized,
+        pending,
+        halted: gadget.halted(),
+    }
 }
 
 /// Finalization retry step of the driver tick: re-attempt, with capped
@@ -843,6 +899,12 @@ mod tests {
         let vote = |height: u64| CheckpointVote {
             height,
             block_hash: h(9),
+            binding: citrate_consensus::checkpoint::VoteBinding {
+                epoch: 1,
+                state_root: Hash::default(),
+                accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+            },
+
             voter: PublicKey::new([3; 32]),
             signature: Signature::new([4; 64]),
         };
@@ -921,6 +983,7 @@ mod tests {
                 committee_size: 100,
                 quorum_threshold: 67,
                 chain_id: CHAIN,
+                genesis_hash: Hash::default(),
                 vote_depth: 3,
             }
         }
@@ -1210,6 +1273,12 @@ mod tests {
         let v = CheckpointVote {
             height: 42,
             block_hash: h(9),
+            binding: citrate_consensus::checkpoint::VoteBinding {
+                epoch: 1,
+                state_root: Hash::default(),
+                accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+            },
+
             voter: PublicKey::new([3; 32]),
             signature: Signature::new([4; 64]),
         };
@@ -1217,10 +1286,12 @@ mod tests {
             NetworkMessage::CheckpointVote {
                 height,
                 block_hash,
+                binding,
                 voter_pubkey,
                 signature,
             } => {
                 assert_eq!(height, 42);
+                assert_eq!(binding, v.binding);
                 assert_eq!(block_hash, h(9));
                 assert_eq!(voter_pubkey, vec![3u8; 32]);
                 assert_eq!(signature, vec![4u8; 64]);

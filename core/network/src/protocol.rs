@@ -288,10 +288,13 @@ pub enum NetworkMessage {
         info: Vec<DagBlockInfo>,
     },
 
-    // WP-S.3: BFT checkpoint vote
+    // WP-S.3: BFT checkpoint vote. r1007 vote message v2 (spec 06 §7): the
+    // vote also carries what it certifies about the block (epoch, state root,
+    // accepted root), all of it under the signature.
     CheckpointVote {
         height: u64,
         block_hash: Hash,
+        binding: citrate_consensus::checkpoint::VoteBinding,
         voter_pubkey: Vec<u8>,
         signature: Vec<u8>,
     },
@@ -348,12 +351,16 @@ pub enum NetworkMessage {
     CheckpointCertificate {
         height: u64,
         block_hash: Hash,
+        /// What every signature certifies about the block (spec 06 §7). The
+        /// receiver compares it with the binding it derives from its own copy
+        /// of the block before it checks a signature.
+        binding: citrate_consensus::checkpoint::VoteBinding,
         signatures: Vec<CheckpointSignature>,
     },
 }
 
 /// One committee member's signature in a [`NetworkMessage::CheckpointCertificate`]:
-/// ed25519 by `voter` over the canonical 69-byte checkpoint vote message.
+/// ed25519 by `voter` over the canonical 173-byte checkpoint vote message (v2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointSignature {
     pub voter: PublicKey,

@@ -78,7 +78,10 @@ fn finality_status_reports_checkpoint_epoch_votes_quorum_and_enforcement() {
     assert_eq!(p["quorumPct"], 25.0);
     assert_eq!(p["hasQuorum"], false);
     assert!(
-        r["dataSource"].as_str().unwrap_or("").contains("CheckpointManager"),
+        r["dataSource"]
+            .as_str()
+            .unwrap_or("")
+            .contains("CheckpointManager"),
         "the response names its data source"
     );
 }

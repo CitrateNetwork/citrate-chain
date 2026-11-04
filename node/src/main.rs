@@ -2234,11 +2234,35 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // signs/verifies vote messages for its own chain. `quorum_threshold` is
         // carried through for reference, but finalization derives the effective
         // quorum `floor(2n/3)+1` from the actual committee size (see checkpoint.rs).
+        // r1007 (spec 06 §1.2, §7): the checkpoint interval is the compiled
+        // consensus constant, aligned with the G11 pruning point; a different
+        // `[checkpoint] interval` is ignored with a warning. Votes bind the
+        // genesis this node loaded (r1006 and r1007 share chain id 40204).
+        let interval = citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
+        if config.checkpoint.interval != interval {
+            warn!(
+                "[checkpoint] interval = {} ignored: r1007 checkpoints are every {} heights \
+                 (consensus constant, aligned with the pruning point)",
+                config.checkpoint.interval, interval
+            );
+        }
+        let genesis_hash = match storage.blocks.get_block_by_height(0) {
+            Ok(Some(g)) => g,
+            other => {
+                warn!(
+                    "checkpoint finality: genesis not readable at start-up ({:?}); votes \
+                     bind the zero genesis and will not verify on the network",
+                    other.err()
+                );
+                citrate_consensus::types::Hash::default()
+            }
+        };
         let cp_config = CheckpointConfig {
-            interval: config.checkpoint.interval,
+            interval,
             committee_size: config.checkpoint.committee_size,
             quorum_threshold: config.checkpoint.quorum_threshold,
             chain_id: config.chain.chain_id,
+            genesis_hash,
             vote_depth: config.checkpoint.vote_depth,
         };
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
@@ -2250,9 +2274,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     };
 
     // WP-S.3 Stage 1a: the checkpoint-finality producer path (propose / sign /
-    // broadcast / early-vote buffer / relay). Switched by the COMPILED pin for this
-    // chain (`checkpoint_gadget::CHECKPOINT_VOTING_PINS`, OFF for every chain in this
-    // release) — never by env or config. Committee source: the shared epoch-snapshot
+    // broadcast / early-vote buffer / relay). r1007 (ADR CV-8): ON from genesis in
+    // this build (`checkpoint_gadget::CHECKPOINT_VOTING_FROM_GENESIS`, no pin) —
+    // never by env or config. Committee source: the shared epoch-snapshot
     // proposer selector (`validator_selector`, filled by registry_sync from
     // `ValidatorRegistry.activeSet()` at each S(E)); `None` when no registry is
     // configured, in which case no committee can be derived and nothing is proposed.
@@ -2273,6 +2297,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // by hash); stays `None` without a canonical applicator (tags then resolve
     // to genesis).
     let mut finality_rpc_handle: Option<citrate_api::FinalizedTagSource> = None;
+    // `citrate_getFinalityStatus` (spec 06 §5.5): the finality driver publishes
+    // the CheckpointManager's finalized and pending checkpoints here each pass;
+    // until it runs, the method reports `published: false`.
+    let finality_status = Arc::new(citrate_api::finality_status::FinalityStatusCell::default());
     // WP-S.3 Stage 1b (spec §11.10): late-joiner checkpoint certificate sync.
     // `None` in Legacy mode (voting pin OFF, every chain in this release) and
     // without a canonical applicator: nothing is requested, served or accepted.
@@ -2363,7 +2391,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // RPC tags frozen, CHECKPOINT FINALITY SAFETY STOP alarm + metrics).
             // Same compiled voting pin and chain id as `finality_gadget` (whose
             // manager was built with `config.chain.chain_id`).
-            let floor_mode = finality_floor::FloorMode::for_chain(config.chain.chain_id);
+            let floor_mode = finality_floor::FloorMode::for_genesis(
+                config.chain.chain_id,
+                &checkpoint_manager.config().genesis_hash,
+            );
             let floor_verifier = Arc::new(finality_floor::FloorVerifier::new(
                 floor_mode,
                 checkpoint_manager.clone(),
@@ -4227,6 +4258,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     NetworkMessage::CheckpointVote {
                         height,
                         block_hash,
+                        binding,
                         voter_pubkey,
                         signature,
                     } => {
@@ -4248,6 +4280,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         let vote = CheckpointVote {
                             height,
                             block_hash,
+                            binding,
                             voter: PublicKey::new(voter_bytes),
                             signature: Signature::new(sig_bytes),
                         };
@@ -4327,13 +4360,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     NetworkMessage::CheckpointCertificate {
                         height,
                         block_hash,
+                        binding,
                         signatures,
                     } => match &certificate_sync_for_net {
                         Some(cs) if cs.accept_response(&pid.0).await => {
                             let cs = cs.clone();
                             let peer = pid.0.clone();
                             tokio::spawn(async move {
-                                let _ = cs.process(&peer, height, block_hash, signatures).await;
+                                let _ = cs
+                                    .process(&peer, height, block_hash, binding, signatures)
+                                    .await;
                             });
                         }
                         _ => tracing::debug!(
@@ -4590,7 +4626,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     ghostdag_params: Some(shared_ghostdag.params().clone()),
                 }
             }),
-        );
+        )
+        // ADR CV-8 / spec 06 §5.5: the real checkpoint state, for the explorer.
+        .with_finality_status(finality_status.clone());
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
         // to the RPC server. Until this commit, main.rs constructed
@@ -4713,6 +4751,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     storage.clone(),
                     peer_manager.clone(),
                     proposer_signing_key.clone(),
+                    finality_status.clone(),
+                    finality_floor::FloorMode::for_genesis(
+                        config.chain.chain_id,
+                        &checkpoint_manager.config().genesis_hash,
+                    ),
                 );
                 // Stage 1b: fetch finalized certificates from peers so a node that
                 // joined late or restarted behind gets its floor without waiting
