@@ -25,6 +25,10 @@ fn create_block_with_params(
     let mut hash_bytes = [0u8; 32];
     hash_bytes[0] = block_id;
     hash_bytes[1] = (height & 0xFF) as u8;
+    // r1007 fixture fix: never the zero hash. Genesis (id 0, height 0) used to
+    // hash to `Hash::default()`, the "no parent" sentinel, which made each of
+    // its children genesis-shaped.
+    hash_bytes[31] = 0xA5;
 
     BlockBuilder::new()
         .hash(Hash::new(hash_bytes))
@@ -33,7 +37,9 @@ fn create_block_with_params(
         .height(height)
         .timestamp(1000000 + height * 10)
         .blue_score(blue_score)
-        .blue_work(blue_score as u128 * 100)
+        // r1007 G7 / SECREM-01: work is the canonical function of the score
+        // (the fixture used score × 100, which admission never accepted).
+        .blue_work(blue_work_for_score(blue_score))
         .proposer(PublicKey::new([block_id; 32]))
         .vrf_reveal(VrfProof {
             proof: vec![0u8; 80],
@@ -83,13 +89,15 @@ mod blue_set_determinism {
             let blue_set_c = ghostdag.calculate_blue_set(&block_c).await.unwrap();
 
             // Verify deterministic properties
-            assert_eq!(blue_set_genesis.score, 1, "Genesis blue score should be 1");
+            // r1007 G7: genesis scores 0 (its blue past is empty).
+            assert_eq!(blue_set_genesis.score, 0, "Genesis blue score should be 0");
             assert!(blue_set_a.score >= blue_set_genesis.score);
             assert!(blue_set_b.score >= blue_set_a.score);
             assert!(blue_set_c.score >= blue_set_b.score);
 
-            // Genesis should be in all blue sets (as it's in the ancestry)
-            assert!(blue_set_genesis.blocks.contains(&genesis.hash()));
+            // Genesis is in every later block's blue set (it is in their past)
+            assert!(blue_set_a.blocks.contains(&genesis.hash()));
+            assert!(blue_set_c.blocks.contains(&genesis.hash()));
         }
     }
 
@@ -429,9 +437,10 @@ mod edge_cases {
         let genesis = create_simple_block(0, 0, None);
         dag_store.store_block(genesis.clone()).await.unwrap();
 
+        // r1007 G7: genesis has blue score 0 and an empty blue set (its past).
         let blue_set = ghostdag.calculate_blue_set(&genesis).await.unwrap();
-        assert_eq!(blue_set.score, 1);
-        assert!(blue_set.blocks.contains(&genesis.hash()));
+        assert_eq!(blue_set.score, 0);
+        assert!(!blue_set.blocks.contains(&genesis.hash()));
 
         let tips = dag_store.get_tips().await;
         assert_eq!(tips.len(), 1);

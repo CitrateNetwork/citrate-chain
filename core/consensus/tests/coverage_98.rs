@@ -32,15 +32,16 @@ fn make_block(hash_byte: u8, height: u64, blue_score: u64, parent: Hash) -> Bloc
         .build_unhashed()
 }
 
-fn make_block_with_merge(
-    hash_byte: u8,
-    height: u64,
-    blue_score: u64,
-    selected_parent: Hash,
-    merge_parents: Vec<Hash>,
-) -> Block {
-    let mut block = make_block(hash_byte, height, blue_score, selected_parent);
-    block.header.merge_parent_hashes = merge_parents;
+/// r1007 (S3-1): a block naming `parents`, with the header the producer
+/// writes: the heaviest parent as selected parent (G3) and the GHOSTDAG
+/// blue_score / blue_work (G7).
+async fn sealed(ghostdag: &GhostDag, hash_byte: u8, parents: Vec<Hash>) -> Block {
+    let (sp, merges, height, data) = ghostdag
+        .ghostdag_for_parents(&parents)
+        .await
+        .expect("valid parents");
+    let mut block = make_block(hash_byte, height, data.blue_score, sp);
+    block.header.merge_parent_hashes = merges;
     block
 }
 
@@ -289,20 +290,18 @@ async fn test_extends_current_chain_via_merge_parent() {
     let b2 = make_block(0x52, 2, 3, b1.hash());
     dag_store.store_block(b2.clone()).await.unwrap();
     ghostdag.add_block(&b2).await.unwrap();
-    // Equal score → no reorg; current tip is still A2.
-    let _ = cs.on_new_block(&b2).await;
+    // r1007 G8: at equal work B2 is the heavier key (0x52 > 0x42), so the
+    // selector is NOT told about B2 on its own (it would reorg to it); B2
+    // reaches the selector only inside the probe block's past. The current
+    // tip is still A2.
     assert_eq!(cs.get_chain_state().await.tip, current_tip);
 
-    // The probe block: selected parent is B2 (NOT the current tip), merge
-    // parent IS the current tip, equal scores so the merge is admissible.
-    // Band for one merge parent: [4, 5] — claim 4.
-    let merge_block = make_block_with_merge(
-        0x50,
-        3,
-        4,
-        b2.hash(),         // selected parent is fork tip B2
-        vec![current_tip], // merge parent is current tip A2
-    );
+    // The probe block: selected parent is B2 (NOT the current tip; G3 makes
+    // it the selected parent as the heavier key), merge parent IS the current
+    // tip. The header carries the GHOSTDAG score (G7).
+    let merge_block = sealed(&ghostdag, 0x50, vec![b2.hash(), current_tip]).await;
+    assert_eq!(merge_block.selected_parent(), b2.hash());
+    assert_eq!(merge_block.header.merge_parent_hashes, vec![current_tip]);
     dag_store.store_block(merge_block.clone()).await.unwrap();
     ghostdag.add_block(&merge_block).await.unwrap();
 
@@ -542,8 +541,10 @@ async fn test_on_new_block_equal_score_no_reorg() {
     }
     // Tip is blocks[2], ghostdag score = 3
 
-    // Create a sibling of blocks[2] from blocks[1] — same depth, so same score = 3
-    let sibling = make_block(0xF0, 2, 3, blocks[1].hash());
+    // Create a sibling of blocks[2] from blocks[1] — same depth, so same score = 3.
+    // r1007 G8: equal work breaks on the key, so the sibling must also be the
+    // lighter key (a smaller hash) not to be preferred.
+    let sibling = make_block(0x01, 2, 3, blocks[1].hash());
     dag_store.store_block(sibling.clone()).await.unwrap();
     ghostdag.add_block(&sibling).await.unwrap();
 
@@ -698,8 +699,8 @@ async fn test_select_highest_blue_score_with_tiebreak_hash_ordering() {
     );
 
     let result = ts.select_current_tip().await.unwrap();
-    // Tie-break: sort candidates, pick first. [0x10;32] < [0x20;32] so child1 wins.
-    assert_eq!(result, child1.hash());
+    // r1007 G8 tie-break: the larger ForkChoiceKey. [0x20;32] > [0x10;32] so child2 wins.
+    assert_eq!(result, child2.hash());
 }
 
 // --- select_weighted_random ---

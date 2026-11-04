@@ -570,15 +570,17 @@ mod tests {
             storage.blocks.put_block(&b).expect("chain");
         }
         storage.blocks.put_applied_tip(&parent, N).expect("tip");
+        // r1007 G12: the durable record is the tip's GHOSTDAG record
+        // (`DAG_GHOSTDAG`), which replaced the `score:` anchor.
         assert!(
-            dag.get_derived_blue_score(&parent).is_some(),
-            "the tip's durable anchor must exist, or this test is exercising the \
-             no-anchor path again rather than the question being asked"
+            dag.get_ghostdag_data(&parent).is_some(),
+            "the tip's durable record must exist, or this test is exercising the \
+             no-record path again rather than the question being asked"
         );
         assert_eq!(prune_once(&storage, &dag, N, MIN_RETAIN_BLOCKS).await, 500);
         assert!(
-            dag.get_derived_blue_score(&parent).is_some(),
-            "pruning must not delete the RETAINED tip's anchor"
+            dag.get_ghostdag_data(&parent).is_some(),
+            "pruning must not delete the RETAINED tip's record"
         );
 
         // RESTART, follower-style: a brand-new GhostDag over the SAME (pruned)
@@ -597,8 +599,9 @@ mod tests {
                 .get_blue_score(&next.header.block_hash)
                 .await
                 .expect("score"),
-            N + 2,
-            "the score sequence continues unbroken across prune AND restart"
+            N + 1,
+            "the score sequence continues unbroken across prune AND restart \
+             (r1007 G7: genesis 0, so height N + 1 scores N + 1)"
         );
     }
 

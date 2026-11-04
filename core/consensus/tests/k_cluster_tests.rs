@@ -33,6 +33,17 @@ fn make_block(
         .build_unhashed()
 }
 
+/// r1007 (S3-1): a block naming `parents`, with the header the producer
+/// writes: the heaviest parent as selected parent (G3) and the GHOSTDAG
+/// blue_score / blue_work (G7).
+async fn sealed(ghostdag: &GhostDag, hash: [u8; 32], parents: Vec<Hash>) -> Block {
+    let (sp, merges, height, data) = ghostdag
+        .ghostdag_for_parents(&parents)
+        .await
+        .expect("valid parents");
+    make_block(hash, sp, merges, height, data.blue_score)
+}
+
 /// Deterministic unique hash from an index.
 fn hash_for(index: u64) -> [u8; 32] {
     let mut h = [0u8; 32];
@@ -77,19 +88,21 @@ async fn test_linear_chain_all_blue() {
     let blue_set = ghostdag.calculate_blue_set(&tip_block).await.unwrap();
 
     // In a linear chain every block is an ancestor of the tip, so anticone
-    // size for each is 0. All 11 blocks (genesis + 10) must be blue.
+    // size for each is 0. r1007 G7: the tip's blue set is its blue past, all
+    // 10 blocks below it (genesis + 9); the tip is not in its own blue set.
     assert_eq!(
-        blue_set.score, 11,
-        "All 11 blocks in a linear chain must be blue, got {}",
+        blue_set.score, 10,
+        "All 10 blocks below the tip in a linear chain must be blue, got {}",
         blue_set.score
     );
-    for hash in &all_hashes {
+    for hash in &all_hashes[..all_hashes.len() - 1] {
         assert!(
             blue_set.contains(hash),
             "Block {} must be in the blue set of the tip",
             hash
         );
     }
+    assert!(!blue_set.contains(&prev));
 }
 
 // ============================================================================
@@ -117,21 +130,26 @@ async fn test_diamond_dag_blue_set() {
     dag_store.store_block(c.clone()).await.unwrap();
     ghostdag.add_block(&c).await.unwrap();
 
-    // D: selected parent = B, merge parent = C
-    let d = make_block(hash_for(3), b.hash(), vec![c.hash()], 2, 2);
+    // D merges B and C. r1007 G3: the selected parent is the heavier key, C
+    // (hash_for(2) > hash_for(1) at equal work); B is the merge parent.
+    let d = sealed(&ghostdag, hash_for(3), vec![b.hash(), c.hash()]).await;
+    assert_eq!(d.selected_parent(), c.hash());
     dag_store.store_block(d.clone()).await.unwrap();
     ghostdag.add_block(&d).await.unwrap();
 
     let blue_set = ghostdag.calculate_blue_set(&d).await.unwrap();
 
-    // All four blocks should be in D's blue set:
-    // A is ancestor of everyone, B is selected parent, C is merge parent
-    // with anticone size 0 relative to B (since both share ancestor A).
+    // A, B and C are D's blue past (r1007 G7: D itself is not in it):
+    // A is ancestor of everyone, C is selected parent, B is merge parent
+    // with blue anticone {C}, size 1 <= k.
     assert!(blue_set.contains(&a.hash()), "A (genesis) must be blue");
     assert!(blue_set.contains(&b.hash()), "B must be blue");
     assert!(blue_set.contains(&c.hash()), "C must be blue");
-    assert!(blue_set.contains(&d.hash()), "D must be blue");
-    assert_eq!(blue_set.score, 4, "Diamond DAG should have blue score 4");
+    assert!(
+        !blue_set.contains(&d.hash()),
+        "D is not in its own blue set"
+    );
+    assert_eq!(blue_set.score, 3, "Diamond DAG: D has blue score 3");
 }
 
 // ============================================================================
@@ -165,28 +183,32 @@ async fn test_wide_dag_at_k_limit() {
     // Create a merge block that references some of these parallel blocks.
     // selected parent = parallel_hashes[0], merge parents = next batch
     // (up to max_parents - 1).
-    let merge_parents: Vec<Hash> =
-        parallel_hashes[1..std::cmp::min(10, parallel_hashes.len())].to_vec();
-    let merge_block = make_block(hash_for(100), parallel_hashes[0], merge_parents, 2, 2);
+    // r1007 G3: the selected parent is the heaviest of the ten (the largest key).
+    let merge_block = sealed(
+        &ghostdag,
+        hash_for(100),
+        parallel_hashes[0..std::cmp::min(10, parallel_hashes.len())].to_vec(),
+    )
+    .await;
     dag_store.store_block(merge_block.clone()).await.unwrap();
     ghostdag.add_block(&merge_block).await.unwrap();
 
     let blue_set = ghostdag.calculate_blue_set(&merge_block).await.unwrap();
 
-    // The merge block's blue set must include at least genesis + itself +
-    // the selected parent. With k=18 parallel blocks, the anticone constraint
-    // should allow the merge parents to be blue too (anticone <= k).
+    // The merge block's blue set (its blue past, r1007 G7) must include at
+    // least genesis + the selected parent. With k=18 parallel blocks, the
+    // anticone constraint allows all ten parents to be blue (anticone <= k).
     assert!(
         blue_set.contains(&genesis_hash),
         "Genesis must always be in the blue set"
     );
     assert!(
-        blue_set.contains(&merge_block.hash()),
-        "The merge block itself must be in the blue set"
+        !blue_set.contains(&merge_block.hash()),
+        "The merge block is not in its own blue set"
     );
-    assert!(
-        blue_set.score >= 3,
-        "Merge block should have blue score >= 3 (genesis + selected parent + self), got {}",
+    assert_eq!(
+        blue_set.score, 11,
+        "Merge block: genesis + its ten parents, got {}",
         blue_set.score
     );
 }
@@ -328,10 +350,15 @@ async fn test_genesis_always_in_blue_set() {
     ghostdag.add_block(&fork_block).await.unwrap();
     all_hashes.push(fork_block.hash());
 
-    // Verify genesis is in the blue set of every block
+    // Verify genesis is in the blue set of every block but itself (r1007
+    // G7: a block's blue set is its blue past, so genesis has an empty one).
     for hash in &all_hashes {
         let block = dag_store.get_block(hash).await.unwrap();
         let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
+        if *hash == genesis_hash {
+            assert!(blue_set.blocks.is_empty() && blue_set.score == 0);
+            continue;
+        }
         assert!(
             blue_set.contains(&genesis_hash),
             "Genesis must always be in the blue set of block {} (blue_score={})",

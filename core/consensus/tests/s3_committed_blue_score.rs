@@ -160,14 +160,15 @@ async fn parents_that_are_ancestors_rejected() {
     let (store, gd) = engine(18);
     let g = genesis(hash_of(b"G"));
     admit_ok(&store, &gd, &g).await;
-    let a1 = block(hash_of(b"a1"), g.hash(), vec![], 1, 1, Hash::default());
-    let a2 = block(hash_of(b"a2"), a1.hash(), vec![], 2, 2, Hash::default());
+    let a1 = block(hash_of(b"z1"), g.hash(), vec![], 1, 1, Hash::default());
+    let a2 = block(hash_of(b"z2"), a1.hash(), vec![], 2, 2, Hash::default());
     let m1 = block(hash_of(b"m1"), g.hash(), vec![], 1, 1, Hash::default());
     let m2 = block(hash_of(b"m2"), m1.hash(), vec![], 2, 2, Hash::default());
     for b in [&a1, &a2, &m1, &m2] {
         admit_ok(&store, &gd, b).await;
     }
-    // Case 1: the merge parent a1 is in the past of the selected parent a2.
+    // The z chain is heavier than the m chain at equal work (larger hash).
+    // Case 1: the merge parent z1 is in the past of the selected parent z2.
     // It adds nothing to the mergeset, so the only plausible score is 3.
     for score in [3u64, 4] {
         let x = block(
@@ -178,13 +179,13 @@ async fn parents_that_are_ancestors_rejected() {
             score,
             Hash::default(),
         );
-        assert!(
-            verdict(&gd, &x).await.is_err(),
-            "a merge parent in the past of the selected parent must be rejected (score {score})"
-        );
+        let why = verdict(&gd, &x)
+            .await
+            .expect_err("a merge parent in the past of the selected parent must be rejected");
+        assert!(why.contains("antichain"), "score {score}: {why}");
     }
     // Case 2: one merge parent (m1) is in the past of another (m2). Both are
-    // outside past(a2), so the mergeset is {m1, m2} however they are listed.
+    // outside past(z2), so the mergeset is {m1, m2} however they are listed.
     for score in [3u64, 4, 5] {
         let x = block(
             hash_of(b"x2"),
@@ -194,10 +195,10 @@ async fn parents_that_are_ancestors_rejected() {
             score,
             Hash::default(),
         );
-        assert!(
-            verdict(&gd, &x).await.is_err(),
-            "a merge parent in the past of another merge parent must be rejected (score {score})"
-        );
+        let why = verdict(&gd, &x)
+            .await
+            .expect_err("a merge parent in the past of another merge parent must be rejected");
+        assert!(why.contains("antichain"), "score {score}: {why}");
     }
     // Case 3: the selected parent is in the past of a merge parent. The merge
     // parent is then heavier, so this is also a G3 violation.
@@ -222,7 +223,7 @@ async fn parents_that_are_ancestors_rejected() {
     assert_eq!(
         verdict(&gd, &ok).await,
         Ok(()),
-        "a2 + m2 (mergeset m1, m2) scores 2 + 3"
+        "z2 + m2 (mergeset z2, m1, m2) scores 2 + 3"
     );
 }
 
@@ -433,6 +434,9 @@ async fn unmerged_ancestor_of_merge_parent_is_colored() {
     }
     admit_ok(&store, &gd, &d(6)).await;
     assert_eq!(gd.get_blue_score(&d(6).hash()).await.expect("ranked"), 6);
+    let data = gd.ghostdag_data(&d(6).hash()).await.expect("record");
+    assert_eq!(data.mergeset_blues, vec![c.hash(), s1.hash(), s2.hash()]);
+    assert!(data.mergeset_reds.is_empty());
 }
 
 /// K = 2. b1, b2, b3 are siblings at height 1. P (SP b1) merges b2 and b3:
@@ -489,6 +493,13 @@ async fn second_kcluster_condition_turns_candidate_red() {
     );
     admit_ok(&store, &gd, &bb(5)).await;
     assert_eq!(gd.get_blue_score(&bb(5).hash()).await.expect("ranked"), 5);
+    let data = gd.ghostdag_data(&bb(5).hash()).await.expect("record");
+    assert_eq!(data.mergeset_blues, vec![p.hash()]);
+    assert_eq!(data.mergeset_reds, vec![c1.hash()]);
+    // The first condition alone would have colored c1 blue: its blue
+    // anticone in B is {P, b1}, two blocks, within K.
+    let p_data = gd.ghostdag_data(&p.hash()).await.expect("record");
+    assert_eq!(p_data.blues_anticone_sizes.get(&b1.hash()), Some(&2));
 }
 
 #[derive(serde::Deserialize)]
@@ -510,10 +521,8 @@ struct KaspaBlock {
     #[serde(rename = "ExpectedSelectedParent")]
     selected_parent: String,
     #[serde(rename = "ExpectedReds")]
-    #[allow(dead_code)]
     reds: Vec<String>,
     #[serde(rename = "ExpectedBlues")]
-    #[allow(dead_code)]
     blues: Vec<String>,
     #[serde(rename = "Parents")]
     parents: Vec<String>,
@@ -597,6 +606,36 @@ async fn coloring_matches_kaspa_vectors() {
                 panic!("dag{n} {}: Kaspa's score {} rejected: {e}", kb.id, kb.score);
             }
             height.insert(kb.id.clone(), h);
+        }
+        // The persisted records match Kaspa's mergeset coloring and order
+        // (SP first, then ascending Key), read back by a fresh engine.
+        let fresh = GhostDag::new(
+            GhostDagParams {
+                k: dag.k,
+                ..GhostDagParams::default()
+            },
+            store.clone(),
+        );
+        for kb in &dag.blocks {
+            let id = kaspa_hash(&kb.id);
+            for engine_view in [&gd, &fresh] {
+                let data = engine_view.ghostdag_data(&id).await.expect("record");
+                let names = |v: &[String]| v.iter().map(|x| kaspa_hash(x)).collect::<Vec<_>>();
+                assert_eq!(
+                    data.selected_parent,
+                    kaspa_hash(&kb.selected_parent),
+                    "dag{n} {}",
+                    kb.id
+                );
+                assert_eq!(
+                    data.mergeset_blues,
+                    names(&kb.blues),
+                    "dag{n} {} blues",
+                    kb.id
+                );
+                assert_eq!(data.mergeset_reds, names(&kb.reds), "dag{n} {} reds", kb.id);
+                assert_eq!(data.blue_score, kb.score, "dag{n} {}", kb.id);
+            }
         }
     }
 }

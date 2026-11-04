@@ -23,6 +23,9 @@ pub const CF_DAG_TIPS: &str = "dag_tips";
 pub const CF_DAG_FINALIZED: &str = "dag_finalized";
 pub const CF_DAG_HEIGHT_INDEX: &str = "dag_height_index";
 pub const CF_DAG_METADATA: &str = "dag_metadata";
+// r1007 G12 (`CF_GHOSTDAG`): per-block GhostdagData records, keyed by block
+// hash (`citrate_consensus::dag_store::cf::DAG_GHOSTDAG`).
+pub const CF_DAG_GHOSTDAG: &str = "dag_ghostdag";
 // WP-S.3: BFT checkpoint column family. UNUSED: finalized checkpoint
 // certificates live in `dag_metadata` under `checkpoint:{height}` (spec D-6,
 // docs/consensus/CHECKPOINT_FINALITY_WIRING.md §4.7). Do NOT remove it from
@@ -60,6 +63,7 @@ pub fn all_column_families() -> Vec<&'static str> {
         CF_DAG_FINALIZED,
         CF_DAG_HEIGHT_INDEX,
         CF_DAG_METADATA,
+        CF_DAG_GHOSTDAG,
         CF_CHECKPOINTS,
         CF_ACCOUNT_VERSIONS,
     ]

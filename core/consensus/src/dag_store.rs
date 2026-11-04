@@ -229,17 +229,18 @@ pub struct DagStore {
     residency: Arc<Mutex<BodyResidency>>,
 }
 
-/// Column family names for persistent DAG storage
-/// S2-5: the tag stored with a derived blue score anchor: the first 8 bytes of
-/// SHA3-256 over a domain label, the block hash and the score. It detects a torn
-/// or corrupted entry and an entry filed under the wrong block; it is not a
-/// defence against someone who can write the node's database.
-fn score_anchor_tag(hash: &Hash, score: u64) -> [u8; 8] {
+/// G12: the tag stored with a persisted GhostdagData record: the first 8
+/// bytes of SHA3-256 over a domain label, the block hash and the encoded
+/// record. It detects a torn or corrupted entry and an entry filed under the
+/// wrong block; it is not a defence against someone who can write the node's
+/// database. (A record copied from another node under the same block hash is
+/// the same record: GhostdagData is a function of the block's past.)
+fn ghostdag_record_tag(hash: &Hash, encoded: &[u8]) -> [u8; 8] {
     use sha3::{Digest, Sha3_256};
     let mut h = Sha3_256::new();
-    h.update(b"citrate/dag/score-anchor/v1");
+    h.update(b"citrate/dag/ghostdag-data/v1");
     h.update(hash.as_bytes());
-    h.update(score.to_be_bytes());
+    h.update(encoded);
     let out: [u8; 32] = h.finalize().into();
     let mut tag = [0u8; 8];
     for (t, o) in tag.iter_mut().zip(out.iter()) {
@@ -248,6 +249,7 @@ fn score_anchor_tag(hash: &Hash, score: u64) -> [u8; 8] {
     tag
 }
 
+/// Column family names for persistent DAG storage
 pub mod cf {
     pub const DAG_BLOCKS: &str = "dag_blocks";
     pub const DAG_CHILDREN: &str = "dag_children";
@@ -255,6 +257,9 @@ pub mod cf {
     pub const DAG_FINALIZED: &str = "dag_finalized";
     pub const DAG_HEIGHT_INDEX: &str = "dag_height_index";
     pub const DAG_METADATA: &str = "dag_metadata";
+    /// G12 (`CF_GHOSTDAG` in the r1007 spec): per-block GhostdagData, keyed
+    /// by block hash. Replaces the `score:<hash>` anchors in `DAG_METADATA`.
+    pub const DAG_GHOSTDAG: &str = "dag_ghostdag";
 }
 
 impl DagStore {
@@ -465,8 +470,8 @@ impl DagStore {
                 key: h.as_bytes().to_vec(),
             });
             ops.push(KvOp::Delete {
-                cf: cf::DAG_METADATA.to_string(),
-                key: Self::score_key(h),
+                cf: cf::DAG_GHOSTDAG.to_string(),
+                key: h.as_bytes().to_vec(),
             });
         }
         for (key, value) in kv
@@ -703,86 +708,59 @@ impl DagStore {
         }
     }
 
-    /// WP-S.1: Persist pruning point.
-    /// SYNC-S1 D3 — durable anchor for a block's locally-derived blue score.
-    ///
-    /// `GhostDag::relations` is in-memory only, so after a restart the score of
-    /// every already-admitted block is gone and the first block admitted has to
-    /// re-derive its parent's score by walking the selected-parent chain back to
-    /// the nearest known ancestor. That walk is what makes DAG-store pruning
-    /// impossible: prune the ancestors and the walk hits a missing block.
-    ///
-    /// Persisting the score removes the walk (O(1) cold start) and with it the
-    /// last reason the DAG store has to retain deep ancestry — which is the
-    /// prerequisite for wiring `prune()`.
-    ///
-    /// Stored under `score:<hash>` in `DAG_METADATA` rather than a new column
-    /// family, so an existing data directory needs no migration. This is a
-    /// cache, not consensus state: a missing or unreadable entry falls back to
-    /// the derivation walk, so a torn write costs performance, never
-    /// correctness. It records the LOCALLY DERIVED score, never a header value
-    /// (SECREM-01 CONS-2).
-    fn score_key(hash: &Hash) -> Vec<u8> {
-        let mut k = Vec::with_capacity(6 + 32);
-        k.extend_from_slice(b"score:");
-        k.extend_from_slice(hash.as_bytes());
-        k
+    /// Whether this store writes through to a persistent backend.
+    pub fn is_persistent(&self) -> bool {
+        self.persistent.is_some()
     }
 
-    /// Persist the derived blue score for `hash`. Best-effort (see
-    /// [`Self::score_key`]): a failure is logged and the read path degrades to
-    /// the walk.
+    /// G12: persist the GhostdagData record of `hash` (`DAG_GHOSTDAG`).
     ///
-    /// S2-5: the entry is the score plus a tag binding it to `hash`
-    /// ([`score_anchor_tag`]), so a torn or corrupted entry, or one copied in
-    /// from another block or node, reads back as absent instead of as a score.
-    pub fn put_derived_blue_score(&self, hash: &Hash, score: u64) {
+    /// Best effort: the record is a pure function of headers, so a lost write
+    /// costs a recomputation from the headers in the window, or, if those are
+    /// pruned too, a fail-closed admission. It is never replaced by a value
+    /// from another source.
+    pub fn put_ghostdag_data(&self, hash: &Hash, data: &crate::types::GhostdagData) {
         if let Some(ref kv) = self.persistent {
-            let mut value = Vec::with_capacity(16);
-            value.extend_from_slice(&score.to_be_bytes());
-            value.extend_from_slice(&score_anchor_tag(hash, score));
-            if let Err(e) = kv.kv_put(cf::DAG_METADATA, &Self::score_key(hash), &value) {
-                debug!("Failed to persist derived blue score for {}: {}", hash, e);
+            let encoded = match bincode::serialize(data) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Failed to encode GHOSTDAG record for {}: {}", hash, e);
+                    return;
+                }
+            };
+            let mut value = Vec::with_capacity(encoded.len().saturating_add(8));
+            value.extend_from_slice(&ghostdag_record_tag(hash, &encoded));
+            value.extend_from_slice(&encoded);
+            if let Err(e) = kv.kv_put(cf::DAG_GHOSTDAG, hash.as_bytes(), &value) {
+                debug!("Failed to persist GHOSTDAG record for {}: {}", hash, e);
             }
         }
     }
 
-    /// The persisted derived blue score for `hash`, if one was recorded by a
-    /// previous process. `None` on an in-memory store, a pre-D3 data directory,
-    /// a torn write, or a tag that does not bind this hash and score — all of
-    /// which are handled by the caller's fallback.
-    ///
-    /// An entry written before the tag (8 bytes, score only) is NOT returned:
-    /// it cannot be told apart from a corrupted or header-scale entry (the
-    /// pre-S2-5 fallback wrote header scores here). A block whose score can be
-    /// derived rewrites its anchor in the tagged form; one whose score cannot
-    /// (just above a prune floor) then fails closed instead of ranking on an
-    /// unverifiable number. Upgrade note: a pruned node restarted within one
-    /// retention window of upgrading can hit that and need a resync.
-    pub fn get_derived_blue_score(&self, hash: &Hash) -> Option<u64> {
+    /// The persisted GhostdagData record of `hash`. `None` on an in-memory
+    /// store, a missing or torn entry, or a tag that does not bind this hash
+    /// and these bytes; the caller then recomputes from headers or fails
+    /// closed.
+    pub fn get_ghostdag_data(&self, hash: &Hash) -> Option<crate::types::GhostdagData> {
         let kv = self.persistent.as_ref()?;
-        let raw = kv.kv_get(cf::DAG_METADATA, &Self::score_key(hash)).ok()??;
-        let (score, tag) = raw.split_first_chunk::<8>()?;
-        let score = u64::from_be_bytes(*score);
-        if tag.len() == 8 && *tag == score_anchor_tag(hash, score) {
-            Some(score)
-        } else {
-            debug!(
-                "Derived blue score anchor for {} does not bind it; ignored",
-                hash
-            );
-            None
+        let raw = kv.kv_get(cf::DAG_GHOSTDAG, hash.as_bytes()).ok()??;
+        let (tag, encoded) = raw.split_first_chunk::<8>()?;
+        if *tag != ghostdag_record_tag(hash, encoded) {
+            debug!("GHOSTDAG record for {} does not bind it; ignored", hash);
+            return None;
         }
+        bincode::deserialize(encoded).ok()
     }
 
-    /// Drop the persisted score for `hash` — used by `prune` so a pruned
-    /// block's anchor does not outlive the block itself.
-    fn persist_delete_derived_blue_score(&self, hash: &Hash) {
+    /// Drop the persisted record of `hash` — used by `prune` so a pruned
+    /// block's record does not outlive the block itself.
+    fn persist_delete_ghostdag_data(&self, hash: &Hash) {
         if let Some(ref kv) = self.persistent {
-            let _ = kv.kv_delete(cf::DAG_METADATA, &Self::score_key(hash));
+            let _ = kv.kv_delete(cf::DAG_GHOSTDAG, hash.as_bytes());
         }
     }
 
+    /// WP-S.1: Persist pruning point.
     fn persist_pruning_point(&self, hash: &Hash) {
         if let Some(ref kv) = self.persistent {
             if let Err(e) = kv.kv_put(cf::DAG_METADATA, b"pruning_point", hash.as_bytes()) {
@@ -1327,11 +1305,9 @@ impl DagStore {
                     if blocks.remove(&hash).is_some() {
                         self.forget_residency(&hash);
                         self.persist_delete_block(&hash);
-                        // SYNC-S1 D3: the score anchor must not outlive its
-                        // block, or a pruned range leaves stale entries behind
-                        // forever (the anchor keyspace would then grow without
-                        // bound, which is the leak pruning exists to stop).
-                        self.persist_delete_derived_blue_score(&hash);
+                        // G12: the GHOSTDAG record must not outlive its block,
+                        // or a pruned range leaves stale entries behind forever.
+                        self.persist_delete_ghostdag_data(&hash);
                         pruned_count = pruned_count.saturating_add(1);
                     }
                 }
