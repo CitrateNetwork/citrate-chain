@@ -443,6 +443,36 @@ impl RocksDB {
         Ok(())
     }
 
+    /// Visit the keys of `cf` from `from` (inclusive) up to `to` (exclusive;
+    /// `None`: no upper bound) that start with `prefix`, in key order, without
+    /// reading values or collecting them. The scan ends at the first key past
+    /// `to` or without `prefix`. Errors end the scan as in
+    /// [`Self::for_each_prefix_key_cf`].
+    pub fn for_each_key_in_range_cf(
+        &self,
+        cf: &str,
+        from: &[u8],
+        to: Option<&[u8]>,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cf_handle = self.cf_handle(cf)?;
+        let mode = rocksdb::IteratorMode::From(from, rocksdb::Direction::Forward);
+        for item in self.db.iterator_cf(&cf_handle, mode) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if let Some(end) = to {
+                if key.as_ref() >= end {
+                    break;
+                }
+            }
+            visit(&key)?;
+        }
+        Ok(())
+    }
+
     /// Compact a column family
     pub fn compact_cf(&self, cf: &str) -> Result<()> {
         let cf_handle = self.cf_handle(cf)?;

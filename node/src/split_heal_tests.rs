@@ -72,6 +72,12 @@ const MIN_STAKE: u128 = 32_000;
 const STAKE: u128 = 40_000;
 /// Messages processed per pump before the harness calls it a storm.
 const PUMP_CAP: usize = 200_000;
+/// The DAG retain window the pruned scenarios prune to: harness scale, below
+/// the node's floor (`dag_prune::MIN_RETAIN_BLOCKS` = the 10,000-height undo
+/// window, S3-4), so a scenario reaches it in about a thousand slots. The
+/// undo records still cover `canonical_apply::MAX_REORG_DEPTH`, so every fork
+/// these scenarios build sits inside both the retained range and the window.
+const HARNESS_PRUNE_RETAIN: u64 = 1_000;
 
 fn key(i: usize) -> Ed25519SigningKey {
     Ed25519SigningKey::from_bytes(&[0x60 + i as u8; 32])
@@ -1696,7 +1702,7 @@ mod tests {
 
     /// DGX devnet C2/D1/D2: the 4v3 restart scenario past the DAG prune
     /// retention. The producers run with a 1000-block retain window (the
-    /// node's minimum, as on the devnet), the split and the restarts happen
+    /// devnet's, below today's 10,000 floor: `HARNESS_PRUNE_RETAIN`), the split and the restarts happen
     /// past height 1000, so the four restart forked below their tip on a
     /// pruned DAG store, where a replay from genesis is refused. They must
     /// switch by a bounded reorg, rejoin and seal again.
@@ -1716,7 +1722,7 @@ mod tests {
                 restart_all: true,
                 solo: Some((4, 60)),
                 require_merged: false,
-                prune_retain: Some(crate::dag_prune::MIN_RETAIN_BLOCKS),
+                prune_retain: Some(HARNESS_PRUNE_RETAIN),
                 ..base(7)
             },
         )
@@ -1803,7 +1809,7 @@ mod tests {
             "4v3 + restarts from disk + lone producer, pruned DAG stores",
             Scenario {
                 warmup: ACT + 152,
-                prune_retain: Some(crate::dag_prune::MIN_RETAIN_BLOCKS),
+                prune_retain: Some(HARNESS_PRUNE_RETAIN),
                 restart_mode: RestartMode::Disk,
                 ..four_three_with_restarts()
             },
@@ -2181,7 +2187,7 @@ mod tests {
             Fleet::new(n).await
         };
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let retain = crate::dag_prune::MIN_RETAIN_BLOCKS;
+        let retain = HARNESS_PRUNE_RETAIN;
         loop {
             let o = rng.order(n);
             fleet.slot(&o).await;
@@ -2313,10 +2319,10 @@ mod tests {
         );
     }
 
-    /// CV-7: the same, with the three's branch more than `MAX_REORG_DEPTH`
-    /// (100) blocks above the fork point when serving returns. The undo
-    /// records cover only the reorg window (`REORG_UNDO_DEPTH`); on an
-    /// unpruned store the applicator can still rebuild from genesis.
+    /// CV-7: the same, with the three's branch more than `SNAPSHOT_RING_DEPTH`
+    /// (100, the in-memory reorg ring and the whole undo window before S3-4)
+    /// blocks above the fork point when serving returns. The switch reverts
+    /// from the undo records (`REORG_UNDO_DEPTH` = 10,000 since S3-4).
     #[tokio::test(flavor = "current_thread")]
     async fn stopped_side_forked_beyond_the_reorg_window_rejoins() {
         if !in_child() {
@@ -2326,7 +2332,7 @@ mod tests {
         }
         let r = stopped_side(45, 30, false, false).await;
         assert!(
-            r.fork_depth > crate::canonical_apply::MAX_REORG_DEPTH,
+            r.fork_depth > crate::canonical_apply::SNAPSHOT_RING_DEPTH,
             "fixture: the three's branch is only {} deep ({})",
             r.fork_depth,
             r.detail
@@ -2341,8 +2347,8 @@ mod tests {
     }
 
     /// CV-7 (H6) on a pruned store: the same >100-deep fork, with the three
-    /// restarted at the end of the partition on stores pruned to the minimum
-    /// retention, so the rebuild from genesis is refused
+    /// restarted at the end of the partition on stores pruned to
+    /// `HARNESS_PRUNE_RETAIN`, so the rebuild from genesis is refused
     /// (`RebuildDecision::RefusePruned`) and the switch needs undo records
     /// for the whole depth. Red on r1007/candidate: the three fetch the four's
     /// whole chain (stored tip 1597) but the applied tip stays on their branch
@@ -2356,7 +2362,7 @@ mod tests {
         }
         let r = stopped_side(45, 30, false, true).await;
         assert!(
-            r.fork_depth > crate::canonical_apply::MAX_REORG_DEPTH,
+            r.fork_depth > crate::canonical_apply::SNAPSHOT_RING_DEPTH,
             "fixture: the three's branch is only {} deep ({})",
             r.fork_depth,
             r.detail

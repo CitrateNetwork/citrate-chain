@@ -25,22 +25,25 @@
 // removed that walk, so retaining deep ancestry is no longer required and this
 // scheduler becomes safe to wire.
 //
-// SAFETY BOUNDS (why a window of 1_000 is a hard floor)
+// SAFETY BOUNDS (why the retention is never below the undo window)
 //
-//   * `canonical_apply::MAX_REORG_DEPTH` = 100 — a fork older than this is
-//     never reverted in memory. A deeper switch is the from-genesis spine
-//     rebuild, which reads the CHAIN store and is allowed only toward a branch
-//     fork choice ranks above the applied tip whose ancestry meets the applied
-//     chain (`CanonicalApplicator::rebuild_target`). A block pruned from the
-//     DAG store is never read as divergence there.
-//   * `GhostDagParams::finality_depth` = 100 — same order.
+//   * `canonical_apply::MAX_REORG_DEPTH` = 10,000 — the undo window, equal to
+//     the retention (ADR-2026-11-03 CV-7a, S3-4; it was 100 before, and a
+//     pruned node forked deeper than that was wedged for good, root cause
+//     H6). Any fork the DAG store still holds is switched across in place,
+//     from the undo records. A deeper switch is the from-genesis spine
+//     rebuild on an unpruned node, which reads the CHAIN store and is allowed
+//     only toward a branch fork choice ranks above the applied tip whose
+//     ancestry meets the applied chain (`CanonicalApplicator::rebuild_target`);
+//     on a pruned node it is refused and the guarded cold resync takes over
+//     (CV-7b/c). A block pruned from the DAG store is never read as divergence.
+//   * `GhostDagParams::finality_depth` = 100 — far inside it.
 //   * `block_serve` reads the CHAIN store exclusively (verified), so serving
 //     peers is completely unaffected by DAG-store pruning. This is the reason
 //     pruning the DAG is far less dangerous than it sounds: the DAG store is
 //     fork-choice working state, not the archive.
 //
-// The floor is therefore 10x the deepest revertible reorg, and the default
-// window is 100x it.
+// The floor and the default are therefore the undo window itself.
 //
 // MERGE BLOCKS (MS-BOUND)
 //
@@ -65,12 +68,14 @@ use tracing::{debug, info, warn};
 /// on deliberately, not inherited by a node that happened to take an upgrade.
 pub const RETAIN_ENV: &str = "CITRATE_DAG_PRUNE_RETAIN";
 
-/// Hard floor on the retain window: 10x `MAX_REORG_DEPTH`. A smaller request is
-/// clamped up rather than honoured — an operator typo must not be able to prune
-/// inside the revertible-reorg window.
-pub const MIN_RETAIN_BLOCKS: u64 = 1_000;
+/// Hard floor on the retain window: the undo window
+/// (`canonical_apply::MAX_REORG_DEPTH`, CV-7a; spec 06 G11: the retention may
+/// only be larger than PRUNING_DEPTH). A smaller request is clamped up rather
+/// than honoured — an operator typo must not be able to prune inside the
+/// revertible-reorg window.
+pub const MIN_RETAIN_BLOCKS: u64 = 10_000;
 
-/// Window used when the env var is set to a non-numeric value.
+/// Window used when the env var is set to a non-numeric value: the undo window.
 pub const DEFAULT_RETAIN_BLOCKS: u64 = 10_000;
 
 /// The configured retain window, or `None` when pruning is disabled.
@@ -181,7 +186,8 @@ pub fn spawn(storage: Arc<StorageManager>, dag_store: Arc<DagStore>) {
     };
     info!(
         "dag-prune: ENABLED — retaining {retain} blocks in the DAG store \
-         (>= {MIN_RETAIN_BLOCKS}; reorg window is 100)"
+         (>= {MIN_RETAIN_BLOCKS}; reorg window is {})",
+        crate::canonical_apply::MAX_REORG_DEPTH
     );
     tokio::spawn(async move {
         // #310: Skip — never run prunes back to back after a slow pass.
@@ -247,8 +253,8 @@ mod tests {
             b
         }
 
-        const N: u64 = 1_500;
         const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+        const N: u64 = RETAIN + 500;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
@@ -343,10 +349,10 @@ mod tests {
     }
 
     /// An operator typo must never be able to prune inside the revertible-reorg
-    /// window (MAX_REORG_DEPTH = 100). A too-small request is clamped UP.
+    /// window (MAX_REORG_DEPTH = 10,000). A too-small request is clamped UP.
     #[test]
     fn retain_window_is_clamped_to_the_floor() {
-        // Asking to keep 10 blocks must behave as if 1_000 were asked for.
+        // Asking to keep 10 blocks must behave as if 10_000 were asked for.
         assert_eq!(
             pruning_point_height(50_000, 10),
             Some(50_000 - MIN_RETAIN_BLOCKS)
@@ -355,12 +361,14 @@ mod tests {
             pruning_point_height(50_000, 0),
             Some(50_000 - MIN_RETAIN_BLOCKS)
         );
-        // And the retained range always clears the reorg window by 10x.
+        // And the retained range always covers the reorg (undo) window, which
+        // is 100x the merge depth.
         let point = pruning_point_height(50_000, 1).expect("clamped");
         assert!(
-            50_000 - point >= 10 * 100,
-            "retained range must clear MAX_REORG_DEPTH by an order of magnitude"
+            50_000 - point >= crate::canonical_apply::MAX_REORG_DEPTH,
+            "retained range must cover MAX_REORG_DEPTH"
         );
+        assert!(50_000 - point >= 10 * 100);
     }
 
     /// End-to-end: `prune_once` must actually shrink the DAG store against real
@@ -396,8 +404,8 @@ mod tests {
             b
         }
 
-        const N: u64 = 1_500;
-        const RETAIN: u64 = MIN_RETAIN_BLOCKS; // 1_000
+        const RETAIN: u64 = MIN_RETAIN_BLOCKS; // 10_000
+        const N: u64 = RETAIN + 500;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
@@ -543,7 +551,7 @@ mod tests {
             b
         }
 
-        const N: u64 = 1_500;
+        const N: u64 = MIN_RETAIN_BLOCKS + 500;
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -790,8 +798,8 @@ mod tests {
             b
         }
 
-        const N: u64 = 1_500;
         const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+        const N: u64 = RETAIN + 500;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
@@ -881,8 +889,8 @@ mod tests {
             b
         }
 
-        const N: u64 = 2_500;
         const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+        const N: u64 = RETAIN + 1_500;
 
         // Same blocks into two nodes: one prunes, one does not.
         let dir = tempfile::tempdir().expect("tempdir");

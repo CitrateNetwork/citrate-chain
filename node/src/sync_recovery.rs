@@ -108,10 +108,14 @@ pub const NODE_WALK_BURST: u32 = MAX_PARENT_WALK_STEPS * 2;
 /// One step comes back to the node-wide budget per this interval.
 pub const NODE_WALK_REFILL_EVERY: Duration = Duration::from_millis(250);
 
-/// Deepest parent the walk asks for, below the applied tip: the reorg window,
-/// the deepest fork point the applied chain can move across without a rebuild
-/// (the DAG pruner retains at least this much, see `dag_prune`).
-pub const MAX_WALK_DEPTH: u64 = crate::canonical_apply::MAX_REORG_DEPTH;
+/// Deepest parent the walk asks for, below the applied tip: the in-memory
+/// reorg ring (`canonical_apply::SNAPSHOT_RING_DEPTH`, 100), which was the whole
+/// reorg window before S3-4. Kept there when the undo window grew to the prune
+/// retention (10,000): the walk recovers one parent per answer, and tying it to
+/// the window would grow every peer's step budget a hundredfold. A deeper fork
+/// is fetched by the sync fork-point search (`sync_rejoin`) instead, and
+/// switched in place from the undo records.
+pub const MAX_WALK_DEPTH: u64 = crate::canonical_apply::SNAPSHOT_RING_DEPTH;
 
 /// Peers with walk state, at most; the least recently seen is dropped first.
 pub const MAX_WALK_PEERS: usize = 256;

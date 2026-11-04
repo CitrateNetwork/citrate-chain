@@ -265,7 +265,7 @@ pub struct RejoinTracker {
     /// give-up owes no rejoin backoff (the split gate rate-limits pulls).
     split: bool,
     /// The applied height a split pull started at; its follow stops
-    /// `SPLIT_PULL_HEIGHT_BAND + MAX_REORG_DEPTH` above it.
+    /// `SPLIT_PULL_HEIGHT_BAND + SNAPSHOT_RING_DEPTH` above it.
     split_top: u64,
     /// Requests the running probe has sent (or skipped while its anchor was
     /// pending), against [`search_request_cap`].
@@ -612,11 +612,13 @@ impl RejoinTracker {
                 };
                 let was_following = previous.is_some();
                 // A split pull fetches a sibling branch, never a catch-up: its
-                // follow stops past the band plus the reorg window.
+                // follow stops past the band plus the snapshot ring (the reorg
+                // window before S3-4; unchanged when the undo window grew, so a
+                // split pull fetches no more than before).
                 let split_limit = self
                     .split_top
                     .saturating_add(crate::sync_peer::SPLIT_PULL_HEIGHT_BAND)
-                    .saturating_add(crate::canonical_apply::MAX_REORG_DEPTH);
+                    .saturating_add(crate::canonical_apply::SNAPSHOT_RING_DEPTH);
                 if self.split && cursor.1 > split_limit {
                     return self.give_up(cursor.1);
                 }
@@ -1771,16 +1773,17 @@ mod tests {
     }
 
     /// A node that applied `own`, its DAG store pruned to the last
-    /// `dag_prune::MIN_RETAIN_BLOCKS` when `prune`, restarted. Returns the
+    /// [`HARNESS_PRUNE_RETAIN`] blocks when `prune`, restarted. Returns the
     /// restarted node and its storage dir.
     async fn restarted_node(net: &Net, own: &[Block], prune: bool) -> (Node, tempfile::TempDir) {
-        restarted_node_retaining(
-            net,
-            own,
-            prune.then_some(crate::dag_prune::MIN_RETAIN_BLOCKS),
-        )
-        .await
+        restarted_node_retaining(net, own, prune.then_some(HARNESS_PRUNE_RETAIN)).await
     }
+
+    /// The retain window `restarted_node` prunes to: the node's floor before
+    /// S3-4 (1,000), below today's (`dag_prune::MIN_RETAIN_BLOCKS` = the
+    /// 10,000-height undo window), so these fixtures stay a few thousand
+    /// blocks long.
+    const HARNESS_PRUNE_RETAIN: u64 = 1_000;
 
     /// [`restarted_node`] with the DAG store pruned to the last `retain`
     /// blocks (any window, below the node's configured minimum too).
@@ -2203,7 +2206,9 @@ mod tests {
             barren,
             h(main_tip),
             network_tip,
-            200,
+            // The heavier branch is a whole window long (S3-4): ~10,100 blocks
+            // to fetch at ~31 a round.
+            800,
         )
         .await;
         let lowest = watch.finish();
@@ -2227,8 +2232,9 @@ mod tests {
     async fn runtime_rebuild_refuses_an_equal_weight_head() {
         // An equal-length rival branch forking deeper than the reorg window:
         // only a rebuild from genesis could switch to it.
-        let fork = 1_200u64 - crate::canonical_apply::MAX_REORG_DEPTH - 5;
-        let net = net(fork, 1_200, 1_200);
+        let fork = 95u64;
+        let top = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
+        let net = net(fork, top, top);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
         let (n, _ndir) = restarted_node(&net, &own, false).await;
         let fx = n
@@ -2245,13 +2251,10 @@ mod tests {
         n.app.maybe_runtime_rebuild(h(rival)).await;
         let lowest = watch.finish();
         assert!(
-            lowest >= 1_200,
+            lowest >= top,
             "rebuilt toward an equal-weight head: {lowest}"
         );
-        assert_eq!(
-            n.applied(),
-            Some((h(net.side.last().expect("side")), 1_200))
-        );
+        assert_eq!(n.applied(), Some((h(net.side.last().expect("side")), top)));
     }
 
     /// The rebuild itself re-checks the prune floor: asked to rebuild toward
@@ -2259,12 +2262,13 @@ mod tests {
     /// tip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_rebuild_refuses_on_a_pruned_node() {
-        // The node's own branch is deeper than the reorg window.
+        // The node's own branch is deeper than the reorg window, its DAG store
+        // pruned at the fork point (so the heavier branch still admits).
         let fork = 1_199u64;
         let side_tip = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
         let net = net(fork, side_tip, side_tip + 40);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
-        let (n, _ndir) = restarted_node(&net, &own, true).await;
+        let (n, _ndir) = restarted_node_retaining(&net, &own, Some(side_tip - fork)).await;
         let fx = n
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
@@ -2315,10 +2319,14 @@ mod tests {
     }
 
     /// The same pruned node (150 retained) with its fork point deeper than the
-    /// reorg window (105 below its tip): still refused, as before. The node keeps its tip
-    /// and its state; an operator resync moves it.
+    /// in-memory snapshot ring (105 below its tip; the whole reorg window
+    /// before S3-4, when this was refused and the node kept its dead branch,
+    /// root cause H6). Since S3-4 the undo window is the prune retention, so
+    /// the restarted node switches in place from its undo records: the
+    /// durable tip never goes below the fork point (no rebuild from genesis,
+    /// which it refuses), and it ends on the heavier chain's state.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pruned_restart_deeper_than_the_window_still_refuses() {
+    async fn pruned_restart_deeper_than_the_ring_switches_from_the_undo_records() {
         let fork = 395u64;
         let net = net(fork, 500, 530);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
@@ -2328,24 +2336,30 @@ mod tests {
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
-        let own_tip = net.side.last().expect("side");
-        let root = n.executor.calculate_state_root();
+        let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
         n.app.drive_drain().await;
         let lowest = watch.finish();
-        assert_eq!(lowest, 500, "the durable tip never moved");
-        assert_eq!(n.applied(), Some((h(own_tip), 500)));
-        assert_eq!(n.executor.calculate_state_root(), root);
+        assert!(
+            lowest >= fork,
+            "the switch went below the fork point {fork}: lowest durable tip {lowest}"
+        );
+        assert_eq!(n.applied(), Some((h(main_tip), 530)));
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
+        assert!(
+            n.app.wedge().expect("read").is_none(),
+            "no dead-branch marker"
+        );
     }
 
     /// H6 (ADR-2026-11-03 CV-7, the r1006 bootnodes on 2026-11-03). A node
-    /// with its DAG store pruned (retain 5,000 here; 10,000 on the fleet) is
-    /// forked 5,000 blocks deep: its own branch runs 5,000 above the fork
-    /// point and the network's heavier chain reaches it (the fork-point search
-    /// found it). The undo records cover `MAX_REORG_DEPTH` = 100 heights and
-    /// the rebuild from genesis is refused on a pruned store
-    /// (`RebuildDecision::RefusePruned`), so the switch can never happen in
-    /// place. Before CV-7b/c the applied tip stayed on the dead branch for
+    /// with its DAG store pruned to the fleet's retention (10,000) is forked
+    /// deeper than it: its own branch runs `MAX_REORG_DEPTH + 100` above the
+    /// fork point and the network's heavier chain reaches it (the fork-point
+    /// search found it). The undo records cover `MAX_REORG_DEPTH` = 10,000
+    /// heights (the retention, S3-4; 100 before) and the rebuild from genesis
+    /// is refused on a pruned store (`RebuildDecision::RefusePruned`), so the
+    /// switch can never happen in place. Before CV-7b/c the applied tip stayed on the dead branch for
     /// good and the node kept serving and advertising it as its chain.
     ///
     /// It must recover with no operator action:
@@ -2360,12 +2374,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pruned_node_forked_beyond_undo_window_recovers() {
         use crate::cold_resync::{self, Decision, Policy};
+        // S3-4: deeper than the undo window (= the retention, 10,000), on a
+        // store pruned to that retention, so the fork point is below the DAG
+        // prune floor too.
+        let depth = crate::canonical_apply::MAX_REORG_DEPTH + 100;
         let fork = 100u64;
-        let side_tip = fork + 5_000;
+        let side_tip = fork + depth;
         let main_tip_height = side_tip + 50;
         let net = net(fork, side_tip, main_tip_height);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
-        let (n, ndir) = restarted_node_retaining(&net, &own, Some(5_000)).await;
+        // Pruned exactly at the fork point (the fixture's pre-S3-4 shape): a
+        // retention of `depth` (above the 10,000 floor), so the network's
+        // branch is above the floor and admits.
+        let (n, ndir) = restarted_node_retaining(&net, &own, Some(depth)).await;
         let fx = n
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
@@ -2396,7 +2417,7 @@ mod tests {
             (wedge.head, wedge.head_height),
             (h(main_tip), main_tip_height)
         );
-        assert_eq!(wedge.fork_depth(), 5_000);
+        assert_eq!(wedge.fork_depth(), depth);
         assert!(
             n.app
                 .dead_branch_handle()
@@ -2435,7 +2456,7 @@ mod tests {
         let state = citrate_api::node_rpc::sync_state_json(&n.storage, Some(main_tip_height))
             .expect("syncState");
         assert_eq!(state["state"], "wedged", "{state}");
-        assert_eq!(state["forkDepth"], 5_000, "{state}");
+        assert_eq!(state["forkDepth"], depth, "{state}");
         assert_eq!(state["appliedHeight"], side_tip, "{state}");
 
         // (c) The guarded cold resync: not before the grace period, then a
@@ -4579,7 +4600,7 @@ mod tests {
     #[test]
     fn an_endless_follow_ends_within_its_bound() {
         use crate::sync_peer::SPLIT_PULL_HEIGHT_BAND;
-        let depth = crate::canonical_apply::MAX_REORG_DEPTH;
+        let depth = crate::canonical_apply::SNAPSHOT_RING_DEPTH;
         for split in [true, false] {
             let mut t = RejoinTracker::new();
             let top = 500u64;

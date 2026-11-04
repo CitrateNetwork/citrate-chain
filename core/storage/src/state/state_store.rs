@@ -48,15 +48,19 @@ pub fn legacy_hydration_view(records: Vec<StorageRecord>) -> Vec<StorageRecord> 
 }
 
 /// Undo records are kept for this many applied heights: the node's reorg
-/// window (`canonical_apply::MAX_REORG_DEPTH`, which asserts it is equal). With
-/// the records of heights `t-99..=t` a node at tip `t` can rebuild the state of
-/// every height `t-100..=t` after a restart.
-pub const REORG_UNDO_DEPTH: u64 = 100;
-
-/// Largest undo record kept, encoded. A bigger one is skipped (the block is
-/// left without a record): it would only shorten the window a restart can
-/// rebuild, and it keeps one oversized block from bloating every commit.
-pub const MAX_UNDO_RECORD_BYTES: usize = 8 * 1024 * 1024;
+/// window (`canonical_apply::MAX_REORG_DEPTH`, which asserts it is equal),
+/// which is the DAG prune retention (ADR-2026-11-03 CV-7a, spec 06 §4.2:
+/// undo window = PRUNING_DEPTH = 10,000). With the records of heights
+/// `t-9_999..=t` a node at tip `t` can rebuild the state of every height
+/// `t-10_000..=t`, so any fork the DAG store still holds can be switched
+/// across in place.
+///
+/// Disk cost (S1-6, `undo_record_size_per_block_shape_s1_6`): about 131
+/// bytes per touched account and 101 per touched slot, so 4.8 MiB for
+/// 10,000 reward-only blocks and 255 MiB for 10,000 blocks of 100 transfers.
+/// Records are never dropped for their size (a missing record inside the
+/// window is a permanent wedge, root cause H6).
+pub const REORG_UNDO_DEPTH: u64 = 10_000;
 
 /// `CF_METADATA` key prefix of the undo records (big-endian height follows).
 /// Metadata, not a column family of its own, so a binary without it still
@@ -474,8 +478,7 @@ impl StateStore {
     /// shortens the window a restart can rebuild, so nothing here can fail the
     /// commit. Any error (a read, an encode, a staging write, the window scan)
     /// is logged and leaves the block without a record (a delete of its height
-    /// is staged last); a record over [`MAX_UNDO_RECORD_BYTES`] is skipped the
-    /// same way.
+    /// is staged last). A record is never skipped for its size.
     fn stage_block_undo(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -507,22 +510,12 @@ impl StateStore {
         }
     }
 
-    /// Stage `record`, or, over [`MAX_UNDO_RECORD_BYTES`] encoded, skip it
-    /// (a warning, and a delete of its height so no stale record stays).
+    /// Stage `record`, whatever its size: one RocksDB value. At the r1007
+    /// acceptance gas cap a record is bounded at about 2 MB (spec 06 §4.2);
+    /// a value of that size needs no chunking.
     fn stage_undo_record(&self, batch: &mut rocksdb::WriteBatch, record: &BlockUndo) -> Result<()> {
         let key = reorg_undo_key(record.height);
         let bytes = bincode::serialize(record)?;
-        if bytes.len() > MAX_UNDO_RECORD_BYTES {
-            warn!(
-                "reorg window: undo record of block {} @ {} is {} bytes (cap {}); not kept, a \
-                 restart can revert no further than this height",
-                record.hash,
-                record.height,
-                bytes.len(),
-                MAX_UNDO_RECORD_BYTES
-            );
-            return self.db.batch_delete_cf(batch, CF_METADATA, &key);
-        }
         self.db.batch_put_cf(batch, CF_METADATA, &key, &bytes)
     }
 
@@ -613,7 +606,6 @@ impl StateStore {
     /// Stage a reorg's undo records (the winning branch's, computed by the
     /// node from its in-memory states) and drop every other record outside the
     /// window at the new tip `tip`, including the abandoned branch's above it.
-    /// A record over [`MAX_UNDO_RECORD_BYTES`] is skipped.
     ///
     /// Fail-soft, as [`Self::stage_block_undo`]: an error is logged and the
     /// branch's heights are left without records; the reorg commit goes on.
@@ -635,16 +627,47 @@ impl StateStore {
     }
 
     /// Delete, in `batch`, every kept record outside the window at `tip`.
+    ///
+    /// Reads only the keys outside the window: those at or below
+    /// `tip - REORG_UNDO_DEPTH` and those above `tip` (keys sort by
+    /// big-endian height). On a linear commit that is the one record that just
+    /// left the window, so the cost per block does not grow with the window.
     fn stage_undo_window(&self, batch: &mut rocksdb::WriteBatch, tip: u64) -> Result<()> {
         #[cfg(test)]
         if test_undo_faults::fail_staging() {
             anyhow::bail!("injected undo staging failure");
         }
-        for height in self.reorg_undo_heights()? {
-            if !in_undo_window(height, tip) {
-                self.db
-                    .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?;
+        let floor = tip.saturating_sub(REORG_UNDO_DEPTH);
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        let mut collect = |key: &[u8]| {
+            if let Some(h) = reorg_undo_height(key) {
+                if !in_undo_window(h, tip) {
+                    doomed.push(key.to_vec());
+                }
             }
+            Ok(())
+        };
+        // Heights 0..=floor (all of them when the tip is inside the first window).
+        let below_end = floor.checked_add(1).map(reorg_undo_key);
+        self.db.for_each_key_in_range_cf(
+            CF_METADATA,
+            &reorg_undo_key(0),
+            below_end.as_deref(),
+            REORG_UNDO_PREFIX,
+            &mut collect,
+        )?;
+        // Heights above the tip.
+        if let Some(above) = tip.checked_add(1) {
+            self.db.for_each_key_in_range_cf(
+                CF_METADATA,
+                &reorg_undo_key(above),
+                None,
+                REORG_UNDO_PREFIX,
+                &mut collect,
+            )?;
+        }
+        for key in doomed {
+            self.db.batch_delete_cf(batch, CF_METADATA, &key)?;
         }
         Ok(())
     }
@@ -1152,7 +1175,15 @@ mod tests {
         let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
         let a = Address([1; 20]);
         let none = ReceiptIndexBatch::default();
-        for h in 1..=150u64 {
+        let d = REORG_UNDO_DEPTH;
+        let top = d + 50;
+        let other = |h: u64| {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&h.to_be_bytes());
+            b[31] = 0xC2;
+            Hash::new(b)
+        };
+        for h in 1..=top {
             store
                 .write_state_batch_with_applied_tip(
                     &[(a, acct(h))],
@@ -1165,21 +1196,31 @@ mod tests {
         }
         assert_eq!(
             store.reorg_undo_heights().expect("heights"),
-            (51..=150).collect::<Vec<u64>>()
+            (51..=top).collect::<Vec<u64>>()
         );
-        // Revert to a fork point at 140: no records passed, nothing changes.
+        // Revert to a fork point at top - 10: no records passed, nothing changes.
+        let fork = top - 10;
         store
-            .write_reorg_batch_sync(&[], &[], &[], &[], Some((block_hash(140), 140)), &none, &[])
+            .write_reorg_batch_sync(
+                &[],
+                &[],
+                &[],
+                &[],
+                Some((block_hash(fork), fork)),
+                &none,
+                &[],
+            )
             .expect("commit");
         assert_eq!(
             store.reorg_undo_heights().expect("heights"),
-            (51..=150).collect::<Vec<u64>>()
+            (51..=top).collect::<Vec<u64>>()
         );
-        // The winning branch 141..=145 commits with its records.
-        let winner: Vec<BlockUndo> = (141..=145u64)
+        // The winning branch fork+1..=fork+5 commits with its records.
+        let win_tip = fork + 5;
+        let winner: Vec<BlockUndo> = (fork + 1..=win_tip)
             .map(|h| BlockUndo {
                 height: h,
-                hash: Hash::new([h as u8; 32]),
+                hash: other(h),
                 parent: None,
                 accounts: vec![(a, Some(acct(h - 1)))],
                 storage: vec![],
@@ -1192,23 +1233,26 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                Some((Hash::new([145; 32]), 145)),
+                Some((other(win_tip), win_tip)),
                 &none,
                 &winner,
             )
             .expect("commit");
         assert_eq!(
             store.reorg_undo_heights().expect("heights"),
-            (46..=145).filter(|h| *h >= 51).collect::<Vec<u64>>(),
-            "abandoned 146..=150 dropped; nothing below the window"
+            (51..=win_tip).collect::<Vec<u64>>(),
+            "abandoned heights above {win_tip} dropped; nothing below the window"
         );
         assert_eq!(
-            store.get_reorg_undo(143).expect("read").map(|r| r.hash),
-            Some(Hash::new([143; 32]))
+            store
+                .get_reorg_undo(fork + 3)
+                .expect("read")
+                .map(|r| r.hash),
+            Some(other(fork + 3))
         );
         assert_eq!(
-            store.get_reorg_undo(140).expect("read").map(|r| r.hash),
-            Some(block_hash(140)),
+            store.get_reorg_undo(fork).expect("read").map(|r| r.hash),
+            Some(block_hash(fork)),
             "the shared chain's records stay"
         );
     }
@@ -1319,80 +1363,6 @@ mod tests {
                 assert!(!stmt.ends_with('?'), "{call} propagates an error: {stmt}");
             }
         }
-    }
-
-    /// An undo record larger than the cap is not kept (a warning, no record
-    /// at that height); the commit itself goes through. Linear and reorg alike.
-    #[test]
-    fn an_oversized_undo_record_is_skipped() {
-        let temp_dir = TempDir::new().expect("tempdir");
-        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
-        let a = Address([1; 20]);
-        let none = ReceiptIndexBatch::default();
-        let big = vec![0xAB; MAX_UNDO_RECORD_BYTES + 1];
-        store
-            .write_state_batch_with_applied_tip(
-                &[(a, acct(1))],
-                &[slot(a, b"big", Some(&big))],
-                Some((block_hash(1), 1)),
-                &none,
-                None,
-            )
-            .expect("block 1");
-        // Block 2 overwrites the big slot: its pre-image is over the cap.
-        store
-            .write_state_batch_with_applied_tip(
-                &[(a, acct(2))],
-                &[slot(a, b"big", Some(b"small"))],
-                Some((block_hash(2), 2)),
-                &none,
-                None,
-            )
-            .expect("block 2 commits");
-        assert_eq!(store.durable_tip().expect("tip"), Some((block_hash(2), 2)));
-        assert!(
-            store.get_reorg_undo(2).expect("read").is_none(),
-            "an oversized record is not kept"
-        );
-        assert!(store.get_reorg_undo(1).expect("read").is_some());
-        // A reorg's winning record over the cap is skipped; the others are kept.
-        let records = [
-            BlockUndo {
-                height: 3,
-                hash: block_hash(3),
-                parent: Some((block_hash(2), 2)),
-                accounts: vec![(a, Some(acct(2)))],
-                storage: vec![(a, b"big".to_vec(), Some(big.clone()))],
-                models_jobs: Some(Default::default()),
-            },
-            BlockUndo {
-                height: 4,
-                hash: block_hash(4),
-                parent: Some((block_hash(3), 3)),
-                accounts: vec![(a, Some(acct(3)))],
-                storage: vec![],
-                models_jobs: Some(Default::default()),
-            },
-        ];
-        store
-            .write_reorg_batch_sync(
-                &[(a, acct(4))],
-                &[],
-                &[],
-                &[],
-                Some((block_hash(4), 4)),
-                &none,
-                &records,
-            )
-            .expect("reorg commits");
-        assert!(
-            store.get_reorg_undo(3).expect("read").is_none(),
-            "an oversized winning record is not kept"
-        );
-        assert_eq!(
-            store.get_reorg_undo(4).expect("read").map(|r| r.hash),
-            Some(block_hash(4))
-        );
     }
 
     /// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2): an undo record is never
@@ -1536,8 +1506,8 @@ mod tests {
             )
             .expect("seed");
         let measure = |height: u64,
-                           accounts: Vec<(Address, AccountState)>,
-                           storage: Vec<StateStorageChange>|
+                       accounts: Vec<(Address, AccountState)>,
+                       storage: Vec<StateStorageChange>|
          -> (usize, usize, usize) {
             let (na, ns) = (accounts.len(), storage.len());
             store
@@ -1599,6 +1569,7 @@ mod tests {
             "reward-only record: {} bytes",
             reward_only.0
         );
-        assert!(native.0 < MAX_UNDO_RECORD_BYTES && tokens.0 < MAX_UNDO_RECORD_BYTES);
+        // Far below the 8 MiB cap the records once had (removed by S3-4).
+        assert!(native.0 < 8 * 1024 * 1024 && tokens.0 < 8 * 1024 * 1024);
     }
 }
