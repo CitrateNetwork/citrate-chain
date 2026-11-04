@@ -2211,6 +2211,178 @@ mod tests {
         assert_eq!(n.executor.calculate_state_root(), root);
     }
 
+    /// H6 (ADR-2026-11-03 CV-7, the r1006 bootnodes on 2026-11-03). A node
+    /// with its DAG store pruned (retain 5,000 here; 10,000 on the fleet) is
+    /// forked 5,000 blocks deep: its own branch runs 5,000 above the fork
+    /// point and the network's heavier chain reaches it (the fork-point search
+    /// found it). The undo records cover `MAX_REORG_DEPTH` = 100 heights and
+    /// the rebuild from genesis is refused on a pruned store
+    /// (`RebuildDecision::RefusePruned`), so the switch can never happen in
+    /// place. Before CV-7b/c the applied tip stayed on the dead branch for
+    /// good and the node kept serving and advertising it as its chain.
+    ///
+    /// It must recover with no operator action:
+    /// (a) the refused switch marks the branch dead, durably: the node stops
+    ///     serving it as current (`serve_blocks` / `serve_headers`), stops
+    ///     advertising it as its head, and the producer gate is raised;
+    /// (b) `syncState` reports `wedged` with the fork depth;
+    /// (c) after the grace period the guarded cold resync moves the chain
+    ///     database aside (kept, not deleted), keeps the node identity, and
+    ///     the restarted node syncs from genesis via its peer onto the
+    ///     network's chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_node_forked_beyond_undo_window_recovers() {
+        use crate::cold_resync::{self, Decision, Policy};
+        let fork = 100u64;
+        let side_tip = fork + 5_000;
+        let main_tip_height = side_tip + 50;
+        let net = net(fork, side_tip, main_tip_height);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, ndir) = restarted_node_retaining(&net, &own, Some(5_000)).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let main_tip = net.main.last().expect("main");
+        let dead_tip = net.side.last().expect("side");
+        let fork_hash = h(net.prefix.last().expect("prefix"));
+        n.app.drive_drain().await;
+        assert_eq!(
+            n.applied(),
+            Some((h(dead_tip), side_tip)),
+            "fixture: the switch is refused on the pruned node"
+        );
+
+        // (a) The dead branch is marked, durably.
+        let wedge = n
+            .app
+            .wedge()
+            .expect("marker read")
+            .expect("the refused switch marks the applied branch dead");
+        assert_eq!(
+            (wedge.dead_tip, wedge.dead_tip_height),
+            (h(dead_tip), side_tip)
+        );
+        assert_eq!((wedge.fork_point, wedge.fork_height), (fork_hash, fork));
+        assert_eq!(
+            (wedge.head, wedge.head_height),
+            (h(main_tip), main_tip_height)
+        );
+        assert_eq!(wedge.fork_depth(), 5_000);
+        assert!(
+            n.app
+                .dead_branch_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the producer gate's dead-branch flag is raised"
+        );
+        let reopened = CanonicalApplicator::new(n.executor.clone(), n.storage.clone());
+        assert!(
+            reopened
+                .dead_branch_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the marker survives a restart"
+        );
+        drop(reopened);
+        let side: HashSet<Hash> = net.side.iter().map(h).collect();
+        let served = block_serve::serve_blocks(&n.storage, &fork_hash, 512);
+        assert!(
+            served.iter().all(|b| !side.contains(&h(b))),
+            "a dead-branch block was served as this node's chain"
+        );
+        assert!(
+            served.iter().any(|b| b.header.height > fork),
+            "the network's blocks the node holds are still served"
+        );
+        assert!(
+            block_serve::serve_headers(&n.storage, &fork_hash, 2_048).is_empty(),
+            "headers above the fork point come from the dead branch's height index"
+        );
+        assert_eq!(
+            cold_resync::advertised_head(&n.storage),
+            Some((fork_hash, fork)),
+            "the node advertises its fork point, not the dead tip"
+        );
+
+        // (b) syncState over RPC.
+        let state = citrate_api::node_rpc::sync_state_json(&n.storage, Some(main_tip_height))
+            .expect("syncState");
+        assert_eq!(state["state"], "wedged", "{state}");
+        assert_eq!(state["forkDepth"], 5_000, "{state}");
+        assert_eq!(state["appliedHeight"], side_tip, "{state}");
+
+        // (c) The guarded cold resync: not before the grace period, then a
+        // request the next start carries out.
+        let policy = Policy::from(&crate::config::RecoveryConfig::default());
+        assert!(matches!(
+            cold_resync::evaluate(&n.app, ndir.path(), policy, false, wedge.since_unix)
+                .expect("evaluate"),
+            Decision::Waiting { .. }
+        ));
+        let now = wedge.since_unix + policy.after_secs;
+        assert!(matches!(
+            cold_resync::evaluate(&n.app, ndir.path(), policy, false, now).expect("evaluate"),
+            Decision::Resync(_)
+        ));
+        std::fs::write(ndir.path().join("noise.key"), b"node identity").expect("identity");
+        // The process exits (every handle on the chain database closes) and
+        // the supervisor starts it again: start_node runs apply_pending
+        // before it opens the chain database.
+        drop(n);
+        let aside = cold_resync::apply_pending_at(ndir.path(), policy, now + 1)
+            .expect("apply")
+            .expect("the chain database is moved aside");
+        assert_eq!(
+            std::fs::read(ndir.path().join("noise.key")).expect("identity kept"),
+            b"node identity"
+        );
+        {
+            let old = StorageManager::new(&aside, PruningConfig::default()).expect("aside opens");
+            assert_eq!(
+                old.blocks.get_applied_tip().expect("read"),
+                Some((h(dead_tip), side_tip)),
+                "the old chain database is kept intact"
+            );
+        }
+        let storage = Arc::new(
+            StorageManager::new(ndir.path(), PruningConfig::default()).expect("fresh store"),
+        );
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("read"),
+            None,
+            "the node starts on an empty chain database"
+        );
+        storage.blocks.put_block(&net.genesis).expect("genesis");
+        storage
+            .blocks
+            .put_applied_tip(&h(&net.genesis), 0)
+            .expect("genesis tip");
+        let (fresh, _dag) = wire_persistent(storage, &net.genesis, None).await;
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let mut tracker = RejoinTracker::new();
+        let run = drive(
+            &fresh,
+            &mut tracker,
+            &peer,
+            h(main_tip),
+            main_tip_height,
+            400,
+        )
+        .await;
+        assert_eq!(
+            fresh.applied(),
+            Some((h(main_tip), main_tip_height)),
+            "the resynced node did not reach the network's chain after {} rounds",
+            run.rounds
+        );
+        assert_eq!(fresh.executor.calculate_state_root(), main_tip.state_root);
+        assert!(fresh.app.wedge().expect("read").is_none());
+        let state = citrate_api::node_rpc::sync_state_json(&fresh.storage, Some(main_tip_height))
+            .expect("syncState");
+        assert_eq!(state["state"], "synced", "{state}");
+    }
+
     /// The node's applicator is built with the DAG prune floor wired, on the
     /// same DAG store fork choice reads: without it a pruned node rebuilds
     /// from genesis after a restart (see the `pruned_restart_*` tests).
