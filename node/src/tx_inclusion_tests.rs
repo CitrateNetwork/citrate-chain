@@ -446,3 +446,92 @@ fn produced_block_line_reports_the_stored_blocks_height_and_tx_count() {
     let missing = crate::producer::produced_block_line(&blk.header.block_hash, None, 25);
     assert!(!missing.contains("txs="), "no guessed count: {missing}");
 }
+
+/// A partition long enough that the losing side's abandoned run is deeper than
+/// the in-memory snapshot ring (`SNAPSHOT_RING_DEPTH`, 100). `shared` blocks are
+/// sealed by A and received by B first (the fork point is at that height); then
+/// A seals `a_run` blocks alone, the first one carrying the sender's nonce-0 tx,
+/// and B seals `b_run` blocks alone (B's branch is the heavier one). A then
+/// receives B's branch. Returns the tx and B's tip.
+async fn deep_partition(
+    a: &TxNode,
+    b: &TxNode,
+    shared: usize,
+    a_run: usize,
+    b_run: usize,
+) -> (Transaction, Block) {
+    for _ in 0..shared {
+        let blk = a.produce().await;
+        b.receive(&blk).await;
+    }
+    let t0 = transfer(0);
+    a.submit(&t0).await;
+    let a1 = a.produce().await;
+    assert!(a1.transactions.iter().any(|t| t.hash == t0.hash));
+    for _ in 1..a_run {
+        a.produce().await;
+    }
+    assert_eq!(a.sender_nonce(), 1, "A executed its own block");
+    let mut b_branch = Vec::new();
+    for _ in 0..b_run {
+        b_branch.push(b.produce().await);
+    }
+    for blk in &b_branch {
+        a.receive(blk).await;
+    }
+    let tip = b_branch.last().expect("B's branch").clone();
+    assert_eq!(
+        a.app.applied_tip().await.hash,
+        tip.header.block_hash,
+        "A follows B's heavier branch"
+    );
+    assert_eq!(a.sender_nonce(), 0, "the tx is not executed on B's branch");
+    (t0, tip)
+}
+
+/// S3-4 x tx-inclusion: a fork point below the snapshot ring is switched in
+/// place from the undo records on disk (`revert_from_undo`), and the abandoned
+/// blocks' still-valid txs return to the pool exactly as on a shallow reorg.
+#[tokio::test]
+async fn deep_reorg_below_the_ring_reinjects_the_abandoned_txs() {
+    let (a, b) = fleet().await;
+    let depth = crate::canonical_apply::SNAPSHOT_RING_DEPTH as usize + 10;
+    let (t0, _) = deep_partition(&a, &b, 2, depth, depth + 2).await;
+    assert!(
+        a.mempool.contains(&t0.hash).await,
+        "the deep reorg ({depth} blocks abandoned) did not return the tx to A's pool"
+    );
+    let blk = a.produce().await;
+    assert!(
+        blk.transactions.iter().any(|t| t.hash == t0.hash),
+        "A includes the re-injected tx in its next block"
+    );
+    b.receive(&blk).await;
+    assert_eq!(a.sender_nonce(), 1);
+    assert_eq!(b.sender_nonce(), 1);
+}
+
+/// The from-genesis rebuild (`recover_automatic`, the drain's fallback when the
+/// fork point has no ring snapshot and no undo walk applies: here the fork point
+/// is genesis itself, below the ring) switches branches too, so it must return
+/// the abandoned blocks' still-valid txs to the pool like `reorg_to` does. The
+/// tx-inclusion lane recorded that it did not (07: "the deep-reorg path does
+/// not re-inject").
+#[tokio::test]
+async fn from_genesis_rebuild_reinjects_the_abandoned_txs() {
+    let (a, b) = fleet().await;
+    let depth = crate::canonical_apply::SNAPSHOT_RING_DEPTH as usize + 10;
+    let (t0, _) = deep_partition(&a, &b, 0, depth, depth + 2).await;
+    assert!(
+        a.mempool.contains(&t0.hash).await,
+        "the rebuild ({depth} blocks abandoned) did not return the tx to A's pool"
+    );
+    let blk = a.produce().await;
+    assert!(
+        blk.transactions.iter().any(|t| t.hash == t0.hash),
+        "A includes the re-injected tx in its next block"
+    );
+    b.receive(&blk).await;
+    assert_eq!(a.sender_nonce(), 1);
+    assert_eq!(b.sender_nonce(), 1);
+}
