@@ -9123,6 +9123,92 @@ mod tests {
             assert!((60..=70).contains(&at), "sealed at {at}s");
         }
 
+        /// A stored-shape block for the contender check: `hash` and `vrf` fill
+        /// every byte of the block hash and the VRF output, blue work is the G7
+        /// value for `blue_score`. Not signed: the check reads recorded blocks.
+        fn keyed(height: u64, parent: Hash, proposer: u8, vrf: u8, hash: u8) -> Block {
+            let mut x = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .proposer(PublicKey::new([proposer; 32]))
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([vrf; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            x.header.block_hash = Hash::new([hash; 32]);
+            x
+        }
+
+        /// The gate's verdict on `head`'s recorded branches against this node's
+        /// own best tip `own`.
+        fn gate_contender(head: &AttestedNetworkHead, own: &BlockHeader) -> Option<Contender> {
+            let inner = head.handle();
+            inner.contender(
+                inner.now_instant(),
+                |_| false,
+                (own.blue_score, own.block_hash),
+            )
+        }
+
+        /// r1007 07 finding 4 (S3-1 against CV-5). Fork choice ranks tips by
+        /// `ForkChoiceKey` (blue work, then VRF output, then hash, spec G8);
+        /// the CV-5 gate must judge a branch it cannot admit by the same order,
+        /// or on an equal-blue-work tie the two disagree about which side is
+        /// preferred: the gate then holds B off a branch fork choice ranks
+        /// below B's tip, or lets B seal next to one fork choice ranks above.
+        ///
+        /// Seven producers, three of them (more than a third) on one branch B
+        /// cannot admit. Its top and B's own tip have equal blue work. In each
+        /// case the VRF order and the hash order point opposite ways.
+        #[test]
+        fn cv5_contender_tie_break_matches_fork_choice() {
+            use citrate_consensus::types::ForkChoiceKey;
+            // (own vrf, own hash, branch-top vrf, branch-top hash)
+            let cases = [
+                // Branch top: larger VRF output, larger hash. Fork choice
+                // prefers the branch; a smaller-hash tie-break prefers B's tip.
+                (0x10u8, 0x01u8, 0xF0u8, 0xF3u8),
+                // Branch top: smaller VRF output, smaller hash. Fork choice
+                // prefers B's tip; a smaller-hash tie-break prefers the branch.
+                (0xF0, 0xF3, 0x10, 0x01),
+            ];
+            for (own_vrf, own_hash, top_vrf, top_hash) in cases {
+                let head = AttestedNetworkHead::new();
+                let inner = head.handle();
+                for i in 1..=6u8 {
+                    inner.known_proposers.lock().insert(PublicKey::new([i; 32]));
+                }
+                let now = inner.now_instant();
+                // A linear branch on a root B never received, by proposers 1..=3.
+                let b1 = keyed(40, Hash::new([0xA0; 32]), 1, 0x30, 0xB1);
+                let b2 = keyed(41, b1.header.block_hash, 2, 0x31, 0xB2);
+                let top = keyed(42, b2.header.block_hash, 3, top_vrf, top_hash);
+                for b in [&b1, &b2, &top] {
+                    head.record_deferred_block(b, now);
+                }
+                // B's own best tip: same height, so the same blue work.
+                let own = keyed(42, Hash::new([0xC0; 32]), 7, own_vrf, own_hash);
+                assert_eq!(own.header.blue_work, top.header.blue_work, "fixture: a tie");
+
+                let fork_choice_prefers_branch =
+                    ForkChoiceKey::of_header(&top.header) > ForkChoiceKey::of_header(&own.header);
+                let verdict = gate_contender(&head, &own.header)
+                    .expect("an equal-work branch backed by three of seven is a contender");
+                assert_eq!(
+                    verdict.preferred, fork_choice_prefers_branch,
+                    "CV-5 gate and fork choice disagree on an equal-blue-work tie \
+                     (own vrf {own_vrf:#x} hash {own_hash:#x}, branch top vrf {top_vrf:#x} \
+                     hash {top_hash:#x})"
+                );
+            }
+        }
+
         /// The quorum sizes the guard uses: a strict majority of the producer set
         /// (the node itself plus the known proposers), never satisfiable alone.
         #[test]
