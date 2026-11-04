@@ -452,7 +452,8 @@ pub enum RebuildRefusal {
     /// the applied chain. A missing (or pruned) ancestor is not divergence.
     MissingAncestor { missing: Hash },
     /// Fork choice does not rank the head above the applied tip (higher score;
-    /// equal scores to the smaller hash), or does not score the head at all:
+    /// on equal scores fork choice's ForkChoiceKey, r1007 G8), or does not
+    /// score the head at all:
     /// nothing justifies abandoning the tip.
     NotHeavier { head: u64, tip: u64 },
     /// A storage read failed; nothing was concluded.
@@ -1379,8 +1380,8 @@ impl CanonicalApplicator {
     }
 
     /// Whether fork choice ranks `head` above the applied `tip`, in its own
-    /// total order (`GhostDag::select_tip`: higher blue score, equal scores to
-    /// the SMALLEST hash). Fork choice already picked `head` among every block
+    /// total order (`GhostDag::select_tip`: the largest ForkChoiceKey
+    /// `(blue_work, vrf_output, hash)`, r1007 G8). Fork choice already picked `head` among every block
     /// it scores, so a tip it does not score (a dropped stale branch, a sibling
     /// the by-height rehydration never registered) is ranked below it, as is
     /// every tip when no weight source is wired (a fixed fork-choice cell).
@@ -1396,8 +1397,19 @@ impl CanonicalApplicator {
             return Ok(());
         };
         // The tie-break is what converges a node restarted on the losing one of
-        // two equal-score siblings (2026-08-06).
-        if h > t || (h == t && head < tip) {
+        // two equal-score siblings (2026-08-06). r1007 G8: on equal scores the
+        // order is fork choice's ForkChoiceKey (blue work, VRF output, hash),
+        // read from the two committed headers. An unreadable header refuses.
+        let key = |hash: Hash| {
+            self.storage
+                .blocks
+                .get_block(&hash)
+                .ok()
+                .flatten()
+                .map(|b| citrate_consensus::types::ForkChoiceKey::of_header(&b.header))
+        };
+        let tie_won = h == t && matches!((key(head), key(tip)), (Some(a), Some(b)) if a > b);
+        if h > t || tie_won {
             Ok(())
         } else {
             Err(RebuildRefusal::NotHeavier { head: h, tip: t })
@@ -2695,7 +2707,8 @@ impl CanonicalApplicator {
     /// Test-only since 2026-10-28: the node's own triggers go through
     /// [`Self::recover_automatic`], which adds the strictly-heavier and prune-floor
     /// rules. This entry keeps fork choice's own order (equal scores to the
-    /// smaller hash), so tests can pin the rebuild mechanics directly.
+    /// larger ForkChoiceKey, r1007 G8), so tests can pin the rebuild mechanics
+    /// directly.
     #[cfg(test)]
     pub async fn recover_to_head(
         &self,
@@ -3863,7 +3876,7 @@ impl std::fmt::Display for RebuildDecision {
 /// except an applied tip that is not held at all (`tip_held == false`).
 ///
 /// Weight is the blue score: GhostDAG fork choice (`select_tip`) ranks tips by
-/// blue score and breaks ties by the smaller hash, and a header's blue work is
+/// blue score and breaks ties by the ForkChoiceKey (r1007 G8), and a header's blue work is
 /// a pure function of its blue score (`blue_work_for_score`, enforced at
 /// admission), so "strictly heavier by blue work" and "strictly higher blue
 /// score" are the same test. The hash tie-break is not weight: a head that
@@ -4940,7 +4953,10 @@ pub(crate) mod tests {
         let r = roots(1);
         let s_a = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
         let s_b = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x5B; 32]);
-        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+        let (winner, loser) = if citrate_consensus::types::ForkChoiceKey::of_header(&s_a.header)
+            > citrate_consensus::types::ForkChoiceKey::of_header(&s_b.header)
+        {
+            // r1007 G8: the winner is the larger ForkChoiceKey (was: the smaller hash).
             (s_a, s_b)
         } else {
             (s_b, s_a)
@@ -5136,7 +5152,10 @@ pub(crate) mod tests {
         let r = roots(2);
         let s_a = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
         let s_b = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x5B; 32]);
-        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+        let (winner, loser) = if citrate_consensus::types::ForkChoiceKey::of_header(&s_a.header)
+            > citrate_consensus::types::ForkChoiceKey::of_header(&s_b.header)
+        {
+            // r1007 G8: the winner is the larger ForkChoiceKey (was: the smaller hash).
             (s_a, s_b)
         } else {
             (s_b, s_a)
@@ -5211,11 +5230,14 @@ pub(crate) mod tests {
         let r = roots(2);
         let a1 = genesis.clone();
         // Two equal-score siblings at height 2 (reward-only state root, distinct VRF
-        // → distinct hash). GhostDag::select_tip breaks the tie by SMALLEST hash.
+        // → distinct hash). GhostDag::select_tip breaks the tie by the larger ForkChoiceKey (r1007 G8).
         let s_a = mk_block_scored(1, a1.header.block_hash, r[0], 1, VRF_OUT);
         let s_b = mk_block_scored(1, a1.header.block_hash, r[0], 1, [0x5B; 32]);
         assert_ne!(s_a.header.block_hash, s_b.header.block_hash);
-        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+        let (winner, loser) = if citrate_consensus::types::ForkChoiceKey::of_header(&s_a.header)
+            > citrate_consensus::types::ForkChoiceKey::of_header(&s_b.header)
+        {
+            // r1007 G8: the winner is the larger ForkChoiceKey (was: the smaller hash).
             (s_a, s_b)
         } else {
             (s_b, s_a)
@@ -5251,7 +5273,7 @@ pub(crate) mod tests {
         assert_eq!(
             ghostdag.select_tip().await.expect("select_tip"),
             winner.header.block_hash,
-            "fork choice picks the smallest-hash sibling"
+            "fork choice picks the larger-key sibling (r1007 G8)"
         );
 
         // SIMULATE RESTART: a fresh applicator seeds the ring from the persisted tip
@@ -5293,7 +5315,7 @@ pub(crate) mod tests {
                 hash: winner.header.block_hash,
                 height: 1
             },
-            "recovered node converged onto the canonical (smallest-hash) winner"
+            "recovered node converged onto the canonical (larger-key) winner"
         );
         // It is now a normal, canonical tip: a further drain is a stable no-op.
         app2.drive_drain().await;
@@ -5337,7 +5359,10 @@ pub(crate) mod tests {
         let a1 = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
         let s_a = mk_block_scored(2, a1.header.block_hash, r[1], 2, VRF_OUT);
         let s_b = mk_block_scored(2, a1.header.block_hash, r[1], 2, [0x5B; 32]);
-        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+        let (winner, loser) = if citrate_consensus::types::ForkChoiceKey::of_header(&s_a.header)
+            > citrate_consensus::types::ForkChoiceKey::of_header(&s_b.header)
+        {
+            // r1007 G8: the winner is the larger ForkChoiceKey (was: the smaller hash).
             (s_a, s_b)
         } else {
             (s_b, s_a)
@@ -5418,7 +5443,10 @@ pub(crate) mod tests {
         let a1 = genesis.clone();
         let s_a = mk_block_scored(1, a1.header.block_hash, r[0], 1, VRF_OUT);
         let s_b = mk_block_scored(1, a1.header.block_hash, r[0], 1, [0x5B; 32]);
-        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+        let (winner, loser) = if citrate_consensus::types::ForkChoiceKey::of_header(&s_a.header)
+            > citrate_consensus::types::ForkChoiceKey::of_header(&s_b.header)
+        {
+            // r1007 G8: the winner is the larger ForkChoiceKey (was: the smaller hash).
             (s_a, s_b)
         } else {
             (s_b, s_a)

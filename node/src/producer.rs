@@ -2796,32 +2796,10 @@ impl BlockProducer {
             }
         }
 
-        // PIL-13: removed the `temp_block` builder + `calculate_blue_set`
-        // call here. The temp_block was only used to feed
-        // calculate_blue_set, which (because BlueSet.blocks is the
-        // cumulative O(N) blue ancestry) walked back O(N) ancestors on cold
-        // cache and OOM'd the box. We derive blue_score from the parent's
-        // header instead.
-        //
-        // PIL-13: derive blue_score from the parent's header instead of
-        // calling calculate_blue_set on a fresh-from-thin-air block.
-        //
-        // Why this is safe for testnet-beta (single-producer pilot):
-        //   * The new block's blue_score is parent.blue_score + 1 + |blue merge
-        //     contributions|.
-        //   * For single-producer chains the merge_parents set is either
-        //     empty or shallow (this producer is the only source of blocks),
-        //     so the +1 approximation matches what the full GhostDAG
-        //     algorithm would yield to within one or two units.
-        //   * The full BlueSet is only an input to calculate_blue_work, and
-        //     that function (see calculate_blue_work below) only reads
-        //     blue_score — the `_blue_set` parameter is unused.
-        //   * select_tip reads only `relation.blue_set.score`, not `.blocks`.
-        //
-        // When multi-validator ships post-pilot, this path needs the full
-        // calculate_blue_set call back, with the BlueSet persistence rework
-        // also in place so it doesn't re-trigger PIL-13. Tracked as a
-        // follow-up below.
+        // PIL-13 / r1007 S3-1: the header's blue_score / blue_work are computed
+        // below by `GhostDag::compute_ghostdag`, which reads headers and the
+        // persisted GHOSTDAG records of the window only (no cumulative blue set,
+        // so nothing O(chain) is materialised), for a block that is not stored.
         //
         // Read parent's height + VRF + blue_score in one storage hit.
         //
@@ -2844,7 +2822,7 @@ impl BlockProducer {
         // Failing loudly is strictly better: a missing selected parent means this
         // node's view is behind, so the correct behaviour is to skip this round
         // and let the sync path fetch the block, not to mint an invalid one.
-        let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work, parent_ts) =
+        let (last_height, parent_vrf_output, parent_blue_score, _parent_blue_work, parent_ts) =
             if selected_parent != Hash::default() {
                 let parent = self
                     .storage
@@ -2877,52 +2855,41 @@ impl BlockProducer {
                 (0, Hash::default(), 0, 0, None)
             };
 
-        // BLUE SCORE — `parent_blue_score + 1`, deliberately.
-        //
-        // REGRESSION HISTORY (2026-07-27): a previous "fix" replaced this with a
-        // real `ghostdag.calculate_blue_set(&candidate)` call whenever
-        // `merge_parents` was non-empty, on the reasoning that GHOSTDAG blue score
-        // is the parent's score plus the blue blocks in the mergeset, so `+1` is an
-        // approximation. The reasoning is right. The implementation was not, and it
-        // walled off the chain.
-        //
-        // `calculate_blue_set` resolves a block through the DAG STORE. The candidate
-        // here has not been stored — it does not exist yet, that is the point of
-        // producing it — so the calculation returned the ancestry's score WITHOUT
-        // counting the new block itself. Live result on 40204: block 4028 was
-        // produced with blue_score 4028, identical to its parent, while
-        // `validate_block_consistency` requires the band `[sp+1, sp+1+|merges|]` =
-        // `[4029, 4030]`. Every follower rejected it:
-        //
-        //     Rejected inconsistent synced block 55f933a0 @ 4028: consistency:
-        //     Header blue_score 4028 outside feasible range [4029, 4030]
-        //
-        // Blocks carrying merge parents are rare on this fleet, so exactly one bad
-        // block was enough — every node stalled at 4027 and retried forever while
-        // the producer ran on alone to 19,000+. A silent, unrecoverable partition.
-        //
-        // `parent_blue_score + 1` is ALWAYS inside the feasible band (it is the
-        // band's minimum), so it can never be rejected. It under-counts a non-empty
-        // mergeset, which is a known, bounded, DOCUMENTED approximation —
-        // `ghostdag.rs::validate_block_consistency` says so explicitly: "the
-        // producer itself currently writes the parent+1 approximation ... exact
-        // k-cluster equality is deliberately deferred to the BlueSet-persistence
-        // rework tracked since PIL-13".
-        //
-        // Making this exact requires that rework — computing the mergeset for a
-        // block that is not yet in the store — not a call into a function whose
-        // contract assumes it is. Until then, in-band and correct beats exact and
-        // rejected.
-        let mut blue_set = citrate_consensus::types::BlueSet::new();
+        // BLUE SCORE. History: until r1007 this was `parent_blue_score + 1`,
+        // deliberately, because exact GHOSTDAG needed the mergeset of a block not
+        // yet in the store and an earlier attempt through `calculate_blue_set`
+        // under-counted it (block 4028 on 40204, 2026-07-27, rejected by every
+        // follower). `compute_ghostdag` takes the parents explicitly, so the
+        // exact value is computable for an unstored block, and admission now
+        // requires it (G7).
         // A block at u64::MAX height/score cannot be extended: refuse to build.
         let next_height = last_height
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("parent height {last_height} cannot be extended"))?;
-        let blue_score = parent_blue_score.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
-        })?;
-        blue_set.score = blue_score;
-        blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
+        // r1007 G7 (S3-1, ADR CV-3): the header commits the exact GHOSTDAG
+        // blue_score and blue_work of this block's parents, computed from
+        // headers the way every receiver recomputes them at admission. The
+        // former `parent + 1` (a lower bound inside the old band) is gone with
+        // the band: there is one unit, and a merge block's score counts its
+        // blue mergeset.
+        let (blue_score, blue_work) = if selected_parent != Hash::default() {
+            let data = self
+                .ghostdag
+                .compute_ghostdag(selected_parent, &merge_parents, next_height)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "GHOSTDAG record of the block on {selected_parent} unavailable: {e}. \
+                         Refusing to produce."
+                    )
+                })?;
+            (data.blue_score, data.blue_work)
+        } else {
+            let score = parent_blue_score.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
+            })?;
+            (score, citrate_consensus::types::blue_work_for_score(score))
+        };
 
         // Prove the block VRF FIRST, before selecting transactions or opening an executor
         // round. If proving fails this slot is skipped: no block is built, stored or
@@ -3002,9 +2969,6 @@ impl BlockProducer {
         } else {
             transactions
         };
-
-        // Blue score and work are already calculated above
-        let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
 
         // Create block header with GhostDAG consensus data.
         // EXECUTE-ON-RECEIVE: v2 headers commit the coinbase (reroll flag); v1 keep legacy hashing.
@@ -3669,97 +3633,49 @@ impl BlockProducer {
             }
         }
 
-        // MP-DEPTH: never BUILD a block our own validity rule would reject.
-        //
-        // The block we are about to seal sits at selected_parent.height + 1. Once
-        // the rule is active, merging a tip more than MERGE_PARENT_MAX_DEPTH below
-        // that makes the block invalid — and since the producer validates its own
-        // block on the way in, it would refuse its own output and stop producing.
-        // A stale tip lingering in the tip set is enough to trigger it, so this is
-        // a filter rather than an error: drop the too-deep tips, keep sealing.
-        //
-        // Applied unconditionally, not gated on the activation height. Before
-        // activation these merges are legal but pointless (a tip 100+ blocks back
-        // is abandoned, not a live branch), and filtering early means the producer
-        // is already emitting rule-compliant blocks well before enforcement
-        // begins — so activation is a no-op for block production rather than a
-        // cliff.
-        let child_height = self
+        // r1007 G2–G5 (S3-1): never BUILD a block our own validity rule would
+        // reject. Offer every other tip as a merge parent, heaviest first, and
+        // keep each one only while the block stays valid: lighter than the
+        // selected parent (G3: SP is the heaviest parent, so a heavier tip
+        // cannot be merged, it would have to be the selected parent), not in
+        // the past of another parent (G2), the mergeset within
+        // MERGESET_SIZE_LIMIT (G4), every mergeset block in the future of the
+        // merge-depth root (G5). A dropped tip stays in the tip set and is
+        // merged once it fits. This replaces the MP-DEPTH height filter and the
+        // header-score "heaviest parent" filter (`dropped_heavier`), which
+        // compared the producer's `parent + 1` unit against fork choice's.
+        // Without the selected parent's header there is nothing to judge a merge
+        // against: merge nothing (the build below then refuses for want of the
+        // parent, as before).
+        if self.dag_store.get_header(&selected_parent).await.is_err() {
+            debug!(
+                "producer: selected parent {} has no readable header; merging nothing",
+                selected_parent
+            );
+            return Ok((selected_parent, Vec::new()));
+        }
+        let (merge_parents, _data) = match self
             .ghostdag
-            .get_block_height(&selected_parent)
+            .parents_for_new_block(selected_parent, &tip_hashes)
             .await
-            .map(|h| h.saturating_add(1));
-
-        // HEAVIEST-PARENT RULE: never list a merge parent whose HEADER blue_score
-        // exceeds the selected parent's. Receivers enforce exactly that comparison
-        // (`validate_block_consistency`), but fork choice above ranks tips by the
-        // RECOMPUTED score, which also counts blue merge parents, while headers carry
-        // `parent + 1`. Once blocks merge, the two orderings can disagree: fork choice
-        // picks a tip whose header score is below another tip's. Merging that other tip
-        // seals a block every peer rejects, and the producer then builds on it alone.
-        // Like MP-DEPTH this is a filter: the skipped tip stays in the tip set and is
-        // merged once a selected parent at least as heavy exists.
-        let sp_header_score = self
-            .dag_store
-            .get_block(&selected_parent)
-            .await
-            .ok()
-            .map(|b| b.header.blue_score);
-
-        let max_parents = self.ghostdag.params().max_parents;
-        let mut dropped_deep = 0usize;
-        let mut dropped_heavier = 0usize;
-        let mut dropped_unreadable = 0usize;
-        let mut merge_parents: Vec<Hash> = Vec::new();
-        for h in tip_hashes.into_iter().filter(|h| *h != selected_parent) {
-            if merge_parents.len() >= max_parents.saturating_sub(1) {
-                break; // Leave room for the selected parent.
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "cannot derive the GHOSTDAG record of a block on {}: {e}. Skipping \
+                     this production round.",
+                    selected_parent
+                ))
             }
-            // Without the selected parent's header there is nothing to compare
-            // against, and a tip whose header we cannot read is one a receiver may
-            // lack: merge neither. Counted apart from "heavier" so the log says why.
-            let (Some(sp_score), Some(tip)) =
-                (sp_header_score, self.dag_store.get_block(&h).await.ok())
-            else {
-                dropped_unreadable = dropped_unreadable.saturating_add(1);
-                continue;
-            };
-            if tip.header.blue_score > sp_score {
-                dropped_heavier = dropped_heavier.saturating_add(1);
-                continue;
-            }
-            if let Some(child_h) = child_height {
-                if child_h.saturating_sub(tip.header.height)
-                    > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
-                {
-                    dropped_deep = dropped_deep.saturating_add(1);
-                    continue;
-                }
-            }
-            merge_parents.push(h);
-        }
-        if dropped_heavier > 0 {
+        };
+        let offered = tip_hashes.len().saturating_sub(1);
+        if merge_parents.len() < offered {
             debug!(
-                "producer: left {} tip(s) unmerged whose header blue_score exceeds the selected \
-                 parent's ({:?}); merging them would make our block invalid for every peer",
-                dropped_heavier, sp_header_score
-            );
-        }
-        if dropped_unreadable > 0 {
-            debug!(
-                "producer: left {} tip(s) unmerged because a header could not be read \
-                 (selected parent header readable: {})",
-                dropped_unreadable,
-                sp_header_score.is_some()
-            );
-        }
-        if dropped_deep > 0 {
-            debug!(
-                "MP-DEPTH: dropped {} stale tip(s) more than {} blocks below the block being \
-                 sealed at height {:?} — merging them would make our own block invalid",
-                dropped_deep,
-                citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH,
-                child_height
+                "producer: merging {} of {} other tip(s); the rest would make this block \
+                 invalid (G2-G5) or are heavier than the selected parent {}",
+                merge_parents.len(),
+                offered,
+                selected_parent
             );
         }
 
@@ -4035,19 +3951,6 @@ impl BlockProducer {
 
         let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
-    }
-
-    /// Calculate blue work based on blue set
-    fn calculate_blue_work(
-        &self,
-        _blue_set: &citrate_consensus::types::BlueSet,
-        blue_score: u64,
-    ) -> anyhow::Result<u128> {
-        // SECREM-01 CONS-2/3: delegate to the canonical score→work function
-        // in citrate-consensus. Admission validation rejects any header
-        // whose blue_work deviates from it, so the producer MUST use the
-        // same source of truth or fork itself off.
-        Ok(citrate_consensus::types::blue_work_for_score(blue_score))
     }
 
     // NOTE (VALIDATOR-S1 §R'): `apply_basic_rewards` was REMOVED. Basic reward
@@ -6017,7 +5920,12 @@ mod tests {
     ///
     /// INVARIANT: the parents the producer picks must satisfy the receiver's linkage
     /// rule, i.e. the block it would seal passes `validate_block_consistency`. A tip
-    /// whose header score does not exceed the selected parent's must still be merged.
+    /// lighter than the selected parent must still be merged.
+    ///
+    /// r1007 (CV-3) removes the two metrics: the header commits the fork-choice
+    /// score. The scenario is kept in its r1007 form: the heavier branch is the
+    /// SHORTER one, and the taller lighter tip is merged (01 H4
+    /// `heavier_shorter_branch_is_still_merged`).
     #[tokio::test]
     async fn producer_never_merges_a_parent_heavier_than_its_selected_parent() {
         use citrate_execution::StateDB;
@@ -6047,31 +5955,35 @@ mod tests {
         let ghostdag = producer.ghostdag();
         let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
 
-        // A peer block as the live producers write it: header blue_score is the
-        // selected parent's header score + 1, whatever it merges.
-        async fn admit(
-            dag: &DagStore,
-            ghostdag: &GhostDag,
-            tag: u8,
-            parent: &Block,
-            merges: &[&Block],
-        ) -> Block {
-            let score = parent.header.blue_score + 1;
+        // A peer block as the r1007 producers write it: the heaviest of `parents`
+        // is the selected parent (G3) and the header commits the GHOSTDAG score
+        // (G7). (Pre-r1007 this fixture wrote `parent + 1`, the second unit.)
+        async fn admit(dag: &DagStore, ghostdag: &GhostDag, tag: u8, parents: &[&Block]) -> Block {
+            let hashes: Vec<Hash> = parents.iter().map(|p| p.header.block_hash).collect();
+            let (sp, merges, height, data) = ghostdag
+                .ghostdag_for_parents(&hashes)
+                .await
+                .expect("valid parents");
+            let sp_ts = parents
+                .iter()
+                .map(|p| p.header.timestamp)
+                .max()
+                .unwrap_or(0);
             let mut blk = BlockBuilder::new()
                 .version(2)
-                .height(parent.header.height + 1)
-                .parent(parent.header.block_hash)
-                .merge_parents(merges.iter().map(|m| m.header.block_hash).collect())
+                .height(height)
+                .parent(sp)
+                .merge_parents(merges)
                 .coinbase([tag; 20])
-                .timestamp(parent.header.timestamp + 1)
+                .timestamp(sp_ts + 1)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([tag; 32]),
                 })
                 .transactions(vec![])
                 .state_root(Hash::default())
-                .blue_score(score)
-                .blue_work(citrate_consensus::types::blue_work_for_score(score))
+                .blue_score(data.blue_score)
+                .blue_work(data.blue_work)
                 .build_unhashed();
             blk.header.block_hash = blk.compute_hash();
             dag.store_block(blk.clone())
@@ -6082,24 +5994,25 @@ mod tests {
         }
 
         // Three siblings at height 1.
-        let a1 = admit(&dag, &ghostdag, 0xA1, &genesis, &[]).await;
-        let a2 = admit(&dag, &ghostdag, 0xA2, &genesis, &[]).await;
-        let a3 = admit(&dag, &ghostdag, 0xA3, &genesis, &[]).await;
-        // X @ 2 merges both siblings: header score 2, recomputed score +2 higher.
-        let x = admit(&dag, &ghostdag, 0xB1, &a1, &[&a2, &a3]).await;
-        // Y @ 3 is a plain chain A1 -> B -> Y: header score 3, recomputed lower than X.
-        let b = admit(&dag, &ghostdag, 0xB2, &a1, &[]).await;
-        let y = admit(&dag, &ghostdag, 0xC1, &b, &[]).await;
-        // Z @ 2: a sibling of X with an equal header score (a legitimate merge).
-        let z = admit(&dag, &ghostdag, 0xB3, &a1, &[]).await;
+        let a1 = admit(&dag, &ghostdag, 0xA1, &[&genesis]).await;
+        let a2 = admit(&dag, &ghostdag, 0xA2, &[&genesis]).await;
+        let a3 = admit(&dag, &ghostdag, 0xA3, &[&genesis]).await;
+        // X @ 2 merges all three siblings: score 1 + 3 = 4.
+        let x = admit(&dag, &ghostdag, 0xB1, &[&a1, &a2, &a3]).await;
+        // Y @ 3 is a plain chain A1 -> B -> Y: taller than X, score 3 < 4.
+        let b = admit(&dag, &ghostdag, 0xB2, &[&a1]).await;
+        let y = admit(&dag, &ghostdag, 0xC1, &[&b]).await;
+        // Z @ 2: a sibling of X on A1, score 2.
+        let z = admit(&dag, &ghostdag, 0xB3, &[&a1]).await;
 
-        // Preconditions: fork choice prefers X while Y carries the higher header score.
+        // Preconditions: fork choice prefers X, the heavier SHORTER branch.
         assert_eq!(
             ghostdag.select_tip().await.expect("select_tip"),
             x.header.block_hash,
-            "fork choice must prefer X (more blue merges) for this scenario to apply"
+            "fork choice must prefer X (more blue blocks) for this scenario to apply"
         );
-        assert!(y.header.blue_score > x.header.blue_score);
+        assert!(y.header.height > x.header.height);
+        assert!(y.header.blue_score < x.header.blue_score);
 
         let tips = dag.get_tips().await;
         let (sp, merges) = producer
@@ -6115,36 +6028,44 @@ mod tests {
         for m in &merges {
             let mb = dag.get_block(m).await.expect("merge parent stored");
             assert!(
-                mb.header.blue_score <= sp_block.header.blue_score,
-                "merge parent {} has header blue_score {} above the selected parent's {}: \
-                 every peer rejects this block (selected parent must be the heaviest parent)",
-                m,
-                mb.header.blue_score,
-                sp_block.header.blue_score
+                citrate_consensus::types::ForkChoiceKey::of_header(&mb.header)
+                    < citrate_consensus::types::ForkChoiceKey::of_header(&sp_block.header),
+                "merge parent {m} is heavier than the selected parent: every peer rejects \
+                 this block (G3)"
             );
         }
+        // H4 `heavier_shorter_branch_is_still_merged`: the taller, lighter Y is
+        // merged (pre-r1007 the producer dropped it as "heavier" by header score).
+        assert!(
+            merges.contains(&y.header.block_hash),
+            "the lighter, taller tip Y must be merged"
+        );
         assert!(
             merges.contains(&z.header.block_hash),
-            "a tip whose header score equals the selected parent's must still be merged"
+            "a lighter sibling tip must be merged"
         );
 
         // The receiver's verdict on the header the producer would seal.
-        let score = sp_block.header.blue_score + 1;
+        let data = ghostdag
+            .compute_ghostdag(sp, &merges, sp_block.header.height + 1)
+            .await
+            .expect("record");
+        assert_eq!(data.blue_score, 4 + 1 + 3, "SP X, plus Y, B, Z blue");
         let mut candidate = BlockBuilder::new()
             .version(2)
             .height(sp_block.header.height + 1)
             .parent(sp)
             .merge_parents(merges.clone())
             .coinbase([0x44; 20])
-            .timestamp(sp_block.header.timestamp + 1)
+            .timestamp(y.header.timestamp + 1)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new([0xEE; 32]),
             })
             .transactions(vec![])
             .state_root(Hash::default())
-            .blue_score(score)
-            .blue_work(citrate_consensus::types::blue_work_for_score(score))
+            .blue_score(data.blue_score)
+            .blue_work(data.blue_work)
             .build_unhashed();
         candidate.header.block_hash = candidate.compute_hash();
         ghostdag
@@ -6187,8 +6108,10 @@ mod tests {
         let ghostdag = producer.ghostdag();
         let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
 
+        // r1007 G7: every merge parent here is a sibling of the selected parent
+        // and blue (k = 18), so the exact score is SP's + 1 + |merges|.
         fn peer_block(tag: u8, parent: &Block, merges: &[&Block]) -> Block {
-            let score = parent.header.blue_score + 1;
+            let score = parent.header.blue_score + 1 + merges.len() as u64;
             let mut blk = BlockBuilder::new()
                 .version(2)
                 .height(parent.header.height + 1)
@@ -6242,13 +6165,15 @@ mod tests {
 
         // 2. Fork choice selects a block whose header this DAG store does not hold
         //    (registered with GhostDAG only): no merge parent can be judged.
-        let ghost = peer_block(0xB1, &a, &[&b]);
+        // r1007 G3: b (VRF 0xA2) outweighs a (0xA1) at equal work, so it is
+        // the selected parent.
+        let ghost = peer_block(0xB1, &b, &[&a]);
         ghostdag
             .add_block(&ghost)
             .await
             .expect("register with GhostDAG only");
         assert!(dag.get_block(&ghost.header.block_hash).await.is_err());
-        let c = peer_block(0xC1, &b, &[]);
+        let c = peer_block(0xC1, &a, &[]);
         admit(&dag, &ghostdag, &c).await;
         assert_eq!(
             ghostdag.select_tip().await.expect("select_tip"),
@@ -6642,10 +6567,10 @@ mod tests {
 
         // ── Node Q: an independent producer that seals a COMPETING block B @ 1 on
         //    the same (empty) genesis with a different coinbase and signing key.
-        //    Tip selection breaks an equal-blue-score tie by SMALLEST hash
-        //    (core/consensus/src/tip_selection.rs — the 2026-08-06 convergence fix
-        //    that aligned the producer's tie-break with the drain's), so we search
-        //    key/coinbase pairs until hash(B) < hash(A) and P's fork-choice
+        //    Tip selection breaks an equal-blue-score tie by the larger
+        //    ForkChoiceKey (r1007 G8; one order for producer and drain since the
+        //    2026-08-06 convergence fix), so we search key/coinbase pairs until
+        //    Key(B) > Key(A) and P's fork-choice
         //    deterministically prefers B. Without that the harness would not
         //    reproduce the live divergence.
         // Stop at the FIRST competitor hashing below A, but search the FULL seed
@@ -6667,14 +6592,18 @@ mod tests {
                 .get_block(&b_hash)
                 .expect("read B")
                 .expect("B present");
-            if candidate.header.block_hash < block_a.header.block_hash {
+            // r1007 G8: fork choice prefers the larger ForkChoiceKey (blue work,
+            // then VRF output, then hash; was: the smaller hash).
+            if citrate_consensus::types::ForkChoiceKey::of_header(&candidate.header)
+                > citrate_consensus::types::ForkChoiceKey::of_header(&block_a.header)
+            {
                 block_b = Some(candidate);
                 break;
             }
         }
         let block_b = block_b.expect(
-            "harness: no competing block hashed below A across the full seed space — \
-             astronomically rare (A below all 255 competitors); re-run",
+            "harness: no competing block keyed above A across the full seed space — \
+             astronomically rare (A above all 255 competitors); re-run",
         );
 
         // Give P the competing block WITHOUT applying it — exactly what the

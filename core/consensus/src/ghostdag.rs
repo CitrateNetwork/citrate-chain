@@ -169,6 +169,10 @@ pub struct GhostDag {
     /// Current tips of the DAG
     tips: Arc<RwLock<HashSet<Hash>>>,
 
+    /// The ForkChoiceKey of every registered block, from its committed header
+    /// (G8), so fork choice ranks a registered block without a store read.
+    keys: Arc<RwLock<HashMap<Hash, ForkChoiceKey>>>,
+
     /// PBA-R2 block-validity hardening (PBA-L1b-003 timestamp bound). Captured
     /// from the process-wide activation height at construction; see
     /// `crate::hardening`.
@@ -257,6 +261,7 @@ impl GhostDag {
             ghostdag_cache: Arc::new(RwLock::new(HashMap::new())),
             validated: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
+            keys: Arc::new(RwLock::new(HashMap::new())),
             dag_hydrated: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -365,8 +370,12 @@ impl GhostDag {
         Ok(self.past_with_links(of, floor).await?.into_keys().collect())
     }
 
-    /// The fork-choice key of a block this node holds, from its header.
+    /// The fork-choice key of a registered block, or of a block this node
+    /// holds, from its committed header.
     pub async fn fork_choice_key(&self, hash: &Hash) -> Option<ForkChoiceKey> {
+        if let Some(k) = self.keys.read().await.get(hash) {
+            return Some(*k);
+        }
         self.dag_store
             .get_header(hash)
             .await
@@ -542,10 +551,16 @@ impl GhostDag {
     ) -> Result<GhostdagData, GhostDagError> {
         let k = self.params.k;
         let sp_header = self.header_of(&sp).await?;
-        let (mdr, mdr_height, sp_chain) = self.merge_depth_root(sp, height).await?;
-        let mut data = GhostdagData::with_selected_parent(sp, mdr);
+        // A block with no merge parents has an empty Mergeset*: nothing to
+        // color and no merge-depth rule to check, so MDR is not walked for it
+        // (it is recorded as the zero hash; nothing reads it for such a block).
+        // This keeps a linear block admissible on a node that retains less
+        // than MERGE_DEPTH heights, as the pre-r1007 rules did.
+        let mut data = GhostdagData::with_selected_parent(sp, Hash::default());
 
         if !merges.is_empty() {
+            let (mdr, mdr_height, sp_chain) = self.merge_depth_root(sp, height).await?;
+            data.merge_depth_root = mdr;
             let window_floor = height.saturating_sub(GHOSTDAG_WINDOW);
             let mut sp_past = LazyPast::new(sp, window_floor, height.saturating_sub(2));
 
@@ -1066,6 +1081,10 @@ impl GhostDag {
             height: block.header.height,
         };
 
+        self.keys
+            .write()
+            .await
+            .insert(block.hash(), ForkChoiceKey::of_header(&block.header));
         let mut relations = self.relations.write().await;
         relations.insert(block.hash(), relation);
         if let Some(parent_relation) = relations.get_mut(&block.selected_parent()) {
