@@ -210,7 +210,7 @@ async fn a_wrong_committed_root_is_reported_at_its_height() {
         (k, Field::CommittedStateRoot),
         "{d}"
     );
-    assert_eq!(d.node, Hash::new([0xEE; 32]).to_string());
+    assert_eq!(d.node, format!("0x{}", hex::encode([0xEE; 32])));
 }
 
 #[tokio::test]
@@ -255,4 +255,58 @@ fn the_recorder_never_writes_the_data_dir() {
         .collect();
     after.sort();
     assert_eq!(before, after, "the recorder changed the data dir");
+}
+
+/// The two CLIs end to end: `replay-record` on the data dir (with the
+/// genesis allocation as a file), `replay-diff` on the recording (exit 0),
+/// and on a copy with one block changed (exit 1, the height printed).
+#[test]
+fn the_clis_record_and_report_the_first_divergence() {
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let dir = rt.block_on(node_dir());
+    let work = tempfile::tempdir().expect("work");
+    let alloc = work.path().join("alloc.json");
+    std::fs::write(
+        &alloc,
+        format!("{{\"0x{}\": \"{FUND}\"}}", hex::encode(ALICE)),
+    )
+    .expect("alloc");
+    let rec_path = work.path().join("node.replay");
+    let srh = citrate_execution::storage_root_hardening::storage_root_hardening_height();
+    let mut record = std::process::Command::new(env!("CARGO_BIN_EXE_replay-record"));
+    record
+        .arg(dir.path())
+        .arg(&rec_path)
+        .arg("--genesis-alloc")
+        .arg(&alloc);
+    if let Some(h) = srh {
+        record.arg("--storage-root-hardening").arg(h.to_string());
+    }
+    let out = record.output().expect("replay-record runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_replay-diff"))
+        .arg(&rec_path)
+        .output()
+        .expect("replay-diff runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    println!("{stdout}");
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("no divergence"), "{stdout}");
+
+    let mut rec = Recording::read_from(&rec_path).expect("read");
+    rec.chain_block_mut(17).expect("block 17").transactions[0].value += 1;
+    let bad = work.path().join("bad.replay");
+    rec.write_to(&bad).expect("write");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_replay-diff"))
+        .arg(&bad)
+        .output()
+        .expect("replay-diff runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    println!("{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("FIRST DIVERGENCE: height 17 "), "{stdout}");
 }

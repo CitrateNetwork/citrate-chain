@@ -117,7 +117,7 @@ fn main() -> ExitCode {
         rec.blocks.len(),
         rec.chain.first().map(|e| e.height).unwrap_or(0),
         rec.chain.last().map(|e| e.height).unwrap_or(0),
-        rec.applied_tip.0,
+        citrate_replay_ref::reference::full_hash(&rec.applied_tip.0),
         rec.applied_tip.1,
         out
     );

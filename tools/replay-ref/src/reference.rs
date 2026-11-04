@@ -70,6 +70,11 @@ impl OrderingMode for SelectedChain {
     }
 }
 
+/// A hash in full (`Hash`'s `Display` is an 8-digit prefix).
+pub fn full_hash(h: &Hash) -> String {
+    format!("0x{}", hex::encode(h.as_bytes()))
+}
+
 /// What differed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Field {
@@ -117,7 +122,11 @@ impl fmt::Display for Divergence {
         write!(
             f,
             "height {} block {}: {}: reference {} node {}",
-            self.height, self.hash, self.field, self.reference, self.node
+            self.height,
+            full_hash(&self.hash),
+            self.field,
+            self.reference,
+            self.node
         )
     }
 }
@@ -227,11 +236,15 @@ pub async fn replay(rec: &Recording, mode: &dyn OrderingMode) -> Result<Report> 
         {
             report.divergence = Some(diverge(
                 Field::ChainLink,
-                format!("height {} on {}", parent.height + 1, parent.hash),
+                format!(
+                    "height {} on {}",
+                    parent.height + 1,
+                    full_hash(&parent.hash)
+                ),
                 format!(
                     "height {} on {}",
                     block.header.height,
-                    block.selected_parent()
+                    full_hash(&block.selected_parent())
                 ),
             ));
             return Ok(report);
@@ -253,8 +266,8 @@ pub async fn replay(rec: &Recording, mode: &dyn OrderingMode) -> Result<Report> 
                 Err(ExecutionError::StateRootMismatch { expected, got }) => {
                     report.divergence = Some(diverge(
                         Field::HeaderStateRoot,
-                        got.to_string(),
-                        expected.to_string(),
+                        full_hash(&got),
+                        full_hash(&expected),
                     ));
                     return Ok(report);
                 }
@@ -270,8 +283,8 @@ pub async fn replay(rec: &Recording, mode: &dyn OrderingMode) -> Result<Report> 
             if root != committed {
                 report.divergence = Some(diverge(
                     Field::CommittedStateRoot,
-                    root.to_string(),
-                    committed.to_string(),
+                    full_hash(&root),
+                    full_hash(&committed),
                 ));
                 return Ok(report);
             }

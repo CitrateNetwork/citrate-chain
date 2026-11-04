@@ -40,5 +40,6 @@ pub mod reference;
 pub use recorder::{record_data_dir, record_db};
 pub use recording::{ChainEntry, RecordedRewardPolicy, Recording, ReplayConfig, FORMAT_VERSION};
 pub use reference::{
-    reference_reward_config, replay, Divergence, Field, OrderingMode, Report, SelectedChain,
+    full_hash, reference_reward_config, replay, Divergence, Field, OrderingMode, Report,
+    SelectedChain,
 };
