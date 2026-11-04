@@ -577,6 +577,68 @@ mod tests {
         );
     }
 
+    /// The canonical genesis as `initialize_genesis_state_with_profile` stores it:
+    /// state root set, block hash from `calculate_block_hash` (the canonical
+    /// genesis encoding).
+    fn stored_genesis() -> Block {
+        let mut g = create_genesis_block(&GenesisConfig::default());
+        g.state_root = Hash::new([0x5A; 32]);
+        g.header.block_hash = calculate_block_hash(&g);
+        g
+    }
+
+    /// CV-9 / H5: at startup the node re-offers the genesis it stored to the
+    /// strict production DAG store (`seed_genesis`, and the eager load when
+    /// nothing is pruned). Configured by its hash, genesis is exempt from the
+    /// proposer/VRF admission checks. Before the fix the exemption also
+    /// required `verify_hash()`, which recomputes the hash with the block-hash
+    /// encoding, while genesis is hashed with the canonical genesis encoding,
+    /// so the exemption never held and the store refused genesis with "zero
+    /// proposer public key".
+    #[tokio::test]
+    async fn genesis_reoffered_to_strict_store_is_exempt() {
+        let genesis = stored_genesis();
+        assert!(
+            !genesis.verify_hash(),
+            "fixture: the stored genesis is hashed with the canonical genesis encoding"
+        );
+        let dag = DagStore::new(); // strict VRF, as start_node builds it
+        dag.set_configured_genesis(genesis.header.block_hash);
+        dag.store_block(genesis.clone())
+            .await
+            .expect("the configured genesis must be admitted by the strict store");
+        // Re-offered again (a second startup pass): already present, not invalid.
+        match dag.store_block(genesis).await {
+            Err(citrate_consensus::DagStoreError::BlockExists(_)) => {}
+            other => panic!("a re-offered genesis must be BlockExists, got {other:?}"),
+        }
+    }
+
+    /// The exemption is by identity, not by the hash field: a height-0 block
+    /// that names the configured hash but carries other content is not genesis.
+    #[tokio::test]
+    async fn a_block_that_only_names_the_genesis_hash_is_not_exempt() {
+        let genesis = stored_genesis();
+        // Content the canonical genesis hash binds, changed.
+        let mut forged_root = genesis.clone();
+        forged_root.state_root = Hash::new([0x6B; 32]);
+        // Content it does not bind (the proposer), changed: a non-inert genesis.
+        let mut forged_proposer = genesis.clone();
+        forged_proposer.header.proposer_pubkey = PublicKey::new([0x77; 32]);
+        for (name, forged) in [("state root", forged_root), ("proposer", forged_proposer)] {
+            assert!(
+                !forged.is_configured_genesis(Some(genesis.header.block_hash)),
+                "a genesis with a forged {name} passed as the configured genesis"
+            );
+            let dag = DagStore::new();
+            dag.set_configured_genesis(genesis.header.block_hash);
+            assert!(
+                dag.store_block(forged).await.is_err(),
+                "the strict store admitted a genesis with a forged {name}"
+            );
+        }
+    }
+
     #[test]
     fn test_standalone_genesis_matches_shared_canonical_block() {
         let config = GenesisConfig::default();
