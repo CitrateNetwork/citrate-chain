@@ -14,6 +14,12 @@ pub enum GhostDagError {
     #[error("Block not found: {0}")]
     BlockNotFound(Hash),
 
+    /// S2-5: the fork-choice score of this block cannot be recomputed from the
+    /// blocks this node holds and no derived score is recorded for it. The block
+    /// is not ranked (never on its header score).
+    #[error("Fork-choice score unavailable for {0}")]
+    ScoreUnavailable(Hash),
+
     #[error("Invalid parent structure")]
     InvalidParents,
 
@@ -841,33 +847,50 @@ impl GhostDag {
         // score on a holed merge block cannot fork state, and the authoritative
         // `calculate_blue_set` still recomputes on demand where cardinality matters.
         let blue_set = match self.derive_score_and_work(block).await {
-            Ok(bs) => bs,
-            Err(e) => {
-                let fallback = self
-                    .dag_store
-                    .get_derived_blue_score(&block.hash())
-                    .unwrap_or(block.header.blue_score);
-                warn!(
-                    "register_existing_block: score derivation for {} @ {} failed ({}) — \
-                     falling back to score {} so the block still enters the tip set",
-                    block.hash(),
-                    block.header.height,
-                    e,
-                    fallback
-                );
-                BlueSet {
-                    blocks: std::collections::HashSet::new(),
-                    score: fallback,
-                    work: crate::types::blue_work_for_score(fallback),
-                }
+            Ok(bs) => {
+                // SYNC-S1 D3: same durable anchor as `add_block` — the rehydration
+                // path must record it too, or a node whose relations were built
+                // only by eager-load starts the next process with no anchors.
+                self.dag_store
+                    .put_derived_blue_score(&block.hash(), bs.score);
+                bs
             }
+            // S2-5 (H4): the score cannot be recomputed from the blocks this
+            // node holds (a pruned or holed ancestry). Use the durable derived
+            // anchor, which is in the same unit, and only if it is plausible.
+            // Never `header.blue_score`: that is the producer's `parent + 1`
+            // count, a different unit from the fork-choice score, and ranking a
+            // block on it next to derived scores mis-orders tips. With no
+            // usable anchor the block is NOT ranked: the caller gets the error.
+            Err(e) => match self.known_score(&block.hash()).await {
+                Some(score) => {
+                    warn!(
+                        "register_existing_block: score derivation for {} @ {} failed ({}) — \
+                         using its durable derived score {}",
+                        block.hash(),
+                        block.header.height,
+                        e,
+                        score
+                    );
+                    BlueSet {
+                        blocks: std::collections::HashSet::new(),
+                        score,
+                        work: crate::types::blue_work_for_score(score),
+                    }
+                }
+                None => {
+                    warn!(
+                        "register_existing_block: score derivation for {} @ {} failed ({}) and \
+                         no derived score is recorded — NOT ranking it (fork choice never uses \
+                         the header score)",
+                        block.hash(),
+                        block.header.height,
+                        e
+                    );
+                    return Err(GhostDagError::ScoreUnavailable(block.hash()));
+                }
+            },
         };
-
-        // SYNC-S1 D3: same durable anchor as `add_block` — the rehydration path
-        // must record it too, or a node whose relations were built only by
-        // eager-load starts the next process with no anchors at all.
-        self.dag_store
-            .put_derived_blue_score(&block.hash(), blue_set.score);
 
         let relation = DagRelation {
             block: block.hash(),
@@ -1240,7 +1263,24 @@ impl GhostDag {
         {
             return Some(score);
         }
-        self.dag_store.get_derived_blue_score(hash)
+        let score = self.dag_store.get_derived_blue_score(hash)?;
+        // S2-5: an anchor counts only for a block this node holds, and only if
+        // it is not below the header score + 1, which no derived score can be
+        // (genesis derives 1 from header 0; every block adds at least 1 to its
+        // selected parent while its header adds exactly 1). An entry on the
+        // header scale, as the pre-S2-5 fallback wrote, is caught here.
+        let header = self.dag_store.get_header(hash).await.ok()?;
+        let genesis =
+            header.selected_parent_hash == Hash::default() && header.merge_parent_hashes.is_empty();
+        if !genesis && score < header.blue_score.checked_add(1)? {
+            warn!(
+                "derived blue score anchor {} for {} is below its header score + 1 ({}): \
+                 not a fork-choice score; ignored",
+                score, hash, header.blue_score
+            );
+            return None;
+        }
+        Some(score)
     }
 
     /// The fork-choice score of an already-admitted block.
