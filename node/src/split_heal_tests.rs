@@ -216,6 +216,10 @@ pub(crate) struct Fleet {
     pub lost: usize,
     /// Messages a node's inbound admission shed (diagnostics).
     pub shed: usize,
+    /// For the apply-cost bench: (slot, time) of every gossiped block a node
+    /// had not admitted yet, through `on_new_block` (stored -> DAG ->
+    /// applied: admission executes on receive).
+    pub admit_cost: Vec<(u64, std::time::Duration)>,
 }
 
 fn genesis_block(root: Hash) -> Block {
@@ -462,6 +466,7 @@ impl Fleet {
             slot_no: 0,
             lost: 0,
             shed: 0,
+            admit_cost: Vec::new(),
         };
         fleet.set_links(|_, _| true);
         for i in 0..n {
@@ -732,8 +737,14 @@ impl Fleet {
                 // Gossip validation relays a block once to every other peer
                 // (`GossipProtocol::handle_new_block`), before admission.
                 let hash = block.header.block_hash;
-                let relay = !node.adm.is_fully_admitted(&hash).await && node.relayed.insert(hash);
+                let fresh = !node.adm.is_fully_admitted(&hash).await;
+                let relay = fresh && node.relayed.insert(hash);
+                let t = std::time::Instant::now();
                 node.on_new_block(&peer, &pid, block.clone()).await;
+                let spent = t.elapsed();
+                if fresh {
+                    self.admit_cost.push((self.slot_no, spent));
+                }
                 if relay {
                     let n = self.nodes.len();
                     for j in (0..n).filter(|j| *j != at && *j != from) {
@@ -1402,6 +1413,11 @@ async fn long_running_history(fleet: &mut Fleet) {
 const CHILD_ENV: &str = "CITRATE_SPLIT_HEAL_CHILD";
 
 fn run_in_child(test: &str) {
+    let _ = child_output(test);
+}
+
+/// [`run_in_child`], returning the child's stdout and stderr.
+fn child_output(test: &str) -> String {
     let exe = std::env::current_exe().expect("exe");
     let out = std::process::Command::new(exe)
         .args([test, "--exact", "--nocapture", "--test-threads=1"])
@@ -1414,6 +1430,7 @@ fn run_in_child(test: &str) {
         out.status.success() && stdout.contains("1 passed"),
         "child {test} failed:\n{stdout}\n{stderr}"
     );
+    format!("{stdout}{stderr}")
 }
 
 fn in_child() -> bool {
@@ -1637,6 +1654,98 @@ mod tests {
         )
         .await;
     }
+
+    /// See `apply_cost_per_block_stays_within_budget`.
+    const APPLY_GROWTH_MAX: f64 = 3.0;
+    /// See `apply_cost_per_block_stays_within_budget`.
+    const APPLY_BUDGET_MS: f64 = 250.0;
+
+    /// Per-block apply cost (planset H7, ADR CV-6): two producers past
+    /// activation through the node's code paths on RocksDB stores, 120 slots.
+    /// Measured: the time each node spends admitting a peer's gossiped block
+    /// (`on_new_block`: stored -> DAG -> applied, since admission executes on
+    /// receive). This is the per-block cost that is ~3 s on r1006 and ~35 ms
+    /// on the devnet. CI thresholds:
+    ///
+    /// * the median over the last 30 slots is at most [`APPLY_GROWTH_MAX`]
+    ///   times the median over slots 10..40: a cost that grows with the store
+    ///   (the H7 class: full scans, body reloads) fails;
+    /// * the median over all blocks is at most `CITRATE_APPLY_BUDGET_MS`
+    ///   (default [`APPLY_BUDGET_MS`], a debug build on a loaded CI runner).
+    ///
+    /// Prints an `APPLYCOST` line with the numbers. Blocks carry no
+    /// transactions, so this is the consensus and storage cost per block, not
+    /// execution.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_cost_per_block_stays_within_budget() {
+        if !in_child() {
+            let out =
+                child_output("split_heal_tests::tests::apply_cost_per_block_stays_within_budget");
+            for line in out.lines().filter(|l| l.starts_with("APPLYCOST")) {
+                eprintln!("{line}");
+            }
+            return;
+        }
+        // Simulated time runs ahead of the wall clock (one slot = 2 s), and
+        // admission refuses blocks too far in the future: stay inside it.
+        const SLOTS: u64 = 120;
+        /// Slots of the early window (after warm-up and activation).
+        const EARLY: (u64, u64) = (10, 40);
+        let mut fleet = Fleet::new(2).await;
+        let mut rng = Rng(0x00C0_FFEE_D00D_F00D);
+        for _ in 0..SLOTS {
+            let o = rng.order(2);
+            fleet.slot(&o).await;
+        }
+        let heights = fleet.applied_heights().await;
+        assert!(
+            heights.iter().all(|h| *h >= SLOTS),
+            "both nodes apply every slot: {heights:?}"
+        );
+        // Every gossiped block a node admitted, by slot, in ms.
+        let per_block: Vec<(u64, f64)> = fleet
+            .admit_cost
+            .iter()
+            .map(|(slot, d)| (*slot, d.as_secs_f64() * 1e3))
+            .collect();
+        fn median(mut v: Vec<f64>) -> f64 {
+            assert!(!v.is_empty(), "no samples");
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[v.len() / 2]
+        }
+        let window = |lo: u64, hi: u64| {
+            median(
+                per_block
+                    .iter()
+                    .filter(|(slot, _)| (lo..hi).contains(slot))
+                    .map(|(_, ms)| *ms)
+                    .collect(),
+            )
+        };
+        let early = window(EARLY.0, EARLY.1);
+        let late = window(SLOTS - 30, SLOTS + 1);
+        let all = median(per_block.iter().map(|(_, ms)| *ms).collect());
+        let budget = std::env::var("CITRATE_APPLY_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(APPLY_BUDGET_MS);
+        eprintln!(
+            "APPLYCOST blocks={} samples={} admit_apply_ms_per_block median={all:.2} \
+             early={early:.2} late={late:.2} growth={:.2} budget_ms={budget}",
+            heights.iter().max().copied().unwrap_or(0),
+            per_block.len(),
+            late / early
+        );
+        assert!(
+            late <= early * APPLY_GROWTH_MAX,
+            "apply cost grew with the store: {early:.2} ms/block early, {late:.2} ms/block late"
+        );
+        assert!(
+            all <= budget,
+            "apply cost {all:.2} ms/block over the {budget} ms budget"
+        );
+    }
+
     /// Tripwire: the harness mirrors main.rs's receive loop and sync tick. If
     /// main.rs stops making one of these calls, the harness no longer tests
     /// what the node runs.
