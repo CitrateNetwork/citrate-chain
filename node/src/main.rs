@@ -2429,7 +2429,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())
                     .with_fork_choice(shared_ghostdag.clone())
                     // Never rebuild from genesis once the DAG store is pruned.
-                    .with_dag_prune_floor(shared_dag_store.clone());
+                    .with_dag_prune_floor(shared_dag_store.clone())
+                    // A reorg returns the abandoned blocks' still-valid txs to
+                    // the pool (a tx in a block that lost the slot is otherwise
+                    // executed by no one).
+                    .with_mempool(mempool.clone());
             // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
             // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
             // proposer selector from the registry — not only the producer.

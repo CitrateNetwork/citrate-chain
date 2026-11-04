@@ -300,6 +300,17 @@ impl BoundedHashSet {
         self.set.contains(hash)
     }
 
+    /// Forget `hash`. Its FIFO slot stays queued until it reaches the front (a
+    /// re-inserted hash can then age out early, which a dedup cache tolerates);
+    /// the queue is compacted when stale slots outnumber live ones, so repeated
+    /// insert/remove cycles cannot grow it without bound.
+    fn remove(&mut self, hash: &Hash) {
+        if self.set.remove(hash) && self.order.len() > self.cap.saturating_mul(2) {
+            let set = &self.set;
+            self.order.retain(|h| set.contains(h));
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.set.len()
@@ -1054,6 +1065,26 @@ impl Mempool {
 
     /// Remove a transaction from mempool
     pub async fn remove_transaction(&self, hash: &Hash) -> Option<Transaction> {
+        self.remove_inner(hash, true).await
+    }
+
+    /// Remove a transaction the node's own block just included.
+    ///
+    /// Unlike [`Self::remove_transaction`] this does not add the hash to the
+    /// `evicted` dedup set when the committed-nonce reader is wired (the node
+    /// always wires it). The tx is valid; its block may still lose the slot,
+    /// and then the tx must be able to come back: by re-injection on the reorg
+    /// (`reinject_transactions`) or by the wallet's resend. An echo of an
+    /// executed tx is already refused by admission (`NonceTooLow`). Before this
+    /// the included hash was evicted, so after its block lost the slot every
+    /// resend was refused as a duplicate until the process restarted (r1007
+    /// devnet, 2026-11-04).
+    pub async fn remove_included(&self, hash: &Hash) -> Option<Transaction> {
+        let evict = self.state_nonce.is_none();
+        self.remove_inner(hash, evict).await
+    }
+
+    async fn remove_inner(&self, hash: &Hash, evict: bool) -> Option<Transaction> {
         // Remove from main storage
         let mempool_tx = self.transactions.write().await.remove(hash)?;
 
@@ -1093,7 +1124,9 @@ impl Mempool {
         }
 
         // Add to evicted set (to prevent re-addition)
-        self.evicted.write().await.insert(*hash);
+        if evict {
+            self.evicted.write().await.insert(*hash);
+        }
 
         debug!("Removed transaction {} from mempool", hash);
 
@@ -1189,6 +1222,64 @@ impl Mempool {
             .and_then(|m| m.checked_add(1))
     }
 
+    /// Put back the transactions of blocks that left the node's applied chain.
+    ///
+    /// Called after a reorg (`CanonicalApplicator::reorg_to`) with the executor
+    /// already at the new tip, so admission re-validates each tx against the
+    /// state the next block is built on: a tx the winning branch executed (or
+    /// whose nonce it spent) is refused as `NonceTooLow`, a valid one returns to
+    /// the pool. The `evicted` set does not block a re-injected tx: it was in a
+    /// block. Returns how many were pooled again.
+    pub async fn reinject_transactions(&self, txs: Vec<Transaction>) -> usize {
+        let mut pooled = 0usize;
+        for tx in txs {
+            let hash = tx.hash;
+            self.evicted.write().await.remove(&hash);
+            match self.add_transaction(tx, TxClass::Standard).await {
+                Ok(()) => pooled = pooled.saturating_add(1),
+                Err(e) => debug!("re-injection of {} refused: {}", hash, e),
+            }
+        }
+        pooled
+    }
+
+    /// Committed nonce per pooled sender, read through the state reader with no
+    /// mempool guard held (lock rule 2). `None` when no reader is wired.
+    async fn committed_nonces(&self) -> Option<HashMap<PublicKey, u64>> {
+        let read = self.state_nonce.as_ref()?;
+        let senders: Vec<PublicKey> = self.by_sender.read().await.keys().copied().collect();
+        Some(senders.into_iter().map(|s| (s, read(&s))).collect())
+    }
+
+    /// Drop pooled transactions whose nonce is below the sender's committed
+    /// nonce: the applied chain executed them, or spent their nonce with a
+    /// different tx. They can never execute, and while pooled they shadowed the
+    /// sender's valid next nonce (and counted against its balance and slots).
+    /// Not added to `evicted`: if a reorg rolls the nonce back, the tx may be
+    /// valid again. Returns how many were dropped.
+    async fn prune_spent(&self, committed: &HashMap<PublicKey, u64>) -> usize {
+        let spent: Vec<Hash> = {
+            let txs = self.transactions.read().await;
+            txs.iter()
+                .filter(|(_, m)| committed.get(&m.tx.from).is_some_and(|&n| m.tx.nonce < n))
+                .map(|(h, _)| *h)
+                .collect()
+        };
+        let mut dropped = 0usize;
+        for hash in spent {
+            if self.remove_inner(&hash, false).await.is_some() {
+                dropped = dropped.saturating_add(1);
+            }
+        }
+        if dropped > 0 {
+            debug!(
+                "dropped {} pooled txs whose nonce is already spent",
+                dropped
+            );
+        }
+        dropped
+    }
+
     /// Get AI transactions (model operations, inference requests)
     pub async fn get_ai_transactions(&self, max_count: usize) -> Vec<Transaction> {
         let transactions = self.transactions.read().await;
@@ -1216,9 +1307,23 @@ impl Mempool {
         max_size: usize,
     ) -> Vec<Transaction> {
         self.sweep_if_v1_window_closed().await;
+        // Each sender starts at its COMMITTED nonce (the state the producer
+        // builds on, read through the node's state reader), not at its lowest
+        // pooled nonce. With the lowest pooled nonce, one pooled tx whose nonce
+        // was already spent (executed in a peer's block, or a different tx at
+        // the same nonce) was offered alone every slot, the producer skipped it,
+        // and the sender's valid next nonce was never offered: the sender was
+        // stuck until the stale copy expired (3,600 s, chain#405). Spent txs are
+        // dropped here. The producer calls this under the applied-tip lock, so
+        // the reader sees a settled state. Without a reader (pool-only tests,
+        // the GUI) the lowest pooled nonce is still the start.
+        let committed = self.committed_nonces().await;
+        if let Some(c) = committed.as_ref() {
+            self.prune_spent(c).await;
+        }
         let mut selected: Vec<Transaction> = Vec::new();
         let mut total_size: usize = 0;
-        let mut next_nonce: HashMap<PublicKey, u64> = HashMap::new();
+        let mut next_nonce: HashMap<PublicKey, u64> = committed.unwrap_or_default();
         let mut picked: HashSet<Hash> = HashSet::new();
 
         // Snapshot state to avoid nested awaits in loops

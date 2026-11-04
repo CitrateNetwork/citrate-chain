@@ -2240,11 +2240,12 @@ impl BlockProducer {
             match self.guard_round(supervised_round(self.clone())).await {
                 RoundOutcome::Produced(block_hash) => {
                     block_count = block_count.saturating_add(1);
+                    // Height and tx count come from the stored block (source:
+                    // `storage.blocks.get_block`, written by the round).
+                    let stored = self.storage.blocks.get_block(&block_hash).ok().flatten();
                     info!(
-                        "Produced block #{} hash={} txs={}",
-                        block_count,
-                        hex::encode(&block_hash.as_bytes()[..8]),
-                        0, // We'll get tx count from block
+                        "{}",
+                        produced_block_line(&block_hash, stored.as_ref(), block_count)
                     );
                 }
                 RoundOutcome::Failed(e) => {
@@ -3047,9 +3048,12 @@ impl BlockProducer {
                 self.storage.transactions.put_receipts(&pairs)?;
             }
 
-            // Remove included transactions from mempool
+            // Remove included transactions from mempool. Not evicted: if this
+            // block loses the slot the txs must be able to come back (the
+            // applicator re-injects them on the reorg; a wallet resend is
+            // accepted too). See `Mempool::remove_included`.
             for tx in &block.transactions {
-                let _ = self.mempool.remove_transaction(&tx.hash).await;
+                let _ = self.mempool.remove_included(&tx.hash).await;
             }
 
             // Sprint EL-1 (Issue #20): Reconcile nonce map after removing
@@ -4096,6 +4100,25 @@ pub(crate) enum AdmitOutcome {
     /// a candidate pooled lets a flood persist to `tx_expiry_secs` (3600s) and
     /// burns selection work every round (the N9 producer half).
     Drop,
+}
+
+/// The info line for a produced block: its height and transaction count from
+/// the stored block, plus this process's produced-block count. If the block
+/// cannot be read back the line says so instead of printing a guessed count.
+pub(crate) fn produced_block_line(hash: &Hash, block: Option<&Block>, produced: u64) -> String {
+    let short = hex::encode(&hash.as_bytes()[..8]);
+    match block {
+        Some(b) => format!(
+            "Produced block height={} hash={} txs={} (produced by this process: {})",
+            b.header.height,
+            short,
+            b.transactions.len(),
+            produced
+        ),
+        None => format!(
+            "Produced block hash={short} (not readable back from storage; produced by this process: {produced})"
+        ),
+    }
 }
 
 /// Per-sender budget state tracked across a single selection pass.

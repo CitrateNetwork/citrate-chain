@@ -798,6 +798,10 @@ pub struct CanonicalApplicator {
     /// The last fork-choice head a from-genesis rebuild was refused for, so the
     /// refusal is logged once per head rather than on every 1 s drain tick.
     refused_rebuild_head: parking_lot::Mutex<Option<Hash>>,
+    /// The node's mempool. After a reorg the transactions of the abandoned
+    /// blocks that the winning branch did not execute are re-injected here
+    /// (`reinject_abandoned`). `None`: no pool (tests, tools).
+    mempool: Option<Arc<citrate_sequencer::mempool::Mempool>>,
 }
 
 impl CanonicalApplicator {
@@ -900,6 +904,7 @@ impl CanonicalApplicator {
             dag_hydrated: None,
             dag_prune_floor: None,
             refused_rebuild_head: parking_lot::Mutex::new(None),
+            mempool: None,
         }
     }
 
@@ -929,6 +934,74 @@ impl CanonicalApplicator {
             Box::pin(async move { h })
         }));
         self
+    }
+
+    /// Attach the node's mempool so a reorg returns the abandoned blocks'
+    /// still-valid transactions to it (see `reinject_abandoned`).
+    pub fn with_mempool(mut self, mempool: Arc<citrate_sequencer::mempool::Mempool>) -> Self {
+        self.mempool = Some(mempool);
+        self
+    }
+
+    /// After a successful reorg from `old_tip` to the winning `branch` (fork
+    /// point `fork`): give the mempool back every transaction of the abandoned
+    /// blocks (fork, old_tip] that the winning branch does not carry, oldest
+    /// block first so a sender's nonces arrive in order.
+    ///
+    /// Why: every producer seals every slot and merged blocks are not executed
+    /// (register H8), so a tx in a block that loses the slot is executed by no
+    /// one. The producer had removed it from its pool when it sealed the block;
+    /// without this it was gone (until a restart, or the wallet's resend after
+    /// the pool forgot it). The pool re-validates each tx against the new tip's
+    /// state, which the executor holds now (the caller holds the applied-tip
+    /// lock), so a tx whose nonce the winning branch spent is refused there.
+    ///
+    /// Source: the abandoned blocks' bodies in `storage.blocks` (they stay
+    /// stored after a reorg); the winning branch's bodies are `branch`.
+    async fn reinject_abandoned(&self, old_tip: AppliedTip, fork: AppliedTip, branch: &[Block]) {
+        let Some(mempool) = self.mempool.as_ref() else {
+            return;
+        };
+        let carried: std::collections::HashSet<Hash> = branch
+            .iter()
+            .flat_map(|b| b.transactions.iter().map(|t| t.hash))
+            .collect();
+        let mut abandoned: Vec<Vec<citrate_consensus::types::Transaction>> = Vec::new();
+        let mut cursor = old_tip.hash;
+        // The abandoned run is old_tip.height - fork.height blocks long (at most
+        // MAX_REORG_DEPTH: reorg_to refuses deeper reverts).
+        let depth = old_tip.height.saturating_sub(fork.height);
+        for _ in 0..depth {
+            if cursor == fork.hash {
+                break;
+            }
+            match read_block(&self.storage, &cursor) {
+                Ok(Some(b)) => {
+                    cursor = b.header.selected_parent_hash;
+                    abandoned.push(b.transactions);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("execute-on-receive: re-injection walk stopped at {cursor}: {e}");
+                    break;
+                }
+            }
+        }
+        let txs: Vec<citrate_consensus::types::Transaction> = abandoned
+            .into_iter()
+            .rev()
+            .flatten()
+            .filter(|t| !carried.contains(&t.hash))
+            .collect();
+        if txs.is_empty() {
+            return;
+        }
+        let offered = txs.len();
+        let pooled = mempool.reinject_transactions(txs).await;
+        info!(
+            "execute-on-receive: reorg abandoned {offered} tx(s) the winning branch does not carry; \
+             {pooled} re-injected into the mempool (the rest are spent or invalid on the new tip)"
+        );
     }
 
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
@@ -2206,6 +2279,7 @@ impl CanonicalApplicator {
             pre_tip.height.saturating_sub(fork.height),
             branch.len()
         );
+        self.reinject_abandoned(pre_tip, fork, &branch).await;
         ReorgOutcome::Reorged {
             new_tip: tip.hash,
             height: tip.height,

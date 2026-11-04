@@ -157,7 +157,8 @@ impl TxNode {
         );
         let app = Arc::new(
             CanonicalApplicator::new(executor.clone(), storage.clone())
-                .with_fork_choice(ghostdag.clone()),
+                .with_fork_choice(ghostdag.clone())
+                .with_mempool(mempool.clone()),
         );
         app.set_genesis(genesis_state(), genesis.header.block_hash);
         let adm = Arc::new(BlockAdmission::new(
@@ -417,4 +418,31 @@ fn produced_block_log_reports_height_and_tx_count() {
         !arm.contains("0, // We'll get tx count from block"),
         "the produced-block log must not print a constant tx count"
     );
+}
+
+/// `start_node` must wire the mempool into the applicator the way the harness
+/// above does, or a reorg never re-injects anything.
+#[test]
+fn start_node_wires_the_mempool_into_the_applicator() {
+    let main = include_str!("main.rs");
+    let start = main
+        .find("canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())")
+        .expect("applicator construction in start_node");
+    let builder = &main[start..start + 900];
+    assert!(
+        builder.contains(".with_mempool(mempool.clone())"),
+        "start_node must attach the mempool to the applicator"
+    );
+}
+
+#[test]
+fn produced_block_line_reports_the_stored_blocks_height_and_tx_count() {
+    let mut blk = genesis_block(Hash::default());
+    blk.header.height = 2801;
+    blk.transactions = vec![transfer(7)];
+    let line = crate::producer::produced_block_line(&blk.header.block_hash, Some(&blk), 25);
+    assert!(line.contains("height=2801"), "{line}");
+    assert!(line.contains("txs=1"), "{line}");
+    let missing = crate::producer::produced_block_line(&blk.header.block_hash, None, 25);
+    assert!(!missing.contains("txs="), "no guessed count: {missing}");
 }
