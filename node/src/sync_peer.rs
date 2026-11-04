@@ -493,8 +493,9 @@ impl SyncPeerSelector {
     /// or below our tip cannot advance us, and selecting one is what made the
     /// live fleet re-import its own anchor every 2 s for seven hours.
     ///
-    /// I2: among those, de-preferred peers (>= [`DEPREFER_AT_FAILURES`]) are
-    /// skipped ONLY while a clean useful peer exists. When every useful peer is
+    /// I2: among those, de-preferred peers (>= [`DEPREFER_AT_FAILURES`]
+    /// timeouts, or a score at [`SCORE_MIN`]) are skipped ONLY while a clean
+    /// useful peer exists. When every useful peer is
     /// de-preferred, the best is used anyway — otherwise the penalty box can
     /// blacklist the entire network. Counters are NOT cleared on that escape;
     /// see the module docs for why that would disable the drop-and-re-handshake
@@ -561,10 +562,24 @@ impl SyncPeerSelector {
         // shared history before a split otherwise outrank, forever, the one
         // peer actually ahead on the network's chain once every score has
         // bottomed out (r1006 bootnodes, 2026-11-03).
+        //
+        // De-preferred means timed out (>= DEPREFER_AT_FAILURES) OR bottomed
+        // out (score at SCORE_MIN: its answers carried nothing usable, again and
+        // again). A timeout penalty clears only when the peer is asked again;
+        // if a peer that answers every request with nothing still counted as
+        // clean, it would shut every timed-out peer out for good, however far
+        // ahead they are. That is H1 (r1007 planset): after a split whose
+        // serving was starved, the stopped side's siblings answered with
+        // their own tip forever and the peers that held the heavier chain were
+        // never asked again. With both kinds de-preferred, the score decides
+        // between them, and a peer that has not proven useless is asked.
         let lead = |id: &str| self.served(id).saturating_sub(applied_height);
+        let de_preferred = |id: &str| {
+            i32::from(self.failures(id) >= DEPREFER_AT_FAILURES || self.score(id) <= SCORE_MIN)
+        };
         useful.into_iter().max_by(|a, b| {
-            let fa = i32::from(self.failures(&a.id) >= DEPREFER_AT_FAILURES);
-            let fb = i32::from(self.failures(&b.id) >= DEPREFER_AT_FAILURES);
+            let fa = de_preferred(&a.id);
+            let fb = de_preferred(&b.id);
             // Lower penalty flag is better, so compare b to a.
             fb.cmp(&fa)
                 .then_with(|| self.score(&a.id).cmp(&self.score(&b.id)))
