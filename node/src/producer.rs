@@ -876,6 +876,7 @@ impl ProduceCatchupGate {
     ///
     /// Candidates at/below the finalized floor are pruned in passing (bounded record).
     /// No-op unless both the candidate record and the scratch watermark are wired.
+    #[cfg(test)]
     fn recompute_attested_ahead(&self, selected: Option<(Hash, u64)>, storage: &StorageManager) {
         self.recompute_with_own_top(selected, None, storage);
     }
@@ -9104,7 +9105,7 @@ mod tests {
         /// follows. Here B follows six producers on one chain, then seals alone.
         #[tokio::test(flavor = "current_thread")]
         async fn cv5_a_producer_at_the_tip_keeps_sealing() {
-            let (_others, mut b, _templates) = seven().await;
+            let (_others, b, _templates) = seven().await;
             for step in 0..12u64 {
                 b.producer
                     .produce_block()

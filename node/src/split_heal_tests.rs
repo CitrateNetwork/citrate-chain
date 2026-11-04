@@ -1714,7 +1714,6 @@ mod tests {
             fleet.slot(&o).await;
         }
         fleet.quiet.clear();
-        let split_top = *fleet.applied_heights().await.iter().max().expect("nodes");
         // Gossip crosses again, requests and answers do not.
         fleet.set_links(|_, _| true);
         fleet.serve_cut = (0..n)

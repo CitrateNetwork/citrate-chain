@@ -240,9 +240,11 @@ fn score_anchor_tag(hash: &Hash, score: u64) -> [u8; 8] {
     h.update(b"citrate/dag/score-anchor/v1");
     h.update(hash.as_bytes());
     h.update(score.to_be_bytes());
-    let out = h.finalize();
+    let out: [u8; 32] = h.finalize().into();
     let mut tag = [0u8; 8];
-    tag.copy_from_slice(&out[..8]);
+    for (t, o) in tag.iter_mut().zip(out.iter()) {
+        *t = *o;
+    }
     tag
 }
 
@@ -760,20 +762,16 @@ impl DagStore {
     pub fn get_derived_blue_score(&self, hash: &Hash) -> Option<u64> {
         let kv = self.persistent.as_ref()?;
         let raw = kv.kv_get(cf::DAG_METADATA, &Self::score_key(hash)).ok()??;
-        match raw.len() {
-            16 => {
-                let score = u64::from_be_bytes(raw[..8].try_into().ok()?);
-                if raw[8..] == score_anchor_tag(hash, score) {
-                    Some(score)
-                } else {
-                    debug!(
-                        "Derived blue score anchor for {} does not bind it; ignored",
-                        hash
-                    );
-                    None
-                }
-            }
-            _ => None,
+        let (score, tag) = raw.split_first_chunk::<8>()?;
+        let score = u64::from_be_bytes(*score);
+        if tag.len() == 8 && *tag == score_anchor_tag(hash, score) {
+            Some(score)
+        } else {
+            debug!(
+                "Derived blue score anchor for {} does not bind it; ignored",
+                hash
+            );
+            None
         }
     }
 
