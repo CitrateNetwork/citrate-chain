@@ -4,9 +4,9 @@ use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Persistent metadata key for the cached latest height value.
 /// RM-B1 / WP-C3.2 (audit L-STORE-01).
@@ -64,6 +64,10 @@ pub struct BlockStore {
     /// and last-writer-wins a child link out of CF_DAG_RELATIONS.
     /// Reads stay lock-free.
     put_lock: std::sync::Mutex<()>,
+    /// Whether the tips index (`TIPS_INDEX_PREFIX`) describes this store.
+    /// False only when the rebuild on open failed; `get_tips` then falls back
+    /// to the full scan rather than answer from an incomplete index.
+    tips_indexed: AtomicBool,
 }
 
 impl BlockStore {
@@ -76,11 +80,65 @@ impl BlockStore {
             }
             _ => 0,
         };
-        Self {
+        let store = Self {
             db,
             cached_latest_height: Arc::new(AtomicU64::new(initial)),
             put_lock: std::sync::Mutex::new(()),
+            tips_indexed: AtomicBool::new(false),
+        };
+        match store.ensure_tips_index() {
+            Ok(()) => store.tips_indexed.store(true, AtomicOrdering::SeqCst),
+            Err(e) => warn!(
+                "tips index could not be built ({e}); get_tips falls back to a full store scan"
+            ),
         }
+        store
+    }
+
+    /// Make the tips index describe the store: a no-op when its marker names
+    /// the current latest height, otherwise one full scan (a data dir written
+    /// by a binary without the index, or one that stored blocks after this
+    /// binary last wrote it) and an atomic rewrite of every tip key plus the
+    /// marker.
+    fn ensure_tips_index(&self) -> Result<()> {
+        let _put_guard = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let latest = self.cached_latest_height.load(AtomicOrdering::SeqCst);
+        if self
+            .db
+            .get_cf(CF_METADATA, TIPS_INDEX_MARKER_KEY)?
+            .as_deref()
+            == Some(latest.to_be_bytes().as_slice())
+        {
+            return Ok(());
+        }
+        let tips = self.scan_tips()?;
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+        self.db
+            .for_each_prefix_key_cf(CF_METADATA, TIPS_INDEX_PREFIX, |key| {
+                stale.push(key.to_vec());
+                Ok(())
+            })?;
+        let mut batch = self.db.batch();
+        for key in &stale {
+            self.db.batch_delete_cf(&mut batch, CF_METADATA, key)?;
+        }
+        for hash in &tips {
+            self.db
+                .batch_put_cf(&mut batch, CF_METADATA, &tip_key(hash), &[])?;
+        }
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            TIPS_INDEX_MARKER_KEY,
+            &latest.to_be_bytes(),
+        )?;
+        self.db.write_batch_sync(batch)?;
+        info!(
+            "tips index rebuilt from a full scan: {} tip(s) at latest height {}",
+            tips.len(),
+            latest
+        );
+        Ok(())
     }
 
     /// Store a complete block
@@ -138,6 +196,21 @@ impl BlockStore {
                 .batch_put_cf(&mut batch, CF_BLUE_SET, &blue_score_key, hash.as_bytes())?;
         }
 
+        // Tips index (planset H7): this block is a tip unless a child was
+        // stored before it; every parent stops being one.
+        if !relation_has_child(
+            self.db
+                .get_cf(CF_DAG_RELATIONS, &parent_children_key(&hash))?
+                .as_deref(),
+        ) {
+            self.db
+                .batch_put_cf(&mut batch, CF_METADATA, &tip_key(&hash), &[])?;
+        }
+        for parent in block.parents() {
+            self.db
+                .batch_delete_cf(&mut batch, CF_METADATA, &tip_key(&parent))?;
+        }
+
         // RM-B1 / WP-C3.2 (audit L-STORE-01): bump the cached
         // latest_height inside the same atomic batch as the block
         // data. On commit we update the in-memory cache; on
@@ -149,6 +222,13 @@ impl BlockStore {
                 &mut batch,
                 CF_METADATA,
                 LATEST_HEIGHT_KEY,
+                &new_height.to_be_bytes(),
+            )?;
+            // The tips index describes the store at this height.
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                TIPS_INDEX_MARKER_KEY,
                 &new_height.to_be_bytes(),
             )?;
         }
@@ -461,20 +541,59 @@ impl BlockStore {
         Ok(blocks)
     }
 
-    /// Return the current DAG tips (blocks without known children), sorted by height descending.
+    /// Return the current DAG tips (blocks without known children), sorted by
+    /// height descending.
+    ///
+    /// Cost: O(tips). Read from the tips index, which every write that changes
+    /// the tip set maintains in its own batch (planset H7, ADR CV-6). It used to
+    /// scan every key of CF_BLOCKS and CF_DAG_RELATIONS on each call.
     pub fn get_tips(&self) -> Result<Vec<Hash>> {
-        let mut all_blocks = HashSet::new();
-        for (key, _) in self.db.iter_cf(CF_BLOCKS)? {
-            let key_bytes = key.as_ref();
-            if key_bytes.len() == 32 {
-                all_blocks.insert(Hash::from_bytes(key_bytes));
-            }
+        let hashes = if self.tips_indexed.load(AtomicOrdering::SeqCst) {
+            let mut hashes = Vec::new();
+            self.db
+                .for_each_prefix_key_cf(CF_METADATA, TIPS_INDEX_PREFIX, |key| {
+                    if let Some(hash) = key
+                        .get(TIPS_INDEX_PREFIX.len()..)
+                        .and_then(Hash::try_from_bytes)
+                    {
+                        hashes.push(hash);
+                    }
+                    Ok(())
+                })?;
+            hashes
+        } else {
+            self.scan_tips()?
+        };
+        let mut tips: Vec<(u64, Hash)> = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let height = self
+                .get_header(&hash)?
+                .map(|header| header.height)
+                .unwrap_or_default();
+            tips.push((height, hash));
         }
+        tips.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        Ok(tips.into_iter().map(|(_, hash)| hash).collect())
+    }
 
+    /// The tip set by a full scan: every stored block whose children relation
+    /// names no child. O(store). Used to build the tips index on open, and as
+    /// the reference the index is tested against.
+    pub fn scan_tips(&self) -> Result<Vec<Hash>> {
+        let mut all_blocks = Vec::new();
+        self.db.for_each_prefix_key_cf(CF_BLOCKS, &[], |key| {
+            if key.len() == 32 {
+                all_blocks.push(Hash::from_bytes(key));
+            }
+            Ok(())
+        })?;
         let mut parents_with_children = HashSet::new();
         for (key, value) in self.db.iter_cf(CF_DAG_RELATIONS)? {
             let key_bytes = key.as_ref();
-            if key_bytes.len() == 33 && key_bytes.first() == Some(&b'c') && !value.is_empty() {
+            if key_bytes.len() == 33
+                && key_bytes.first() == Some(&b'c')
+                && relation_has_child(Some(value.as_ref()))
+            {
                 // SECREM-01 CONS-6: key length checked above (33), so the
                 // 32-byte tail is sound; use the fallible decode anyway to
                 // keep the no-panic invariant uniform across this module.
@@ -483,29 +602,22 @@ impl BlockStore {
                 }
             }
         }
-
-        let mut tips: Vec<(u64, Hash)> = Vec::new();
-
-        for hash in all_blocks
+        Ok(all_blocks
             .into_iter()
             .filter(|h| !parents_with_children.contains(h))
-        {
-            let height = self
-                .get_header(&hash)?
-                .map(|header| header.height)
-                .unwrap_or_default();
-            tips.push((height, hash));
-        }
-
-        tips.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-        Ok(tips.into_iter().map(|(_, hash)| hash).collect())
+            .collect())
     }
 
     /// Delete a block and its associated data
     pub fn delete_block(&self, hash: &Hash) -> Result<()> {
+        // The children lists and the tips index are read-modify-writes, as in
+        // `put_block`.
+        let _put_guard = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Get block first to clean up relationships
         if let Some(block) = self.get_block(hash)? {
             let mut batch = self.db.batch();
+            self.db
+                .batch_delete_cf(&mut batch, CF_METADATA, &tip_key(hash))?;
 
             // Delete block
             self.db
@@ -525,6 +637,11 @@ impl BlockStore {
                 let parent_children_key = parent_children_key(&parent);
                 if let Ok(mut children) = self.get_children(&parent) {
                     children.retain(|&child| child != *hash);
+                    // A stored parent whose last child goes is a tip again.
+                    if children.is_empty() && self.has_block(&parent)? {
+                        self.db
+                            .batch_put_cf(&mut batch, CF_METADATA, &tip_key(&parent), &[])?;
+                    }
                     let children_bytes = bincode::serialize(&children)?;
                     self.db.batch_put_cf(
                         &mut batch,
@@ -574,6 +691,8 @@ impl BlockStore {
                 .batch_delete_cf(&mut batch, CF_HEADERS, hash.as_bytes())?;
             self.db
                 .batch_delete_cf(&mut batch, CF_DAG_RELATIONS, &parent_children_key(hash))?;
+            self.db
+                .batch_delete_cf(&mut batch, CF_METADATA, &tip_key(hash))?;
             let hk = height_to_key(block.header.height);
             if self.db.get_cf(CF_METADATA, &hk)?.as_deref() == Some(hash.as_bytes()) {
                 self.db.batch_delete_cf(&mut batch, CF_METADATA, &hk)?;
@@ -593,6 +712,10 @@ impl BlockStore {
                 .filter(|c| !doomed.contains(c))
                 .collect();
             if kept.len() != children.len() {
+                if kept.is_empty() && self.has_block(parent)? {
+                    self.db
+                        .batch_put_cf(&mut batch, CF_METADATA, &tip_key(parent), &[])?;
+                }
                 let bytes = bincode::serialize(&kept)?;
                 self.db.batch_put_cf(
                     &mut batch,
@@ -632,6 +755,12 @@ impl BlockStore {
             &mut batch,
             CF_METADATA,
             LATEST_HEIGHT_KEY,
+            &latest.to_be_bytes(),
+        )?;
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            TIPS_INDEX_MARKER_KEY,
             &latest.to_be_bytes(),
         )?;
         self.db.write_batch_sync(batch)?;
@@ -799,6 +928,40 @@ pub(crate) fn stage_canonical_index(
 }
 
 // Key generation helpers
+/// DAG tips index (`CF_METADATA`): this prefix followed by the 32-byte hash of
+/// a stored block with no stored child. Maintained in the same batch as every
+/// write that changes the tip set (`put_block`, `delete_block`,
+/// `purge_blocks`), so `get_tips` reads O(tips) keys instead of scanning
+/// CF_BLOCKS and CF_DAG_RELATIONS (planset H7, ADR CV-6).
+const TIPS_INDEX_PREFIX: &[u8] = b"tips_idx:";
+
+/// Present once the tips index describes the store. A data dir written by a
+/// binary without the index has no marker; [`BlockStore::new`] rebuilds the
+/// index from a full scan once and writes the marker in the same batch.
+const TIPS_INDEX_MARKER_KEY: &[u8] = b"tips_idx_v1";
+
+fn tip_key(hash: &Hash) -> Vec<u8> {
+    let mut k = Vec::with_capacity(TIPS_INDEX_PREFIX.len().saturating_add(32));
+    k.extend_from_slice(TIPS_INDEX_PREFIX);
+    k.extend_from_slice(hash.as_bytes());
+    k
+}
+
+/// Whether a stored `CF_DAG_RELATIONS` children value names at least one
+/// child. Absent, empty, or an empty list: no child. A value that does not
+/// decode counts as a child (it is not proof the block has none), as the
+/// full-scan rule always did for non-empty bytes.
+fn relation_has_child(value: Option<&[u8]>) -> bool {
+    match value {
+        None => false,
+        Some([]) => false,
+        Some(bytes) => match bincode::deserialize::<Vec<Hash>>(bytes) {
+            Ok(children) => !children.is_empty(),
+            Err(_) => true,
+        },
+    }
+}
+
 fn height_to_key(height: u64) -> Vec<u8> {
     let mut key = vec![b'h'];
     key.extend_from_slice(&height.to_be_bytes());
@@ -1099,7 +1262,7 @@ mod tests {
                 .build_unhashed()
         };
         let mut batch = db.batch();
-        let mut write = |b: &Block, batch: &mut rocksdb::WriteBatch| {
+        let write = |b: &Block, batch: &mut rocksdb::WriteBatch| {
             let hash = b.hash();
             db.batch_put_cf(
                 batch,
@@ -1207,5 +1370,164 @@ mod tests {
             "get_tips on 20,000 blocks took {t_big:?} vs {t_small:?} on 200: it scales with \
              the store, not with the tips"
         );
+    }
+
+    fn sorted(mut v: Vec<Hash>) -> Vec<Hash> {
+        v.sort();
+        v
+    }
+
+    fn dag_block(id: u16, height: u64, parents: &[Hash]) -> Block {
+        let mut h = [0x5C; 32];
+        h[..2].copy_from_slice(&id.to_be_bytes());
+        h[2..10].copy_from_slice(&height.to_be_bytes());
+        BlockBuilder::new()
+            .hash(Hash::new(h))
+            .parent(parents.first().copied().unwrap_or_default())
+            .merge_parents(parents.iter().skip(1).copied().collect())
+            .height(height)
+            .timestamp(1_000_000 + height)
+            .blue_score(height)
+            .blue_work(u128::from(height))
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+    }
+
+    /// The maintained tips index answers exactly what a full scan answers,
+    /// through out-of-order puts (a child stored before its parent), merges,
+    /// deletes (pruning) and purges (rollback), and across a reopen.
+    #[test]
+    fn tips_index_matches_a_full_scan_through_put_delete_and_purge() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = BlockStore::new(db.clone());
+        let check = |store: &BlockStore, what: &str| {
+            assert_eq!(
+                sorted(store.get_tips().unwrap()),
+                sorted(store.scan_tips().unwrap()),
+                "{what}"
+            );
+        };
+        // Deterministic pseudo-random DAG: each block names 1-3 parents among
+        // the last 6 blocks; every 5th block is stored after its successor.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let g = dag_block(0, 0, &[]);
+        store.put_block(&g).unwrap();
+        let mut blocks = vec![g];
+        let mut held: Option<Block> = None;
+        for id in 1..300u16 {
+            let n = blocks.len();
+            let k = 1 + (next() % 3) as usize;
+            let mut parents = Vec::new();
+            for _ in 0..k {
+                let p = blocks[n - 1 - (next() as usize % n.min(6))].hash();
+                if !parents.contains(&p) {
+                    parents.push(p);
+                }
+            }
+            let height = parents
+                .iter()
+                .filter_map(|p| blocks.iter().find(|b| b.hash() == *p))
+                .map(|b| b.header.height)
+                .max()
+                .unwrap()
+                + 1;
+            let b = dag_block(id, height, &parents);
+            if id % 5 == 0 {
+                held = Some(b.clone());
+            } else {
+                store.put_block(&b).unwrap();
+                if let Some(h) = held.take() {
+                    store.put_block(&h).unwrap();
+                }
+            }
+            blocks.push(b);
+            check(&store, "after put");
+        }
+        if let Some(h) = held.take() {
+            store.put_block(&h).unwrap();
+        }
+        check(&store, "all stored");
+        // Pruning deletes the oldest blocks one by one.
+        for b in blocks.iter().take(40) {
+            store.delete_block(&b.hash()).unwrap();
+            check(&store, "after delete");
+        }
+        // Deleting a tip makes its parents tips again where it was their
+        // last child.
+        for b in blocks.iter().rev().take(10) {
+            store.delete_block(&b.hash()).unwrap();
+            check(&store, "after deleting a tip");
+        }
+        // A rollback purges the top of the DAG in one batch.
+        let doomed: HashSet<Hash> = blocks
+            .iter()
+            .rev()
+            .skip(10)
+            .take(30)
+            .map(|b| b.hash())
+            .collect();
+        store.purge_blocks(&doomed).unwrap();
+        check(&store, "after purge");
+        assert!(!store.get_tips().unwrap().is_empty(), "purge leaves tips");
+        let before = sorted(store.get_tips().unwrap());
+        drop(store);
+        let reopened = BlockStore::new(db);
+        assert_eq!(sorted(reopened.get_tips().unwrap()), before, "reopen");
+    }
+
+    /// A data dir written without the index (no marker), or one an older
+    /// binary extended after the index was written (marker behind the latest
+    /// height), is rebuilt from a full scan on open.
+    #[test]
+    fn tips_index_is_rebuilt_on_open_when_missing_or_stale() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = BlockStore::new(db.clone());
+        let a = create_test_block(1, Hash::new([0xA0; 32]));
+        let b = create_test_block(2, a.header.block_hash);
+        store.put_block(&a).unwrap();
+        store.put_block(&b).unwrap();
+        drop(store);
+
+        // No marker and no index: an upgraded data dir.
+        db.delete_cf(CF_METADATA, TIPS_INDEX_MARKER_KEY).unwrap();
+        db.delete_cf(CF_METADATA, &tip_key(&b.header.block_hash))
+            .unwrap();
+        let store = BlockStore::new(db.clone());
+        assert_eq!(store.get_tips().unwrap(), vec![b.header.block_hash]);
+        drop(store);
+
+        // An older binary stored a child of b and bumped the latest height
+        // without touching the index.
+        let c = create_test_block(3, b.header.block_hash);
+        db.put_cf(
+            CF_BLOCKS,
+            c.header.block_hash.as_bytes(),
+            &bincode::serialize(&c).unwrap(),
+        )
+        .unwrap();
+        db.put_cf(
+            CF_HEADERS,
+            c.header.block_hash.as_bytes(),
+            &bincode::serialize(&c.header).unwrap(),
+        )
+        .unwrap();
+        db.put_cf(
+            CF_DAG_RELATIONS,
+            &parent_children_key(&b.header.block_hash),
+            &bincode::serialize(&vec![c.header.block_hash]).unwrap(),
+        )
+        .unwrap();
+        db.put_cf(CF_METADATA, LATEST_HEIGHT_KEY, &3u64.to_be_bytes())
+            .unwrap();
+        let store = BlockStore::new(db);
+        assert_eq!(store.get_tips().unwrap(), vec![c.header.block_hash]);
     }
 }
