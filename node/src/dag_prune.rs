@@ -456,15 +456,15 @@ mod tests {
             .add_block(&next)
             .await
             .expect("admission must survive a pruned ancestry");
-        // SECREM-A001 RC-8: the chain ROOT is now the real height-0 genesis
-        // (`is_configured_genesis()` holds), so a block at height h scores h+1.
-        // What matters is that the sequence CONTINUES unbroken across the prune.
+        // r1007 G7: genesis scores 0, so a block at height h of a linear chain
+        // scores h (its committed header value). What matters is that the
+        // sequence CONTINUES unbroken across the prune.
         assert_eq!(
             ghostdag
                 .get_blue_score(&next.header.block_hash)
                 .await
                 .unwrap(),
-            N + 2,
+            N + 1,
             "score sequence continues across the prune"
         );
 
@@ -570,15 +570,17 @@ mod tests {
             storage.blocks.put_block(&b).expect("chain");
         }
         storage.blocks.put_applied_tip(&parent, N).expect("tip");
+        // r1007 G12: the durable record is the tip's GHOSTDAG record
+        // (`DAG_GHOSTDAG`), which replaced the `score:` anchor.
         assert!(
-            dag.get_derived_blue_score(&parent).is_some(),
-            "the tip's durable anchor must exist, or this test is exercising the \
-             no-anchor path again rather than the question being asked"
+            dag.get_ghostdag_data(&parent).is_some(),
+            "the tip's durable record must exist, or this test is exercising the \
+             no-record path again rather than the question being asked"
         );
         assert_eq!(prune_once(&storage, &dag, N, MIN_RETAIN_BLOCKS).await, 500);
         assert!(
-            dag.get_derived_blue_score(&parent).is_some(),
-            "pruning must not delete the RETAINED tip's anchor"
+            dag.get_ghostdag_data(&parent).is_some(),
+            "pruning must not delete the RETAINED tip's record"
         );
 
         // RESTART, follower-style: a brand-new GhostDag over the SAME (pruned)
@@ -597,8 +599,9 @@ mod tests {
                 .get_blue_score(&next.header.block_hash)
                 .await
                 .expect("score"),
-            N + 2,
-            "the score sequence continues unbroken across prune AND restart"
+            N + 1,
+            "the score sequence continues unbroken across prune AND restart \
+             (r1007 G7: genesis 0, so height N + 1 scores N + 1)"
         );
     }
 
@@ -658,11 +661,14 @@ mod tests {
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
-        // The merge block lands at height N+1, so a merge parent at height
-        // `N + 1 - MERGE_PARENT_MAX_DEPTH` is EXACTLY at the bound (admits) and one at
-        // `N - MERGE_PARENT_MAX_DEPTH` is one-past the bound (rejected).
-        let within_bound_height = N + 1 - MERGE_PARENT_MAX_DEPTH; // depth == 100
-        let over_bound_height = N - MERGE_PARENT_MAX_DEPTH; // depth == 101
+        // r1007 G5 (strict merge depth) replaces MP-DEPTH: every mergeset block
+        // must have MDR = the chain block MERGE_DEPTH below the merging block in
+        // its past. The merge block lands at height N+1, so a SIDE block (off
+        // the chain, r1007 G2 forbids merging the selected parent's own
+        // ancestors) at depth MERGE_DEPTH - 1 admits, and one at depth
+        // MERGE_DEPTH is one past the bound (rejected).
+        let within_bound_height = N + 2 - MERGE_PARENT_MAX_DEPTH; // depth == 99
+        let over_bound_height = N + 1 - MERGE_PARENT_MAX_DEPTH; // depth == 100
 
         let mut parent = Hash::default();
         let mut within_bound_hash = Hash::default();
@@ -672,13 +678,21 @@ mod tests {
         // InvalidParents under the genesis-identity binding).
         for h in 0..=N {
             let b = mk(h, parent, vec![]);
+            // The side blocks sit on the chain block below their height. Their
+            // smaller VRF output keeps the chain block the heavier sibling (G3).
+            if h == within_bound_height || h == over_bound_height {
+                let mut side = mk(h, parent, vec![]);
+                side.header.vrf_reveal.output = Hash::new([0x01; 32]);
+                side.header.block_hash = side.compute_hash();
+                if h == within_bound_height {
+                    within_bound_hash = side.header.block_hash;
+                } else {
+                    over_bound_hash = side.header.block_hash;
+                }
+                dag.store_block(side.clone()).await.expect("dag");
+                ghostdag.add_block(&side).await.expect("admit side");
+            }
             parent = b.header.block_hash;
-            if h == within_bound_height {
-                within_bound_hash = b.header.block_hash;
-            }
-            if h == over_bound_height {
-                over_bound_hash = b.header.block_hash;
-            }
             dag.store_block(b.clone()).await.expect("dag");
             ghostdag.add_block(&b).await.expect("admit");
             storage.blocks.put_block(&b).expect("chain");
@@ -697,6 +711,8 @@ mod tests {
 
         // (1) A merge parent at exactly MERGE_PARENT_MAX_DEPTH admits — the legal merge a
         // cold-syncing node must be able to cross.
+        // The side block's anticone (99 chain blocks) is far over K, so it is
+        // red and adds nothing: the merge scores the selected parent's N + 1.
         let ok = mk(N + 1, parent, vec![within_bound_hash]);
         dag.store_block(ok.clone()).await.expect("dag");
         ghostdag
@@ -708,9 +724,9 @@ mod tests {
                 .get_blue_score(&ok.header.block_hash)
                 .await
                 .expect("score"),
-            // SECREM-A001 RC-8: with the real height-0 genesis a block at height
-            // h scores h+1, so the merge at height N+1 scores N+2.
-            N + 2,
+            // r1007 G7: genesis 0, so the chain block at height N scores N and
+            // the merge (one blue: its selected parent) scores N + 1.
+            N + 1,
             "the applied chain advances past a legal merge"
         );
 
@@ -724,9 +740,8 @@ mod tests {
             .await
             .expect_err("a merge parent deeper than MP-DEPTH must be rejected from genesis");
         assert!(
-            format!("{err:?}").contains("MP-DEPTH")
-                || format!("{err:?}").contains("below this block"),
-            "rejection must be the MP-DEPTH linkage error, got: {err:?}"
+            format!("{err:?}").contains("MergeDepthViolation"),
+            "rejection must be the merge-depth (G5) error, got: {err:?}"
         );
     }
 
@@ -908,10 +923,27 @@ mod tests {
         let dropped = prune_once(&storage, &pruned_dag, N, RETAIN).await;
         assert!(dropped > 0, "the pruned node must actually have pruned");
 
-        // Two producers seal siblings at N+1; the next block merges them.
+        // Two producers seal siblings at N+1; the next block merges them. r1007
+        // G3: the heavier of the two (larger ForkChoiceKey) is the selected
+        // parent; G7: the merge commits SP's N + 1 plus {SP, other} = N + 3.
         let a = mk(N + 1, parent, vec![], 0x33);
         let b = mk(N + 1, parent, vec![], 0x44);
-        let merge = mk(N + 2, a.header.block_hash, vec![b.header.block_hash], 0x33);
+        let (heavy, light) = if citrate_consensus::types::ForkChoiceKey::of_header(&a.header)
+            > citrate_consensus::types::ForkChoiceKey::of_header(&b.header)
+        {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+        let mut merge = mk(
+            N + 2,
+            heavy.header.block_hash,
+            vec![light.header.block_hash],
+            0x33,
+        );
+        merge.header.blue_score = N + 3;
+        merge.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 3);
+        merge.header.block_hash = merge.compute_hash();
         for blk in [&a, &b, &merge] {
             for (dag, gd) in [(&pruned_dag, &pruned), (&full_dag, &full)] {
                 dag.store_block(blk.clone()).await.expect("dag");
@@ -931,15 +963,18 @@ mod tests {
             pruned_score, full_score,
             "pruned and unpruned nodes must agree on a merge block's score"
         );
-        // Genesis..N is N+1 blocks, plus a, plus the blue merge parent b, plus merge.
+        // r1007 G7: blue past(merge) = genesis..N (N+1 blocks), a, b.
         assert_eq!(
             full_score,
-            N + 4,
-            "merge = sp score + 1 + one blue merge parent"
+            N + 3,
+            "merge = sp score + |{{sp, blue merge parent}}|"
         );
 
         // And the chain keeps going on top of it.
-        let child = mk(N + 3, h, vec![], 0x44);
+        let mut child = mk(N + 3, h, vec![], 0x44);
+        child.header.blue_score = N + 4;
+        child.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 4);
+        child.header.block_hash = child.compute_hash();
         pruned_dag.store_block(child.clone()).await.expect("dag");
         pruned
             .add_block(&child)
@@ -950,7 +985,7 @@ mod tests {
                 .get_blue_score(&child.header.block_hash)
                 .await
                 .expect("score"),
-            N + 5
+            N + 4
         );
     }
 

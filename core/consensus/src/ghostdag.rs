@@ -1,8 +1,22 @@
 // citrate/core/consensus/src/ghostdag.rs
+//
+// GHOSTDAG for r1007 (ADR CV-3, planset 2026-11-03-r1007-v060
+// `06_CONSENSUS_SPEC.md` §2). One blue score: the header commits the exact
+// GHOSTDAG `blue_score` / `blue_work`, admission recomputes both from headers
+// and rejects any mismatch, and fork choice reads the committed values.
+//
+// The coloring is rusty-kaspa's `GhostdagManager::ghostdag` /
+// `check_blue_candidate` (kaspanet/rusty-kaspa af6ff23a,
+// `consensus/src/processes/ghostdag/protocol.rs`), over the whole mergeset,
+// with both k-cluster conditions. Every read is of headers and of the
+// persisted per-block `GhostdagData` of blocks inside the GHOSTDAG window.
 
 use crate::dag_store::DagStore;
-use crate::types::{Block, BlueSet, DagRelation, GhostDagParams, Hash};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::types::{
+    Block, BlockHeader, BlueSet, DagRelation, ForkChoiceKey, GhostDagParams, GhostdagData, Hash,
+    WORK_UNIT,
+};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -14,10 +28,10 @@ pub enum GhostDagError {
     #[error("Block not found: {0}")]
     BlockNotFound(Hash),
 
-    /// S2-5: the fork-choice score of this block cannot be recomputed from the
-    /// blocks this node holds and no derived score is recorded for it. The block
-    /// is not ranked (never on its header score).
-    #[error("Fork-choice score unavailable for {0}")]
+    /// The GHOSTDAG record of this block cannot be read or recomputed from
+    /// the headers this node holds. Fail closed: never a value from another
+    /// source.
+    #[error("GHOSTDAG data unavailable for {0}")]
     ScoreUnavailable(Hash),
 
     #[error("Invalid parent structure")]
@@ -38,23 +52,96 @@ pub enum GhostDagError {
     #[error("Header height {claimed} != selected parent height + 1 ({expected})")]
     HeightMismatch { claimed: u64, expected: u64 },
 
-    #[error("Header blue_score {claimed} outside feasible range [{min}, {max}]")]
-    BlueScoreOutOfRange { claimed: u64, min: u64, max: u64 },
+    /// G7: the header's blue_score is not the GHOSTDAG value.
+    #[error("Header blue_score {claimed} != GHOSTDAG blue_score {expected}")]
+    BlueScoreMismatch { claimed: u64, expected: u64 },
 
-    #[error("Header blue_work {claimed} != canonical work for score ({expected})")]
+    /// G7: the header's blue_work is not the GHOSTDAG value.
+    #[error("Header blue_work {claimed} != GHOSTDAG blue_work {expected}")]
     BlueWorkMismatch { claimed: u128, expected: u128 },
+
+    /// G2: one parent is in the past of another.
+    #[error("Parents are not an antichain: {ancestor} is in the past of {descendant}")]
+    ParentsNotAntichain { ancestor: Hash, descendant: Hash },
+
+    /// G3: the header names a selected parent that is not the heaviest parent.
+    #[error("Selected parent {claimed} is not the heaviest parent {heaviest}")]
+    SelectedParentNotHeaviest { claimed: Hash, heaviest: Hash },
+
+    /// G4: |Mergeset(B)| > MERGESET_SIZE_LIMIT.
+    #[error("Mergeset of {size} blocks exceeds the limit of {limit}")]
+    MergesetTooLarge { size: usize, limit: usize },
+
+    /// G5: a mergeset block does not have the merge-depth root in its past.
+    #[error(
+        "Mergeset block {block} is not in the future of the merge-depth root {merge_depth_root}"
+    )]
+    MergeDepthViolation { block: Hash, merge_depth_root: Hash },
 
     #[error("Invalid linkage: {0}")]
     InvalidLinkage(String),
 }
 
-/// Hard cap on `blue_cache` entries.
+/// §1.2 `K`. The r1007 value is conditional on S1 measuring the end-to-end
+/// block delay (spec §1.3): it holds while 2·D·λ ≤ 10. This is the spec
+/// default; `GhostDagParams::default().k` equals it.
+pub const GHOSTDAG_K: u32 = 18;
+
+/// §1.2 `MAX_PARENTS`: 1 selected + at most 9 merge parents.
+pub const MAX_PARENTS: usize = 10;
+
+/// §1.2 `MERGESET_SIZE_LIMIT` (G4): |Mergeset(B)|, selected parent included.
+/// 10·K, rusty-kaspa's floor (`bps.rs`). Provisional on S1 M3.
+pub const MERGESET_SIZE_LIMIT: usize = 180;
+
+/// §1.2 `MERGE_DEPTH` (G5), in heights.
 ///
-/// Every entry holds a cumulative blue-ancestry set whose size grows with
-/// chain length, so an unbounded map reaches O(entries × N) — the same
-/// quadratic blow-up that halted chain 40204, just reached more slowly.
-/// Entries are pure cache: recomputing one yields an identical set.
-const MAX_BLUE_CACHE_ENTRIES: usize = 32;
+/// Reviewer question R3 is answered with the spec default: the STRICT rule.
+/// Every block of `Mergeset*(B)` must have `MDR(B)` in its past, where
+/// `MDR(B) = chain_ancestor(SP(B), max(0, height(B) - MERGE_DEPTH))`. Kaspa's
+/// bounded merge depth with "kosherizing" blues is not implemented.
+///
+/// One consequence the spec does not spell out: a direct merge parent at
+/// exactly `height(B) - MERGE_DEPTH` is rejected (it is not `MDR`, which is in
+/// past(SP), so it cannot have `MDR` in its past), so the deepest admissible
+/// merge parent sits `MERGE_DEPTH - 1` below the block. The pre-r1007 MP-DEPTH
+/// rule admitted depth `MERGE_DEPTH`.
+pub const MERGE_PARENT_MAX_DEPTH: u64 = 100;
+
+/// Spec name for [`MERGE_PARENT_MAX_DEPTH`].
+pub const MERGE_DEPTH: u64 = MERGE_PARENT_MAX_DEPTH;
+
+/// §1.2 `GHOSTDAG_WINDOW` = 2·MERGE_DEPTH, in heights. Every read the
+/// coloring of a block B makes lies in `[height(B) - GHOSTDAG_WINDOW,
+/// height(B))`: G5 bounds the mergeset to the future of `MDR(B)`, and every
+/// mergeset block's own parents to the future of its own merge-depth root.
+/// A read that would go below it fails closed.
+pub const MERGE_SCORE_WINDOW: u64 = 2 * MERGE_PARENT_MAX_DEPTH;
+
+/// Spec name for [`MERGE_SCORE_WINDOW`].
+pub const GHOSTDAG_WINDOW: u64 = MERGE_SCORE_WINDOW;
+
+/// Height from which merge-depth limits apply: 0, and fixed.
+///
+/// r1007 is a new genesis with every rule active from block 0 (ADR CV-2), so
+/// G5 has no activation height. This constant is kept only because the
+/// consensus manifest fingerprints it.
+pub const MERGE_DEPTH_ACTIVATION_HEIGHT: u64 = 0;
+
+/// Former devnet override for [`MERGE_DEPTH_ACTIVATION_HEIGHT`]. No longer
+/// read: the r1007 rules have no environment override (spec §1.2).
+pub const MERGE_DEPTH_ACTIVATION_ENV: &str = "CITRATE_MERGE_DEPTH_ACTIVATION_HEIGHT";
+
+/// The merge-depth activation height: always [`MERGE_DEPTH_ACTIVATION_HEIGHT`].
+pub fn merge_depth_activation_height() -> u64 {
+    MERGE_DEPTH_ACTIVATION_HEIGHT
+}
+
+/// Bound on in-memory `GhostdagData` records when the DAG store is persistent
+/// (the records are also on disk, so an evicted entry is re-read, never
+/// recomputed from another source). An in-memory store keeps every record, as
+/// it keeps every block.
+const MAX_GHOSTDAG_CACHE_ENTRIES: usize = 65_536;
 
 /// GhostDAG consensus engine
 pub struct GhostDag {
@@ -64,19 +151,27 @@ pub struct GhostDag {
     /// DAG storage
     dag_store: Arc<DagStore>,
 
-    /// DAG relations cache
+    /// DAG relations cache. `blue_set.score` / `.work` are copies of the
+    /// committed header values (G8); `blue_set.blocks` is always empty.
     relations: Arc<RwLock<HashMap<Hash, DagRelation>>>,
 
-    /// Blue set cache for efficiency
-    blue_cache: Arc<RwLock<HashMap<Hash, BlueSet>>>,
+    /// GhostdagData records (G12). A cache over the persisted records.
+    ghostdag_cache: Arc<RwLock<HashMap<Hash, Arc<GhostdagData>>>>,
+
+    /// Records computed by the consistency gate for blocks not yet added,
+    /// keyed by hash and the (selected parent, merge parents, height) they were
+    /// computed from, so `add_block` right after the gate (the admission
+    /// order) does not color the mergeset twice. A pure memo: an entry is used
+    /// only for the same parents and height, and the record is a function of
+    /// those and the immutable past.
+    validated: Arc<std::sync::Mutex<VecDeque<ValidatedRecord>>>,
 
     /// Current tips of the DAG
     tips: Arc<RwLock<HashSet<Hash>>>,
 
-    /// MP-DEPTH activation height. `None` = rule not enforced (the default), so
-    /// this field is inert until an operator schedules it. See
-    /// [`MERGE_PARENT_MAX_DEPTH`] and `handoffs/PRUNE_MERGE_PARENT_BOUND_SPEC.md`.
-    merge_depth_activation_height: Option<u64>,
+    /// The ForkChoiceKey of every registered block, from its committed header
+    /// (G8), so fork choice ranks a registered block without a store read.
+    keys: Arc<RwLock<HashMap<Hash, ForkChoiceKey>>>,
 
     /// PBA-R2 block-validity hardening (PBA-L1b-003 timestamp bound). Captured
     /// from the process-wide activation height at construction; see
@@ -90,132 +185,85 @@ pub struct GhostDag {
     dag_hydrated: Arc<AtomicBool>,
 }
 
-/// MP-DEPTH: the deepest a merge parent may sit below the block that merges it.
-///
-/// **This is a consensus rule, not a local policy.** It exists so that DAG
-/// pruning can be enabled: a bounded merge depth is what makes it PROVABLE that
-/// nothing a valid block can reference lies below the retained window, which in
-/// turn is what lets the blue-set walk terminate at the window instead of
-/// walking to genesis (`get_or_calculate_blue_set` phase 1) and failing against
-/// a pruned store.
-///
-/// Without it, a block at height 72,000 may legally merge a parent at height 5,
-/// and a node that bounded its walk would compute a WRONG SCORE rather than an
-/// error — a silent fork. Verified live 2026-07-29: a merge block referencing a
-/// pruned parent is rejected with `MissingParent` while unpruned peers accept it
-/// (`dag_prune::merge_block_referencing_a_pruned_parent_is_rejected_not_scored`).
-///
-/// Value: 100, matching `finality_depth` and `canonical_apply::MAX_REORG_DEPTH`.
-/// It bounds how long a partitioned producer can be away and still have its work
-/// merged rather than orphaned. It must stay well under `MIN_RETAIN_BLOCKS`
-/// (1,000) so the pruner can never remove a block a valid block may still cite:
-///
-///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
-pub const MERGE_PARENT_MAX_DEPTH: u64 = 100;
+/// One entry of `GhostDag::validated`.
+struct ValidatedRecord {
+    hash: Hash,
+    selected_parent: Hash,
+    merges: Vec<Hash>,
+    height: u64,
+    data: GhostdagData,
+}
 
-/// MS-BOUND: how far below a merge block its fork-choice score may look.
-///
-/// A merge block's score is `score(selected parent) + 1 + (number of its merge
-/// parents that are blue)`, where a merge parent is blue when at most `k` blocks
-/// of the selected parent's past within this window sit in its anticone (see
-/// `bounded_blue_merge_count`). Everything that computation reads lies in
-/// `[height - MERGE_SCORE_WINDOW, height)`, and a block's past within a height
-/// range is fixed by the parent hashes in headers, so every node that holds that
-/// range computes the same score, whether or not it prunes below it.
-///
-/// Must stay well under `MIN_RETAIN_BLOCKS` (1,000) so a pruned node always holds
-/// the window plus one MP-DEPTH of parents below it (300 heights here):
-///
-///   MERGE_PARENT_MAX_DEPTH (100) < MERGE_SCORE_WINDOW (200) < MIN_RETAIN_BLOCKS (1,000)
-pub const MERGE_SCORE_WINDOW: u64 = 2 * MERGE_PARENT_MAX_DEPTH;
+/// How many gate results `validated` keeps (admission adds each block right
+/// after gating it, so a handful suffices).
+const MAX_VALIDATED_RECORDS: usize = 64;
 
-/// Height from which MP-DEPTH is enforced on chain 40204.
-///
-/// **0 since the 2026-08-04 re-roll.** The previous value (100_000) existed
-/// only because chain 40204 already had ~78,000 blocks produced under the old
-/// rule, and re-judging history under a new validity rule forks just as surely
-/// as enforcing it early does — so the rule could only switch on at a future
-/// height (owner decision 2026-07-29, ~12-hour upgrade window).
-///
-/// The re-roll wiped that history, so there is nothing to stay compatible with
-/// and a non-zero activation is now actively dangerous. MP-DEPTH is what makes
-/// bounding the blue-set walk sound, and therefore what makes DAG pruning safe:
-/// the documented invariant is
-///
-///   MERGE_PARENT_MAX_DEPTH (100) < MIN_RETAIN_BLOCKS (1,000) <= retain window
-///
-/// so that no valid block can cite anything the pruner may have dropped. DAG
-/// pruning is now ENABLED fleet-wide (`CITRATE_DAG_PRUNE_RETAIN=10000`, added
-/// 2026-08-04 to stop the bootnodes OOM-looping). With enforcement deferred to
-/// 100_000 that invariant does not hold for the first ~100k blocks: a block
-/// could legally cite a merge parent deeper than the retained window, and a
-/// pruned node then rejects it `MissingParent` while an unpruned peer accepts
-/// it — a silent fork, exactly the shape verified live on 2026-07-29 by
-/// `dag_prune::merge_block_referencing_a_pruned_parent_is_rejected_not_scored`.
-/// The window is live from validator activation (2000), where multi-producer
-/// merges begin.
-///
-/// Enforcing from genesis closes it: one validity rule for the whole chain, and
-/// a cold sync from block 0 never straddles a rule change.
-///
-/// **Baked into `GhostDag::new` rather than passed by each call site.** There are
-/// six `GhostDag::new` call sites across the node and producer; a validity rule
-/// that depends on every one of them remembering a builder method is a rule that
-/// will eventually be enforced by some nodes and not others, which is a fork. The
-/// default IS the consensus value, and disabling it takes an explicit call.
-pub const MERGE_DEPTH_ACTIVATION_HEIGHT: u64 = 0;
+/// One step of the coloring walk down the selected chain: the block being
+/// colored itself (its partial record), or a chain block with its record.
+enum ChainStep {
+    New,
+    Block(Hash, Arc<GhostdagData>),
+}
 
-/// Devnet-only override for [`MERGE_DEPTH_ACTIVATION_HEIGHT`].
-///
-/// DANGER: this is a consensus parameter. Two nodes on the same chain with
-/// different values disagree about block validity. It exists so an isolated
-/// devnet can activate at a low height; never set it on 40204.
-pub const MERGE_DEPTH_ACTIVATION_ENV: &str = "CITRATE_MERGE_DEPTH_ACTIVATION_HEIGHT";
+/// `past(of) ∪ {of}` restricted to heights `>= floor`, with the floor lowered
+/// on demand. Exact for every block at or above the current floor (see
+/// `GhostDag::past_with_links`), so a query is answered from a walk that goes
+/// only as deep as the deepest block asked about. Never below `window_floor`:
+/// a query there fails closed (only an ancestry that breaks G5 reaches it).
+struct LazyPast {
+    of: Hash,
+    window_floor: u64,
+    floor: u64,
+    set: Option<HashSet<Hash>>,
+}
 
-/// Resolve the MP-DEPTH activation height, honouring the devnet override.
-pub fn merge_depth_activation_height() -> u64 {
-    std::env::var(MERGE_DEPTH_ACTIVATION_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(MERGE_DEPTH_ACTIVATION_HEIGHT)
+impl LazyPast {
+    fn new(of: Hash, window_floor: u64, initial_floor: u64) -> Self {
+        Self {
+            of,
+            window_floor,
+            floor: initial_floor.max(window_floor),
+            set: None,
+        }
+    }
+
+    async fn contains(
+        &mut self,
+        gd: &GhostDag,
+        hash: &Hash,
+        height: u64,
+    ) -> Result<bool, GhostDagError> {
+        if height < self.window_floor {
+            return Err(GhostDagError::MergeDepthViolation {
+                block: *hash,
+                merge_depth_root: self.of,
+            });
+        }
+        if self.set.is_none() || height < self.floor {
+            // Lower in steps, so a walk down the window is O(window) walks of
+            // growing depth at worst, and one shallow walk in the common case.
+            if height < self.floor {
+                self.floor = height.saturating_sub(16).max(self.window_floor);
+            }
+            self.set = Some(gd.past_within(&self.of, self.floor).await?);
+        }
+        Ok(self.set.as_ref().is_some_and(|s| s.contains(hash)))
+    }
 }
 
 impl GhostDag {
     pub fn new(params: GhostDagParams, dag_store: Arc<DagStore>) -> Self {
-        let activation = merge_depth_activation_height();
         Self {
             params,
             dag_store,
-            merge_depth_activation_height: Some(activation),
             pba_hardening: crate::hardening::PbaHardening::from_process(),
             relations: Arc::new(RwLock::new(HashMap::new())),
-            blue_cache: Arc::new(RwLock::new(HashMap::new())),
+            ghostdag_cache: Arc::new(RwLock::new(HashMap::new())),
+            validated: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
+            keys: Arc::new(RwLock::new(HashMap::new())),
             dag_hydrated: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Schedule MP-DEPTH enforcement from `height` onward.
-    ///
-    /// A validity rule, so it MUST be activated by height rather than switched
-    /// on at upgrade time: a node enforcing it while a peer does not disagree
-    /// about which blocks are valid, which is a fork. Blocks below `height` are
-    /// judged by the old rule forever — re-validating history under a new rule
-    /// forks the chain just as surely.
-    ///
-    /// Rollout order: upgrade every node, THEN pick a height comfortably beyond
-    /// the slowest upgrade, and confirm the producer refuses to build violating
-    /// blocks before it arrives.
-    pub fn with_merge_depth_activation_height(mut self, height: u64) -> Self {
-        self.merge_depth_activation_height = Some(height);
-        self
-    }
-
-    /// Disable MP-DEPTH entirely. For tests and isolated devnets that build
-    /// deliberately deep merges; never for a node on a shared chain.
-    pub fn without_merge_depth_enforcement(mut self) -> Self {
-        self.merge_depth_activation_height = None;
-        self
     }
 
     /// Override the PBA-R2 hardening activation (tests / isolated devnets).
@@ -229,815 +277,621 @@ impl GhostDag {
         self.pba_hardening
     }
 
-    /// Whether MP-DEPTH is enforced for a block at `height`. `None` activation
-    /// means never — the default, so an upgraded binary changes nothing until
-    /// an activation height is set deliberately.
-    pub fn merge_depth_enforced_at(&self, height: u64) -> bool {
-        matches!(self.merge_depth_activation_height, Some(a) if height >= a)
-    }
-
     /// Get consensus parameters
     pub fn params(&self) -> &GhostDagParams {
         &self.params
     }
 
-    /// Calculate blue set for a block following GhostDAG rules
-    pub async fn calculate_blue_set(&self, block: &Block) -> Result<BlueSet, GhostDagError> {
-        // Check cache first
-        if let Some(cached) = self.blue_cache.read().await.get(&block.hash()) {
-            return Ok(cached.clone());
-        }
+    // -----------------------------------------------------------------------
+    // Header and record access
+    // -----------------------------------------------------------------------
 
-        let mut blue_set = BlueSet::new();
-
-        // Genesis block is always blue
-        if block.is_genesis() {
-            blue_set.insert(block.hash());
-            self.insert_blue_cache_bounded(block.hash(), blue_set.clone())
-                .await;
-            return Ok(blue_set);
-        }
-
-        // Get selected parent's blue set
-        let selected_parent_blue = self
-            .get_or_calculate_blue_set(&block.selected_parent())
-            .await?;
-
-        // Start with selected parent's blue set
-        blue_set.blocks = selected_parent_blue.blocks.clone();
-        blue_set.score = selected_parent_blue.score;
-
-        // Calculate blue blocks among merge parents
-        let blue_merge_parents = self
-            .calculate_blue_merge_parents(block, &selected_parent_blue)
-            .await?;
-
-        // Add blue merge parents to blue set
-        for parent_hash in &blue_merge_parents {
-            let parent_blue_set = self.get_or_calculate_blue_set(parent_hash).await?;
-            blue_set.blocks.extend(parent_blue_set.blocks);
-        }
-
-        // Add current block to blue set and recompute score from set size
-        blue_set.blocks.insert(block.hash());
-        blue_set.score = blue_set.blocks.len() as u64;
-        // SECREM-01 CONS-2: work is always derived from the recomputed
-        // score (canonical fn in types.rs) — never copied from a header.
-        blue_set.work = crate::types::blue_work_for_score(blue_set.score);
-
-        // Cache the result
-        self.insert_blue_cache_bounded(block.hash(), blue_set.clone())
-            .await;
-
-        info!(
-            "Calculated blue set for block {}: score={}",
-            block.hash(),
-            blue_set.score
-        );
-        Ok(blue_set)
+    /// The header of a block this node holds. A miss is `MissingParent`: the
+    /// caller cannot judge without it (admission defers, never guesses).
+    async fn header_of(&self, hash: &Hash) -> Result<BlockHeader, GhostDagError> {
+        self.dag_store
+            .get_header(hash)
+            .await
+            .map_err(|_| GhostDagError::MissingParent(*hash))
     }
 
-    /// Calculate which merge parents are blue according to k-cluster rule
-    async fn calculate_blue_merge_parents(
-        &self,
-        block: &Block,
-        selected_parent_blue: &BlueSet,
-    ) -> Result<Vec<Hash>, GhostDagError> {
-        let mut blue_parents = Vec::new();
-        let mut red_parents = Vec::new();
-
-        for merge_parent in &block.header.merge_parent_hashes {
-            if self
-                .is_blue_candidate(merge_parent, selected_parent_blue, &blue_parents)
-                .await?
-            {
-                blue_parents.push(*merge_parent);
-            } else {
-                red_parents.push(*merge_parent);
-            }
+    /// Selected parent, merge parents and height of a block this node holds,
+    /// from `relations` or, after a restart, the DAG store.
+    async fn links_of(&self, hash: &Hash) -> Result<(Hash, Vec<Hash>, u64), GhostDagError> {
+        if let Some(r) = self.relations.read().await.get(hash) {
+            return Ok((r.selected_parent, r.merge_parents.clone(), r.height));
         }
-
-        debug!(
-            "Block {} has {} blue and {} red merge parents",
-            block.hash(),
-            blue_parents.len(),
-            red_parents.len()
-        );
-
-        Ok(blue_parents)
+        // Header only: after a restart every stored block is a skeleton, and
+        // `get_block` would reload and decode its whole body for three fields.
+        let header = self
+            .dag_store
+            .get_header(hash)
+            .await
+            .map_err(|_| GhostDagError::MissingParent(*hash))?;
+        Ok((
+            header.selected_parent_hash,
+            header.merge_parent_hashes,
+            header.height,
+        ))
     }
 
-    /// Check if a block can be blue according to k-cluster rule
-    async fn is_blue_candidate(
-        &self,
-        candidate: &Hash,
-        selected_parent_blue: &BlueSet,
-        current_blue_parents: &[Hash],
-    ) -> Result<bool, GhostDagError> {
-        // The k-cluster rule only cares whether the anticone count
-        // exceeds k — not the exact count. We pass k as an upper bound
-        // so `count_blue_anticone` can short-circuit after k+1 hits,
-        // instead of walking the entire blue set (thousands of entries
-        // on a long-running chain) with an O(BFS_depth) call each.
-        //
-        // Before this bound, validation of a single block at chain
-        // height 14k+ was doing millions of BFS visits and OOM-killing
-        // the node (observed on testnet-beta, Apr 2026). See
-        // `count_blue_anticone` docs.
-        let k = self.params.k as usize;
-        let anticone_size = self
-            .count_blue_anticone(
-                candidate,
-                selected_parent_blue,
-                current_blue_parents,
-                k.saturating_add(1),
-            )
-            .await?;
-
-        Ok(anticone_size <= k)
+    async fn height_of(&self, hash: &Hash) -> Result<u64, GhostDagError> {
+        Ok(self.links_of(hash).await?.2)
     }
 
-    /// Count blue blocks in anticone, short-circuiting once the count
-    /// reaches `max_count` (the caller only needs to know whether the
-    /// count exceeds a threshold, not the exact total).
+    /// `of` and every block reachable from it by parent edges whose height is
+    /// at least `floor`, each with its parents and height.
     ///
-    /// **Why the bound matters**: each pair of `is_ancestor_of` calls
-    /// does a BFS up to `MAX_BFS_DEPTH` ancestors, allocating a
-    /// HashSet + VecDeque per call. A reference blue set on a
-    /// long-running chain can contain thousands of blocks, so the
-    /// unbounded version did O(|blue_set| × BFS_depth) work per block
-    /// validation — routinely millions of visits and the actual
-    /// memory pressure behind the OOM loop on testnet-beta (Apr 2026).
-    ///
-    /// With `max_count = k + 1` (the k-cluster rule's threshold), this
-    /// caps the work at O(k × BFS_depth) per call. For k=18, that's
-    /// ~18 BFS calls worst case instead of thousands.
-    async fn count_blue_anticone(
+    /// Exact for that range, not an approximation: parent edges strictly
+    /// decrease height, so every path from `of` to a block at height `>= floor`
+    /// stays at or above `floor`, and cutting the walk below `floor` never hides
+    /// one.
+    async fn past_with_links(
         &self,
-        block: &Hash,
-        reference_blue_set: &BlueSet,
-        additional_blues: &[Hash],
-        max_count: usize,
-    ) -> Result<usize, GhostDagError> {
-        let mut count = 0;
-
-        // `is_ancestor_of(blue_block, block)` BFS-walks up from `block` down
-        // to `blue_block`'s height. For the deep ancestors that dominate a
-        // cumulative blue set that walk is O(depth × width) EACH, so summed
-        // over the set it is Theta(N²) — the residual time cost that remained
-        // after the Theta(N²) *memory* fix, and on its own enough to stop the
-        // producer (~53 min for one merge block at the live chain's height).
-        //
-        // Walk `block`'s past ONCE instead, then answer each query by set
-        // membership. Equivalent by construction: `is_ancestor_of` resolves
-        // ancestry purely by reachability over `relations` parent edges, with
-        // a height short-circuit that is reproduced verbatim below.
-        let past = self.collect_past(block).await?;
-        let heights: HashMap<Hash, u64> = {
-            let relations = self.relations.read().await;
-            reference_blue_set
-                .blocks
-                .iter()
-                .chain(additional_blues.iter())
-                .chain(std::iter::once(block))
-                .filter_map(|h| relations.get(h).map(|r| (*h, r.height)))
-                .collect()
-        };
-        let block_height = heights.get(block).copied();
-        let is_ancestor_of_block = |candidate: &Hash| -> bool {
-            if candidate == block {
-                return true;
-            }
-            // Mirrors the structural short-circuit in `is_ancestor_of`:
-            // a parent edge strictly decreases height, so an equal-or-higher
-            // block can never be an ancestor.
-            if let (Some(a_h), Some(d_h)) = (heights.get(candidate).copied(), block_height) {
-                if a_h >= d_h {
-                    return false;
-                }
-            }
-            past.contains(candidate)
-        };
-
-        // Check against reference blue set
-        for blue_block in &reference_blue_set.blocks {
-            if count >= max_count {
-                return Ok(count);
-            }
-            if !self.is_ancestor_of(block, blue_block).await? && !is_ancestor_of_block(blue_block) {
-                count = count.saturating_add(1);
-            }
-        }
-
-        // Check against additional blue blocks
-        for blue_block in additional_blues {
-            if count >= max_count {
-                return Ok(count);
-            }
-            if !self.is_ancestor_of(block, blue_block).await? && !is_ancestor_of_block(blue_block) {
-                count = count.saturating_add(1);
-            }
-        }
-
-        Ok(count)
-    }
-
-    /// Every block reachable from `of` by parent edges, including `of` itself.
-    ///
-    /// Traverses exactly the edges [`Self::is_ancestor_of`] traverses
-    /// (`relations` selected-parent + merge-parents), so
-    /// `collect_past(d).contains(a)` answers the same question as
-    /// `is_ancestor_of(a, d)` for any `a` — but once per `d` rather than once
-    /// per `(a, d)` pair.
-    async fn collect_past(&self, of: &Hash) -> Result<HashSet<Hash>, GhostDagError> {
-        // Same absolute bound as `is_ancestor_of`, and the same refusal to
-        // silently return a wrong answer when it is hit.
+        of: &Hash,
+        floor: u64,
+    ) -> Result<HashMap<Hash, (Vec<Hash>, u64)>, GhostDagError> {
+        // Generous: the window is GHOSTDAG_WINDOW heights times the DAG width.
         const MAX_VISITED: usize = 1_000_000;
-
-        let relations = self.relations.read().await;
-        let mut visited: HashSet<Hash> = HashSet::new();
+        let mut visited: HashMap<Hash, (Vec<Hash>, u64)> = HashMap::new();
         let mut queue: VecDeque<Hash> = VecDeque::new();
         queue.push_back(*of);
-
         while let Some(current) = queue.pop_front() {
-            if !visited.insert(current) {
+            if visited.contains_key(&current) {
                 continue;
             }
+            let (sp, merges, height) = self.links_of(&current).await?;
+            if height < floor {
+                continue;
+            }
+            let mut parents = Vec::with_capacity(merges.len().saturating_add(1));
+            if sp != Hash::default() {
+                parents.push(sp);
+            }
+            parents.extend(merges);
+            // The selected parent sits exactly one height below; skip it
+            // without a read once it is under the floor.
+            for (i, p) in parents.iter().enumerate() {
+                if i == 0 && height <= floor && sp != Hash::default() {
+                    continue;
+                }
+                queue.push_back(*p);
+            }
+            visited.insert(current, (parents, height));
             if visited.len() >= MAX_VISITED {
-                tracing::error!(
-                    "collect_past exceeded MAX_VISITED ({}) walking the past of {}; \
-                     refusing to lie about ancestry",
-                    MAX_VISITED,
-                    of
-                );
                 return Err(GhostDagError::CycleDetected);
             }
-            if let Some(relation) = relations.get(&current) {
-                if relation.selected_parent != Hash::default() {
-                    queue.push_back(relation.selected_parent);
-                }
-                for parent in &relation.merge_parents {
-                    queue.push_back(*parent);
-                }
-            }
         }
-
         Ok(visited)
     }
 
-    /// Check if `ancestor` is an ancestor of `descendant`.
-    ///
-    /// Closes audit finding **H-07**. The previous implementation BFS-
-    /// walked up to a fixed `MAX_BFS_DEPTH = 10_000` cap and silently
-    /// returned `Ok(false)` on exhaustion — turning an unknown answer
-    /// into a definitively-wrong "no". On a long-running chain, this
-    /// caused divergent blue-set computation between fresh-sync nodes
-    /// (small relations cache, BFS cap fires often) and warm-cache
-    /// nodes (large cache, no cap), producing fork-inducing blue-set
-    /// disagreement.
-    ///
-    /// The fix uses structural height reachability: if both blocks
-    /// have known heights and `ancestor.height >= descendant.height`
-    /// (with `ancestor != descendant`), ancestry is impossible by
-    /// the GhostDAG well-formedness rule (each parent edge strictly
-    /// decreases height). Otherwise BFS up from `descendant` but
-    /// prune any branch that would walk *below* `ancestor.height`,
-    /// since blocks at height < `ancestor.height` cannot themselves
-    /// be `ancestor` or one of `ancestor`'s descendants.
-    ///
-    /// The remaining work is bounded by `(descendant.height -
-    /// ancestor.height) × max_dag_width`, which is a function of
-    /// content (heights and DAG shape), not of cache state. This is
-    /// the load-bearing property the planset's
-    /// `BlueSetIsContentDetermined` invariant captures.
-    ///
-    /// Backward-compat fallback: if either height is unavailable
-    /// (the relation hasn't been added to the cache, e.g., a unit
-    /// test that constructs `DagRelation` manually with the default
-    /// `height = 0`), the old BFS-with-cap path is taken and a
-    /// `tracing::warn!` is logged. Production paths always go
-    /// through `add_block` which records height, so the warn fires
-    /// only on test surfaces.
-    async fn is_ancestor_of(
-        &self,
-        ancestor: &Hash,
-        descendant: &Hash,
-    ) -> Result<bool, GhostDagError> {
-        if ancestor == descendant {
-            return Ok(true);
-        }
-
-        let relations = self.relations.read().await;
-
-        let ancestor_height = relations.get(ancestor).map(|r| r.height);
-        let descendant_height = relations.get(descendant).map(|r| r.height);
-
-        // Structural short-circuit: when both heights are known,
-        // ancestry is impossible whenever ancestor.height >=
-        // descendant.height (we already returned early on equality).
-        if let (Some(a_h), Some(d_h)) = (ancestor_height, descendant_height) {
-            if a_h >= d_h {
-                return Ok(false);
-            }
-        }
-
-        // Hard absolute-cap to bound adversarial DAG abuse. With the
-        // height pruning below this should rarely (if ever) be hit
-        // by honest chains; if it IS hit we return Err so the caller
-        // can decide rather than silently lying about ancestry.
-        const MAX_VISITED: usize = 1_000_000;
-        let mut queue = VecDeque::new();
-        let mut visited = HashSet::new();
-        queue.push_back(*descendant);
-
-        while let Some(current) = queue.pop_front() {
-            if visited.contains(&current) {
-                continue;
-            }
-            if visited.len() >= MAX_VISITED {
-                // H-07 fix: previously returned Ok(false) — silently
-                // wrong. Now we return Err so the caller surfaces
-                // the limit instead of producing a content-divergent
-                // answer.
-                tracing::error!(
-                    "is_ancestor_of exceeded MAX_VISITED ({}) walking {} -> {}; \
-                     refusing to lie about ancestry",
-                    MAX_VISITED,
-                    ancestor,
-                    descendant
-                );
-                return Err(GhostDagError::CycleDetected);
-            }
-            visited.insert(current);
-
-            if let Some(relation) = relations.get(&current) {
-                if relation.selected_parent == *ancestor {
-                    return Ok(true);
-                }
-                if relation.merge_parents.contains(ancestor) {
-                    return Ok(true);
-                }
-
-                // H-07: prune branches that drop below ancestor's
-                // height — they cannot reach ancestor or anything
-                // above it. Only applies when ancestor's height is
-                // known.
-                let prune_threshold = ancestor_height;
-
-                let sp = relation.selected_parent;
-                let sp_height = relations.get(&sp).map(|r| r.height);
-                let prune_sp = match (prune_threshold, sp_height) {
-                    (Some(a_h), Some(p_h)) => p_h < a_h,
-                    _ => false,
-                };
-                if !prune_sp {
-                    queue.push_back(sp);
-                }
-
-                for parent in &relation.merge_parents {
-                    let p_height = relations.get(parent).map(|r| r.height);
-                    let prune_mp = match (prune_threshold, p_height) {
-                        (Some(a_h), Some(p_h)) => p_h < a_h,
-                        _ => false,
-                    };
-                    if !prune_mp {
-                        queue.push_back(*parent);
-                    }
-                }
-            }
-        }
-
-        Ok(false)
+    /// `of` and its past at heights `>= floor` (see [`Self::past_with_links`]).
+    async fn past_within(&self, of: &Hash, floor: u64) -> Result<HashSet<Hash>, GhostDagError> {
+        Ok(self.past_with_links(of, floor).await?.into_keys().collect())
     }
 
-    /// Calculate blue score for a block
-    pub async fn calculate_blue_score(&self, block: &Block) -> Result<u64, GhostDagError> {
-        let blue_set = self.calculate_blue_set(block).await?;
-        Ok(blue_set.score)
+    /// The fork-choice key of a registered block, or of a block this node
+    /// holds, from its committed header.
+    pub async fn fork_choice_key(&self, hash: &Hash) -> Option<ForkChoiceKey> {
+        if let Some(k) = self.keys.read().await.get(hash) {
+            return Some(*k);
+        }
+        self.dag_store
+            .get_header(hash)
+            .await
+            .ok()
+            .map(|h| ForkChoiceKey::of_header(&h))
     }
 
-    /// Get or calculate blue set for a block.
+    /// G3: the heaviest of `parents` by [`ForkChoiceKey`]. Every parent must be
+    /// held (`MissingParent` otherwise).
+    pub async fn heaviest_parent(&self, parents: &[Hash]) -> Result<Hash, GhostDagError> {
+        let mut best: Option<ForkChoiceKey> = None;
+        for p in parents {
+            let key = ForkChoiceKey::of_header(&self.header_of(p).await?);
+            if best.is_none_or(|b| key > b) {
+                best = Some(key);
+            }
+        }
+        best.map(|k| k.hash).ok_or(GhostDagError::InvalidParents)
+    }
+
+    /// The persisted or cached GhostdagData of a block this node holds, or,
+    /// if neither has it, the record recomputed from headers (G12).
     ///
-    /// The selected-parent chain walk is **iterative** so replay of a
-    /// long chain with an empty cache cannot blow the stack. Before
-    /// this rewrite, a fresh startup recursed one frame per block along
-    /// the selected-parent chain. On testnet-beta at chain height ~1800
-    /// the main thread hit its stack limit and aborted with:
-    ///
-    /// ```text
-    /// thread 'main' has overflowed its stack
-    /// fatal runtime error: stack overflow, aborting
-    /// ```
-    ///
-    /// Now the algorithm:
-    ///
-    /// 1. Walk the selected-parent chain backward, collecting each
-    ///    uncached block into a `Vec`, until we hit either the cache,
-    ///    genesis, or a missing block (error). All heap, no recursion.
-    /// 2. Walk that list forward (oldest → newest), composing each
-    ///    block's blue set from its now-cached selected parent plus
-    ///    its qualified merge parents.
-    ///
-    /// Merge-parent calls remain recursive because merge parents form
-    /// a wide-but-shallow DAG in practice, not a 1000+ deep chain.
-    fn get_or_calculate_blue_set<'a>(
+    /// Recomputation walks the selected chain down to the nearest block whose
+    /// record is available (or genesis), then colors forward. If a header on
+    /// that walk is missing (a pruned range) it fails closed with
+    /// `MissingParent`; it never substitutes a value from anywhere else.
+    pub fn ghostdag_data<'a>(
         &'a self,
         hash: &'a Hash,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<BlueSet, GhostDagError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<Arc<GhostdagData>, GhostDagError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            // Fast path: already cached
-            if let Some(cached) = self.blue_cache.read().await.get(hash) {
-                return Ok(cached.clone());
+            if let Some(d) = self.cached_data(hash).await {
+                return Ok(d);
             }
-
-            // --- Phase 1: unwind the selected-parent chain iteratively ---
-            // `pending` holds blocks whose blue set we must compute,
-            // ordered from oldest (pending.last()) to newest (pending.first()).
-            let mut pending: Vec<Block> = Vec::new();
+            // Walk down to the first block whose record is known.
+            let mut pending: Vec<BlockHeader> = Vec::new();
             let mut cursor = *hash;
-
             loop {
-                if self.blue_cache.read().await.contains_key(&cursor) {
-                    // Hit a cached ancestor — stop walking back.
+                if self.cached_data(&cursor).await.is_some() {
                     break;
                 }
-
-                let block = self
-                    .dag_store
-                    .get_block(&cursor)
-                    .await
-                    .map_err(|_| GhostDagError::BlockNotFound(cursor))?;
-
-                if block.is_genesis() {
-                    // Seed the cache with genesis, then stop.
-                    let mut blue = BlueSet::new();
-                    blue.blocks.insert(cursor);
-                    blue.score = 1;
-                    self.blue_cache.write().await.insert(cursor, blue);
+                let header = self.header_of(&cursor).await?;
+                if header.selected_parent_hash == Hash::default()
+                    && header.merge_parent_hashes.is_empty()
+                {
+                    let g = Arc::new(genesis_data(&header));
+                    self.cache_data(cursor, g.clone(), true).await;
                     break;
                 }
-
-                let parent = block.selected_parent();
-                pending.push(block);
-                cursor = parent;
-            }
-
-            // --- Phase 2: compose blue sets forward, oldest first ---
-            // pending is newest-first; reverse-iterate for oldest-first.
-            //
-            // The running set is carried in a LOCAL and only the requested
-            // hash is cached at the end. Caching every intermediate here is
-            // what made this Theta(N²): each of the N blocks on the walk got
-            // its own cumulative ancestry set, of sizes 1..N, so a single
-            // call retained ~N²/2 hashes. At the live chain's height that was
-            // ~30 GB, which OOM-killed the producer and halted chain 40204 on
-            // 2026-07-29 (see `merge_block_on_deep_chain_does_not_
-            // materialise_quadratic_ancestry`). Peak memory is now the one
-            // running set — O(N), not O(N²).
-            //
-            // The composed VALUES are unchanged; only what is retained is.
-            // A later request for an intermediate recomputes the identical
-            // set, so no caller can observe the difference.
-            let mut running: Option<(Hash, BlueSet)> = None;
-            for block in pending.iter().rev() {
-                let bhash = block.hash();
-                let sp = block.selected_parent();
-
-                // The selected parent is either the block composed on the
-                // previous iteration (the common case, walking forward down
-                // a chain) or — for the first block only — the cached
-                // ancestor that terminated phase 1.
-                let selected_parent_blue = match running.take() {
-                    Some((prev_hash, prev_blue)) if prev_hash == sp => prev_blue,
-                    _ => {
-                        let cache = self.blue_cache.read().await;
-                        cache.get(&sp).cloned().ok_or({
-                            // Should never happen — Phase 1 guarantees
-                            // the selected parent is now cached.
-                            GhostDagError::BlockNotFound(sp)
-                        })?
+                let next = header.selected_parent_hash;
+                if let Some(prev) = pending.last() {
+                    // Heights strictly fall along selected-parent edges.
+                    if header.height >= prev.height {
+                        return Err(GhostDagError::CycleDetected);
                     }
-                };
-
-                let blue_merge_parents = self
-                    .calculate_blue_merge_parents(block, &selected_parent_blue)
+                }
+                pending.push(header);
+                cursor = next;
+            }
+            // Color forward, oldest first. Each step's chain reads hit records
+            // computed on an earlier step (or already known).
+            for header in pending.iter().rev() {
+                let data = self
+                    .compute_ghostdag(
+                        header.selected_parent_hash,
+                        &header.merge_parent_hashes,
+                        header.height,
+                    )
                     .await?;
-
-                // Take the parent's set by value — the parent is not being
-                // cached, so there is nothing left to share it with.
-                let mut all_blocks = selected_parent_blue.blocks;
-                // Merge parents: recurse, but depth here is bounded by
-                // DAG width (usually <= max_parents = 10), not chain
-                // length, so stack is safe.
-                for p in &blue_merge_parents {
-                    let pset = self.get_or_calculate_blue_set(p).await?;
-                    all_blocks.extend(pset.blocks);
+                if data.blue_score != header.blue_score || data.blue_work != header.blue_work {
+                    // A stored block was admitted with exactly these values, so
+                    // a disagreement means the store does not hold what was
+                    // admitted. Refuse rather than rank on either number.
+                    warn!(
+                        "GHOSTDAG record of stored block {} recomputes to score {} / work {}, \
+                         but its header commits {} / {}: refusing",
+                        header.block_hash,
+                        data.blue_score,
+                        data.blue_work,
+                        header.blue_score,
+                        header.blue_work
+                    );
+                    return Err(GhostDagError::ScoreUnavailable(header.block_hash));
                 }
-                all_blocks.insert(bhash);
-
-                let mut blue = BlueSet::new();
-                blue.score = all_blocks.len() as u64;
-                blue.blocks = all_blocks;
-                running = Some((bhash, blue));
+                self.cache_data(header.block_hash, Arc::new(data), true)
+                    .await;
             }
-
-            if let Some((bhash, blue)) = running {
-                let result = blue.clone();
-                self.insert_blue_cache_bounded(bhash, blue).await;
-                // `pending` ended on the requested hash by construction.
-                if bhash == *hash {
-                    return Ok(result);
-                }
-            }
-
-            // Phase 1 terminated immediately (the hash was already cached, or
-            // it is genesis, seeded above).
-            let cache = self.blue_cache.read().await;
-            cache
-                .get(hash)
-                .cloned()
-                .ok_or(GhostDagError::BlockNotFound(*hash))
+            self.cached_data(hash)
+                .await
+                .ok_or(GhostDagError::ScoreUnavailable(*hash))
         })
     }
 
-    /// Insert into `blue_cache` under a hard entry cap.
-    ///
-    /// Each entry holds a cumulative ancestry set that grows with chain
-    /// length, so an unbounded map is O(entries × N) — the same quadratic
-    /// by a slower route. Entries are pure cache (recomputing yields an
-    /// identical set), so evicting is always safe.
-    async fn insert_blue_cache_bounded(&self, hash: Hash, blue: BlueSet) {
-        let mut cache = self.blue_cache.write().await;
-        if cache.len() >= MAX_BLUE_CACHE_ENTRIES && !cache.contains_key(&hash) {
-            // Access is overwhelmingly tip-local, so the cheapest correct
-            // policy is to drop an arbitrary entry rather than track
-            // recency. Worst case costs one recomputation.
+    /// Cache, then the persisted record. A persisted record counts only if it
+    /// decodes, its tag binds this hash (see `DagStore::get_ghostdag_data`),
+    /// and it agrees with the block's committed header.
+    async fn cached_data(&self, hash: &Hash) -> Option<Arc<GhostdagData>> {
+        if let Some(d) = self.ghostdag_cache.read().await.get(hash) {
+            return Some(d.clone());
+        }
+        let stored = self.dag_store.get_ghostdag_data(hash)?;
+        let header = self.dag_store.get_header(hash).await.ok()?;
+        if stored.selected_parent != header.selected_parent_hash
+            || stored.blue_score != header.blue_score
+            || stored.blue_work != header.blue_work
+        {
+            debug!(
+                "persisted GHOSTDAG record for {} disagrees with its header; ignored",
+                hash
+            );
+            return None;
+        }
+        let d = Arc::new(stored);
+        self.cache_data(*hash, d.clone(), false).await;
+        Some(d)
+    }
+
+    async fn cache_data(&self, hash: Hash, data: Arc<GhostdagData>, persist: bool) {
+        if persist {
+            self.dag_store.put_ghostdag_data(&hash, &data);
+        }
+        let mut cache = self.ghostdag_cache.write().await;
+        if self.dag_store.is_persistent()
+            && cache.len() >= MAX_GHOSTDAG_CACHE_ENTRIES
+            && !cache.contains_key(&hash)
+        {
             if let Some(victim) = cache.keys().next().copied() {
                 cache.remove(&victim);
             }
         }
-        cache.insert(hash, blue);
+        cache.insert(hash, data);
     }
 
-    /// Register an EXISTING block whose `blue_score`/`blue_work` are already
-    /// recorded in the block header.
-    ///
-    /// PIL-13: the eager DAG-load loop in `BlockProducer::with_shared_dag`
-    /// previously called [`Self::add_block`] for every persisted block on
-    /// startup. `add_block` recomputes the full BlueSet, which (because
-    /// `BlueSet.blocks` is the cumulative O(chain-length) blue ancestry)
-    /// allocates O(N²) memory across N=281k blocks. The 16 GB RPC droplet
-    /// kernel-OOM'd within 30 s of every restart.
-    ///
-    /// For blocks already on disk the score + work are durable in the
-    /// header (BlockHeader.blue_score is u64, blue_work is u128, both
-    /// transmitted on the wire too). Loading them is an O(1) read; no
-    /// recomputation needed.
-    ///
-    /// **What this method does NOT do that [`Self::add_block`] does:**
-    /// - It does not populate `blue_cache` with cumulative ancestry sets.
-    /// - It stores a lightweight `BlueSet` (empty `blocks` HashSet, just
-    ///   `score` + `work` from the header) in `relations`.
-    ///
-    /// **Why that's safe:** the only reader of `relations[*].blue_set` is
-    /// [`Self::select_tip`], which only touches `.score`. The cumulative
-    /// `.blocks` HashSet is never read out of `relations` anywhere in the
-    /// tree (verified by grep at the time this method was added, PIL-13).
-    ///
-    /// **Where the full BlueSet IS needed:** validator-side
-    /// `count_blue_anticone` (k-cluster anticone counting). That path goes
-    /// through [`Self::calculate_blue_set`], which lazily walks the chain
-    /// on demand and is unaffected by this lightweight registration.
-    pub async fn register_existing_block(&self, block: &Block) -> Result<(), GhostDagError> {
-        if !block.is_genesis() && block.selected_parent() == Hash::default() {
-            return Err(GhostDagError::InvalidParents);
-        }
+    // -----------------------------------------------------------------------
+    // GHOSTDAG (G2, G4, G5, G6, G7)
+    // -----------------------------------------------------------------------
 
-        // SYNC-S1 D1: derive the score the SAME way the receive path does
-        // (`derive_score_and_work`) instead of copying it out of the header.
-        //
-        // Pre-D1 this read `header.blue_score` while `add_block` recomputed set
-        // cardinality, so the two paths disagreed by exactly one on the same
-        // block: a tip received live scored `height + 1` and the same tip
-        // rehydrated from disk after a restart scored `height`. `select_tip`
-        // compares those numbers across tips, so a live tip and a rehydrated
-        // tip at equal height did not compare equal — a latent fork-choice
-        // inconsistency, now removed. It also keeps SECREM-01 CONS-2 intact
-        // here: no header-reported score reaches the fork-choice baseline.
-        //
-        // Still O(1) per block: the eager rehydration loop walks blocks in
-        // height order, so the selected parent is already in `relations` and
-        // the linear derivation applies.
-        //
-        // NON-FATAL SCORE DERIVATION (restart-liveness fix, 2026-08-11). Pre-fix
-        // this was `derive_score_and_work(block).await?` — all-or-nothing. When a
-        // merge parent's score was unresolvable on restart (a pruned/holed merge
-        // parent → `BlockNotFound` out of `calculate_blue_set`), the `?` returned
-        // BEFORE the `relations` insert and the tips bookkeeping below, so the block
-        // never entered the tip set AND its selected parent was never removed from
-        // it — leaving a STALE ANCESTOR as a tip. `select_tip` (fork-choice for BOTH
-        // the producer and the drain since #163) then returned that ancestor, so the
-        // follower's drain saw no advance and the miner's rebuild was driven at a
-        // stale head — the 2026-08-11 restart wedge. Fall back to the durable derived
-        // anchor, then the header's own blue_score, so a score is ALWAYS available
-        // and the tips bookkeeping ALWAYS runs. The fallback score is only a
-        // fork-choice ranking input (never a consensus state root); an off-by-a-few
-        // score on a holed merge block cannot fork state, and the authoritative
-        // `calculate_blue_set` still recomputes on demand where cardinality matters.
-        let blue_set = match self.derive_score_and_work(block).await {
-            Ok(bs) => {
-                // SYNC-S1 D3: same durable anchor as `add_block` — the rehydration
-                // path must record it too, or a node whose relations were built
-                // only by eager-load starts the next process with no anchors.
-                self.dag_store
-                    .put_derived_blue_score(&block.hash(), bs.score);
-                bs
+    /// `MDR(B)` for a block at `height` whose selected parent is `sp`: the
+    /// chain ancestor of `sp` at `max(0, height - MERGE_DEPTH)`. Also returns
+    /// SP's selected chain from `sp` down to MDR, both included.
+    async fn merge_depth_root(
+        &self,
+        sp: Hash,
+        height: u64,
+    ) -> Result<(Hash, u64, HashSet<Hash>), GhostDagError> {
+        let target = height.saturating_sub(MERGE_DEPTH);
+        let mut chain = HashSet::new();
+        let mut cursor = sp;
+        loop {
+            chain.insert(cursor);
+            let (next, _, h) = self.links_of(&cursor).await?;
+            if h <= target || next == Hash::default() {
+                return Ok((cursor, h, chain));
             }
-            // S2-5 (H4): the score cannot be recomputed from the blocks this
-            // node holds (a pruned or holed ancestry). Use the durable derived
-            // anchor, which is in the same unit, and only if it is plausible.
-            // Never `header.blue_score`: that is the producer's `parent + 1`
-            // count, a different unit from the fork-choice score, and ranking a
-            // block on it next to derived scores mis-orders tips. With no
-            // usable anchor the block is NOT ranked: the caller gets the error.
-            Err(e) => match self.known_score(&block.hash()).await {
-                Some(score) => {
-                    warn!(
-                        "register_existing_block: score derivation for {} @ {} failed ({}) — \
-                         using its durable derived score {}",
-                        block.hash(),
-                        block.header.height,
-                        e,
-                        score
-                    );
-                    BlueSet {
-                        blocks: std::collections::HashSet::new(),
-                        score,
-                        work: crate::types::blue_work_for_score(score),
+            cursor = next;
+        }
+    }
+
+    /// `ghostdag(B)` for a block with selected parent `sp`, merge parents
+    /// `merges` and height `height` (spec G6), with the mergeset rules it
+    /// depends on: G2 (antichain), G4 (size), G5 (merge depth). Reads headers
+    /// and the records of `sp`'s selected chain inside the window only.
+    ///
+    /// The caller checks G3 (`sp` is the heaviest parent) and G1.
+    pub async fn compute_ghostdag(
+        &self,
+        sp: Hash,
+        merges: &[Hash],
+        height: u64,
+    ) -> Result<GhostdagData, GhostDagError> {
+        let k = self.params.k;
+        let sp_header = self.header_of(&sp).await?;
+        // A block with no merge parents has an empty Mergeset*: nothing to
+        // color and no merge-depth rule to check, so MDR is not walked for it
+        // (it is recorded as the zero hash; nothing reads it for such a block).
+        // This keeps a linear block admissible on a node that retains less
+        // than MERGE_DEPTH heights, as the pre-r1007 rules did.
+        let mut data = GhostdagData::with_selected_parent(sp, Hash::default());
+
+        if !merges.is_empty() {
+            let (mdr, mdr_height, sp_chain) = self.merge_depth_root(sp, height).await?;
+            data.merge_depth_root = mdr;
+            let window_floor = height.saturating_sub(GHOSTDAG_WINDOW);
+            let mut sp_past = LazyPast::new(sp, window_floor, height.saturating_sub(2));
+
+            // G2 (part) and G5 for the direct merge parents. A merge parent at or
+            // below MDR's height either is in past(SP) (G2) or cannot have MDR in
+            // its past (G5): invalid either way, decided without a deeper read.
+            let direct: HashSet<Hash> = merges.iter().copied().collect();
+            for m in merges {
+                let mh = self.height_of(m).await?;
+                if mh <= mdr_height {
+                    return Err(GhostDagError::MergeDepthViolation {
+                        block: *m,
+                        merge_depth_root: mdr,
+                    });
+                }
+                if sp_past.contains(self, m, mh).await? {
+                    return Err(GhostDagError::ParentsNotAntichain {
+                        ancestor: *m,
+                        descendant: sp,
+                    });
+                }
+            }
+
+            // G4: Mergeset*(B) by a BFS from the merge parents that stops at
+            // past(SP) ∪ {SP} (Kaspa `unordered_mergeset_without_selected_parent`).
+            let mut mergeset: HashMap<Hash, (Vec<Hash>, u64)> = HashMap::new();
+            let mut queue: VecDeque<Hash> = merges.iter().copied().collect();
+            for m in merges {
+                mergeset.insert(*m, (Vec::new(), 0));
+            }
+            while let Some(cur) = queue.pop_front() {
+                let (csp, cmerges, ch) = self.links_of(&cur).await?;
+                let mut parents = Vec::with_capacity(cmerges.len().saturating_add(1));
+                if csp != Hash::default() {
+                    parents.push(csp);
+                }
+                parents.extend(cmerges);
+                for p in &parents {
+                    // G2: SP, or a direct merge parent, reached from a mergeset
+                    // block is in the past of one of B's merge parents.
+                    if *p == sp || direct.contains(p) {
+                        return Err(GhostDagError::ParentsNotAntichain {
+                            ancestor: *p,
+                            descendant: cur,
+                        });
                     }
-                }
-                None => {
-                    warn!(
-                        "register_existing_block: score derivation for {} @ {} failed ({}) and \
-                         no derived score is recorded — NOT ranking it (fork choice never uses \
-                         the header score)",
-                        block.hash(),
-                        block.header.height,
-                        e
-                    );
-                    return Err(GhostDagError::ScoreUnavailable(block.hash()));
-                }
-            },
-        };
-
-        let relation = DagRelation {
-            block: block.hash(),
-            selected_parent: block.selected_parent(),
-            merge_parents: block.header.merge_parent_hashes.clone(),
-            children: Vec::new(),
-            blue_set,
-            is_chain_block: true,
-            height: block.header.height,
-        };
-
-        let mut relations = self.relations.write().await;
-        relations.insert(block.hash(), relation);
-
-        // Update parent's children link (matches add_block semantics)
-        if let Some(parent_relation) = relations.get_mut(&block.selected_parent()) {
-            parent_relation.children.push(block.hash());
-        }
-        for merge_parent in &block.header.merge_parent_hashes {
-            if let Some(parent_relation) = relations.get_mut(merge_parent) {
-                parent_relation.children.push(block.hash());
-            }
-        }
-        drop(relations);
-
-        // Tips bookkeeping (same as add_block)
-        let mut tips = self.tips.write().await;
-        tips.remove(&block.selected_parent());
-        for merge_parent in &block.header.merge_parent_hashes {
-            tips.remove(merge_parent);
-        }
-        tips.insert(block.hash());
-
-        Ok(())
-    }
-
-    /// AUTHORITATIVE TIP REHYDRATION (restart-liveness fix, 2026-08-11). Align this
-    /// GhostDag's in-memory `tips` with the DAG store's AUTHORITATIVE tip set.
-    ///
-    /// After a restart the eager-load loops (`producer.rs`) register only the
-    /// CANONICAL single-block-per-height chain via [`Self::register_existing_block`],
-    /// so `GhostDag.tips` can diverge from the true DAG tips: a sibling/fork tip is
-    /// never registered, or a block whose registration failed left its parent
-    /// stranded as a tip. Since #163 `select_tip` is the fork-choice authority for
-    /// BOTH the producer's parent-selection AND the drain's reorg, a wrong tip set
-    /// wedges restart recovery (the follower drain sees a stale ancestor as best; the
-    /// miner's runtime rebuild is driven at the wrong head). `DagStore` already
-    /// reconstructs its tip set authoritatively from block-header parentage on load
-    /// (PIL-42, `load_from_persistent`: a block is a tip iff no stored block names it
-    /// as a selected/merge parent). This copies that authoritative set in, first
-    /// registering any tip missing from `relations` so `select_tip` can rank it.
-    ///
-    /// O(number of tips), NOT O(chain length): it only registers TIPS (a handful),
-    /// never walks `calculate_blue_set` for interior blocks (PIL-13 stays intact).
-    /// Returns the number of authoritative tips after reconciliation.
-    pub async fn reconcile_tips_from_dag_store(&self) -> usize {
-        let authoritative: Vec<Hash> = self
-            .dag_store
-            .get_tips()
-            .await
-            .into_iter()
-            .map(|t| t.hash)
-            .collect();
-
-        // Ensure every authoritative tip has a `relations` entry (with a score) so
-        // `select_tip` considers it. `register_existing_block` is now non-fatal, so
-        // a tip whose merge-parent score is unresolvable still lands with a fallback
-        // score rather than being skipped.
-        for hash in &authoritative {
-            let known = self.relations.read().await.contains_key(hash);
-            if !known {
-                if let Ok(block) = self.dag_store.get_block(hash).await {
-                    if let Err(e) = self.register_existing_block(&block).await {
-                        warn!(
-                            "reconcile_tips_from_dag_store: could not register tip {}: {}",
-                            hash, e
-                        );
+                    if mergeset.contains_key(p) {
+                        continue;
                     }
+                    let ph = self.height_of(p).await?;
+                    // Outside past(SP), at or below MDR's height: a mergeset
+                    // block without MDR in its past (G5). Below the window the
+                    // question cannot even be answered (only an invalid ancestry
+                    // reaches there): invalid, and never read further.
+                    if ph < window_floor {
+                        return Err(GhostDagError::MergeDepthViolation {
+                            block: *p,
+                            merge_depth_root: mdr,
+                        });
+                    }
+                    if sp_past.contains(self, p, ph).await? {
+                        continue;
+                    }
+                    if ph <= mdr_height {
+                        return Err(GhostDagError::MergeDepthViolation {
+                            block: *p,
+                            merge_depth_root: mdr,
+                        });
+                    }
+                    mergeset.insert(*p, (Vec::new(), 0));
+                    let size = mergeset.len().saturating_add(1);
+                    if size > MERGESET_SIZE_LIMIT {
+                        return Err(GhostDagError::MergesetTooLarge {
+                            size,
+                            limit: MERGESET_SIZE_LIMIT,
+                        });
+                    }
+                    queue.push_back(*p);
                 }
+                mergeset.insert(cur, (parents, ch));
+            }
+
+            // G5: every mergeset block has MDR in its past. Fast path: a parent
+            // on SP's selected chain at or above MDR, or a mergeset block already
+            // shown to descend from MDR. Otherwise (a parent elsewhere in past(SP))
+            // a bounded walk down to MDR's height decides.
+            let mut by_height: Vec<(u64, Hash)> =
+                mergeset.iter().map(|(h, (_, ht))| (*ht, *h)).collect();
+            by_height.sort_unstable();
+            let mut from_mdr: HashSet<Hash> = HashSet::new();
+            for (_, x) in &by_height {
+                let parents = mergeset.get(x).map(|(p, _)| p.as_slice()).unwrap_or(&[]);
+                let fast = parents
+                    .iter()
+                    .any(|p| sp_chain.contains(p) || from_mdr.contains(p));
+                if fast || self.past_within(x, mdr_height).await?.contains(&mdr) {
+                    from_mdr.insert(*x);
+                } else {
+                    return Err(GhostDagError::MergeDepthViolation {
+                        block: *x,
+                        merge_depth_root: mdr,
+                    });
+                }
+            }
+
+            // G6: color Mergeset*(B) in ascending Key, which is topological
+            // (Key strictly grows along every parent edge of admitted blocks).
+            let mut candidates: Vec<(ForkChoiceKey, u64)> = Vec::with_capacity(mergeset.len());
+            for (h, (_, ht)) in &mergeset {
+                candidates.push((ForkChoiceKey::of_header(&self.header_of(h).await?), *ht));
+            }
+            candidates.sort_unstable();
+            for (c, ch) in candidates {
+                if self
+                    .is_blue_candidate(&mut data, c.hash, ch, k, window_floor)
+                    .await?
+                {
+                    continue;
+                }
+                data.mergeset_reds.push(c.hash);
             }
         }
 
-        // Replace the in-memory tip set with the authoritative one (register above
-        // may have mutated `tips`; the authoritative set is the final word).
-        let mut tips = self.tips.write().await;
-        *tips = authoritative.iter().copied().collect();
-        let n = tips.len();
-        drop(tips);
-
-        // Mark hydration complete so consumers that gate on it (the applicator's
-        // runtime deep-fork rebuild) stop deferring and start trusting `select_tip`.
-        self.dag_hydrated.store(true, Ordering::SeqCst);
-        info!(
-            "reconcile_tips_from_dag_store: GhostDag tips reconciled to {} authoritative tip(s); DAG hydration complete",
-            n
-        );
-        n
+        // G7: score and work from SP's committed values.
+        let blues = data.mergeset_blues.len() as u64;
+        data.blue_score = score_add(sp_header.blue_score, blues)?;
+        data.blue_work = WORK_UNIT
+            .checked_mul(u128::from(blues))
+            .and_then(|w| sp_header.blue_work.checked_add(w))
+            .ok_or_else(|| GhostDagError::InvalidLinkage("blue work overflow".to_string()))?;
+        Ok(data)
     }
 
-    /// Shared handle to the "DAG hydration complete" flag — set true by
-    /// [`Self::reconcile_tips_from_dag_store`] once the in-memory tip set is
-    /// authoritative. Consumers (the applicator's runtime deep-fork rebuild) gate on
-    /// this instead of a block-height heuristic: a genuinely-canonical `select_tip`
-    /// head is frequently LOWER than a longer losing branch, so height cannot stand
-    /// in for "hydration done". Defaults false until reconciliation runs.
-    pub fn dag_hydrated_handle(&self) -> Arc<AtomicBool> {
-        self.dag_hydrated.clone()
-    }
-
-    /// Add a block to the DAG
-    /// SECREM-01 CONS-3 (root cause of CONS-1 + CONS-2): validate the
-    /// structural linkage a header *claims* against what this node can
-    /// verify from its own already-admitted ancestors. Read-only — safe to
-    /// call before any persistence. `add_block` runs it unconditionally, so
-    /// every ingest path that builds DAG relations (gossip, sync,
-    /// efficient-sync) passes this gate and no future caller can forget it.
+    /// Kaspa `check_blue_candidate`: color `candidate` blue (and update
+    /// `data`) if both k-cluster conditions hold, else return false.
     ///
-    /// What is enforced, and why each check exists:
-    /// - **parents exist** — an unknown parent means nothing below the
-    ///   block is verifiable; admitting it would let an attacker build on
-    ///   phantom history.
-    /// - **height == selected_parent.height + 1, exactly** — `header.height`
-    ///   drives the finality boundary (CONS-1): a forged height of 10M on a
-    ///   height-500 chain finalized still-reorg-eligible blocks. Heights are
-    ///   validated inductively from genesis.
-    /// - **selected-parent rule** — no merge parent may have a higher blue
-    ///   score than the selected parent; choosing a lighter selected parent
-    ///   while merging a heavier branch is a fork-choice manipulation.
-    /// - **blue_score within the feasible band** `[sp+1, sp+1+|merges|]` —
-    ///   each block adds itself plus at most its blue merge parents to the
-    ///   blue set, so any claim outside this band is arithmetically
-    ///   impossible. This kills the `u64::MAX` baseline-poisoning attack
-    ///   (CONS-2): inflation is capped at `max_parents` per VRF-elected
-    ///   block instead of unbounded per packet. (Exact k-cluster equality —
-    ///   pinning the score to one value inside the band — is deliberately
-    ///   deferred to the BlueSet-persistence rework tracked since PIL-13;
-    ///   the producer itself currently writes the parent+1 approximation.
-    ///   `add_block` logs any in-band drift as telemetry for that flip.)
-    /// - **blue_work == blue_work_for_score(blue_score)** — work is a pure
-    ///   function of score (single source of truth in `types.rs`); a
-    ///   self-reported work value is never stored.
+    /// 1. |anticone(candidate) ∩ blues| ≤ K;
+    /// 2. no blue in anticone(candidate) already has K blues in its anticone.
+    ///
+    /// The walk visits B's partial record, then SP's record, SP(SP)'s, …, and
+    /// stops at the first chain block in past(candidate): every blue older
+    /// than it is in past(candidate) too. By G5 that happens at MDR(B) at the
+    /// latest.
+    async fn is_blue_candidate(
+        &self,
+        data: &mut GhostdagData,
+        candidate: Hash,
+        candidate_height: u64,
+        k: u32,
+        window_floor: u64,
+    ) -> Result<bool, GhostDagError> {
+        if data.mergeset_blues.len() as u64 == u64::from(k).saturating_add(1) {
+            return Ok(false);
+        }
+        let mut past = LazyPast::new(candidate, window_floor, candidate_height.saturating_sub(2));
+
+        let mut sizes: BTreeMap<Hash, u32> = BTreeMap::new();
+        let mut anticone: u32 = 0;
+        let mut step = ChainStep::New;
+        loop {
+            let blues: Vec<Hash> = match &step {
+                ChainStep::New => data.mergeset_blues.clone(),
+                ChainStep::Block(h, d) => {
+                    if past.contains(self, h, self.height_of(h).await?).await? {
+                        break;
+                    }
+                    d.mergeset_blues.clone()
+                }
+            };
+            for b in &blues {
+                if past.contains(self, b, self.height_of(b).await?).await? {
+                    continue;
+                }
+                let s = self.blue_anticone_size(b, data).await?;
+                sizes.insert(*b, s);
+                anticone = anticone.saturating_add(1);
+                if anticone > k || s == k {
+                    return Ok(false);
+                }
+                if s > k {
+                    return Err(GhostDagError::KClusterViolation);
+                }
+            }
+            let next = match &step {
+                ChainStep::New => data.selected_parent,
+                ChainStep::Block(_, d) => d.selected_parent,
+            };
+            if next == Hash::default() {
+                // Walked past genesis without meeting a block in past(c):
+                // genesis is in the past of every block, so this cannot happen.
+                return Err(GhostDagError::InvalidLinkage(format!(
+                    "coloring walk for {candidate} left the selected chain"
+                )));
+            }
+            let d = self.ghostdag_data(&next).await?;
+            step = ChainStep::Block(next, d);
+        }
+        data.mergeset_blues.push(candidate);
+        data.blues_anticone_sizes.insert(candidate, anticone);
+        for (b, s) in sizes {
+            data.blues_anticone_sizes.insert(b, s.saturating_add(1));
+        }
+        Ok(true)
+    }
+
+    /// Kaspa `blue_anticone_size`: the blue anticone size of `block` from the
+    /// point of view of `context`, found in the first record on `context`'s
+    /// selected chain that has it.
+    async fn blue_anticone_size(
+        &self,
+        block: &Hash,
+        context: &GhostdagData,
+    ) -> Result<u32, GhostDagError> {
+        if let Some(s) = context.blues_anticone_sizes.get(block) {
+            return Ok(*s);
+        }
+        let mut cursor = context.selected_parent;
+        loop {
+            if cursor == Hash::default() {
+                return Err(GhostDagError::InvalidLinkage(format!(
+                    "{block} is not in the blue set of the context"
+                )));
+            }
+            let d = self.ghostdag_data(&cursor).await?;
+            if let Some(s) = d.blues_anticone_sizes.get(block) {
+                return Ok(*s);
+            }
+            cursor = d.selected_parent;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Producer support
+    // -----------------------------------------------------------------------
+
+    /// The parents and GHOSTDAG record of a block this node is about to seal
+    /// on `sp` (spec §9.3): `candidates` are offered as merge parents,
+    /// heaviest first, and each is kept only while G2–G5 still hold and it is
+    /// lighter than `sp` (G3). A candidate that would make the block invalid
+    /// is dropped, never sealed.
+    pub async fn parents_for_new_block(
+        &self,
+        sp: Hash,
+        candidates: &[Hash],
+    ) -> Result<(Vec<Hash>, GhostdagData), GhostDagError> {
+        let max_merges = self.params.max_parents.saturating_sub(1);
+        let sp_header = self.header_of(&sp).await?;
+        let height = sp_header
+            .height
+            .checked_add(1)
+            .ok_or_else(|| GhostDagError::InvalidLinkage("height overflow".to_string()))?;
+        let sp_key = ForkChoiceKey::of_header(&sp_header);
+        let mut offered: Vec<ForkChoiceKey> = Vec::new();
+        for c in candidates {
+            if *c == sp {
+                continue;
+            }
+            if let Ok(h) = self.dag_store.get_header(c).await {
+                let key = ForkChoiceKey::of_header(&h);
+                if key < sp_key {
+                    offered.push(key);
+                }
+            }
+        }
+        offered.sort_unstable_by(|a, b| b.cmp(a));
+        offered.dedup();
+        let mut merges: Vec<Hash> = Vec::new();
+        let mut data = self.compute_ghostdag(sp, &merges, height).await?;
+        for c in offered {
+            if merges.len() >= max_merges {
+                break;
+            }
+            let mut trial = merges.clone();
+            trial.push(c.hash);
+            match self.compute_ghostdag(sp, &trial, height).await {
+                Ok(d) => {
+                    merges = trial;
+                    data = d;
+                }
+                Err(e) => debug!("producer: not merging {}: {}", c.hash, e),
+            }
+        }
+        Ok((merges, data))
+    }
+
+    /// The header a block naming exactly `parents` must carry (G3, G7): its
+    /// selected parent (the heaviest parent), its merge parents (the rest, in
+    /// the given order), its height and its GHOSTDAG record. Fails if the
+    /// parents are not held or would make the block invalid (G2, G4, G5).
+    pub async fn ghostdag_for_parents(
+        &self,
+        parents: &[Hash],
+    ) -> Result<(Hash, Vec<Hash>, u64, GhostdagData), GhostDagError> {
+        let sp = self.heaviest_parent(parents).await?;
+        let merges: Vec<Hash> = parents.iter().copied().filter(|p| *p != sp).collect();
+        let height = self
+            .height_of(&sp)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| GhostDagError::InvalidLinkage("height overflow".to_string()))?;
+        let data = self.compute_ghostdag(sp, &merges, height).await?;
+        Ok((sp, merges, height, data))
+    }
+
+    // -----------------------------------------------------------------------
+    // Admission
+    // -----------------------------------------------------------------------
+
+    /// SECREM-01 CONS-3 + r1007 G1–G7: validate the linkage and the GHOSTDAG
+    /// values a header claims against what this node computes from the headers
+    /// it holds. Read-only — safe to call before any persistence. `add_block`
+    /// runs it unconditionally, so every ingest path passes this gate.
+    ///
+    /// - G1 structure: non-default selected parent, `1 + |merges| ≤
+    ///   max_parents`, no duplicates, no self-reference, SP not repeated,
+    ///   every parent admitted (`MissingParent` otherwise), `height =
+    ///   height(SP) + 1`, timestamps (FWA-C1-03, PBA-L1b-003).
+    /// - G3: the selected parent is the heaviest parent by [`ForkChoiceKey`].
+    /// - G2, G4, G5, G6: see [`Self::compute_ghostdag`].
+    /// - G7: `blue_score` and `blue_work` equal the GHOSTDAG values exactly.
     pub async fn validate_block_consistency(&self, block: &Block) -> Result<(), GhostDagError> {
+        self.check_block(block).await.map(|_| ())
+    }
+
+    /// [`Self::validate_block_consistency`], returning the block's record.
+    async fn check_block(&self, block: &Block) -> Result<GhostdagData, GhostDagError> {
         // SECREM-A001: exempt genesis by IDENTITY, not by shape. A block
         // merely shaped like genesis (parentless, arbitrary height) must
         // fall through to the missing-parent check below, not short-circuit.
         if block.is_configured_genesis(self.dag_store.configured_genesis()) {
-            return Ok(());
+            return Ok(genesis_data(&block.header));
         }
 
         let header = &block.header;
@@ -1077,15 +931,15 @@ impl GhostDag {
             }
         }
 
-        // Parents must already be admitted locally.
-        let sp = self
-            .dag_store
-            .get_block(&sp_hash)
-            .await
-            .map_err(|_| GhostDagError::MissingParent(sp_hash))?;
+        // Parents must already be admitted locally (headers only).
+        let sp = self.header_of(&sp_hash).await?;
+        let mut parent_keys = vec![ForkChoiceKey::of_header(&sp)];
+        for mp in merge_parents {
+            parent_keys.push(ForkChoiceKey::of_header(&self.header_of(mp).await?));
+        }
 
         // Height linkage is exact and inductive from genesis.
-        let expected_height = sp.header.height.checked_add(1).ok_or_else(|| {
+        let expected_height = sp.height.checked_add(1).ok_or_else(|| {
             GhostDagError::InvalidLinkage("selected parent height overflow".to_string())
         })?;
         if header.height != expected_height {
@@ -1096,27 +950,17 @@ impl GhostDag {
         }
 
         // FWA-C1-03: timestamp must be monotonic vs the selected parent.
-        // Previously only a future-bound was enforced (gossip.rs); nothing
-        // stopped a proposer from BACKDATING a block before its parent,
-        // skewing any time-based logic that reads header.timestamp. A block
-        // can never be older than the block it builds on.
-        if header.timestamp < sp.header.timestamp {
+        if header.timestamp < sp.timestamp {
             return Err(GhostDagError::InvalidLinkage(format!(
                 "timestamp {} precedes selected parent's {} — must be parent-monotonic",
-                header.timestamp, sp.header.timestamp
+                header.timestamp, sp.timestamp
             )));
         }
 
         // PBA-L1b-003: and it may not run more than
-        // MAX_BLOCK_TIMESTAMP_ADVANCE_SECS ahead of it. Without an upper bound
-        // one block stamped u64::MAX became the tip and every honest child
-        // (stamped `now`) failed the monotonic check above: a permanent halt.
-        // Parent-relative so it is deterministic (a wall-clock bound is local
-        // policy, enforced at ingress). Height-gated: history is never
-        // re-judged under a new rule.
+        // MAX_BLOCK_TIMESTAMP_ADVANCE_SECS ahead of it.
         if self.pba_hardening.active_at(header.height) {
             let max_ts = sp
-                .header
                 .timestamp
                 .saturating_add(crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS);
             if header.timestamp > max_ts {
@@ -1124,323 +968,77 @@ impl GhostDag {
                     "timestamp {} is more than {}s past selected parent's {} (PBA-L1b-003)",
                     header.timestamp,
                     crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS,
-                    sp.header.timestamp
+                    sp.timestamp
                 )));
             }
         }
 
-        // Selected-parent rule + merge-parent existence.
-        for mp in merge_parents {
-            let mp_block = self
-                .dag_store
-                .get_block(mp)
-                .await
-                .map_err(|_| GhostDagError::MissingParent(*mp))?;
-            if mp_block.header.blue_score > sp.header.blue_score {
-                return Err(GhostDagError::InvalidLinkage(format!(
-                    "merge parent {} blue_score {} exceeds selected parent's {} — \
-                     selected parent must be the heaviest parent",
-                    mp, mp_block.header.blue_score, sp.header.blue_score
-                )));
-            }
+        // G3: the selected parent is derived, not chosen.
+        let heaviest = parent_keys
+            .iter()
+            .max()
+            .map(|k| k.hash)
+            .ok_or(GhostDagError::InvalidParents)?;
+        if heaviest != sp_hash {
+            return Err(GhostDagError::SelectedParentNotHeaviest {
+                claimed: sp_hash,
+                heaviest,
+            });
+        }
 
-            // MP-DEPTH. Before this rule there was NO lower bound on merge
-            // parent depth — height, count, duplicates and blue-score ordering
-            // were all checked, but a block at height 72,000 could legally merge
-            // a parent at height 5. That is what makes a bounded blue-set walk
-            // unsound, and therefore what blocks DAG pruning.
-            //
-            // Gated on an activation height: enforcing a new validity rule
-            // without one splits the fleet into nodes that accept a block and
-            // nodes that reject it.
-            if self.merge_depth_enforced_at(header.height) {
-                let depth = header.height.saturating_sub(mp_block.header.height);
-                if depth > MERGE_PARENT_MAX_DEPTH {
-                    return Err(GhostDagError::InvalidLinkage(format!(
-                        "merge parent {} is {} blocks below this block (height {} vs {}), \
-                         over the MP-DEPTH bound of {}. A merge parent deeper than the \
-                         retained window cannot be scored by a pruned node, so accepting \
-                         it would fork pruned nodes away from unpruned ones",
-                        mp, depth, mp_block.header.height, header.height, MERGE_PARENT_MAX_DEPTH
-                    )));
+        // G2, G4, G5, G6.
+        let memo = {
+            let v = match self.validated.lock() {
+                Ok(v) => v,
+                Err(p) => p.into_inner(),
+            };
+            v.iter()
+                .find(|r| {
+                    r.hash == block.hash()
+                        && r.selected_parent == sp_hash
+                        && r.merges == *merge_parents
+                        && r.height == header.height
+                })
+                .map(|r| r.data.clone())
+        };
+        let data = match memo {
+            Some(d) => d,
+            None => {
+                let d = self
+                    .compute_ghostdag(sp_hash, merge_parents, header.height)
+                    .await?;
+                let mut v = match self.validated.lock() {
+                    Ok(v) => v,
+                    Err(p) => p.into_inner(),
+                };
+                if v.len() >= MAX_VALIDATED_RECORDS {
+                    v.pop_front();
                 }
+                v.push_back(ValidatedRecord {
+                    hash: block.hash(),
+                    selected_parent: sp_hash,
+                    merges: merge_parents.clone(),
+                    height: header.height,
+                    data: d.clone(),
+                });
+                d
             }
-        }
-
-        // Blue-score feasibility band, computed from the validated parent.
-        let min_score = sp.header.blue_score.checked_add(1).ok_or_else(|| {
-            GhostDagError::InvalidLinkage("selected parent blue_score overflow".to_string())
-        })?;
-        let max_score = min_score
-            .checked_add(merge_parents.len() as u64)
-            .ok_or_else(|| GhostDagError::InvalidLinkage("blue_score band overflow".to_string()))?;
-        if header.blue_score < min_score || header.blue_score > max_score {
-            return Err(GhostDagError::BlueScoreOutOfRange {
-                claimed: header.blue_score,
-                min: min_score,
-                max: max_score,
-            });
-        }
-
-        // Work is derived, never trusted.
-        let expected_work = crate::types::blue_work_for_score(header.blue_score);
-        if header.blue_work != expected_work {
-            return Err(GhostDagError::BlueWorkMismatch {
-                claimed: header.blue_work,
-                expected: expected_work,
-            });
-        }
-
-        Ok(())
-    }
-
-    /// SYNC-S1 D1 — the canonical blue score/work for `block`, recomputed
-    /// locally, in O(1) for the linear case and WITHOUT retaining cumulative
-    /// ancestry in either case.
-    ///
-    /// Returns a LIGHTWEIGHT [`BlueSet`]: `score` + `work` populated, `blocks`
-    /// deliberately empty. Callers that genuinely need the ancestor set (only
-    /// k-cluster anticone counting does) go through [`Self::calculate_blue_set`].
-    ///
-    /// **Why the linear derivation is exact, not an approximation.** A block
-    /// with no merge parents has blue set `sp.blue_set ∪ {self}`, and `self` is
-    /// by definition not in its own ancestry, so the cardinality is exactly
-    /// `|sp.blue_set| + 1` — i.e. `sp.score + 1`. No union, no set, no clone.
-    /// This reproduces the pre-D1 value bit-for-bit on a linear chain, which is
-    /// what the live chain is (`mergeParentHashes: []` throughout).
-    ///
-    /// **Why it recomputes rather than trusting the header.** SECREM-01 CONS-2:
-    /// a self-reported score must never reach the fork-choice baseline. The
-    /// recursion base is genesis (score 1) and every step adds 1 locally, so no
-    /// header value is ever consumed. `register_existing_block` uses this too,
-    /// which also repairs the pre-D1 split where the receive path and the
-    /// restart-rehydration path disagreed by one on the same block.
-    ///
-    /// **A merge block (MS-BOUND)** scores `sp.score + 1 + blue merge parents`,
-    /// with blueness judged inside [`MERGE_SCORE_WINDOW`] by
-    /// [`Self::bounded_blue_merge_count`]. It used to fall back to
-    /// [`Self::calculate_blue_set`], which builds the cumulative set by walking
-    /// to genesis; on a pruned DAG store that walk fails `BlockNotFound` and the
-    /// merge block can never be admitted. `calculate_blue_set` remains for
-    /// callers that need the full set; fork choice no longer depends on it.
-    async fn derive_score_and_work(&self, block: &Block) -> Result<BlueSet, GhostDagError> {
-        let lightweight = |score: u64| BlueSet {
-            blocks: std::collections::HashSet::new(),
-            score,
-            work: crate::types::blue_work_for_score(score),
         };
 
-        // Base case: genesis is the single blue block in its own ancestry.
-        if block.is_genesis() {
-            return Ok(lightweight(1));
+        // G7: the committed values are exactly the GHOSTDAG values.
+        if header.blue_score != data.blue_score {
+            return Err(GhostDagError::BlueScoreMismatch {
+                claimed: header.blue_score,
+                expected: data.blue_score,
+            });
         }
-
-        let sp_score = self.score_of(&block.selected_parent()).await?;
-        let added = self.score_contribution(block).await?;
-        Ok(lightweight(score_add(sp_score, added)?))
-    }
-
-    /// What `block` adds on top of its selected parent's score: 1 for itself,
-    /// plus 1 for each blue merge parent (MS-BOUND). Does not depend on any
-    /// score, only on the DAG shape within [`MERGE_SCORE_WINDOW`] below `block`.
-    async fn score_contribution(&self, block: &Block) -> Result<u64, GhostDagError> {
-        if block.header.merge_parent_hashes.is_empty() {
-            return Ok(1);
+        if header.blue_work != data.blue_work {
+            return Err(GhostDagError::BlueWorkMismatch {
+                claimed: header.blue_work,
+                expected: data.blue_work,
+            });
         }
-        let blues = self.bounded_blue_merge_count(block).await?;
-        score_add(1, blues)
-    }
-
-    /// A score this node already holds for `hash`: in-memory `relations`
-    /// first, then the durable `score:<hash>` anchor (SYNC-S1 D3).
-    async fn known_score(&self, hash: &Hash) -> Option<u64> {
-        if let Some(score) = self
-            .relations
-            .read()
-            .await
-            .get(hash)
-            .map(|r| r.blue_set.score)
-        {
-            return Some(score);
-        }
-        let score = self.dag_store.get_derived_blue_score(hash)?;
-        // S2-5: an anchor counts only for a block this node holds, and only if
-        // it is not below the header score + 1, which no derived score can be
-        // (genesis derives 1 from header 0; every block adds at least 1 to its
-        // selected parent while its header adds exactly 1). An entry on the
-        // header scale, as the pre-S2-5 fallback wrote, is caught here.
-        let header = self.dag_store.get_header(hash).await.ok()?;
-        let genesis =
-            header.selected_parent_hash == Hash::default() && header.merge_parent_hashes.is_empty();
-        if !genesis && score < header.blue_score.checked_add(1)? {
-            warn!(
-                "derived blue score anchor {} for {} is below its header score + 1 ({}): \
-                 not a fork-choice score; ignored",
-                score, hash, header.blue_score
-            );
-            return None;
-        }
-        Some(score)
-    }
-
-    /// The fork-choice score of an already-admitted block.
-    ///
-    /// Usually O(1): the score is in `relations` or in the durable anchor.
-    ///
-    /// COLD PATH: neither holds it (a process that has not rehydrated the
-    /// block yet). Walk back along the selected-parent chain to the nearest
-    /// block whose score is known, summing each block's
-    /// [`Self::score_contribution`] on the way, so
-    /// `score(hash) = score(known ancestor) + sum of contributions`. O(depth)
-    /// time and O(1) memory. It must never build a cumulative ancestor set:
-    /// that is the Theta(N²) footprint that OOM-killed boot-3, and against a
-    /// pruned DAG store it walks off the retained window and fails
-    /// `BlockNotFound` (the merge-block wedge MS-BOUND removes).
-    async fn score_of(&self, hash: &Hash) -> Result<u64, GhostDagError> {
-        if let Some(score) = self.known_score(hash).await {
-            return Ok(score);
-        }
-
-        let mut sum: u64 = 0;
-        let mut cursor = *hash;
-        let mut hops: u64 = 0;
-        let mut max_hops: Option<u64> = None;
-        loop {
-            if let Some(score) = self.known_score(&cursor).await {
-                return score_add(score, sum);
-            }
-            let ancestor = self
-                .dag_store
-                .get_block(&cursor)
-                .await
-                .map_err(|_| GhostDagError::BlockNotFound(cursor))?;
-            if ancestor.is_genesis() {
-                return score_add(1, sum);
-            }
-            // An honest chain cannot have more ancestors than its height; a
-            // longer walk means corrupt linkage (or a cycle).
-            let limit = *max_hops.get_or_insert(ancestor.header.height.saturating_add(1));
-            if hops > limit {
-                return Err(GhostDagError::CycleDetected);
-            }
-            sum = score_add(sum, self.score_contribution(&ancestor).await?)?;
-            cursor = ancestor.selected_parent();
-            hops = hops.saturating_add(1);
-        }
-    }
-
-    /// Selected parent, merge parents and height of a block this node holds,
-    /// from `relations` or, after a restart, the DAG store.
-    async fn links_of(&self, hash: &Hash) -> Result<(Hash, Vec<Hash>, u64), GhostDagError> {
-        if let Some(r) = self.relations.read().await.get(hash) {
-            return Ok((r.selected_parent, r.merge_parents.clone(), r.height));
-        }
-        // Header only: after a restart every stored block is a skeleton, and
-        // `get_block` would reload and decode its whole body for three fields.
-        let header = self
-            .dag_store
-            .get_header(hash)
-            .await
-            .map_err(|_| GhostDagError::BlockNotFound(*hash))?;
-        Ok((
-            header.selected_parent_hash,
-            header.merge_parent_hashes,
-            header.height,
-        ))
-    }
-
-    /// `of` and every block reachable from it by parent edges whose height is
-    /// at least `floor`.
-    ///
-    /// Exact for that range, not an approximation: parent edges strictly
-    /// decrease height, so every path from `of` to a block at height `>= floor`
-    /// stays at or above `floor`, and cutting the walk below `floor` never hides
-    /// one. Reads at most one MP-DEPTH below `floor` (a parent's height is
-    /// checked before it is dropped).
-    async fn past_within(&self, of: &Hash, floor: u64) -> Result<HashSet<Hash>, GhostDagError> {
-        // Generous: the window is MERGE_SCORE_WINDOW heights times the DAG
-        // width (max_parents per block).
-        const MAX_VISITED: usize = 1_000_000;
-        let mut visited: HashSet<Hash> = HashSet::new();
-        let mut queue: VecDeque<Hash> = VecDeque::new();
-        queue.push_back(*of);
-        while let Some(current) = queue.pop_front() {
-            if visited.contains(&current) {
-                continue;
-            }
-            let (sp, merges, height) = self.links_of(&current).await?;
-            if height < floor {
-                continue;
-            }
-            visited.insert(current);
-            if visited.len() >= MAX_VISITED {
-                return Err(GhostDagError::CycleDetected);
-            }
-            // The selected parent sits exactly one height below; skip it
-            // without a read once it is under the floor.
-            if sp != Hash::default() && height > floor {
-                queue.push_back(sp);
-            }
-            for p in merges {
-                queue.push_back(p);
-            }
-        }
-        Ok(visited)
-    }
-
-    /// MS-BOUND: how many of `block`'s merge parents are blue, judged only
-    /// within [`MERGE_SCORE_WINDOW`] heights below `block`.
-    ///
-    /// Merge parents are judged in header order (part of the block's content).
-    /// A merge parent already in the selected parent's past adds nothing. Any
-    /// other merge parent is blue when its anticone, within the window,
-    /// holds at most `k` blocks from (the selected parent and its past) plus
-    /// the merge parents already judged blue. This is the k-cluster rule of
-    /// `is_blue_candidate`, with two differences: it never reads below the
-    /// window, and every block of the selected parent's past in the window
-    /// counts (a red one included), which can only make a merge parent red
-    /// sooner, never blue.
-    ///
-    /// For the common case (siblings from producers sealing at the same height,
-    /// merged one block later) it gives the same score as the full blue-set
-    /// union: the union adds exactly the blue merge parents.
-    async fn bounded_blue_merge_count(&self, block: &Block) -> Result<u64, GhostDagError> {
-        let floor = block.header.height.saturating_sub(MERGE_SCORE_WINDOW);
-        let k = self.params.k as usize;
-        let sp_past = self.past_within(&block.selected_parent(), floor).await?;
-
-        // (hash, its past within the window) for each merge parent judged blue.
-        let mut blues: Vec<(Hash, HashSet<Hash>)> = Vec::new();
-        for mp in &block.header.merge_parent_hashes {
-            if sp_past.contains(mp) {
-                continue;
-            }
-            let mp_past = self.past_within(mp, floor).await?;
-            // A block in the selected parent's past cannot be in mp's future
-            // (mp is not in that past), so it is in mp's anticone exactly when
-            // it is not in mp's past.
-            let mut anticone = 0usize;
-            for y in &sp_past {
-                if !mp_past.contains(y) {
-                    anticone = anticone.saturating_add(1);
-                    if anticone > k {
-                        break;
-                    }
-                }
-            }
-            for (b, b_past) in &blues {
-                if anticone > k {
-                    break;
-                }
-                if !mp_past.contains(b) && !b_past.contains(mp) {
-                    anticone = anticone.saturating_add(1);
-                }
-            }
-            if anticone <= k {
-                blues.push((*mp, mp_past));
-            }
-        }
-        Ok(blues.len() as u64)
+        Ok(data)
     }
 
     pub async fn add_block(&self, block: &Block) -> Result<(), GhostDagError> {
@@ -1451,65 +1049,44 @@ impl GhostDag {
 
         // SECREM-01 CONS-3: every relation-building path passes the
         // consistency gate. Reject before any state mutation.
-        self.validate_block_consistency(block).await?;
+        let data = self.check_block(block).await?;
 
-        // SYNC-S1 D1: score + work are RECOMPUTED locally (never read from the
-        // header — SECREM-01 CONS-2) but WITHOUT materialising the cumulative
-        // blue ancestry. See `derive_score_and_work`: for a linear block the
-        // derivation is exact and O(1); only a merge block falls back to a set
-        // computation. Pre-D1 this called `calculate_blue_set` unconditionally,
-        // which cloned the selected parent's full ancestor set per block and
-        // retained it here AND in `blue_cache` — Theta(N²) memory, the follower
-        // OOM that froze every non-producing node in the 9k-15k range.
-        let blue_set = self.derive_score_and_work(block).await?;
+        // G12: the record is persisted with the block's admission and read,
+        // never re-derived from another source, on restart.
+        self.cache_data(block.hash(), Arc::new(data), true).await;
 
-        // Log check (never a validity rule): the fork-choice score must not sit
-        // BELOW the header's score + 1. Fork choice counts blue merge parents
-        // (MS-BOUND) while the producer writes `parent + 1` into headers, so on
-        // a DAG that merges the fork-choice score runs ahead of the header by
-        // the blue merge parents of the whole ancestry. That gap is expected
-        // (about 1.5 per block on r1006) and is not reported. A score below
-        // header + 1 cannot come from honest headers: it means this node holds
-        // less score than it should (a restart or registration path that lost
-        // its scale) or a header claimed more than its blue merge parents.
-        if blue_score_inconsistent(block, blue_set.score) {
-            warn!(
-                "blue_score inconsistency on {}: fork-choice score {} is below header \
-                 blue_score {} + 1 (honest headers carry parent + 1, so the local \
-                 score can only meet or exceed that)",
-                block.hash(),
-                blue_set.score,
-                block.header.blue_score
-            );
-        }
+        self.insert_relation(block).await;
+        info!(
+            "Added block {} to DAG with blue score {}",
+            block.hash(),
+            block.header.blue_score
+        );
+        Ok(())
+    }
 
-        // Create DAG relation.
-        //
-        // `blue_set.blocks` is intentionally EMPTY here. The only reader of
-        // `relations[*].blue_set` is `select_tip`, which touches `.score` only
-        // (verified by grep at PIL-13 and re-verified for D1), so retaining the
-        // cumulative hash set per relation bought nothing and cost O(N²).
+    /// Record `block` in `relations` and the tip set. Fork choice ranks it on
+    /// its committed header values (G8).
+    async fn insert_relation(&self, block: &Block) {
         let relation = DagRelation {
             block: block.hash(),
             selected_parent: block.selected_parent(),
             merge_parents: block.header.merge_parent_hashes.clone(),
             children: Vec::new(),
-            blue_set: blue_set.clone(),
-            is_chain_block: true, // Will be determined by chain selection
+            blue_set: BlueSet {
+                blocks: HashSet::new(),
+                score: block.header.blue_score,
+                work: block.header.blue_work,
+            },
+            is_chain_block: true,
             height: block.header.height,
         };
 
-        // SYNC-S1 D3: record the derived score durably so the next process does
-        // not have to walk the selected-parent chain to re-derive it. Best
-        // effort — a failure only costs a walk on the next cold start.
-        self.dag_store
-            .put_derived_blue_score(&block.hash(), blue_set.score);
-
-        // Update relations
+        self.keys
+            .write()
+            .await
+            .insert(block.hash(), ForkChoiceKey::of_header(&block.header));
         let mut relations = self.relations.write().await;
         relations.insert(block.hash(), relation);
-
-        // Update parent's children
         if let Some(parent_relation) = relations.get_mut(&block.selected_parent()) {
             parent_relation.children.push(block.hash());
         }
@@ -1520,59 +1097,120 @@ impl GhostDag {
         }
         drop(relations);
 
-        // Update tips
         let mut tips = self.tips.write().await;
-
-        // Remove parents from tips
         tips.remove(&block.selected_parent());
         for merge_parent in &block.header.merge_parent_hashes {
             tips.remove(merge_parent);
         }
-
-        // Add new block as tip
         tips.insert(block.hash());
+    }
 
-        info!(
-            "Added block {} to DAG with blue score {}",
-            block.hash(),
-            blue_set.score
-        );
+    /// Register an EXISTING block (one this node admitted before, read back
+    /// from its DAG store on restart).
+    ///
+    /// CV-3: its `blue_score` / `blue_work` are the committed header values,
+    /// which admission validated exactly (G7), so fork choice ranks it on them
+    /// directly. Nothing is derived, so nothing can fall back to another unit,
+    /// and a block whose ancestry was pruned registers like any other (G12).
+    /// O(1) per block. Its GhostdagData stays on disk until a coloring walk
+    /// reads it.
+    pub async fn register_existing_block(&self, block: &Block) -> Result<(), GhostDagError> {
+        if !block.is_genesis() && block.selected_parent() == Hash::default() {
+            return Err(GhostDagError::InvalidParents);
+        }
+        if block.header.blue_work != crate::types::blue_work_for_score(block.header.blue_score) {
+            // Not a header admission could have accepted (G7 unit work).
+            return Err(GhostDagError::BlueWorkMismatch {
+                claimed: block.header.blue_work,
+                expected: crate::types::blue_work_for_score(block.header.blue_score),
+            });
+        }
+        self.insert_relation(block).await;
         Ok(())
     }
 
-    /// Select the best tip based on blue score
-    pub async fn select_tip(&self) -> Result<Hash, GhostDagError> {
-        let tips = self.tips.read().await;
-        let relations = self.relations.read().await;
+    /// AUTHORITATIVE TIP REHYDRATION (restart-liveness fix, 2026-08-11). Align this
+    /// GhostDag's in-memory `tips` with the DAG store's AUTHORITATIVE tip set.
+    ///
+    /// After a restart the eager-load loops (`producer.rs`) register only the
+    /// CANONICAL single-block-per-height chain via [`Self::register_existing_block`],
+    /// so `GhostDag.tips` can diverge from the true DAG tips. `DagStore` already
+    /// reconstructs its tip set authoritatively from block-header parentage on load
+    /// (PIL-42). This copies that authoritative set in, first registering any tip
+    /// missing from `relations` so `select_tip` can rank it.
+    ///
+    /// O(number of tips), NOT O(chain length). Returns the number of
+    /// authoritative tips after reconciliation.
+    pub async fn reconcile_tips_from_dag_store(&self) -> usize {
+        let authoritative: Vec<Hash> = self
+            .dag_store
+            .get_tips()
+            .await
+            .into_iter()
+            .map(|t| t.hash)
+            .collect();
 
-        let mut best_tip: Option<Hash> = None;
-        let mut best_score: u64 = 0;
-
-        for tip in tips.iter() {
-            if let Some(relation) = relations.get(tip) {
-                let score = relation.blue_set.score;
-                // Deterministic total order matching the producer's
-                // `cmp_tip_for_parent_selection` (higher blue_score first, ties
-                // broken by SMALLEST hash). This is the receive-side analogue of
-                // audit finding H-08: `tips` is a `HashSet`, so a bare `>` keeps
-                // whichever equal-score sibling the process-random iteration order
-                // surfaces first. Two producers at the same height publish
-                // equal-`blue_score` sibling tips (and `blue_work` is purely
-                // score-derived, so it cannot discriminate either), which made
-                // different nodes latch different branches and never reorg —
-                // a permanent fork. The hash tie-break MUST NOT be removed.
-                let better = match best_tip {
-                    None => true,
-                    Some(cur) => score > best_score || (score == best_score && *tip < cur),
-                };
-                if better {
-                    best_score = score;
-                    best_tip = Some(*tip);
+        for hash in &authoritative {
+            let known = self.relations.read().await.contains_key(hash);
+            if !known {
+                if let Ok(block) = self.dag_store.get_block(hash).await {
+                    if let Err(e) = self.register_existing_block(&block).await {
+                        warn!(
+                            "reconcile_tips_from_dag_store: could not register tip {}: {}",
+                            hash, e
+                        );
+                    }
                 }
             }
         }
 
-        best_tip.ok_or(GhostDagError::BlockNotFound(Hash::default()))
+        let mut tips = self.tips.write().await;
+        *tips = authoritative.iter().copied().collect();
+        let n = tips.len();
+        drop(tips);
+
+        self.dag_hydrated.store(true, Ordering::SeqCst);
+        info!(
+            "reconcile_tips_from_dag_store: GhostDag tips reconciled to {} authoritative tip(s); DAG hydration complete",
+            n
+        );
+        n
+    }
+
+    /// Shared handle to the "DAG hydration complete" flag — set true by
+    /// [`Self::reconcile_tips_from_dag_store`] once the in-memory tip set is
+    /// authoritative. Defaults false until reconciliation runs.
+    pub fn dag_hydrated_handle(&self) -> Arc<AtomicBool> {
+        self.dag_hydrated.clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // Fork choice (G8)
+    // -----------------------------------------------------------------------
+
+    /// The selected tip: the registered tip with the largest
+    /// [`ForkChoiceKey`] `(blue_work, vrf_output, hash)`, read from committed
+    /// headers only (G8). The same order G3 uses for the selected parent, so
+    /// a producer that seals on `select_tip` always names a valid SP.
+    pub async fn select_tip(&self) -> Result<Hash, GhostDagError> {
+        let tips: Vec<Hash> = {
+            let tips = self.tips.read().await;
+            let relations = self.relations.read().await;
+            tips.iter()
+                .filter(|t| relations.contains_key(*t))
+                .copied()
+                .collect()
+        };
+        let mut best: Option<ForkChoiceKey> = None;
+        for tip in tips {
+            if let Some(key) = self.fork_choice_key(&tip).await {
+                if best.is_none_or(|b| key > b) {
+                    best = Some(key);
+                }
+            }
+        }
+        best.map(|k| k.hash)
+            .ok_or(GhostDagError::BlockNotFound(Hash::default()))
     }
 
     /// Get current tips
@@ -1580,16 +1218,26 @@ impl GhostDag {
         self.tips.read().await.iter().copied().collect()
     }
 
-    /// Fork choice's score for a block this node holds, computed the way
-    /// fork choice computes it: `relations`, else the durable score anchor,
-    /// else recomputed along the selected-parent chain from the nearest known
-    /// score (genesis = 1). Never a header-claimed score (SECREM-01 CONS-2).
-    /// `None` when the block is not in the DAG store and no score is known.
+    /// The fork-choice score of a block this node holds: its committed
+    /// header `blue_score` (G8). `None` when the block is not held.
     pub async fn fork_choice_score(&self, hash: &Hash) -> Option<u64> {
-        self.score_of(hash).await.ok()
+        if let Some(score) = self
+            .relations
+            .read()
+            .await
+            .get(hash)
+            .map(|r| r.blue_set.score)
+        {
+            return Some(score);
+        }
+        self.dag_store
+            .get_header(hash)
+            .await
+            .ok()
+            .map(|h| h.blue_score)
     }
 
-    /// Get blue score for a block
+    /// Blue score of a registered block (its committed header value).
     pub async fn get_blue_score(&self, hash: &Hash) -> Result<u64, GhostDagError> {
         self.relations
             .read()
@@ -1600,60 +1248,83 @@ impl GhostDag {
     }
 
     /// Height of a known block, or `None` if we do not hold it.
-    ///
-    /// Checks `relations` first (in-memory, O(1)) and falls back to the DAG
-    /// store, because `relations` is empty after a restart on a non-producing
-    /// node. Returns `Option` rather than `Result`: the caller (MP-DEPTH parent
-    /// filtering in the producer) treats "height unknown" as "cannot judge the
-    /// depth", and must not turn that into a hard failure that stops block
-    /// production.
     pub async fn get_block_height(&self, hash: &Hash) -> Option<u64> {
         if let Some(h) = self.relations.read().await.get(hash).map(|r| r.height) {
             return Some(h);
         }
-        self.dag_store
-            .get_block(hash)
-            .await
-            .ok()
-            .map(|b| b.header.height)
+        self.dag_store.get_header(hash).await.ok().map(|h| h.height)
     }
 
-    /// PIL-13 tripwire metric: the total number of cumulative blue-ancestry
-    /// entries materialised in memory, across every DAG relation's stored
-    /// `blue_set.blocks` plus the `blue_cache`.
+    // -----------------------------------------------------------------------
+    // Diagnostics (not consensus)
+    // -----------------------------------------------------------------------
+
+    /// GHOSTDAG blue score of `block` (stored or not; its parents must be
+    /// held), computed from headers. For an admitted block it equals the
+    /// committed `header.blue_score`.
+    pub async fn calculate_blue_score(&self, block: &Block) -> Result<u64, GhostDagError> {
+        Ok(self.data_for_block(block).await?.blue_score)
+    }
+
+    /// The blue set of `block`: every blue block in past(block), with
+    /// `score = |blocks| = blue_score(block)` (G7; the block itself is not in
+    /// its own blue set, and genesis has an empty one).
     ///
-    /// The PIL-13 producer leak was exactly this number growing O(N²): the
-    /// eager startup loop called `add_block` per persisted block, and each
-    /// call cached the FULL O(chain-length) blue ancestry. The steady-state
-    /// producer path ([`Self::register_existing_block`] + header-derived
-    /// scores) must keep the per-block contribution O(1) — the
-    /// `producer_steady_state` integration test (core/sequencer) asserts
-    /// this stays zero across an eager-load of a linear chain.
+    /// DIAGNOSTIC ONLY. It walks the selected chain to genesis (Θ(chain)), so
+    /// no consensus path calls it: admission and fork choice use the
+    /// window-bounded [`Self::compute_ghostdag`] and committed header values.
+    pub async fn calculate_blue_set(&self, block: &Block) -> Result<BlueSet, GhostDagError> {
+        let data = self.data_for_block(block).await?;
+        let mut set = BlueSet::new();
+        set.blocks.extend(data.mergeset_blues.iter().copied());
+        let mut cursor = data.selected_parent;
+        while cursor != Hash::default() {
+            let d = self.ghostdag_data(&cursor).await?;
+            set.blocks.extend(d.mergeset_blues.iter().copied());
+            cursor = d.selected_parent;
+        }
+        set.score = data.blue_score;
+        set.work = data.blue_work;
+        Ok(set)
+    }
+
+    async fn data_for_block(&self, block: &Block) -> Result<Arc<GhostdagData>, GhostDagError> {
+        if block.is_genesis() {
+            return Ok(Arc::new(genesis_data(&block.header)));
+        }
+        if let Some(d) = self.cached_data(&block.hash()).await {
+            return Ok(d);
+        }
+        let sp = self.heaviest_parent(&block.parents()).await?;
+        let merges: Vec<Hash> = block.parents().into_iter().filter(|p| *p != sp).collect();
+        let height = self
+            .height_of(&sp)
+            .await?
+            .checked_add(1)
+            .ok_or_else(|| GhostDagError::InvalidLinkage("height overflow".to_string()))?;
+        Ok(Arc::new(self.compute_ghostdag(sp, &merges, height).await?))
+    }
+
+    /// PIL-13 tripwire metric: the number of cumulative blue-ancestry entries
+    /// materialised in memory across `relations`. CV-3 keeps none (fork
+    /// choice reads committed header values), so this is always 0; the
+    /// `producer_steady_state` test asserts it.
     pub async fn materialised_blue_ancestry_entries(&self) -> usize {
         let relations = self.relations.read().await;
-        let from_relations: usize = relations.values().map(|r| r.blue_set.blocks.len()).sum();
-        drop(relations);
-        let cache = self.blue_cache.read().await;
-        let from_cache: usize = cache.values().map(|b| b.blocks.len()).sum();
-        from_relations.saturating_add(from_cache)
+        relations.values().map(|r| r.blue_set.blocks.len()).sum()
     }
 }
 
-/// Whether `block`'s locally derived fork-choice score is BELOW its header's
-/// `blue_score + 1` (logged by [`GhostDag::add_block`]; never a validity rule).
-///
-/// Honest headers carry `parent + 1` (the band minimum) and fork choice adds 1
-/// plus the blue merge parents per block from genesis = 1, so by induction the
-/// fork-choice score is at least header + 1 on every block, merge blocks
-/// included. Exceeding it is the normal merging-DAG case. A header whose
-/// `+ 1` overflows can never be met and is flagged.
-fn blue_score_inconsistent(block: &Block, fork_choice_score: u64) -> bool {
-    if block.is_genesis() {
-        return false;
-    }
-    match block.header.blue_score.checked_add(1) {
-        Some(floor) => fork_choice_score < floor,
-        None => true,
+/// The GHOSTDAG record of a genesis block: an empty mergeset, with the
+/// score and work its header commits (0 and 0 for every network genesis,
+/// `citrate_economics::genesis`, as G7 requires). Genesis is admitted by
+/// identity, so its header values are part of the configured genesis, and
+/// every child scores from them.
+fn genesis_data(header: &BlockHeader) -> GhostdagData {
+    GhostdagData {
+        blue_score: header.blue_score,
+        blue_work: header.blue_work,
+        ..GhostdagData::genesis()
     }
 }
 
@@ -1754,6 +1425,27 @@ mod tests {
             .build_unhashed()
     }
 
+    /// The producer's header construction (spec §9.3), for fixtures that
+    /// merge: the selected parent is the heaviest of `parents` (G3), the rest
+    /// are merge parents, and blue_score / blue_work are the GHOSTDAG values.
+    async fn sealed(gd: &GhostDag, hash: [u8; 32], parents: Vec<Hash>) -> Block {
+        let sp = gd.heaviest_parent(&parents).await.expect("parents held");
+        let merges: Vec<Hash> = parents.into_iter().filter(|p| *p != sp).collect();
+        let height = gd.height_of(&sp).await.expect("sp height") + 1;
+        let data = gd
+            .compute_ghostdag(sp, &merges, height)
+            .await
+            .expect("valid parents");
+        BlockBuilder::new()
+            .hash(Hash::new(hash))
+            .parent(sp)
+            .merge_parents(merges)
+            .height(height)
+            .blue_score(data.blue_score)
+            .blue_work(data.blue_work)
+            .build_unhashed()
+    }
+
     /// Mutation-survivor kills inside validate_block_consistency (the
     /// function PBA-L1b-003 changed): the blue-score band edges and the
     /// MP-DEPTH boundary are pinned exactly.
@@ -1787,6 +1479,11 @@ mod tests {
         );
     }
 
+    /// Mutation-survivor kill for the merge-depth boundary, under r1007 G5
+    /// (which replaces MP-DEPTH): a mergeset block must have MDR(B) in its
+    /// past, MDR(B) being the chain block MERGE_DEPTH below B. A merge parent
+    /// at depth MERGE_DEPTH - 1 is admitted; at depth MERGE_DEPTH it is not
+    /// (it sits at MDR's height without being MDR), nor deeper.
     #[tokio::test]
     async fn pba_r2_mp_depth_boundary_is_exact() {
         fn h(i: u64) -> [u8; 32] {
@@ -1796,8 +1493,7 @@ mod tests {
             b
         }
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone())
-            .with_merge_depth_activation_height(0);
+        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone());
         let mut chain = vec![create_test_block_with_parents(
             h(0),
             Hash::default(),
@@ -1811,22 +1507,28 @@ mod tests {
             dag_store.store_block(b.clone()).await.unwrap();
             chain.push(b);
         }
-        // A side block at height 1 (sibling of chain[1]) to merge.
+        // Side blocks at heights 1 and 2 (siblings of chain[1], chain[2]).
         let side1 = create_test_block_with_parents([0xA1; 32], chain[0].hash(), vec![], 1);
+        let side2 = create_test_block_with_parents([0xA2; 32], chain[1].hash(), vec![], 2);
         dag_store.store_block(side1.clone()).await.unwrap();
+        dag_store.store_block(side2.clone()).await.unwrap();
         let sp = chain[(top - 1) as usize].hash();
-        let merging = |mp: Hash, tag: u8| {
-            let mut b = create_test_block_with_parents([tag; 32], sp, vec![mp], top);
-            b.header.blue_score = top;
-            b.header.blue_work = crate::types::blue_work_for_score(top);
-            b
-        };
-        // depth = top - 1 = MERGE_PARENT_MAX_DEPTH: allowed.
+        // The side block's anticone holds the 99 chain blocks above it, far
+        // over K, so it is red and the score is SP's + 1 = top.
+        let merging =
+            |mp: Hash, tag: u8| create_test_block_with_parents([tag; 32], sp, vec![mp], top);
+        // depth = top - 2 = MERGE_DEPTH - 1: allowed.
         assert!(gd
-            .validate_block_consistency(&merging(side1.hash(), 0xB1))
+            .validate_block_consistency(&merging(side2.hash(), 0xB0))
             .await
             .is_ok());
-        // depth = top - 0 = MERGE_PARENT_MAX_DEPTH + 1: rejected.
+        // depth = top - 1 = MERGE_DEPTH: rejected (G5).
+        assert!(matches!(
+            gd.validate_block_consistency(&merging(side1.hash(), 0xB1))
+                .await,
+            Err(GhostDagError::MergeDepthViolation { .. })
+        ));
+        // depth = top = MERGE_DEPTH + 1, and in past(SP): rejected.
         let side0 = chain[0].hash();
         assert!(gd
             .validate_block_consistency(&merging(side0, 0xB2))
@@ -1899,9 +1601,11 @@ mod tests {
         // Store genesis in dag_store
         dag_store.store_block(genesis.clone()).await.unwrap();
 
+        // r1007 G7: blue_score(B) counts the blue blocks in past(B), so genesis
+        // has score 0 and an empty blue set (it is not in its own).
         let blue_set = ghostdag.calculate_blue_set(&genesis).await.unwrap();
-        assert_eq!(blue_set.score, 1);
-        assert!(blue_set.contains(&genesis.hash()));
+        assert_eq!(blue_set.score, 0);
+        assert!(!blue_set.contains(&genesis.hash()));
     }
 
     #[tokio::test]
@@ -1915,15 +1619,6 @@ mod tests {
 
         // Store genesis in dag_store
         dag_store.store_block(genesis.clone()).await.unwrap();
-
-        // Manually add genesis to cache
-        let mut blue_set = BlueSet::new();
-        blue_set.insert(genesis.hash());
-        ghostdag
-            .blue_cache
-            .write()
-            .await
-            .insert(genesis.hash(), blue_set);
 
         // Add genesis relation
         let genesis_relation = DagRelation {
@@ -1997,14 +1692,7 @@ mod tests {
             .store_block(genesis.clone())
             .await
             .expect("store genesis");
-        let mut g_blue = BlueSet::new();
-        g_blue.insert(genesis.hash());
-        g_blue.score = 1;
-        ghostdag
-            .blue_cache
-            .write()
-            .await
-            .insert(genesis.hash(), g_blue.clone());
+        let g_blue = BlueSet::new();
         ghostdag.relations.write().await.insert(
             genesis.hash(),
             DagRelation {
@@ -2024,13 +1712,14 @@ mod tests {
         dag_store.store_block(a1.clone()).await.expect("store a1");
         ghostdag.add_block(&a1).await.expect("admit a1");
 
-        // Two equal-blue_score siblings at height 2. `winner` has the SMALLER hash,
-        // so the shared tie-break (smallest hash) makes it the canonical head.
-        let winner = create_test_block_with_parents([2; 32], a1.hash(), vec![], 2);
-        let loser = create_test_block_with_parents([9; 32], a1.hash(), vec![], 2);
+        // Two equal-blue_score siblings at height 2. `winner` has the LARGER hash,
+        // so the shared tie-break (r1007 G8: the larger ForkChoiceKey, VRF outputs
+        // equal here) makes it the canonical head.
+        let winner = create_test_block_with_parents([9; 32], a1.hash(), vec![], 2);
+        let loser = create_test_block_with_parents([2; 32], a1.hash(), vec![], 2);
         assert!(
-            winner.hash() < loser.hash(),
-            "winner must be the smaller hash"
+            winner.hash() > loser.hash(),
+            "winner must be the larger hash"
         );
 
         // Production desync: the LOSER (this node's own sibling) is admitted to BOTH;
@@ -2065,7 +1754,7 @@ mod tests {
         assert_eq!(
             producer_pick,
             winner.hash(),
-            "producer (TipSelector over DAG-store tips) targets the smaller-hash winner"
+            "producer (TipSelector over DAG-store tips) targets the larger-key winner"
         );
         assert_eq!(
             drain_pick,
@@ -2089,7 +1778,7 @@ mod tests {
     /// the DAG store (and therefore the producer). Same divergence shape as the pin
     /// above — a winner sibling present in the DAG store but MISSING from GhostDAG's
     /// tips — but here we reconcile and assert `select_tip` converges on the true
-    /// canonical (smaller-hash) winner.
+    /// canonical (larger-key, r1007 G8) winner.
     #[tokio::test]
     async fn reconcile_tips_from_dag_store_realigns_select_tip_with_the_authoritative_set() {
         let params = GhostDagParams::default();
@@ -2107,10 +1796,10 @@ mod tests {
         dag_store.store_block(a1.clone()).await.expect("store a1");
         ghostdag.add_block(&a1).await.expect("admit a1");
 
-        // Two equal-score siblings; winner has the smaller hash.
-        let winner = create_test_block_with_parents([2; 32], a1.hash(), vec![], 2);
-        let loser = create_test_block_with_parents([9; 32], a1.hash(), vec![], 2);
-        assert!(winner.hash() < loser.hash());
+        // Two equal-score siblings; winner has the larger hash (G8 Key).
+        let winner = create_test_block_with_parents([9; 32], a1.hash(), vec![], 2);
+        let loser = create_test_block_with_parents([2; 32], a1.hash(), vec![], 2);
+        assert!(winner.hash() > loser.hash());
 
         // The LOSER is admitted to GhostDAG; the WINNER reaches only the DAG store
         // (the restart-rehydration gap). select_tip is stuck on the loser.
@@ -2148,7 +1837,7 @@ mod tests {
         assert_eq!(
             ghostdag.select_tip().await.expect("select_tip"),
             winner.hash(),
-            "after reconcile, select_tip returns the true canonical (smaller-hash) winner"
+            "after reconcile, select_tip returns the true canonical (larger-key) winner"
         );
     }
 
@@ -2181,11 +1870,9 @@ mod tests {
             .write()
             .await
             .insert(genesis.hash(), genesis_relation);
-        ghostdag
-            .blue_cache
-            .write()
-            .await
-            .insert(genesis.hash(), genesis_blue);
+        // r1007 G8: fork choice reads the committed header, so the block is held.
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        drop(genesis_blue);
         ghostdag.tips.write().await.insert(genesis.hash());
 
         let best_tip = ghostdag.select_tip().await.unwrap();
@@ -2196,13 +1883,22 @@ mod tests {
     async fn test_select_tip_deterministic_tie_break_by_hash() {
         // Receive-side analogue of audit finding H-08: equal-`blue_score` sibling
         // tips (what two concurrent producers create at the same height) MUST
-        // resolve to the same tip — the smallest hash — on every node regardless
-        // of `HashSet` iteration order, or the fleet forks permanently. Before the
-        // fix `select_tip` used a bare `>` with no tie-break and returned whichever
-        // equal-score tip iteration happened to surface first.
+        // resolve to the same tip on every node regardless of `HashSet`
+        // iteration order, or the fleet forks permanently. r1007 G8: the tip
+        // with the largest ForkChoiceKey (blue_work, vrf_output, hash) wins, so
+        // with equal work and VRF output, the largest hash.
         let params = GhostDagParams::default();
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
+        let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        let mut parent = genesis.hash();
+        for i in 1..7u8 {
+            let b = create_test_block_with_parents([0xE0 + i; 32], parent, vec![], u64::from(i));
+            dag_store.store_block(b.clone()).await.unwrap();
+            ghostdag.register_existing_block(&b).await.unwrap();
+            parent = b.hash();
+        }
 
         // Five sibling tips, all at blue_score = 7, distinct hashes.
         let tie_hashes = [
@@ -2213,65 +1909,44 @@ mod tests {
             Hash::new([0x05; 32]),
         ];
         for h in tie_hashes.iter() {
-            let mut bs = BlueSet::new();
-            bs.insert(*h);
-            bs.score = 7;
-            let rel = DagRelation {
-                block: *h,
-                selected_parent: Hash::default(),
-                merge_parents: vec![],
-                children: vec![],
-                blue_set: bs.clone(),
-                is_chain_block: true,
-                height: 7,
-            };
-            ghostdag.relations.write().await.insert(*h, rel);
-            ghostdag.tips.write().await.insert(*h);
+            let b = create_test_block_with_parents(*h.as_bytes(), parent, vec![], 7);
+            dag_store.store_block(b.clone()).await.unwrap();
+            ghostdag.add_block(&b).await.unwrap();
         }
 
-        let expected = *tie_hashes.iter().min().expect("non-empty"); // 0x05..
+        let expected = *tie_hashes.iter().max().expect("non-empty"); // 0xAA..
                                                                      // HashSet iteration order varies run-to-run; the result must not.
         for _ in 0..50 {
             let got = ghostdag.select_tip().await.expect("a tip is available");
             assert_eq!(
                 got, expected,
-                "select_tip must deterministically pick the smallest-hash tip on a blue_score tie"
+                "select_tip must deterministically pick the largest-key tip on a blue_score tie"
             );
         }
 
         // A strictly higher blue_score must win over the whole tie group even
-        // though its hash is the largest — score dominates the tie-break.
-        let winner = Hash::new([0xFF; 32]);
-        let mut wbs = BlueSet::new();
-        wbs.insert(winner);
-        wbs.score = 8;
-        let wrel = DagRelation {
-            block: winner,
-            selected_parent: Hash::default(),
-            merge_parents: vec![],
-            children: vec![],
-            blue_set: wbs.clone(),
-            is_chain_block: true,
-            height: 8,
-        };
-        ghostdag.relations.write().await.insert(winner, wrel);
-        ghostdag.tips.write().await.insert(winner);
+        // though its hash is the smallest — work dominates the tie-break.
+        let winner = create_test_block_with_parents([0x01; 32], tie_hashes[0], vec![], 8);
+        dag_store.store_block(winner.clone()).await.unwrap();
+        ghostdag.add_block(&winner).await.unwrap();
         for _ in 0..20 {
             assert_eq!(
                 ghostdag.select_tip().await.expect("a tip is available"),
-                winner,
+                winner.hash(),
                 "higher blue_score must win regardless of hash ordering"
             );
         }
     }
 
     #[tokio::test]
-    /// PANIC-S1 G4: an ANCESTOR among the merge parents is not in the anticone.
-    /// Merge parents c and e with e a child of c: when the k-cluster check reaches
-    /// the second of them, the first is already in `additional_blues` and is an
-    /// ancestor (in one direction), so it must NOT count. With k = 2 both then fit.
-    /// Counting it (the `&&` -> `||` mutant at count_blue_anticone's merge loop)
-    /// wrongly colours one red.
+    /// PANIC-S1 G4, under r1007 G6: an ANCESTOR inside the mergeset is not in
+    /// the anticone. K = 2. Main chain c <- e (SP side) and a second chain
+    /// b1 <- b2, both from genesis; d merges b2, so Mergeset*(d) = {b1, b2}.
+    /// When b2 is colored, b1 is already blue and is b2's ancestor, so it must
+    /// NOT count: b2's blue anticone is {e, c} = 2 <= K. Counting b1 would
+    /// make it 3 and wrongly color b2 red. (The old fixture merged c and e
+    /// together; r1007 G2 rejects parents in each other's past, so the
+    /// ancestor now reaches the mergeset through the merge parent's past.)
     async fn panic_s1_merge_parent_ancestor_is_not_counted_in_anticone() {
         let params = GhostDagParams {
             k: 2,
@@ -2282,26 +1957,7 @@ mod tests {
 
         let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.unwrap();
-        let mut gset = BlueSet::new();
-        gset.insert(genesis.hash());
-        ghostdag
-            .blue_cache
-            .write()
-            .await
-            .insert(genesis.hash(), gset.clone());
-        ghostdag.relations.write().await.insert(
-            genesis.hash(),
-            DagRelation {
-                block: genesis.hash(),
-                selected_parent: Hash::default(),
-                merge_parents: vec![],
-                children: vec![],
-                blue_set: gset,
-                is_chain_block: true,
-                height: 0,
-            },
-        );
-        ghostdag.tips.write().await.insert(genesis.hash());
+        ghostdag.add_block(&genesis).await.unwrap();
 
         let b1 = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
         let b2 = create_test_block_with_parents([0xB2; 32], b1.hash(), vec![], 2);
@@ -2312,17 +1968,19 @@ mod tests {
             ghostdag.add_block(blk).await.unwrap();
         }
 
-        let d = create_test_block_with_parents([0xD3; 32], b2.hash(), vec![c.hash(), e.hash()], 3);
+        let d = sealed(&ghostdag, [0xD3; 32], vec![b2.hash(), e.hash()]).await;
+        assert_eq!(d.selected_parent(), e.hash(), "0xE2 > 0xB2 at equal work");
         dag_store.store_block(d.clone()).await.unwrap();
         ghostdag.add_block(&d).await.unwrap();
 
         let blue = ghostdag.calculate_blue_set(&d).await.unwrap();
-        assert!(blue.contains(&c.hash()), "c: anticone {{b1, b2}} = 2 <= k");
+        assert!(blue.contains(&b1.hash()), "b1: anticone {{e, c}} = 2 <= k");
         assert!(
-            blue.contains(&e.hash()),
-            "e: anticone {{b1, b2}}; c is its ancestor, not anticone"
+            blue.contains(&b2.hash()),
+            "b2: anticone {{e, c}}; b1 is its ancestor, not anticone"
         );
-        assert_eq!(blue.score, 6, "blue = {{genesis, b1, b2, c, e, d}}");
+        assert_eq!(blue.score, 5, "blue past(d) = {{genesis, c, e, b1, b2}}");
+        assert_eq!(d.header.blue_score, 5);
     }
 
     /// Genesis seeded as the DAG root, the way the other fixtures here do it.
@@ -2345,11 +2003,11 @@ mod tests {
         ghostdag.get_blue_score(&b.hash()).await.unwrap()
     }
 
-    /// The fork-choice score counts blue merge parents and the producer writes
-    /// `parent + 1` into headers, so on a DAG that merges, a linear block's
-    /// fork-choice score sits ABOVE header + 1 by the blue merge parents of its
-    /// ancestry. That is the live r1006 shape (about 1.5 merge parents per
-    /// block) and is not an inconsistency.
+    /// r1007 CV-3: one unit. A merge block commits SP's score + its blue
+    /// mergeset, and a linear block above it commits exactly one more. The
+    /// fork-choice score of each is its header value. (Pre-r1007 the header
+    /// carried `parent + 1` while fork choice ran ahead of it by the blue
+    /// merge parents of the ancestry; that gap no longer exists.)
     #[tokio::test]
     async fn blue_score_check_accepts_a_linear_block_whose_ancestry_merged() {
         let (dag_store, ghostdag, genesis) = ms_bound_fixture(18).await;
@@ -2357,61 +2015,83 @@ mod tests {
         let b = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
         ms_bound_admit(&dag_store, &ghostdag, &a).await;
         ms_bound_admit(&dag_store, &ghostdag, &b).await;
-        let c = create_test_block_with_parents([0xC2; 32], a.hash(), vec![b.hash()], 2);
-        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &c).await, 4);
+        let c = sealed(&ghostdag, [0xC2; 32], vec![a.hash(), b.hash()]).await;
+        assert_eq!(
+            ms_bound_admit(&dag_store, &ghostdag, &c).await,
+            3,
+            "1 + {{b, a}}"
+        );
         let d = create_test_block_with_parents([0xD3; 32], c.hash(), vec![], 3);
+        let mut d = d;
+        d.header.blue_score = 4;
+        d.header.blue_work = crate::types::blue_work_for_score(4);
         let score = ms_bound_admit(&dag_store, &ghostdag, &d).await;
-        assert_eq!(score, 5, "genesis, a, b, c, d");
-        assert!(
-            !blue_score_inconsistent(&d, score),
-            "a linear block above a merge scores header + 1 + 1 blue merge parent: consistent"
+        assert_eq!(score, 4, "blue past(d) = genesis, a, b, c");
+        assert_eq!(
+            score, d.header.blue_score,
+            "fork choice reads the committed value"
         );
-        assert!(!blue_score_inconsistent(&c, 4), "the merge block itself");
-    }
-
-    /// The real inconsistency: a fork-choice score BELOW header + 1. Honest
-    /// headers (`parent + 1`) can never produce one, so it means this node lost
-    /// score it should hold (the restart score-scale class) or a header claimed
-    /// more than its blue merge parents. Flagged for merge blocks too.
-    #[test]
-    fn blue_score_check_flags_a_score_below_header_plus_one() {
-        let linear = create_test_block_with_parents([0x71; 32], Hash::new([0x70; 32]), vec![], 7);
-        assert!(
-            blue_score_inconsistent(&linear, 7),
-            "linear: score == header"
-        );
-        assert!(
-            !blue_score_inconsistent(&linear, 8),
-            "linear: score == header + 1"
-        );
-        let merge = create_test_block_with_parents(
-            [0x51; 32],
-            Hash::new([0x50; 32]),
-            vec![Hash::new([0x4F; 32])],
-            5,
-        );
-        assert!(
-            blue_score_inconsistent(&merge, 5),
-            "merge block: score below header + 1"
-        );
-        assert!(!blue_score_inconsistent(&merge, 6));
-        assert!(!blue_score_inconsistent(&merge, 7), "one blue merge parent");
-        let genesis = create_test_block_with_parents([0x01; 32], Hash::default(), vec![], 0);
-        assert!(!blue_score_inconsistent(&genesis, 1));
-        assert!(
-            blue_score_inconsistent(&linear, 0),
-            "a lost score is flagged even at 0"
-        );
-        let top =
-            create_test_block_with_parents([0x7F; 32], Hash::new([0x7E; 32]), vec![], u64::MAX);
-        assert!(
-            blue_score_inconsistent(&top, u64::MAX),
-            "header + 1 overflows: no score can be consistent"
+        assert_eq!(
+            ghostdag.get_blue_score(&c.hash()).await.unwrap(),
+            c.header.blue_score,
+            "the merge block itself"
         );
     }
 
-    /// MS-BOUND: the bounded fork-choice score matches the full k-cluster union
-    /// on the over-wide-anticone shape (k = 1, three siblings, two merged).
+    /// r1007 G7 replaces the old log-only check (`blue_score_inconsistent`,
+    /// which flagged a fork-choice score below header + 1) with exact equality
+    /// at admission: a header claiming less, or more, than the GHOSTDAG score
+    /// is rejected, on a linear block and on a merge block alike.
+    #[tokio::test]
+    async fn blue_score_check_flags_a_score_below_header_plus_one() {
+        let (dag_store, ghostdag, genesis) = ms_bound_fixture(18).await;
+        let a = create_test_block_with_parents([0x71; 32], genesis.hash(), vec![], 1);
+        let b = create_test_block_with_parents([0x72; 32], genesis.hash(), vec![], 1);
+        ms_bound_admit(&dag_store, &ghostdag, &a).await;
+        ms_bound_admit(&dag_store, &ghostdag, &b).await;
+        let with_score = |mut blk: Block, score: u64| {
+            blk.header.blue_score = score;
+            blk.header.blue_work = crate::types::blue_work_for_score(score);
+            blk
+        };
+        let linear = create_test_block_with_parents([0x73; 32], a.hash(), vec![], 2);
+        for wrong in [0u64, 1, 3, u64::MAX] {
+            assert!(
+                matches!(
+                    ghostdag
+                        .validate_block_consistency(&with_score(linear.clone(), wrong))
+                        .await,
+                    Err(GhostDagError::BlueScoreMismatch { .. })
+                ),
+                "linear: {wrong}"
+            );
+        }
+        assert!(ghostdag
+            .validate_block_consistency(&with_score(linear, 2))
+            .await
+            .is_ok());
+        let merge = create_test_block_with_parents([0x74; 32], b.hash(), vec![a.hash()], 2);
+        for wrong in [2u64, 4] {
+            assert!(
+                matches!(
+                    ghostdag
+                        .validate_block_consistency(&with_score(merge.clone(), wrong))
+                        .await,
+                    Err(GhostDagError::BlueScoreMismatch { .. })
+                ),
+                "merge block: {wrong}"
+            );
+        }
+        assert!(ghostdag
+            .validate_block_consistency(&with_score(merge, 3))
+            .await
+            .is_ok());
+    }
+
+    /// The window-bounded score (what admission checks) matches the full
+    /// blue-set union on the over-wide-anticone shape (k = 1, three siblings,
+    /// two merged). Under r1007 G3 the selected parent is the heaviest sibling
+    /// (0xE1); of b and c only the first in Key order fits next to it.
     #[tokio::test]
     async fn ms_bound_score_matches_the_full_union_on_a_k_cluster_merge() {
         let (dag_store, ghostdag, genesis) = ms_bound_fixture(1).await;
@@ -2421,32 +2101,43 @@ mod tests {
         for blk in [&b, &c, &e] {
             ms_bound_admit(&dag_store, &ghostdag, blk).await;
         }
-        let d = create_test_block_with_parents([0xD1; 32], b.hash(), vec![c.hash(), e.hash()], 2);
+        let d = sealed(&ghostdag, [0xD1; 32], vec![b.hash(), c.hash(), e.hash()]).await;
         let bounded = ms_bound_admit(&dag_store, &ghostdag, &d).await;
         let full = ghostdag.calculate_blue_set(&d).await.unwrap().score;
         assert_eq!(
             bounded, full,
             "bounded score must equal the full union here"
         );
-        assert_eq!(bounded, 4, "genesis, b, one blue merge parent, d");
+        assert_eq!(bounded, 3, "genesis, e (SP), one blue of b/c");
+        let data = ghostdag.ghostdag_data(&d.hash()).await.unwrap();
+        assert_eq!(data.mergeset_blues, vec![e.hash(), b.hash()]);
+        assert_eq!(data.mergeset_reds, vec![c.hash()]);
     }
 
-    /// MS-BOUND: merging a block already in the selected parent's past adds
-    /// nothing (the union would not grow either).
+    /// Merging a block already in the selected parent's past would add
+    /// nothing to the mergeset. Under r1007 G2 it is not tolerated: the parents
+    /// must be an antichain, so the block is rejected.
     #[tokio::test]
     async fn ms_bound_merging_an_ancestor_adds_nothing() {
         let (dag_store, ghostdag, genesis) = ms_bound_fixture(18).await;
         let a = create_test_block_with_parents([0xA1; 32], genesis.hash(), vec![], 1);
         let b = create_test_block_with_parents([0xB1; 32], a.hash(), vec![], 2);
         ms_bound_admit(&dag_store, &ghostdag, &a).await;
-        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &b).await, 3);
+        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &b).await, 2);
         let c = create_test_block_with_parents([0xC1; 32], b.hash(), vec![a.hash()], 3);
-        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &c).await, 4);
-        assert_eq!(ghostdag.calculate_blue_set(&c).await.unwrap().score, 4);
+        assert!(matches!(
+            ghostdag.validate_block_consistency(&c).await,
+            Err(GhostDagError::ParentsNotAntichain { .. })
+        ));
+        let c = create_test_block_with_parents([0xC1; 32], b.hash(), vec![], 3);
+        assert_eq!(ms_bound_admit(&dag_store, &ghostdag, &c).await, 3);
+        assert_eq!(ghostdag.calculate_blue_set(&c).await.unwrap().score, 3);
     }
 
-    /// MS-BOUND: a merge parent from a branch that ran apart for longer than
-    /// k blocks is red: its anticone in the selected parent's window is over k.
+    /// A side branch that ran apart for longer than k blocks is red: every
+    /// block of it has more than k blues of the main chain in its anticone.
+    /// Under r1007 G6 the whole unmerged branch is in the mergeset, not just
+    /// its tip, and all of it is red.
     #[tokio::test]
     async fn ms_bound_a_long_side_branch_is_red() {
         let (dag_store, ghostdag, genesis) = ms_bound_fixture(2).await;
@@ -2458,27 +2149,29 @@ mod tests {
             main = blk.hash();
         }
         let mut side = genesis.hash();
+        let mut sides = Vec::new();
         for h in 1..=4u64 {
             let blk = create_test_block_with_parents([0x50 + h as u8; 32], side, vec![], h);
             ms_bound_admit(&dag_store, &ghostdag, &blk).await;
             side = blk.hash();
+            sides.push(side);
         }
-        // Merging s4 into m6: s4's anticone holds m1..m5 (5 > k = 2), so red.
+        // Merging s4 into m6: each s_i has m1..m5 (5 > k = 2) in its anticone.
         let m6 = create_test_block_with_parents([0x99; 32], main, vec![side], 6);
         assert_eq!(
             ms_bound_admit(&dag_store, &ghostdag, &m6).await,
-            7,
-            "red merge parent adds nothing: sp score 6 + 1"
+            6,
+            "red mergeset adds nothing: sp score 5 + 1"
         );
+        let data = ghostdag.ghostdag_data(&m6.hash()).await.unwrap();
+        assert_eq!(data.mergeset_reds, sides, "s1..s4, in Key order");
     }
 
     #[tokio::test]
-    /// PANIC-S1 G4: the k-cluster rule must actually colour blocks RED. Every other
-    /// fixture merges at most one block into a k=18 DAG, so nothing is ever red and a
-    /// mutated `is_blue_candidate` (always `Ok(true)`) or a flipped anticone test in
-    /// `count_blue_anticone` survived. With k = 1 and three genesis siblings merged
-    /// into one block, the second merge parent's blue anticone is {b, c} (size 2 > k)
-    /// so exactly one merge parent must be red.
+    /// PANIC-S1 G4: the k-cluster rule must actually colour blocks RED. With
+    /// k = 1 and three genesis siblings merged into one block, the selected
+    /// parent (the heaviest sibling, r1007 G3) and one more fit; the third has
+    /// a blue anticone of size 2 > k, so exactly one mergeset block is red.
     async fn panic_s1_k_cluster_colours_an_over_wide_anticone_red() {
         let params = GhostDagParams {
             k: 1,
@@ -2489,26 +2182,7 @@ mod tests {
 
         let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.unwrap();
-        let mut gset = BlueSet::new();
-        gset.insert(genesis.hash());
-        ghostdag
-            .blue_cache
-            .write()
-            .await
-            .insert(genesis.hash(), gset.clone());
-        ghostdag.relations.write().await.insert(
-            genesis.hash(),
-            DagRelation {
-                block: genesis.hash(),
-                selected_parent: Hash::default(),
-                merge_parents: vec![],
-                children: vec![],
-                blue_set: gset,
-                is_chain_block: true,
-                height: 0,
-            },
-        );
-        ghostdag.tips.write().await.insert(genesis.hash());
+        ghostdag.add_block(&genesis).await.unwrap();
 
         let b = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
         let c = create_test_block_with_parents([0xC1; 32], genesis.hash(), vec![], 1);
@@ -2518,44 +2192,24 @@ mod tests {
             ghostdag.add_block(blk).await.unwrap();
         }
 
-        let d = create_test_block_with_parents([0xD1; 32], b.hash(), vec![c.hash(), e.hash()], 2);
+        let d = sealed(&ghostdag, [0xD1; 32], vec![b.hash(), c.hash(), e.hash()]).await;
         dag_store.store_block(d.clone()).await.unwrap();
         ghostdag.add_block(&d).await.unwrap();
 
         let blue = ghostdag.calculate_blue_set(&d).await.unwrap();
-        assert!(
-            blue.contains(&genesis.hash()) && blue.contains(&b.hash()) && blue.contains(&d.hash())
-        );
-        let blue_merges = [c.hash(), e.hash()]
+        assert!(blue.contains(&genesis.hash()) && blue.contains(&e.hash()));
+        let blue_merges = [b.hash(), c.hash()]
             .iter()
             .filter(|h| blue.contains(h))
             .count();
         assert_eq!(
             blue_merges, 1,
-            "k=1: exactly one of the two merge parents fits the k-cluster"
+            "k=1: exactly one of the two other parents fits the k-cluster"
         );
-        assert_eq!(blue.score, 4, "blue = {{genesis, b, one merge parent, d}}");
+        assert_eq!(blue.score, 3, "blue past(d) = {{genesis, e, one of b/c}}");
 
-        // The materialised-ancestry metric is the exact sum over relations + cache.
-        let expected: usize = ghostdag
-            .relations
-            .read()
-            .await
-            .values()
-            .map(|r| r.blue_set.blocks.len())
-            .sum::<usize>()
-            + ghostdag
-                .blue_cache
-                .read()
-                .await
-                .values()
-                .map(|b| b.blocks.len())
-                .sum::<usize>();
-        assert!(expected > 0);
-        assert_eq!(
-            ghostdag.materialised_blue_ancestry_entries().await,
-            expected
-        );
+        // CV-3: fork choice keeps no cumulative ancestry anywhere.
+        assert_eq!(ghostdag.materialised_blue_ancestry_entries().await, 0);
     }
 
     #[tokio::test]
@@ -2567,30 +2221,7 @@ mod tests {
         // Genesis
         let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.unwrap();
-
-        // Prime relations/cache for genesis
-        let mut gset = BlueSet::new();
-        gset.insert(genesis.hash());
-        ghostdag
-            .blue_cache
-            .write()
-            .await
-            .insert(genesis.hash(), gset.clone());
-        let grel = DagRelation {
-            block: genesis.hash(),
-            selected_parent: Hash::default(),
-            merge_parents: vec![],
-            children: vec![],
-            blue_set: gset,
-            is_chain_block: true,
-            height: 0,
-        };
-        ghostdag
-            .relations
-            .write()
-            .await
-            .insert(genesis.hash(), grel);
-        ghostdag.tips.write().await.insert(genesis.hash());
+        ghostdag.add_block(&genesis).await.unwrap();
 
         // Two parallel children of genesis: b and c
         let b = create_test_block_with_parents([0xB1; 32], genesis.hash(), vec![], 1);
@@ -2600,57 +2231,50 @@ mod tests {
         ghostdag.add_block(&b).await.unwrap();
         ghostdag.add_block(&c).await.unwrap();
 
-        // d references b as selected parent and c as merge parent
-        let d = create_test_block_with_parents([0xD1; 32], b.hash(), vec![c.hash()], 2);
+        // d merges both (r1007 G3: c, the heavier key, is the selected parent).
+        let d = sealed(&ghostdag, [0xD1; 32], vec![b.hash(), c.hash()]).await;
         dag_store.store_block(d.clone()).await.unwrap();
         ghostdag.add_block(&d).await.unwrap();
 
-        // Blue set for d should include at least {genesis, b, c, d}
+        // Blue set of d is its blue past: {genesis, b, c} (G7: not d itself).
         let blue = ghostdag.calculate_blue_set(&d).await.unwrap();
         assert!(blue.contains(&genesis.hash()));
         assert!(blue.contains(&b.hash()));
         assert!(blue.contains(&c.hash()));
-        assert!(blue.contains(&d.hash()));
-        assert!(blue.score >= 4);
+        assert!(!blue.contains(&d.hash()));
+        assert_eq!(blue.score, 3);
     }
 
     #[tokio::test]
     async fn test_count_blue_anticone_short_circuits_at_max_count() {
-        // Regression test for the OOM fix (Apr 2026): count_blue_anticone
-        // must stop walking once the count reaches max_count. The caller
-        // (is_blue_candidate) only needs to know whether the count
-        // exceeds k; walking the entire blue set is O(|blue| × BFS_depth)
-        // per block and drove the testnet-beta node into a 14k-restart
-        // OOM loop.
-        let params = GhostDagParams::default();
+        // Regression for the OOM fix (Apr 2026), carried to the r1007 coloring:
+        // the work per candidate is bounded by K, not by the size of the blue
+        // set. Once a block holds K + 1 blues (SP included) every further
+        // candidate is red without a walk (Kaspa `check_blue_candidate`).
+        // K = 3, nine siblings merged: exactly K + 1 blues.
+        let params = GhostDagParams {
+            k: 3,
+            ..GhostDagParams::default()
+        };
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
-
-        // Build a reference blue set with many unrelated blocks — all
-        // hit the "not ancestor" branch and increment count.
-        let mut blue_set = BlueSet::new();
-        for i in 0..200u8 {
-            let mut h = [0u8; 32];
-            h[0] = i;
-            blue_set.insert(Hash::new(h));
+        let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        ghostdag.add_block(&genesis).await.unwrap();
+        let mut parents = Vec::new();
+        for i in 0..9u8 {
+            let b = create_test_block_with_parents([0x10 + i; 32], genesis.hash(), vec![], 1);
+            dag_store.store_block(b.clone()).await.unwrap();
+            ghostdag.add_block(&b).await.unwrap();
+            parents.push(b.hash());
         }
-        blue_set.score = 200;
-
-        let mut candidate_hash = [0u8; 32];
-        candidate_hash[31] = 0xFF;
-        let candidate = Hash::new(candidate_hash);
-
-        // max_count = 5 — should return exactly 5, not 200.
-        let count = ghostdag
-            .count_blue_anticone(&candidate, &blue_set, &[], 5)
-            .await
-            .expect("count_blue_anticone should succeed");
-
-        assert_eq!(
-            count, 5,
-            "expected early-exit at max_count=5, got {}",
-            count
-        );
+        let d = sealed(&ghostdag, [0xDD; 32], parents).await;
+        dag_store.store_block(d.clone()).await.unwrap();
+        ghostdag.add_block(&d).await.unwrap();
+        let data = ghostdag.ghostdag_data(&d.hash()).await.unwrap();
+        assert_eq!(data.mergeset_blues.len(), 4, "K + 1 blues");
+        assert_eq!(data.mergeset_reds.len(), 5);
+        assert_eq!(d.header.blue_score, 1 + 4);
     }
 
     /// SYNC-S1 D1 — the receive path materialises QUADRATIC blue ancestry.
@@ -2734,8 +2358,10 @@ mod tests {
         );
     }
 
-    /// SYNC-S1 D3 — the durable score anchor removes the cold-start walk, which
-    /// is what makes DAG-store pruning possible.
+    /// SYNC-S1 D3, carried to r1007 G12 — the durable GHOSTDAG record (and the
+    /// committed header score) remove the cold-start walk, which is what makes
+    /// DAG-store pruning possible. Scores follow G7 (genesis 0, height h scores
+    /// h on a linear chain).
     ///
     /// D1's cold path walks the selected-parent chain back to the nearest known
     /// score. That is O(1) memory but it REQUIRES the ancestry to still be in
@@ -2759,7 +2385,7 @@ mod tests {
         dag_store.store_block(genesis.clone()).await.unwrap();
         let mut blocks = vec![genesis.clone()];
         let mut parent = genesis.hash();
-        for i in 1..=40u64 {
+        for i in 1..=260u64 {
             let mut h = [0u8; 32];
             h[0..8].copy_from_slice(&i.to_le_bytes());
             h[31] = 0xD4;
@@ -2773,14 +2399,14 @@ mod tests {
             for b in &blocks {
                 gd1.add_block(b).await.expect("admit");
             }
-            assert_eq!(gd1.get_blue_score(&parent).await.unwrap(), 41);
+            assert_eq!(gd1.get_blue_score(&parent).await.unwrap(), 260);
         }
 
-        // The anchor is durable, not just in-memory.
+        // G12: the GHOSTDAG record is durable, not just in-memory.
         assert_eq!(
-            dag_store.get_derived_blue_score(&parent),
-            Some(41),
-            "the derived score must be persisted, not only held in `relations`"
+            dag_store.get_ghostdag_data(&parent).map(|d| d.blue_score),
+            Some(260),
+            "the GHOSTDAG record must be persisted, not only held in memory"
         );
 
         // "Process 2": a fresh GhostDag over the same store — relations empty,
@@ -2793,15 +2419,17 @@ mod tests {
         );
 
         // Now PRUNE the ancestry through the REAL production mechanism: set the
-        // pruning point at height 39 and call `prune()`, which drops every block
-        // below it from memory and disk. The D1 walk would hit a missing block
-        // and fail; the anchor makes it a single key read.
+        // pruning point at height 60 and call `prune()`, which drops every block
+        // below it from memory and disk. r1007 G12: a node keeps the GHOSTDAG
+        // window (GHOSTDAG_WINDOW = 200 heights below the next block, 61..=260
+        // here) and nothing below it. (The pre-r1007 fixture kept only the tip
+        // and its parent, which the windowed rules do not support.)
         dag_store
-            .update_pruning_point(blocks[39].hash())
+            .update_pruning_point(blocks[60].hash())
             .await
             .expect("set pruning point");
         let pruned = dag_store.prune().await.expect("prune");
-        assert_eq!(pruned, 39, "heights 0..=38 pruned, tip + parent retained");
+        assert_eq!(pruned, 60, "heights 0..=59 pruned, the window retained");
         assert!(
             dag_store.get_block(&blocks[0].hash()).await.is_err(),
             "a pruned ancestor is genuinely gone from the DAG store"
@@ -2809,9 +2437,9 @@ mod tests {
 
         // Admit the next block on top of the pruned chain.
         let mut h = [0u8; 32];
-        h[0..8].copy_from_slice(&41u64.to_le_bytes());
+        h[0..8].copy_from_slice(&261u64.to_le_bytes());
         h[31] = 0xD4;
-        let next = create_test_block_with_parents(h, parent, vec![], 41);
+        let next = create_test_block_with_parents(h, parent, vec![], 261);
         dag_store.store_block(next.clone()).await.unwrap();
         gd2.add_block(&next)
             .await
@@ -2819,7 +2447,7 @@ mod tests {
 
         assert_eq!(
             gd2.get_blue_score(&next.hash()).await.unwrap(),
-            42,
+            261,
             "score continues the sequence across a restart AND a pruned ancestry"
         );
         assert_eq!(
@@ -2875,8 +2503,8 @@ mod tests {
 
         assert_eq!(
             ghostdag.get_blue_score(&tip.hash()).await.unwrap(),
-            N + 1,
-            "cold-path derivation must agree with the warm path: genesis 1 + one per step"
+            N,
+            "cold-path value is the committed one: genesis 0 + one per step (G7)"
         );
         assert_eq!(
             ghostdag.materialised_blue_ancestry_entries().await,
@@ -2895,7 +2523,7 @@ mod tests {
         ghostdag.add_block(&next).await.expect("warm admit");
         assert_eq!(
             ghostdag.get_blue_score(&next.hash()).await.unwrap(),
-            N + 2,
+            N + 1,
             "warm path continues the same sequence"
         );
         assert_eq!(
@@ -2965,13 +2593,12 @@ mod tests {
              a block's blue score, or fork choice depends on how the block arrived"
         );
         assert_eq!(
-            score_live, 2,
-            "canonical convention: genesis == 1, each linear step adds 1 (height + 1)"
+            score_live, 1,
+            "r1007 G7 convention: genesis == 0, each linear step adds 1 (height)"
         );
         assert_eq!(
-            b1.header.blue_score, 1,
-            "the HEADER convention stays score == height; the recomputed score sits \
-             exactly one above it, which is the invariant add_block now checks"
+            b1.header.blue_score, score_live,
+            "CV-3: one unit; the fork-choice score IS the committed header score"
         );
     }
 
@@ -3027,25 +2654,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_blue_anticone_zero_max_short_circuits_immediately() {
-        // Edge case: max_count=0 must return 0 without walking at all.
-        let params = GhostDagParams::default();
+        // Edge case: K = 0 admits only the selected parent as blue; every
+        // other mergeset block is red at once.
+        let params = GhostDagParams {
+            k: 0,
+            ..GhostDagParams::default()
+        };
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(params, dag_store.clone());
-
-        let mut blue_set = BlueSet::new();
-        for i in 0..50u8 {
-            let mut h = [0u8; 32];
-            h[0] = i;
-            blue_set.insert(Hash::new(h));
+        let genesis = create_test_block_with_parents([0xAA; 32], Hash::default(), vec![], 0);
+        dag_store.store_block(genesis.clone()).await.unwrap();
+        ghostdag.add_block(&genesis).await.unwrap();
+        let mut parents = Vec::new();
+        for i in 0..5u8 {
+            let b = create_test_block_with_parents([0x20 + i; 32], genesis.hash(), vec![], 1);
+            dag_store.store_block(b.clone()).await.unwrap();
+            ghostdag.add_block(&b).await.unwrap();
+            parents.push(b.hash());
         }
-
-        let candidate = Hash::new([0xAA; 32]);
-        let count = ghostdag
-            .count_blue_anticone(&candidate, &blue_set, &[], 0)
+        let d = sealed(&ghostdag, [0xDE; 32], parents).await;
+        let data = ghostdag
+            .compute_ghostdag(d.selected_parent(), &d.header.merge_parent_hashes, 2)
             .await
-            .expect("count_blue_anticone should succeed");
-
-        assert_eq!(count, 0);
+            .unwrap();
+        assert_eq!(data.mergeset_blues, vec![d.selected_parent()]);
+        assert_eq!(data.mergeset_reds.len(), 4);
     }
 
     // -----------------------------------------------------------------------
@@ -3065,14 +2698,7 @@ mod tests {
         let genesis = create_test_block_with_parents([0xEE; 32], Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.unwrap();
 
-        let mut gset = BlueSet::new();
-        gset.insert(genesis.hash());
-        gset.score = 1;
-        ghostdag
-            .blue_cache
-            .write()
-            .await
-            .insert(genesis.hash(), gset.clone());
+        let gset = BlueSet::new();
         let grel = DagRelation {
             block: genesis.hash(),
             selected_parent: Hash::default(),
@@ -3147,7 +2773,9 @@ mod tests {
             })?;
         }
 
-        /// Property: Blue set always contains the block itself.
+        /// Property: a block's blue set is its blue PAST (r1007 G7): it never
+        /// contains the block itself, and on a linear chain it contains the
+        /// selected parent and has exactly `blue_score` members.
         #[test]
         fn prop_blue_set_contains_self(n in 1..15usize, seed in 1..1000u64) {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3156,8 +2784,13 @@ mod tests {
                 for hash in &hashes {
                     if let Ok(block) = dag_store.get_block(hash).await {
                         let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
-                        prop_assert!(blue_set.contains(hash),
-                            "Block {:?} not in its own blue set", hash);
+                        prop_assert!(!blue_set.contains(hash),
+                            "Block {:?} is in its own blue set", hash);
+                        if !block.is_genesis() {
+                            prop_assert!(blue_set.contains(&block.selected_parent()));
+                        }
+                        prop_assert_eq!(blue_set.blocks.len() as u64, blue_set.score);
+                        prop_assert_eq!(blue_set.score, block.header.blue_score);
                     }
                 }
                 Ok(())
@@ -3185,53 +2818,34 @@ mod tests {
     }
 
     /// The activation height is a consensus constant: every node must use the
-    /// same one or they disagree about validity. Pinned so a future edit is a
-    /// deliberate act with a failing test attached, not a silent one-character
-    /// change.
+    /// same one or they disagree about validity. r1007 (ADR CV-2): every rule
+    /// is active from block 0, G5 included, with no environment override.
     #[test]
     fn mp_depth_activation_height_is_the_agreed_consensus_value() {
         assert_eq!(
             MERGE_DEPTH_ACTIVATION_HEIGHT, 0,
-            "owner decision 2026-08-04. The re-roll wiped the ~78k blocks of \
-             old-rule history that forced a future activation, so the fresh \
-             chain enforces MP-DEPTH from genesis. Changing this changes which \
-             blocks are valid — it requires a coordinated fleet upgrade AND a \
-             re-roll, not an edit"
+            "r1007 is a new genesis with every rule active from block 0"
         );
-        // A const block, so a violating edit fails to COMPILE rather than
-        // failing a test somebody might not run. For a consensus constant that
-        // is the right strength.
-        //
-        // The bound is no longer "comfortably ahead of the chain height" (that
-        // guarded a deferred activation on a chain with history). The property
-        // that matters now is pruning safety: enforcement must cover EVERY
-        // height at which the pruner could already have dropped a citable
-        // block. `node::dag_prune::MIN_RETAIN_BLOCKS` (1,000) is the smallest
-        // retain window, and it lives in another crate, so the check here is
-        // the stronger and simpler one — activation at genesis leaves no
-        // unenforced prefix at all.
         const {
             assert!(
                 MERGE_DEPTH_ACTIVATION_HEIGHT == 0,
-                "MP-DEPTH must be enforced from genesis: any unenforced prefix \
-                 is a window where a valid block can cite a parent the pruner \
-                 may drop, and pruned/unpruned nodes then disagree about validity"
+                "G5 must be enforced from genesis: any unenforced prefix is a \
+                 window where a valid block can cite a parent the pruner may drop"
             )
         };
+        // The former devnet override is no longer read.
+        assert_eq!(merge_depth_activation_height(), 0);
+        // §1.2 constants, pinned.
+        assert_eq!(GHOSTDAG_K, GhostDagParams::default().k);
+        assert_eq!(MAX_PARENTS, GhostDagParams::default().max_parents);
+        assert_eq!(MERGESET_SIZE_LIMIT, 10 * GHOSTDAG_K as usize);
+        assert_eq!(GHOSTDAG_WINDOW, 2 * MERGE_DEPTH);
     }
 
-    /// MP-DEPTH must not apply BELOW the activation height. Blocks already on
-    /// the chain were produced under the old rule and must stay valid forever —
-    /// re-judging history under a new rule forks just as surely as enforcing it
-    /// early does.
-    ///
-    /// The SHIPPED activation is 0 since the 2026-08-04 re-roll, so on this
-    /// chain there is no below-activation region at all. The gating mechanism
-    /// still has to work for any FUTURE deferred activation, so this test now
-    /// drives it explicitly with `with_merge_depth_activation_height` rather
-    /// than leaning on the default. Deleting it would drop the only coverage of
-    /// "do not re-judge history", which is the property that makes a staged
-    /// rollout possible at all.
+    /// r1007: there is no "below the activation height". G5 applies to every
+    /// block from genesis, so a merge parent far deeper than MERGE_DEPTH is
+    /// rejected at any height (formerly: accepted below a deferred
+    /// activation, a mechanism r1007 removes; ADR CV-2, spec §0).
     #[tokio::test]
     async fn mp_depth_is_not_enforced_below_the_activation_height() {
         fn h(i: u64) -> [u8; 32] {
@@ -3241,30 +2855,8 @@ mod tests {
         }
         const N: u64 = 300; // deeper than MERGE_PARENT_MAX_DEPTH
 
-        // A hypothetical FUTURE deferred activation, well above the fixture.
-        const DEFERRED_ACTIVATION: u64 = 100_000;
-
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone())
-            .with_merge_depth_activation_height(DEFERRED_ACTIVATION);
-        assert!(
-            !ghostdag.merge_depth_enforced_at(N + 1),
-            "height {} is below the activation height {} — the rule must not apply",
-            N + 1,
-            DEFERRED_ACTIVATION
-        );
-        assert!(
-            ghostdag.merge_depth_enforced_at(DEFERRED_ACTIVATION),
-            "and it must apply from the activation height onward"
-        );
-        // The SHIPPED default leaves no unenforced prefix — that is the whole
-        // point of activating at genesis, and it is what pruning depends on.
-        let shipped = GhostDag::new(GhostDagParams::default(), dag_store.clone());
-        assert!(
-            shipped.merge_depth_enforced_at(0),
-            "the shipped activation ({MERGE_DEPTH_ACTIVATION_HEIGHT}) must enforce \
-             from genesis, or the pruner can drop a block a valid block may cite"
-        );
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.expect("store");
@@ -3283,19 +2875,26 @@ mod tests {
             }
             tip = b.hash();
         }
+        // A side block on `deep`, so the merge parent is outside past(SP) and
+        // only the depth rule can reject it.
+        let side = create_test_block_with_parents(h(N + 7), deep, vec![], 11);
+        dag_store.store_block(side.clone()).await.expect("store");
+        ghostdag.register_existing_block(&side).await.expect("reg");
 
-        let merger = create_test_block_with_parents(h(N + 1), tip, vec![deep], N + 1);
+        let merger = create_test_block_with_parents(h(N + 1), tip, vec![side.hash()], N + 1);
         dag_store.store_block(merger.clone()).await.expect("store");
         assert!(
-            ghostdag.add_block(&merger).await.is_ok(),
-            "with no activation height the old rule stands and this block is valid — \
-             rejecting it on upgrade would fork against un-upgraded peers"
+            matches!(
+                ghostdag.add_block(&merger).await,
+                Err(GhostDagError::MergeDepthViolation { .. })
+            ),
+            "G5 is active from genesis: a merge parent 290 below is invalid"
         );
     }
 
-    /// Once activated, a merge parent deeper than the bound is invalid. This is
-    /// what makes bounding the blue-set walk sound, and therefore what unblocks
-    /// DAG pruning: no valid block can cite anything below the retained window.
+    /// A merge parent deeper than the bound is invalid. This is what makes
+    /// bounding the coloring walk sound, and therefore what makes DAG pruning
+    /// safe: no valid block can cite anything below the GHOSTDAG window.
     #[tokio::test]
     async fn mp_depth_rejects_a_too_deep_merge_parent_once_activated() {
         fn h(i: u64) -> [u8; 32] {
@@ -3306,9 +2905,7 @@ mod tests {
         const N: u64 = 300;
 
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
-        // Activate from genesis so every block in the fixture is judged by it.
-        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone())
-            .with_merge_depth_activation_height(0);
+        let ghostdag = GhostDag::new(GhostDagParams::default(), dag_store.clone());
 
         let genesis = create_test_block_with_parents(h(0), Hash::default(), vec![], 0);
         dag_store.store_block(genesis.clone()).await.expect("store");
@@ -3332,30 +2929,37 @@ mod tests {
             tip = b.hash();
         }
 
-        // Too deep: height N+1 merging height 10 is 291 below the bound of 100.
-        let bad = create_test_block_with_parents(h(N + 1), tip, vec![deep], N + 1);
+        // Too deep: height N+1 merging (a side block of) height 10.
+        let side = create_test_block_with_parents(h(N + 9), deep, vec![], 11);
+        dag_store.store_block(side.clone()).await.expect("store");
+        ghostdag.register_existing_block(&side).await.expect("reg");
+        let bad = create_test_block_with_parents(h(N + 1), tip, vec![side.hash()], N + 1);
         dag_store.store_block(bad.clone()).await.expect("store");
         let err = ghostdag.add_block(&bad).await;
         assert!(
             err.is_err(),
-            "a merge parent {} blocks deep must be rejected once MP-DEPTH is active",
-            N + 1 - 10
+            "a merge parent {} blocks deep must be rejected",
+            N + 1 - 11
         );
+        // Merging an ancestor of the selected parent is rejected too (G2).
+        let bad2 = create_test_block_with_parents(h(N + 3), tip, vec![deep], N + 1);
+        assert!(ghostdag.add_block(&bad2).await.is_err());
 
         // A sibling one height back is well inside the bound and stays valid —
         // the rule must not break ordinary DAG merging, which is the whole point
-        // of multi-producer.
+        // of multi-producer. Its anticone (the tip) is within K, so it is blue.
         let sibling = create_test_block_with_parents(h(N + 500), shallow_parent, vec![], N);
         dag_store.store_block(sibling.clone()).await.expect("store");
         ghostdag
             .register_existing_block(&sibling)
             .await
             .expect("reg");
-        let good = create_test_block_with_parents(h(N + 2), tip, vec![sibling.hash()], N + 1);
+        let good = sealed(&ghostdag, h(N + 2), vec![tip, sibling.hash()]).await;
+        assert_eq!(good.header.blue_score, N + 2, "SP's N + {{SP, sibling}}");
         dag_store.store_block(good.clone()).await.expect("store");
         assert!(
             ghostdag.add_block(&good).await.is_ok(),
-            "a merge parent inside the bound must still be accepted — MP-DEPTH \
+            "a merge parent inside the bound must still be accepted — the depth rule \
              bounds how DEEP a merge reaches, it does not forbid merging"
         );
     }
@@ -3464,7 +3068,9 @@ mod tests {
             "rehydration must not materialise cumulative ancestry (PIL-13)"
         );
 
-        let merge = create_test_block_with_parents(h(N + 2_000), tip, vec![sibling.hash()], N + 1);
+        // r1007: the heavier of tip and sibling is SP (G3), and the header
+        // commits the GHOSTDAG score (G7).
+        let merge = sealed(&ghostdag, h(N + 2_000), vec![tip, sibling.hash()]).await;
         dag_store
             .store_block(merge.clone())
             .await
@@ -3564,11 +3170,17 @@ mod tests {
 
     use crate::dag_store::KvStore as _;
 
-    /// A DAG with merges: `width` producers seal one block per height on the
-    /// best tip, each merging the previous height's other blocks (as producers
-    /// that hear each other do), `height` heights above genesis. Seeded, so a
-    /// failing seed reproduces. Returns the blocks in height order.
-    fn merging_dag(seed: u64, height: u64) -> Vec<Block> {
+    /// A DAG with merges: `width` producers seal one block per height, each
+    /// naming one block of the previous height and the others it heard as
+    /// parents, `height` heights above genesis. Seeded, so a failing seed
+    /// reproduces. Returns the blocks in height order.
+    ///
+    /// r1007: headers are built the way the producer builds them (spec §9.3):
+    /// the selected parent is the heaviest parent (G3) and blue_score /
+    /// blue_work are the GHOSTDAG values (G7), computed on a scratch DAG.
+    /// (The pre-r1007 fixture chose the selected parent at random and wrote
+    /// `parent + 1`, the flawed unit CV-3 removes.)
+    async fn merging_dag(seed: u64, height: u64) -> Vec<Block> {
         let mut x = seed | 1;
         let mut next = move || {
             x ^= x << 13;
@@ -3576,31 +3188,37 @@ mod tests {
             x ^= x << 17;
             x
         };
+        let scratch = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let gd = GhostDag::new(GhostDagParams::default(), scratch.clone());
         let mut id = 0u64;
-        let mut mk = |sp: Hash, merges: Vec<Hash>, h: u64| {
+        let mut next_id = || {
             id += 1;
             let mut b = [0u8; 32];
             b[0..8].copy_from_slice(&id.to_le_bytes());
             b[8..16].copy_from_slice(&seed.to_le_bytes());
             b[31] = 0x5C;
-            create_test_block_with_parents(b, sp, merges, h)
+            b
         };
-        let genesis = mk(Hash::default(), vec![], 0);
+        let genesis = create_test_block_with_parents(next_id(), Hash::default(), vec![], 0);
+        scratch.store_block(genesis.clone()).await.expect("store");
+        gd.add_block(&genesis).await.expect("genesis");
         let mut all = vec![genesis.clone()];
         let mut prev: Vec<Hash> = vec![genesis.hash()];
-        for h in 1..=height {
+        for _h in 1..=height {
             let width = 1 + (next() % 3) as usize;
             let mut layer = Vec::new();
             for _ in 0..width {
-                // Selected parent: one block of the previous height; the rest
-                // of that height (those this producer heard) as merge parents.
-                let sp = prev[(next() as usize) % prev.len()];
-                let merges: Vec<Hash> = prev
+                // One block of the previous height, plus the rest of that
+                // height this producer heard.
+                let base = prev[(next() as usize) % prev.len()];
+                let parents: Vec<Hash> = prev
                     .iter()
                     .copied()
-                    .filter(|p| *p != sp && next() % 4 != 0)
+                    .filter(|p| *p == base || next() % 4 != 0)
                     .collect();
-                let b = mk(sp, merges, h);
+                let b = sealed(&gd, next_id(), parents).await;
+                scratch.store_block(b.clone()).await.expect("store");
+                gd.add_block(&b).await.expect("fixture block admitted");
                 layer.push(b.hash());
                 all.push(b);
             }
@@ -3610,7 +3228,7 @@ mod tests {
     }
 
     /// What fork choice concludes on `gd`: the selected tip, and every tip
-    /// ranked the way `select_tip` ranks (score, then the smaller hash).
+    /// with its score, in a canonical order (score, then the smaller hash).
     async fn fork_choice_view(gd: &GhostDag) -> Result<(Hash, Vec<(u64, Hash)>), GhostDagError> {
         let tip = gd.select_tip().await?;
         let mut ranked = Vec::new();
@@ -3636,61 +3254,48 @@ mod tests {
         (kv, dag_store)
     }
 
-    /// S2-5 (H4): when the derived-score anchor is missing and the score cannot
-    /// be recomputed (the selected parent is pruned), registration used to rank
-    /// the block on `header.blue_score`, a different unit from the fork-choice
-    /// score (which counts blue merge parents and starts at genesis = 1). Now it
-    /// fails closed: the block is not ranked, and the caller gets an error.
+    /// S2-5 (H4), carried to r1007 CV-3: a rehydrated block is ranked on its
+    /// committed header score, which IS the fork-choice unit (one score). With
+    /// its ancestry pruned and its GHOSTDAG record deleted, registration still
+    /// ranks it on exactly the value the first process validated, and writes
+    /// nothing back.
     #[tokio::test]
     async fn register_existing_block_never_ranks_on_header_scale() {
-        let blocks = merging_dag(0xA11CE, 40);
+        let blocks = merging_dag(0xA11CE, 40).await;
         let (kv, dag_store) = admitted_store(&blocks).await;
         let floor = blocks
             .iter()
-            .find(|b| b.header.height == 30)
+            .find(|b| b.header.height == 30 && !b.header.merge_parent_hashes.is_empty())
+            .or_else(|| blocks.iter().find(|b| b.header.height == 30))
             .expect("a block at the floor")
             .clone();
-        let derived = dag_store
-            .get_derived_blue_score(&floor.hash())
-            .expect("the first process recorded a derived score");
-        assert_ne!(
-            derived, floor.header.blue_score,
-            "fixture: the two scales differ on this block"
-        );
+        let validated = dag_store
+            .get_ghostdag_data(&floor.hash())
+            .expect("the first process persisted the GHOSTDAG record")
+            .blue_score;
+        assert_eq!(validated, floor.header.blue_score, "admission enforced G7");
         dag_store
             .update_pruning_point(floor.hash())
             .await
             .expect("pruning point");
         dag_store.prune().await.expect("prune");
-        // The anchor for the floor block is gone (a torn write, an old data dir).
-        kv.kv_delete(
-            crate::dag_store::cf::DAG_METADATA,
-            &[b"score:".as_slice(), floor.hash().as_bytes()].concat(),
-        )
-        .expect("delete anchor");
-        assert_eq!(dag_store.get_derived_blue_score(&floor.hash()), None);
+        // The record for the floor block is gone (a torn write, an old data dir).
+        kv.kv_delete(crate::dag_store::cf::DAG_GHOSTDAG, floor.hash().as_bytes())
+            .expect("delete record");
+        assert!(dag_store.get_ghostdag_data(&floor.hash()).is_none());
 
         let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone());
-        let out = gd.register_existing_block(&floor).await;
-        match out {
-            Err(_) => assert!(
-                gd.get_blue_score(&floor.hash()).await.is_err(),
-                "a block that failed registration must not be ranked"
-            ),
-            Ok(()) => {
-                let score = gd.get_blue_score(&floor.hash()).await.expect("ranked");
-                assert_eq!(
-                    score, derived,
-                    "the block was ranked on score {score}, not its fork-choice score \
-                     {derived} (header blue_score {})",
-                    floor.header.blue_score
-                );
-            }
-        }
+        gd.register_existing_block(&floor)
+            .await
+            .expect("a retained block registers from its committed header");
+        let score = gd.get_blue_score(&floor.hash()).await.expect("ranked");
         assert_eq!(
-            dag_store.get_derived_blue_score(&floor.hash()),
-            None,
-            "a header-scale score must never be written back as the derived anchor"
+            score, validated,
+            "the block was ranked on {score}, not the score admission validated"
+        );
+        assert!(
+            dag_store.get_ghostdag_data(&floor.hash()).is_none(),
+            "registration must not write a record it did not compute"
         );
     }
 
@@ -3703,14 +3308,20 @@ mod tests {
         Foreign,
     }
 
-    /// Apply `fault` to every `score:` entry of `kv`. `foreign` holds the
-    /// entries of another node over a different DAG.
-    fn fault_cache(kv: &MemKv, blocks: &[Block], fault: CacheFault, foreign: &MemKv, seed: u64) {
-        let cf = crate::dag_store::cf::DAG_METADATA;
-        let key = |h: &Hash| [b"score:".as_slice(), h.as_bytes()].concat();
+    /// Apply `fault` to every persisted GHOSTDAG record of `kv` (G12). `foreign`
+    /// holds the records of another node over a different DAG.
+    fn fault_cache(
+        kv: &MemKv,
+        store: &DagStore,
+        blocks: &[Block],
+        fault: CacheFault,
+        foreign: &MemKv,
+        seed: u64,
+    ) {
+        let cf = crate::dag_store::cf::DAG_GHOSTDAG;
         let mut x = seed | 1;
         for (i, b) in blocks.iter().enumerate() {
-            let k = key(&b.hash());
+            let k = b.hash().as_bytes().to_vec();
             match fault {
                 CacheFault::Missing => {
                     kv.kv_delete(cf, &k).expect("delete");
@@ -3727,8 +3338,13 @@ mod tests {
                     kv.kv_put(cf, &k, &v).expect("put");
                 }
                 CacheFault::HeaderScale => {
-                    kv.kv_put(cf, &k, &b.header.blue_score.to_be_bytes())
-                        .expect("put");
+                    // A well-formed, correctly tagged record on another scale
+                    // (the pre-r1007 genesis = 1 convention): one too high.
+                    if let Some(mut d) = store.get_ghostdag_data(&b.hash()) {
+                        d.blue_score = d.blue_score.saturating_add(1);
+                        d.blue_work = crate::types::blue_work_for_score(d.blue_score);
+                        store.put_ghostdag_data(&b.hash(), &d);
+                    }
                 }
                 CacheFault::Foreign => {
                     kv.kv_delete(cf, &k).expect("delete");
@@ -3736,44 +3352,53 @@ mod tests {
             }
         }
         if let CacheFault::Foreign = fault {
-            for (k, v) in foreign.kv_iter_cf(cf).expect("iter") {
-                if k.starts_with(b"score:") {
-                    kv.kv_put(cf, &k, &v).expect("put");
-                }
-            }
-            // And another node's anchors filed under OUR block hashes.
+            // Another node's records filed under OUR block hashes.
             let theirs: Vec<Vec<u8>> = foreign
                 .kv_iter_cf(cf)
                 .expect("iter")
                 .into_iter()
-                .filter(|(k, _)| k.starts_with(b"score:"))
                 .map(|(_, v)| v)
                 .collect();
             for (b, v) in blocks.iter().zip(theirs.iter().cycle()) {
-                kv.kv_put(cf, &key(&b.hash()), v).expect("put");
+                kv.kv_put(cf, b.hash().as_bytes(), v).expect("put");
             }
         }
     }
 
-    /// S2-5 (H4) property: fork choice is a function of block data. A node
-    /// whose score anchors are missing, corrupt, on the header scale, or copied
-    /// from another node rehydrates (the production order: every height, then
-    /// the authoritative tips) to the same selected tip and the same tip
-    /// ranking as a node with intact anchors, or, where the score cannot be
-    /// recomputed (a pruned store), refuses to rank. It never picks a
-    /// different tip.
+    /// S2-5 (H4) / CV-3 property: fork choice is a function of block data. A
+    /// node whose GHOSTDAG records are missing, corrupt, on another scale, or
+    /// copied from another node rehydrates (the production order: every
+    /// height, then the authoritative tips) to the same selected tip and the
+    /// same tip ranking as a node with intact records, and that ranking is the
+    /// committed header blue_score of each tip. It then judges the next block
+    /// exactly as the intact node does, or, where the window cannot be
+    /// recomputed (a pruned store), refuses to judge it. It never reaches a
+    /// different verdict.
     #[tokio::test]
     async fn fork_choice_score_is_a_function_of_block_data() {
-        let foreign_blocks = merging_dag(0xF0E1, 25);
+        let foreign_blocks = merging_dag(0xF0E1, 25).await;
         let (foreign_kv, _) = admitted_store(&foreign_blocks).await;
         for seed in 1..=12u64 {
-            let blocks = merging_dag(seed.wrapping_mul(0x9E37_79B9), 24 + seed % 7);
+            let blocks = merging_dag(seed.wrapping_mul(0x9E37_79B9), 24 + seed % 7).await;
+            // The next block, sealed by an intact, unpruned node over all tips.
+            let next = {
+                let (_kv, full) = admitted_store(&blocks).await;
+                let gd = GhostDag::new(GhostDagParams::default(), full.clone());
+                for b in &blocks {
+                    gd.register_existing_block(b).await.expect("register");
+                }
+                gd.reconcile_tips_from_dag_store().await;
+                let mut id = [0x4E; 32];
+                id[0..8].copy_from_slice(&seed.to_le_bytes());
+                sealed(&gd, id, gd.get_tips().await).await
+            };
             for pruned in [false, true] {
-                // Reference: intact anchors, rehydrated the production way.
+                // Reference: intact records, rehydrated the production way.
                 let (ref_kv, ref_store) = admitted_store(&blocks).await;
                 let floor_height = 12u64;
                 let rehydrate = |store: Arc<DagStore>| {
                     let blocks = blocks.clone();
+                    let next = next.clone();
                     async move {
                         let gd = GhostDag::new(GhostDagParams::default(), store.clone());
                         let from = if pruned { floor_height } else { 0 };
@@ -3781,7 +3406,8 @@ mod tests {
                             let _ = gd.register_existing_block(b).await;
                         }
                         gd.reconcile_tips_from_dag_store().await;
-                        fork_choice_view(&gd).await
+                        let verdict = gd.validate_block_consistency(&next).await;
+                        fork_choice_view(&gd).await.map(|v| (v, verdict))
                     }
                 };
                 let prune = |store: Arc<DagStore>| {
@@ -3799,9 +3425,27 @@ mod tests {
                     prune(ref_store.clone()).await;
                 }
                 let _ = ref_kv;
-                let reference = rehydrate(ref_store)
+                let (reference, ref_verdict) = rehydrate(ref_store.clone())
                     .await
-                    .expect("intact anchors always rank");
+                    .expect("committed values always rank");
+                // CV-3: the ranking IS the committed header value. There is
+                // one unit, so a tip's fork-choice score is its header's
+                // blue_score, which admission validated exactly.
+                for (score, tip) in &reference.1 {
+                    let header = ref_store.get_header(tip).await.expect("tip header");
+                    assert_eq!(
+                        *score, header.blue_score,
+                        "seed {seed} pruned={pruned}: tip {tip} ranked on {score}, but its \
+                         committed blue_score is {}",
+                        header.blue_score
+                    );
+                }
+                if !pruned {
+                    assert!(
+                        ref_verdict.is_ok(),
+                        "seed {seed}: the intact node rejects the next block: {ref_verdict:?}"
+                    );
+                }
                 for fault in [
                     CacheFault::Missing,
                     CacheFault::Corrupt,
@@ -3812,16 +3456,24 @@ mod tests {
                     if pruned {
                         prune(store.clone()).await;
                     }
-                    fault_cache(&kv, &blocks, fault, &foreign_kv, seed);
-                    match rehydrate(store).await {
-                        Ok(view) => assert_eq!(
-                            view, reference,
-                            "seed {seed} pruned={pruned} {fault:?}: a different fork choice"
-                        ),
-                        Err(e) => assert!(
-                            pruned,
-                            "seed {seed} {fault:?}: an unpruned node must recompute every \
-                             score from block data, but refused to rank: {e}"
+                    fault_cache(&kv, &store, &blocks, fault, &foreign_kv, seed);
+                    let (view, verdict) = rehydrate(store)
+                        .await
+                        .expect("committed values always rank");
+                    assert_eq!(
+                        view, reference,
+                        "seed {seed} pruned={pruned} {fault:?}: a different fork choice"
+                    );
+                    match (&verdict, pruned) {
+                        (Ok(()), _) => {}
+                        (
+                            Err(GhostDagError::MissingParent(_))
+                            | Err(GhostDagError::ScoreUnavailable(_)),
+                            true,
+                        ) => {}
+                        (Err(e), _) => panic!(
+                            "seed {seed} pruned={pruned} {fault:?}: the next block was judged \
+                             differently from the intact node ({ref_verdict:?}): {e}"
                         ),
                     }
                 }

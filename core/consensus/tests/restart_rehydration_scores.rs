@@ -10,9 +10,11 @@
 //   * a peer block extending the tip, or merging the side tip, is admitted
 //     after the restart, although genesis and every block below the pruning
 //     point are absent from the DAG store;
-//   * the gap between the fork-choice score and the header score is exactly the
-//     number of blue merge parents on the selected chain: the producer writes
-//     `parent + 1` into headers, fork choice counts blue merge parents.
+//   * r1007 CV-3: the fork-choice score IS the committed header score (one
+//     unit). Headers are built the way the producer builds them (spec §9.3):
+//     the heaviest parent as selected parent (G3), the GHOSTDAG score (G7).
+//     (Pre-r1007 the producer wrote `parent + 1` and fork choice ran ahead of
+//     it by the blue merge parents of the selected chain.)
 //
 // The rehydration sequence mirrors the node: the boot-time tip reconcile, then
 // the producer's eager load (every canonical height from 0, through
@@ -92,7 +94,8 @@ fn hash(tag: u8, height: u64) -> Hash {
     Hash::new(h)
 }
 
-/// A block as the live producers write it: header blue_score = parent's + 1.
+/// A linear block whose header commits `height` as its blue score (exact on a
+/// chain without merges, genesis = 0).
 fn block(tag: u8, height: u64, parent: Hash, merges: Vec<Hash>) -> Block {
     BlockBuilder::new()
         .hash(hash(tag, height))
@@ -104,18 +107,50 @@ fn block(tag: u8, height: u64, parent: Hash, merges: Vec<Hash>) -> Block {
         .build_unhashed()
 }
 
-const CANON: u8 = 0xA0;
+// CANON is the largest tag below PEER so that at equal blue work the
+// canonical block is the heavier key (r1007 G3/G8 tie-break on the hash).
+const CANON: u8 = 0xC8;
 const SIBLING: u8 = 0xB0;
 const SIDE: u8 = 0xC0;
 const PEER: u8 = 0xD0;
 
+/// A block as the r1007 producer writes it: `parent` must be the heaviest of
+/// its parents (G3), and blue_score / blue_work are the GHOSTDAG values `gd`
+/// computes for them (G7).
+async fn sealed(gd: &GhostDag, tag: u8, height: u64, parent: Hash, merges: Vec<Hash>) -> Block {
+    let mut parents = vec![parent];
+    parents.extend(merges.iter().copied());
+    let (sp, m, h, data) = gd
+        .ghostdag_for_parents(&parents)
+        .await
+        .expect("valid parents");
+    assert_eq!(
+        sp, parent,
+        "fixture: the named selected parent is the heaviest"
+    );
+    assert_eq!(h, height);
+    BlockBuilder::new()
+        .hash(hash(tag, height))
+        .parent(sp)
+        .merge_parents(m)
+        .height(h)
+        .blue_score(data.blue_score)
+        .blue_work(data.blue_work)
+        .build_unhashed()
+}
+
 /// Canonical chain A_0..A_n where every A_h (h >= 2) merges the sibling
 /// B_{h-1} (same selected parent as A_{h-1}), plus one unmerged side tip C at
 /// `side_h` off A_{side_h - 1}. Returns (canonical, siblings, side tip).
-fn build_dag(n: u64, side_h: u64) -> (Vec<Block>, Vec<Block>, Block) {
+/// Headers are sealed on a scratch DAG.
+async fn build_dag(n: u64, side_h: u64) -> (Vec<Block>, Vec<Block>, Block) {
+    let scratch = Arc::new(DagStore::with_permissive_vrf_for_testing());
+    let gd = GhostDag::new(GhostDagParams::default(), scratch.clone());
     let genesis = block(CANON, 0, Hash::default(), vec![]);
+    admit(&scratch, &gd, &genesis).await;
     let mut canon = vec![genesis];
     let mut sibs: Vec<Block> = Vec::new();
+    let mut side = None;
     for h in 1..=n {
         let sp = canon[(h - 1) as usize].hash();
         let merges = if h >= 2 {
@@ -123,13 +158,28 @@ fn build_dag(n: u64, side_h: u64) -> (Vec<Block>, Vec<Block>, Block) {
         } else {
             vec![]
         };
-        canon.push(block(CANON, h, sp, merges));
+        let a = sealed(&gd, CANON, h, sp, merges).await;
         if h < n {
-            sibs.push(block(SIBLING, h, sp, vec![]));
+            let b = sealed(&gd, SIBLING, h, sp, vec![]).await;
+            admit(&scratch, &gd, &b).await;
+            sibs.push(b);
         }
+        if h == side_h {
+            let c = sealed(&gd, SIDE, side_h, sp, vec![]).await;
+            admit(&scratch, &gd, &c).await;
+            side = Some(c);
+        }
+        admit(&scratch, &gd, &a).await;
+        canon.push(a);
     }
-    let side = block(SIDE, side_h, canon[(side_h - 1) as usize].hash(), vec![]);
-    (canon, sibs, side)
+    (canon, sibs, side.expect("side tip"))
+}
+
+/// `b` with its committed score and work set to `score`.
+fn with_score(mut b: Block, score: u64) -> Block {
+    b.header.blue_score = score;
+    b.header.blue_work = citrate_consensus::types::blue_work_for_score(score);
+    b
 }
 
 async fn admit(dag: &DagStore, gd: &GhostDag, b: &Block) {
@@ -144,7 +194,7 @@ async fn restart_of_a_pruned_node_keeps_fork_choice_and_admits_peer_blocks() {
     const SIDE_H: u64 = N - 3;
 
     let kv = Arc::new(MemKv::default());
-    let (canon, sibs, side) = build_dag(N, SIDE_H);
+    let (canon, sibs, side) = build_dag(N, SIDE_H).await;
 
     // ---- process 1: the live receive path ----
     let mut before: HashMap<Hash, u64> = HashMap::new();
@@ -174,14 +224,12 @@ async fn restart_of_a_pruned_node_keeps_fork_choice_and_admits_peer_blocks() {
         tip_before = gd.select_tip().await.expect("tip");
         assert_eq!(tip_before, canon[N as usize].hash());
 
-        // The fork-choice score counts every blue merge parent; the header
-        // carries parent + 1. For the tip that gap is the N - 1 merged siblings.
+        // CV-3: the fork-choice score is the committed header score. Each
+        // A_h (h >= 2) adds itself's SP and the blue sibling, so A_N scores
+        // 2N - 1 (worked by hand, independent of the implementation).
         let tip_score = before[&tip_before];
-        assert_eq!(
-            tip_score,
-            canon[N as usize].header.blue_score + 1 + (N - 1),
-            "fork-choice score = header + 1 + blue merge parents on the selected chain"
-        );
+        assert_eq!(tip_score, canon[N as usize].header.blue_score);
+        assert_eq!(tip_score, 2 * N - 1, "A_1 = 1, A_h = A_(h-1) + 2");
 
         dag.update_pruning_point(canon[PRUNE_AT as usize].hash())
             .await
@@ -220,7 +268,10 @@ async fn restart_of_a_pruned_node_keeps_fork_choice_and_admits_peer_blocks() {
     // A peer extends the tip, and another merges the side tip, after the
     // restart. Both must be admitted and scored on the pre-restart scale.
     let tip = &canon[N as usize];
-    let p1 = block(PEER, N + 1, tip.hash(), vec![]);
+    let p1 = with_score(
+        block(PEER, N + 1, tip.hash(), vec![]),
+        before[&tip.hash()] + 1,
+    );
     gd.validate_block_consistency(&p1)
         .await
         .expect("peer block passes the consistency gate after a restart");
@@ -230,7 +281,11 @@ async fn restart_of_a_pruned_node_keeps_fork_choice_and_admits_peer_blocks() {
         Some(before[&tip.hash()] + 1)
     );
 
-    let p2 = block(PEER + 1, N + 2, p1.hash(), vec![side.hash()]);
+    // p2's mergeset is {side}, blue: p1's score + {p1, side}.
+    let p2 = with_score(
+        block(PEER + 1, N + 2, p1.hash(), vec![side.hash()]),
+        before[&tip.hash()] + 1 + 2,
+    );
     gd.validate_block_consistency(&p2)
         .await
         .expect("merging the side tip passes the consistency gate after a restart");
@@ -257,7 +312,7 @@ async fn restart_rehydration_and_the_next_admission_do_not_reload_block_bodies()
     const SIDE_H: u64 = N - 3;
 
     let kv = Arc::new(MemKv::default());
-    let (canon, sibs, side) = build_dag(N, SIDE_H);
+    let (canon, sibs, side) = build_dag(N, SIDE_H).await;
     let tip_score;
     {
         let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("store"));
@@ -302,7 +357,11 @@ async fn restart_rehydration_and_the_next_admission_do_not_reload_block_bodies()
 
     // The next peer block merges the side tip, so its score walks the window.
     let tip = &canon[N as usize];
-    let p1 = block(PEER, N + 1, tip.hash(), vec![side.hash()]);
+    // Mergeset {side}, blue: the tip's score + {tip, side}.
+    let p1 = with_score(
+        block(PEER, N + 1, tip.hash(), vec![side.hash()]),
+        tip_score + 2,
+    );
     kv.body_reads.store(0, Ordering::SeqCst);
     gd.validate_block_consistency(&p1)
         .await
@@ -335,10 +394,6 @@ async fn admission_after_a_restart_costs_no_body_reloads_per_block() {
     const PRUNE_AT: u64 = 300;
     const POST: u64 = 250;
 
-    fn sib(tag: u8, h: u64, sp: Hash) -> Block {
-        block(tag, h, sp, vec![])
-    }
-
     for producer_style in [false, true] {
         let kv = Arc::new(MemKv::default());
         let mut canon: Vec<Block> = vec![block(CANON, 0, Hash::default(), vec![])];
@@ -350,9 +405,9 @@ async fn admission_after_a_restart_costs_no_body_reloads_per_block() {
             admit(&dag, &gd, &canon[0]).await;
             for h in 1..=PRE {
                 let sp = canon[(h - 1) as usize].hash();
-                let c = block(CANON, h, sp, std::mem::take(&mut prev_sibs));
-                let s1 = sib(SIBLING, h, sp);
-                let s2 = sib(SIDE, h, sp);
+                let c = sealed(&gd, CANON, h, sp, std::mem::take(&mut prev_sibs)).await;
+                let s1 = sealed(&gd, SIBLING, h, sp, vec![]).await;
+                let s2 = sealed(&gd, SIDE, h, sp, vec![]).await;
                 for b in [&c, &s1, &s2] {
                     admit(&dag, &gd, b).await;
                 }
@@ -386,10 +441,10 @@ async fn admission_after_a_restart_costs_no_body_reloads_per_block() {
         let mut first_window_time = std::time::Duration::ZERO;
         for h in (PRE + 1)..=(PRE + POST) {
             let sp = canon[(h - 1) as usize].hash();
-            let c = block(PEER, h, sp, std::mem::take(&mut prev_sibs));
-            let s1 = sib(PEER + 1, h, sp);
-            let s2 = sib(PEER + 2, h, sp);
             kv.body_reads.store(0, Ordering::SeqCst);
+            let c = sealed(&gd, PEER, h, sp, std::mem::take(&mut prev_sibs)).await;
+            let s1 = sealed(&gd, PEER + 1, h, sp, vec![]).await;
+            let s2 = sealed(&gd, PEER + 2, h, sp, vec![]).await;
             for b in [&c, &s1, &s2] {
                 gd.validate_block_consistency(b)
                     .await

@@ -2007,7 +2007,7 @@ mod tests {
     }
 
     /// A restarted node on the canonical chain hears of a sibling of its tip
-    /// (same height, same score, smaller hash: the fork-choice tie-break
+    /// (same height, same score, larger ForkChoiceKey: the fork-choice tie-break
     /// prefers it until the tip's children arrive). The durable applied tip
     /// must never go below the restart tip's parent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2124,12 +2124,13 @@ mod tests {
     }
 
     /// A same-height sibling of `tip` sealed by a fresh key whose hash is
-    /// smaller: equal blue score, so the fork-choice tie-break prefers it.
+    /// larger (same VRF output): equal blue score, so the fork-choice
+    /// tie-break (r1007 G8, the larger ForkChoiceKey) prefers it.
     fn tie_winning_sibling(tip: &Block, parent: Hash) -> Block {
         loop {
             let k = crypto::generate_keypair();
             let b = seal(&k, tip.header.height, parent, tip.state_root);
-            if h(&b) < h(tip) {
+            if h(&b) > h(tip) {
                 break b;
             }
         }
@@ -2957,32 +2958,36 @@ mod tests {
         extend(key, h(g), 1, n, r)
     }
 
-    /// A block at `height` on `parent` sealed by `key` whose hash sorts on the
-    /// `below` side of `than` (fork choice breaks equal-score ties toward the
-    /// SMALLEST hash). Same transactions and coinbase as the chain, so the
+    /// A block at `height` on `parent` sealed by `key` whose ForkChoiceKey is
+    /// above `than`'s when `wins` (fork choice breaks equal-score ties toward
+    /// the larger key, r1007 G8), below it otherwise. Same transactions and coinbase as the chain, so the
     /// same state root.
     fn sibling(
         key: &ed25519_dalek::SigningKey,
         height: u64,
         parent: Hash,
         root: Hash,
-        than: Hash,
-        below: bool,
+        than: &Block,
+        wins: bool,
     ) -> Block {
+        // r1007 G8: the tie-break is the ForkChoiceKey (VRF output before the
+        // hash); `wins` asks for a sibling whose key is above `than`'s.
+        let than = citrate_consensus::types::ForkChoiceKey::of_header(&than.header);
         for salt in 1..=u16::MAX {
             let mut b = seal(key, height, parent, root);
             // Vary the VRF output (no transactions read it) rather than the
             // timestamp, which must stay parent-monotonic for its children.
             let mut out = [0x5A; 32];
-            out[..2].copy_from_slice(&salt.to_be_bytes());
+            out[30..].copy_from_slice(&salt.to_be_bytes());
             b.header.vrf_reveal.output = Hash::new(out);
             b.header.block_hash = b.compute_hash();
             b.signature = crypto::sign_block(&b.header.block_hash, key);
-            if (b.header.block_hash < than) == below {
+            let key_of_b = citrate_consensus::types::ForkChoiceKey::of_header(&b.header);
+            if key_of_b != than && (key_of_b > than) == wins {
                 return b;
             }
         }
-        panic!("no sibling hash on the requested side");
+        panic!("no sibling key on the requested side");
     }
 
     /// The node after a restart, built the way `start_node` builds one over an
@@ -3097,7 +3102,7 @@ mod tests {
     /// advertises a higher head and answers the tip anchor with nothing (it
     /// never held the node's tip); when the fork-point search probes below the
     /// tip it serves a validly signed sibling of the tip that fork choice ranks
-    /// first (equal score, smaller hash). The restart keeps the reorg window,
+    /// first (equal score, larger ForkChoiceKey). The restart keeps the reorg window,
     /// so the node follows the tie-break as a running node does: a one-block
     /// reorg. An equal-weight head never starts a from-genesis rebuild (owner
     /// decision 2026-10-28): the durable applied tip never goes below the fork
@@ -3112,13 +3117,13 @@ mod tests {
         let own = chain(&key, &g, RESTART_TIP, &r);
         let tip = own.last().expect("tip").clone();
         let parent = own[own.len() - 2].header.block_hash;
-        // Validly signed by another proposer, same height and parent, smaller hash.
+        // Validly signed by another proposer, same height and parent, larger key.
         let rival = sibling(
             &other,
             RESTART_TIP,
             parent,
             r[RESTART_TIP as usize],
-            h(&tip),
+            &tip,
             true,
         );
         let net = Net {
@@ -3258,7 +3263,7 @@ mod tests {
             next.header.height,
             next.selected_parent(),
             next.state_root,
-            h(next),
+            next,
             false,
         );
         n.storage.blocks.put_block(&rival).expect("put");
@@ -3307,7 +3312,7 @@ mod tests {
             RESTART_TIP,
             parent,
             r[RESTART_TIP as usize],
-            h(&tip),
+            &tip,
             false,
         );
         let mut heavier = vec![rival.clone()];
@@ -3365,8 +3370,8 @@ mod tests {
         // Known to fork choice (stored + scored), not applied: the tip's
         // equal-score siblings on both sides of the hash tie-break, and a
         // heavier branch on the losing one.
-        let wins = sibling(&other, 30, tip.selected_parent(), r[30], h(&tip), true);
-        let loses = sibling(&other, 30, tip.selected_parent(), r[30], h(&tip), false);
+        let wins = sibling(&other, 30, tip.selected_parent(), r[30], &tip, true);
+        let loses = sibling(&other, 30, tip.selected_parent(), r[30], &tip, false);
         let heavier = extend(&other, h(&loses), 31, 32, &r);
         for b in [&wins, &loses].into_iter().chain(heavier.iter()) {
             n.storage.blocks.put_block(b).expect("put");
@@ -3750,7 +3755,7 @@ mod tests {
     /// Seal the block `m` would produce now, as the producer does: drain, the
     /// initial-sync gate (#126), fork choice's tip as the selected parent and
     /// only when it is the applied tip (MP-S1), the other tips as merge
-    /// parents (heaviest-parent and MP-DEPTH filters). `None` when the
+    /// parents (`GhostDag::parents_for_new_block`, r1007 G2-G5). `None` when the
     /// producer would refuse.
     async fn mesh_produce(
         m: &MeshNode,
@@ -3774,22 +3779,17 @@ mod tests {
         }
         let sp = m.node.storage.blocks.get_block(&sp_hash).ok()??;
         let height = sp.header.height + 1;
-        let mut merges = Vec::new();
-        for tip in m.node.ghostdag.get_tips().await {
-            if tip == sp_hash || merges.len() + 1 >= GhostDagParams::default().max_parents {
-                continue;
-            }
-            let Ok(Some(b)) = m.node.storage.blocks.get_block(&tip) else {
-                continue;
-            };
-            if b.header.blue_score <= sp.header.blue_score
-                && height - b.header.height <= citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
-            {
-                merges.push(tip);
-            }
-        }
-        merges.sort();
-        let score = sp.header.blue_score + 1;
+        // r1007 (S3-1): the producer's own merge-parent choice (G2-G5) and the
+        // exact GHOSTDAG score (G7), replacing the old header-score and MP-DEPTH
+        // filters and the `parent + 1` score.
+        let tips = m.node.ghostdag.get_tips().await;
+        let (merges, data) = m
+            .node
+            .ghostdag
+            .parents_for_new_block(sp_hash, &tips)
+            .await
+            .ok()?;
+        let score = data.blue_score;
         let mut b = BlockBuilder::new()
             .version(2)
             .height(height)
