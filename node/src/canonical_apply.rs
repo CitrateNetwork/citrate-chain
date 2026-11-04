@@ -2113,7 +2113,7 @@ impl CanonicalApplicator {
                                 "execute-on-receive: reorg to {new_tip}: fork point {} @ {} rebuilt from {} undo record(s) below the ring",
                                 fork.hash,
                                 fork.height,
-                                low_h - fork.height
+                                low_h.saturating_sub(fork.height)
                             );
                             snap
                         }
@@ -14215,7 +14215,7 @@ pub(crate) mod tests {
             assert_eq!(n, ACCOUNTS as usize, "fixture: resident accounts");
             let per_account =
                 std::mem::size_of::<(Address, citrate_execution::types::AccountState)>();
-            let per_snapshot = n * per_account;
+            let per_snapshot = std::mem::size_of_val(snap.account_entries());
             let ring_at_window = per_snapshot as u64 * MAX_REORG_DEPTH;
             let ring_now = per_snapshot as u64 * SNAPSHOT_RING_DEPTH;
             println!(

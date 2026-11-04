@@ -974,10 +974,12 @@ mod tests {
             DEFAULT_RETAIN_BLOCKS,
             "undo window != prune retention"
         );
-        assert!(
-            MIN_RETAIN_BLOCKS >= crate::canonical_apply::MAX_REORG_DEPTH,
-            "a retention shorter than the undo window is accepted ({MIN_RETAIN_BLOCKS})"
-        );
+        const {
+            assert!(
+                MIN_RETAIN_BLOCKS >= crate::canonical_apply::MAX_REORG_DEPTH,
+                "a retention shorter than the undo window is accepted"
+            )
+        };
         assert_eq!(
             citrate_storage::state::REORG_UNDO_DEPTH,
             DEFAULT_RETAIN_BLOCKS,
