@@ -3799,9 +3799,21 @@ mod tests {
                     prune(ref_store.clone()).await;
                 }
                 let _ = ref_kv;
-                let reference = rehydrate(ref_store)
+                let reference = rehydrate(ref_store.clone())
                     .await
                     .expect("intact anchors always rank");
+                // CV-3: the ranking IS the committed header value. There is
+                // one unit, so a tip's fork-choice score is its header's
+                // blue_score, which admission validated exactly.
+                for (score, tip) in &reference.1 {
+                    let header = ref_store.get_header(tip).await.expect("tip header");
+                    assert_eq!(
+                        *score, header.blue_score,
+                        "seed {seed} pruned={pruned}: tip {tip} ranked on {score}, but its \
+                         committed blue_score is {}",
+                        header.blue_score
+                    );
+                }
                 for fault in [
                     CacheFault::Missing,
                     CacheFault::Corrupt,
