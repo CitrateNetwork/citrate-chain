@@ -452,6 +452,8 @@ impl NetworkMessage {
             Self::HolePunchRequest { .. } => "HolePunchRequest",
             Self::HolePunchNotify { .. } => "HolePunchNotify",
             Self::LearningGossip { .. } => "LearningGossip",
+            Self::GetCheckpoint { .. } => "GetCheckpoint",
+            Self::CheckpointCertificate { .. } => "CheckpointCertificate",
         }
     }
 
