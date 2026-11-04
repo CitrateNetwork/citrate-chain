@@ -2234,7 +2234,7 @@ mod tests {
         let b_tip = heights[side_b[0]];
         let fork = (0..=b_tip)
             .rev()
-            .find(|h| b_chain.get(h).is_some() && b_chain.get(h) == a_chain.get(h))
+            .find(|h| b_chain.contains_key(h) && b_chain.get(h) == a_chain.get(h))
             .unwrap_or(0);
         let mut rejoined_at = None;
         for slot in 1..=60u64 {
