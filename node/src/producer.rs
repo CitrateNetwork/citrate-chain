@@ -19,7 +19,8 @@ use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::hardening::PbaHardening;
 use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, ForkChoiceKey, GhostDagParams, Hash, PublicKey, Transaction,
+    VrfProof,
 };
 use citrate_economics::{RewardCalculator, RewardConfig, UnifiedEconomicsManager};
 use citrate_execution::revm_adapter::BlockContext;
@@ -317,8 +318,12 @@ struct DeferredBlock {
     /// Its selected parent and merge parents (bounded by [`DEFERRED_BLOCK_PARENTS`]).
     parents: Vec<Hash>,
     height: u64,
-    /// The blue score its producer claims (the measure fork choice ranks tips by).
+    /// The blue score its producer claims.
     blue_score: u64,
+    /// Its fork-choice key from its header (blue work, VRF output, hash: the
+    /// order fork choice ranks tips by, r1007 G8). Claimed, like the score:
+    /// the block cannot be validated without its ancestry.
+    key: ForkChoiceKey,
     proposer: PublicKey,
     first_heard: Instant,
 }
@@ -526,6 +531,7 @@ impl AttestedNetworkHead {
                 parents,
                 height: block.header.height,
                 blue_score: block.header.blue_score,
+                key: ForkChoiceKey::of_header(&block.header),
                 proposer: block.header.proposer_pubkey,
                 first_heard: now,
             },
@@ -642,11 +648,13 @@ impl AttestedInner {
     /// ([`deferred_quorum_size`]), if there is one.
     ///
     /// `own_top` is this node's best tip by the same header measure the branch is
-    /// judged by (header blue score, then the smaller hash, as `select_tip` breaks
-    /// ties): both sides are header values, because the branch cannot be scored
-    /// without its ancestry. Judging both sides by their best tip makes the
-    /// verdict antisymmetric: of two sides that hear each other, at most one finds
-    /// the other preferred.
+    /// judged by: [`ForkChoiceKey`] (blue work, then VRF output, then hash), the
+    /// one order `select_tip`, the rebuild weight path (`outranks_tip`) and this
+    /// gate share, so they cannot disagree on a tie (r1007 07 finding 4). Both
+    /// sides are header values, because the branch cannot be scored without its
+    /// ancestry. Judging both sides by their best tip makes the verdict
+    /// antisymmetric: of two sides that hear each other, at most one finds the
+    /// other preferred.
     ///
     /// A branch backed by fewer producers never counts, so one key (or two of
     /// seven) cannot hold the rest of the fleet off by signing blocks on parents
@@ -662,20 +670,16 @@ impl AttestedInner {
         &self,
         now: Instant,
         holds: impl Fn(&Hash) -> bool,
-        own_top: (u64, Hash),
+        own_top: ForkChoiceKey,
     ) -> Option<Contender> {
         let needed = deferred_quorum_size(self.known_proposers.lock().len());
         self.deferred_branches(now, |b| b.parents.first().is_some_and(&holds))
             .into_iter()
-            .filter(|b| b.proposers >= needed && b.blue_score >= own_top.0)
-            .max_by(|a, b| {
-                (a.blue_score, std::cmp::Reverse(a.top))
-                    .cmp(&(b.blue_score, std::cmp::Reverse(b.top)))
-            })
+            .filter(|b| b.proposers >= needed && b.top.blue_work >= own_top.blue_work)
+            .max_by_key(|b| b.top)
             .map(|b| Contender {
                 height: b.height,
-                preferred: (b.blue_score, std::cmp::Reverse(b.top))
-                    > (own_top.0, std::cmp::Reverse(own_top.1)),
+                preferred: b.top > own_top,
             })
     }
 
@@ -710,13 +714,13 @@ impl AttestedInner {
                 }
             }
         }
-        // Connected components: proposers, highest height, and the top block by
-        // (blue score, smaller hash).
+        // Connected components: proposers, highest height, highest claimed blue
+        // score, and the top block by ForkChoiceKey.
         struct Component {
             proposers: HashSet<PublicKey>,
             height: u64,
             blue: u64,
-            top: Hash,
+            top: Option<ForkChoiceKey>,
         }
         let mut component_of: HashMap<Hash, usize> = HashMap::new();
         let mut components: Vec<Component> = Vec::new();
@@ -729,21 +733,17 @@ impl AttestedInner {
                 proposers: HashSet::new(),
                 height: 0,
                 blue: 0,
-                top: *start,
+                top: None,
             };
-            let mut first = true;
             let mut queue = std::collections::VecDeque::from([*start]);
             component_of.insert(*start, id);
             while let Some(h) = queue.pop_front() {
                 if let Some(b) = fresh.get(&h) {
                     c.proposers.insert(b.proposer);
                     c.height = c.height.max(b.height);
-                    if first
-                        || (b.blue_score, std::cmp::Reverse(h)) > (c.blue, std::cmp::Reverse(c.top))
-                    {
-                        c.blue = b.blue_score;
-                        c.top = h;
-                        first = false;
+                    c.blue = c.blue.max(b.blue_score);
+                    if c.top.is_none_or(|t| b.key > t) {
+                        c.top = Some(b.key);
                     }
                 }
                 for next in links.get(&h).map(Vec::as_slice).unwrap_or(&[]) {
@@ -765,15 +765,18 @@ impl AttestedInner {
         }
         components
             .iter()
-            .map(|c| DeferredBranch {
-                height: c.height,
-                blue_score: c.blue,
-                top: c.top,
-                proposers: c
-                    .proposers
-                    .iter()
-                    .filter(|p| branches_of.get(*p).copied().unwrap_or(0) == 1)
-                    .count(),
+            // Every component holds at least its start block, so it has a top.
+            .filter_map(|c| {
+                Some(DeferredBranch {
+                    height: c.height,
+                    blue_score: c.blue,
+                    top: c.top?,
+                    proposers: c
+                        .proposers
+                        .iter()
+                        .filter(|p| branches_of.get(*p).copied().unwrap_or(0) == 1)
+                        .count(),
+                })
             })
             .collect()
     }
@@ -785,8 +788,8 @@ struct DeferredBranch {
     height: u64,
     /// Highest blue score claimed on the branch.
     blue_score: u64,
-    /// The branch's top block by (blue score, smaller hash).
-    top: Hash,
+    /// The branch's top block's key (the largest [`ForkChoiceKey`] on it).
+    top: ForkChoiceKey,
     /// Distinct proposers with a fresh block on it (equivocators excluded).
     proposers: usize,
 }
@@ -885,12 +888,12 @@ impl ProduceCatchupGate {
     }
 
     /// [`Self::recompute_attested_ahead`] with this node's best tip by header measure
-    /// (`(header blue score, hash)`, the best of its DAG tips; `None`: the selected
+    /// (the largest [`ForkChoiceKey`] of its DAG tips; `None`: the selected
     /// head's). The contender check ([`AttestedInner::contender`]) compares against it.
     fn recompute_with_own_top(
         &self,
         selected: Option<(Hash, u64)>,
-        own_top: Option<(u64, Hash)>,
+        own_top: Option<ForkChoiceKey>,
         storage: &StorageManager,
     ) {
         let (Some(scratch), Some(observed)) = (
@@ -941,14 +944,18 @@ impl ProduceCatchupGate {
         // high as this node's own best tip. Header measure on both sides, as above.
         {
             let own = own_top.unwrap_or_else(|| {
-                let blue = storage
+                storage
                     .blocks
                     .get_block(&sel_hash)
                     .ok()
                     .flatten()
-                    .map(|b| b.header.blue_score)
-                    .unwrap_or(u64::MAX);
-                (blue, sel_hash)
+                    .map(|b| ForkChoiceKey::of_header(&b.header))
+                    // Unreadable: nothing outranks it (no contender).
+                    .unwrap_or(ForkChoiceKey {
+                        blue_work: u128::MAX,
+                        vrf_output: Hash::new([0xFF; 32]),
+                        hash: sel_hash,
+                    })
             });
             *self.contender.lock() = observed.contender(
                 observed.now_instant(),
@@ -2619,11 +2626,9 @@ impl BlockProducer {
                             .get_block(&h)
                             .ok()
                             .flatten()
-                            .map(|b| (b.header.blue_score, h))
+                            .map(|b| ForkChoiceKey::of_header(&b.header))
                     })
-                    .max_by(|a, b| {
-                        (a.0, std::cmp::Reverse(a.1)).cmp(&(b.0, std::cmp::Reverse(b.1)))
-                    });
+                    .max();
                 gate.recompute_with_own_top(selected, own_top, &self.storage);
             }
         }
@@ -8700,8 +8705,11 @@ mod tests {
         fn signed(templates: &[Block], i: u8, height: u64, parent: Hash, skew_secs: u64) -> Block {
             let mut x = templates[usize::from(i) - 1].clone();
             x.header.height = height;
-            // A linear branch: one blue block per height, as fork choice scores it.
+            // A linear branch: one blue block per height, as fork choice scores it,
+            // with the G7 blue work for that score (the gate ranks by the header's
+            // ForkChoiceKey, blue work first, since S3-1).
             x.header.blue_score = height;
+            x.header.blue_work = citrate_consensus::types::blue_work_for_score(height);
             x.header.selected_parent_hash = parent;
             x.header.merge_parent_hashes = Vec::new();
             x.header.timestamp =
@@ -8984,8 +8992,11 @@ mod tests {
                     .extend(&templates, if step == 0 { 4 } else { 2 }, t)
                     .into_iter()
                     .map(|mut x| {
-                        // Taller, but lighter than B's head by fork choice's measure.
+                        // Taller, but lighter than B's head by fork choice's measure
+                        // (blue work first, G8; the G7 work for the lighter score).
                         x.header.blue_score = b_blue.saturating_sub(1);
+                        x.header.blue_work =
+                            citrate_consensus::types::blue_work_for_score(b_blue.saturating_sub(1));
                         x
                     })
                     .collect();
@@ -9152,7 +9163,7 @@ mod tests {
             inner.contender(
                 inner.now_instant(),
                 |_| false,
-                (own.blue_score, own.block_hash),
+                ForkChoiceKey::of_header(own),
             )
         }
 
