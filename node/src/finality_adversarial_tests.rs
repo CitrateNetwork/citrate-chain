@@ -3685,3 +3685,91 @@ async fn s1b_late_joiner_handles_out_of_order_certificates() {
     net.nodes.push(n3);
     net.assert_no_conflicting_finality(&[2, 4, 6, 8]).await;
 }
+
+// ---------------------------------------------------------------------------
+// S3-5 (ADR CV-8, spec 06 §7): finality is a fork-choice filter, never a
+// block-validity rule; certificates survive a restart.
+// ---------------------------------------------------------------------------
+
+/// With enforcement on, a heavier branch that does not contain the finalized
+/// checkpoint is not adopted, but none of its blocks is invalidated: they are
+/// stored, kept in the DAG, and stay available (spec §7: certificates are
+/// node-local knowledge, so a validity rule would split nodes). With the
+/// switches this build ships (voting on, enforcement off) the floor is
+/// observed only and the same fork-choice move would proceed.
+#[tokio::test]
+async fn finality_filters_fork_choice_but_never_invalidates_a_block() {
+    assert!(
+        !FloorMode::from_switches(true, false).raises_floor(),
+        "observed mode (enforcement off) never filters fork choice"
+    );
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    let _ = net.round().await;
+    assert_eq!(net.node(0).floor(), 4, "checkpoint 4 finalized and enforced");
+
+    // A heavier branch forking at 3, below the finalized checkpoint.
+    let b = chains.branch(&a, 3, 14, VRF_B);
+    match net.node_mut(0).reorg_onto(&b).await {
+        ReorgOutcome::Rejected(why) => assert!(why.contains("below finalized"), "{why}"),
+        other => panic!("the filter must refuse the branch, got {other:?}"),
+    }
+    assert_eq!(net.node(0).app.applied_tip().await.hash, hash_at(&a, 8));
+    // Not invalid: every block of the refused branch is still stored, in the
+    // DAG and in the block store, and nothing marks it bad.
+    for blk in b.iter().filter(|x| x.header.height >= 3) {
+        let h = blk.header.block_hash;
+        assert!(net.node(0).dag.has_block(&h).await, "DAG keeps {h}");
+        assert!(
+            net.node(0)
+                .storage
+                .blocks
+                .get_header(&h)
+                .expect("read header")
+                .is_some(),
+            "block store keeps {h}"
+        );
+    }
+    // The finality gadget is not halted and keeps finalizing on A.
+    assert!(!net.node(0).gadget.halted());
+    let a = chains.main(12);
+    net.follow_all(&a).await;
+    let ticks = net.round().await;
+    assert!(ticks.iter().all(|t| *t == verified(8)), "{ticks:?}");
+}
+
+/// A finalized certificate is written durably (synced) before it is visible,
+/// and after a process restart over the same RocksDB the node reloads it,
+/// re-verifies it against the committee it derives itself, and restores the
+/// floor before it admits any block. The reloaded certificate still binds the
+/// block's state root and the governing epoch.
+#[tokio::test]
+async fn cert_survives_restart() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    let _ = net.round().await;
+    assert_eq!(net.node(0).finalized().await, 4);
+    let before = net.node(0).mgr().get_checkpoint(4).await.expect("cert 4");
+    assert!(net.node(0).mgr().is_certificate_persisted(4, &hash_at(&a, 4)));
+
+    let n0 = net.nodes.remove(0);
+    let (n0, boot) = n0.restart(&vals, config(100)).await;
+    assert_eq!(boot, verified(4), "boot re-verifies and restores the floor");
+    assert_eq!(n0.floor(), 4);
+    assert_eq!(n0.finalized().await, 4);
+    let after = n0.mgr().get_checkpoint(4).await.expect("cert 4 reloaded");
+    assert_eq!(after.block_hash, before.block_hash);
+    assert_eq!(after.votes, before.votes);
+    assert_eq!(after.binding, before.binding);
+    assert_eq!(after.binding.state_root, at(&a, 4).state_root);
+    assert_eq!(after.stakes, before.stakes);
+    assert!(after.has_derived_quorum());
+}
