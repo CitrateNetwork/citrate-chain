@@ -94,6 +94,8 @@ mod sync_peer;
 mod sync_recovery;
 mod sync_rejoin;
 mod timing;
+#[cfg(test)]
+mod tx_inclusion_tests;
 
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
