@@ -480,6 +480,19 @@ impl Node {
 }
 
 impl Fleet {
+    /// Node `i`'s data dir recorded for the differential replay harness
+    /// (`tools/replay-ref`, S3-3c): opened read-only while the node runs, with
+    /// the execution parameters this harness starts every node with.
+    fn record(&self, i: usize) -> citrate_replay_ref::Recording {
+        let mut cfg = citrate_replay_ref::ReplayConfig::from_process(CHAIN_ID);
+        cfg.validator_activation_height = Some(ACT);
+        cfg.reward_policy = Some(citrate_replay_ref::RecordedRewardPolicy::from_policy(
+            &policy(self.nodes.len()),
+        ));
+        citrate_replay_ref::record_data_dir(self.nodes[i].dir.path(), cfg)
+            .expect("record a node's data dir")
+    }
+
     pub(crate) async fn new(n: usize) -> Self {
         Self::with_refuse_window(n, None).await
     }
@@ -2163,6 +2176,15 @@ mod tests {
         /// Slots after serving returned until all three hold the four's chain
         /// at the four's height of that moment (None: not within 60).
         rejoined_at: Option<u64>,
+        /// With `pruned`: for each of the three, its data dir replayed by the
+        /// reference path (S3-3c) after the rejoin, and again with the block
+        /// at the given height changed.
+        replays: Vec<(
+            String,
+            citrate_replay_ref::Report,
+            citrate_replay_ref::Report,
+            u64,
+        )>,
         detail: String,
     }
 
@@ -2258,10 +2280,26 @@ mod tests {
                 break;
             }
         }
+        let mut replays = Vec::new();
+        if pruned && rejoined_at.is_some() {
+            use citrate_replay_ref::{replay, SelectedChain};
+            let k = fork + 10;
+            for i in side_b.iter().copied() {
+                let rec = fleet.record(i);
+                let clean = replay(&rec, &SelectedChain).await.expect("replay");
+                let mut bad = rec.clone();
+                if let Some(b) = bad.chain_block_mut(k) {
+                    b.header.coinbase = [0xEE; 20];
+                }
+                let mutated = replay(&bad, &SelectedChain).await.expect("replay");
+                replays.push((format!("node {i}"), clean, mutated, k));
+            }
+        }
         StoppedSide {
             fork_depth: b_tip.saturating_sub(fork),
             cut_tops: (settled, cut_end),
             rejoined_at,
+            replays,
             detail: format!(
                 "target {top}, fork at {fork}, three at {b_tip}: {}",
                 fleet.describe().await
@@ -2374,5 +2412,18 @@ mod tests {
             r.fork_depth,
             r.detail
         );
+        // S3-3c: each of the three, after switching that fork from its undo
+        // records, replays with zero divergence from genesis through the
+        // independent reference path; one changed block is caught at its height.
+        assert_eq!(r.replays.len(), 3, "{}", r.detail);
+        for (name, clean, mutated, k) in &r.replays {
+            assert_eq!(clean.divergence, None, "{name}: {clean:?}");
+            assert_eq!(clean.matched, clean.tip_height, "{name}: {clean:?}");
+            assert_eq!(
+                mutated.divergence.as_ref().map(|d| d.height),
+                Some(*k),
+                "{name}: {mutated:?}"
+            );
+        }
     }
 }

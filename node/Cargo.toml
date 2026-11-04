@@ -106,6 +106,9 @@ tokio = { version = "1.32", features = ["full", "test-util"] }
 # WS-5 ceremony fuzz: property-based coverage of proposer-key derivation,
 # Register-digest encoding, sign→verify_strict roundtrip, and calldata layout.
 proptest = { workspace = true }
+# r1007 S3-3c: record a test node's data dir and replay it through the
+# independent reference path (tools/replay-ref never depends on the node).
+citrate-replay-ref = { path = "../tools/replay-ref" }
 
 [features]
 # PBA-L1a-003: the consensus feature set is part of the DEFAULT build so every

@@ -4276,6 +4276,16 @@ pub(crate) mod tests {
         (r.validator_reward, r.treasury_reward)
     }
 
+    /// S3-3c: the replay harness restates the block-reward rule so it never
+    /// imports the node (spec 06 §8.3). It must be this rule.
+    #[test]
+    fn replay_reference_reward_rule_matches_the_node() {
+        assert_eq!(
+            serde_json::to_value(citrate_replay_ref::reference_reward_config()).expect("reference"),
+            serde_json::to_value(canonical_reward_config()).expect("node"),
+        );
+    }
+
     /// Post-execution state root a reward-only block must produce, computed on a
     /// throwaway executor (mirrors `apply_block`: set context → credit rewards →
     /// root). Isolated so the test asserts the driver reproduces the producer.
@@ -14100,6 +14110,85 @@ pub(crate) mod tests {
                 storage.state.reorg_undo_heights().expect("heights").len() as u64,
                 MAX_REORG_DEPTH,
                 "the new branch's undo records cover the whole window"
+            );
+        }
+
+        /// S3-3c (spec 06 §8.3, I6): a node that switched a fork deeper than
+        /// the snapshot ring from its undo records, then restarted and kept
+        /// applying, is recorded from its data dir (read-only, while open)
+        /// and replayed by the independent reference path
+        /// (`tools/replay-ref`): every applied block's committed root matches
+        /// a plain linear replay from genesis. A recording with one block of
+        /// the winning branch changed is reported at exactly that height.
+        #[tokio::test]
+        async fn a_deep_reorg_replays_with_zero_divergence() {
+            use citrate_replay_ref::{record_data_dir, replay, ReplayConfig, SelectedChain};
+            let tip_height = 400u64;
+            let fork = tip_height - 300;
+            let (main, snaps) = rsr_main(tip_height).await;
+            let side = rsr_fork(&main, &snaps, fork, 320, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            let (storage, dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                app.apply_received(b).await;
+            }
+            for b in &side {
+                persist(&storage, b);
+            }
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.drive_drain().await;
+            assert_eq!(
+                app.applied_tip().await.hash,
+                head.header.block_hash,
+                "fixture: the 300-deep switch"
+            );
+            drop(app);
+            // Restart, then keep applying on the winner.
+            let exec = rsr_hydrated(&storage);
+            let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let more = rsr_extend(
+                exec.state_snapshot(),
+                head.header.block_hash,
+                head.header.height + 1,
+                5,
+                [0x5B; 32],
+                CAROL,
+            )
+            .await
+            .0;
+            for b in &more {
+                persist(&storage, b);
+                assert!(matches!(
+                    app.apply_received(b).await,
+                    ApplyOutcome::Applied { .. }
+                ));
+            }
+            let mut cfg = ReplayConfig::from_process(exec.chain_id());
+            let mut fund = [0u8; 32];
+            U256::from(FUND).to_big_endian(&mut fund);
+            cfg.genesis_alloc = vec![(ALICE, fund)];
+            let rec = record_data_dir(dir.path(), cfg).expect("record the live data dir");
+            let top = head.header.height + 5;
+            assert_eq!(rec.applied_tip.1, top);
+            assert_eq!(rec.chain.len() as u64, top + 1, "genesis sentinel..=tip");
+            let report = replay(&rec, &SelectedChain).await.expect("replay");
+            assert_eq!(report.divergence, None, "{report:?}");
+            assert_eq!(report.matched, top);
+            assert!(
+                report.committed_compared >= top - fork,
+                "every block of the winning branch has a committed root: {report:?}"
+            );
+            let k = fork + 150;
+            let mut bad = rec.clone();
+            bad.chain_block_mut(k).expect("block k").transactions[0].value += 1;
+            let report = replay(&bad, &SelectedChain).await.expect("replay");
+            assert_eq!(
+                report.divergence.as_ref().map(|d| d.height),
+                Some(k),
+                "{report:?}"
             );
         }
 
