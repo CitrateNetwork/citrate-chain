@@ -15,6 +15,10 @@
 // (`block_serve::serve_blocks` / `serve_headers`), as the loop did before CV-6.
 // What is measured is how long a gossiped block waits in front of admission:
 // from `forward_incoming` until the loop takes it off the queue.
+//
+// With ADR CV-6 the node also sets a serving lane (`set_serve_sink`) and runs
+// `serve_plane::spawn` on it, as `start_node` does: serve requests then never
+// reach the loop, and every one of them must still be answered.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,6 +98,10 @@ async fn serve_does_not_block_admission() {
     // main.rs: the 512-slot inbound queue.
     let (in_tx, mut in_rx) = mpsc::channel::<(PeerId, NetworkMessage)>(512);
     pm.set_incoming(in_tx).await;
+    // start_node: the serving lane and its task.
+    let (serve_tx, serve_rx) = mpsc::channel(citrate_network::inbound::SERVE_LANE_CAPACITY);
+    pm.set_serve_sink(serve_tx).await;
+    let serving = crate::serve_plane::spawn(storage.clone(), pm.clone(), serve_rx);
     let mut outboxes = Vec::new();
     for p in 0..PEERS {
         let (peer, rx) = peer(&format!("catchup-{p}"));
@@ -169,6 +177,29 @@ async fn serve_does_not_block_admission() {
         "a gossiped block waited {waited:?} for admission behind history serving \
          (bound {ADMISSION_WAIT_BOUND:?})"
     );
+
+    // Serving was moved, not dropped: every request is answered with blocks.
+    let started = Instant::now();
+    for (p, outbox) in outboxes.iter_mut().enumerate() {
+        let mut answered = 0usize;
+        while answered < REQUESTS_PER_PEER {
+            let msg = tokio::time::timeout(Duration::from_secs(120), outbox.recv())
+                .await
+                .unwrap_or_else(|_| panic!("catchup-{p}: only {answered} answers"))
+                .expect("outbox open");
+            if let NetworkMessage::Blocks { blocks } = msg {
+                assert!(!blocks.is_empty(), "catchup-{p}: an empty answer");
+                answered += 1;
+            }
+        }
+    }
+    eprintln!(
+        "SERVEPLANE all {} requests answered {:?} after the block was admitted",
+        PEERS * REQUESTS_PER_PEER,
+        started.elapsed()
+    );
+    assert_eq!(pm.serve_drops(), 0, "a serve request was shed");
+    assert_eq!(pm.inbound_drops(), 0, "a consensus-queue message was shed");
     consensus_loop.abort();
-    drop(outboxes);
+    serving.abort();
 }

@@ -13,7 +13,8 @@
 // for gossip, the `Blocks` handler's steps (`SyncManager::handle_blocks`,
 // the fork-point tracker, `admit_to_fixpoint` with the orphan buffer, the
 // missing-parent walk, the serve credit), the 2 s sync tick (peer selection,
-// anchor, `request_blocks`), `block_serve::serve_blocks` for every answer,
+// anchor, `request_blocks`), the serving plane (`serve_plane::answer` over
+// `block_serve`, under its `ServeQueue` budgets, ADR CV-6) for every answer,
 // and the periodic drain. Requests and answers travel as real
 // `NetworkMessage`s through each node's `Peer` handles; a message on a down
 // link is lost, exactly like a dropped frame. Nothing is retried that the node
@@ -56,7 +57,6 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 
 use crate::admission::{self, AdmitOutcome, BlockAdmission};
-use crate::block_serve;
 use crate::canonical_apply::CanonicalApplicator;
 use crate::producer::{AttestedNetworkHead, BlockProducer, EquivocationVoteConfig};
 use crate::sync_peer;
@@ -164,6 +164,10 @@ struct Node {
     pm: Arc<citrate_network::PeerManager>,
     /// The node's inbound queue (main.rs: 512 slots).
     inbound: mpsc::Receiver<(PeerId, NetworkMessage)>,
+    /// The serving lane (main.rs: `set_serve_sink`, ADR CV-6) and the
+    /// serving plane's budgeted queue.
+    serve_rx: mpsc::Receiver<(PeerId, NetworkMessage)>,
+    serve_q: citrate_network::inbound::ServeQueue<NetworkMessage>,
     orphans: Vec<Block>,
     attested: AttestedNetworkHead,
     max_seen: AtomicU64,
@@ -363,6 +367,8 @@ impl Node {
         ));
         let (in_tx, inbound) = mpsc::channel(512);
         pm.set_incoming(in_tx).await;
+        let (serve_tx, serve_rx) = mpsc::channel(citrate_network::inbound::SERVE_LANE_CAPACITY);
+        pm.set_serve_sink(serve_tx).await;
         Self {
             name: format!("p{i}"),
             storage,
@@ -378,6 +384,8 @@ impl Node {
             walk: sync_recovery::ParentWalks::new(clock, SyncConfig::default().request_timeout),
             pm,
             inbound,
+            serve_rx,
+            serve_q: crate::serve_plane::queue(),
             orphans: Vec::new(),
             attested,
             max_seen: AtomicU64::new(0),
@@ -687,30 +695,36 @@ impl Fleet {
             node.pm.forward_incoming(pid.clone(), msg).await;
             match node.inbound.try_recv() {
                 Ok((_, msg)) => msg,
-                Err(_) => {
-                    self.shed += 1;
-                    return;
-                }
+                Err(_) => match node.serve_rx.try_recv() {
+                    // The serving lane: the plane's budgeted queue, answered
+                    // now (the harness's serving task never lags).
+                    Ok((sender, request)) => {
+                        use citrate_network::inbound::ServeAdmit;
+                        if node.serve_q.push(sender, request) != ServeAdmit::Queued {
+                            self.shed += 1;
+                            return;
+                        }
+                        let peer = self.peer(at, from);
+                        let node = &mut self.nodes[at];
+                        while let Some((asker, request)) = node.serve_q.take_next() {
+                            if let Some(reply) = crate::serve_plane::answer(&node.storage, &request)
+                            {
+                                let _ = peer.send(reply).await;
+                            }
+                            node.serve_q.done(&asker);
+                        }
+                        return;
+                    }
+                    Err(_) => {
+                        self.shed += 1;
+                        return;
+                    }
+                },
             }
         };
         let peer = self.peer(at, from);
         let node = &mut self.nodes[at];
         match msg {
-            NetworkMessage::GetBlocks {
-                from: anchor,
-                count,
-                ..
-            } => {
-                let blocks = block_serve::serve_blocks(&node.storage, &anchor, count);
-                let _ = peer.send(NetworkMessage::Blocks { blocks }).await;
-            }
-            NetworkMessage::GetHeaders {
-                from: anchor,
-                count,
-            } => {
-                let headers = block_serve::serve_headers(&node.storage, &anchor, count);
-                let _ = peer.send(NetworkMessage::Headers { headers }).await;
-            }
             NetworkMessage::Headers { headers } => {
                 let _ = node.sync.handle_headers(&pid, headers).await;
             }
@@ -1655,6 +1669,9 @@ mod tests {
             "|h| held_heads.contains(h)",
             "sync_rejoin::classify(",
             "sel.record_serve(",
+            // Serving plane (ADR CV-6).
+            "peer_manager.set_serve_sink(serve_tx)",
+            "serve_plane::spawn(storage.clone(), peer_manager.clone(), serve_rx)",
             // Sync tick.
             "sync_rejoin::choose_source(",
             ".note_sync_target(target, applied_tip.1)",

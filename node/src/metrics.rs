@@ -63,6 +63,7 @@ pub const METRIC_PEER_CONNECTIONS_TOTAL: &str = "citrate_peer_connections_total"
 pub const METRIC_PEER_DISCONNECTIONS_TOTAL: &str = "citrate_peer_disconnections_total";
 pub const METRIC_PEER_LATENCY: &str = "citrate_peer_latency_seconds";
 pub const METRIC_P2P_INBOUND_DROPPED_TOTAL: &str = "citrate_p2p_inbound_dropped_total";
+pub const METRIC_P2P_SERVE_DROPPED_TOTAL: &str = "citrate_p2p_serve_dropped_total";
 
 // Mempool
 pub const METRIC_MEMPOOL_SIZE: &str = "citrate_mempool_size";
@@ -202,6 +203,10 @@ fn register_metric_descriptions() {
     describe_counter!(
         METRIC_P2P_INBOUND_DROPPED_TOTAL,
         "Inbound P2P messages shed because the inbound queue was full, by message type"
+    );
+    describe_counter!(
+        METRIC_P2P_SERVE_DROPPED_TOTAL,
+        "Peer history requests (GetBlocks/GetHeaders) shed by the serving lane, by message type"
     );
     describe_histogram!(
         METRIC_PEER_LATENCY,
@@ -396,6 +401,14 @@ pub fn record_inbound_drops(by_kind: &[(&'static str, u64)]) {
     for (kind, count) in by_kind {
         let labels = [("type", kind.to_string())];
         absolute_counter!(METRIC_P2P_INBOUND_DROPPED_TOTAL, *count, &labels);
+    }
+}
+
+/// Publish the serving-lane drop counters (`PeerManager::serve_drops_by_kind`).
+pub fn record_serve_drops(by_kind: &[(&'static str, u64)]) {
+    for (kind, count) in by_kind {
+        let labels = [("type", kind.to_string())];
+        absolute_counter!(METRIC_P2P_SERVE_DROPPED_TOTAL, *count, &labels);
     }
 }
 
@@ -612,6 +625,7 @@ mod tests {
         record_block_height(100);
         record_mempool_size(10, 1000);
         record_inbound_drops(&[("NewBlock", 2), ("GetBlocks", 7)]);
+        record_serve_drops(&[("GetHeaders", 3)]);
     }
 
     /// PIL-13 WP-13.5: the RSS sampler reads a real, plausible value from the

@@ -357,6 +357,14 @@ pub struct PeerManager {
     pub(crate) inbound_drops: Arc<AtomicU64>,
     /// The same drops by message type, with a rate-limited warning.
     inbound_drops_by_kind: Arc<InboundDrops>,
+    /// ADR CV-6: the serving lane. When set, serve requests
+    /// (`inbound::serve_request`) go here instead of `incoming`.
+    serve_sink: Arc<RwLock<Option<IncomingTx>>>,
+    /// Serve requests the serving lane shed (lane full, or over the serving
+    /// plane's budget). Kept apart from `inbound_drops`: the consensus loop is
+    /// not behind when history serving is.
+    serve_drops: Arc<AtomicU64>,
+    serve_drops_by_kind: Arc<InboundDrops>,
     /// When each connected peer's last message reached `forward_incoming`
     /// (queued or shed): proof its connection delivers. Cleared on removal.
     last_inbound: Arc<DashMap<PeerId, Instant>>,
@@ -405,6 +413,9 @@ impl PeerManager {
             incoming: Arc::new(RwLock::new(None)),
             inbound_drops: Arc::new(AtomicU64::new(0)),
             inbound_drops_by_kind: Arc::new(InboundDrops::default()),
+            serve_sink: Arc::new(RwLock::new(None)),
+            serve_drops: Arc::new(AtomicU64::new(0)),
+            serve_drops_by_kind: Arc::new(InboundDrops::with_reason("serve lane over budget")),
             last_inbound: Arc::new(DashMap::new()),
         }
     }
@@ -412,6 +423,31 @@ impl PeerManager {
     /// Set incoming message sink
     pub async fn set_incoming(&self, tx: mpsc::Sender<(PeerId, NetworkMessage)>) {
         *self.incoming.write().await = Some(tx);
+    }
+
+    /// Set the serving lane (ADR CV-6): from now on serve requests go to `tx`
+    /// and never to the consensus queue. The receiver is the node's serving
+    /// task; without one, serve requests share the consensus queue as before.
+    pub async fn set_serve_sink(&self, tx: mpsc::Sender<(PeerId, NetworkMessage)>) {
+        *self.serve_sink.write().await = Some(tx);
+    }
+
+    /// Count one serve request the serving lane shed (the serving plane calls
+    /// this for a request over its budget).
+    pub fn record_serve_drop(&self, kind: &'static str, peer_id: &PeerId) {
+        self.serve_drops.fetch_add(1, Ordering::Relaxed);
+        self.serve_drops_by_kind
+            .record(kind, peer_id, Instant::now());
+    }
+
+    /// Total serve requests the serving lane shed.
+    pub fn serve_drops(&self) -> u64 {
+        self.serve_drops.load(Ordering::Relaxed)
+    }
+
+    /// The same drops as `(message type, count)`, sorted by type.
+    pub fn serve_drops_by_kind(&self) -> Vec<(&'static str, u64)> {
+        self.serve_drops_by_kind.by_kind()
     }
 
     /// Forward a received message to the configured incoming sink, if any.
@@ -432,6 +468,18 @@ impl PeerManager {
         let now = Instant::now();
         if self.peers.contains_key(&peer_id) {
             self.last_inbound.insert(peer_id.clone(), now);
+        }
+        // ADR CV-6: history requests take the serving lane, never a slot in
+        // the consensus queue. A full lane sheds the request and returns; it
+        // never waits, so serving load cannot hold up this reader.
+        if inbound::serve_request(&message) {
+            if let Some(tx) = self.serve_sink.read().await.clone() {
+                let kind = message.kind();
+                if tx.try_send((peer_id.clone(), message)).is_err() {
+                    self.record_serve_drop(kind, &peer_id);
+                }
+                return;
+            }
         }
         if let Some(tx) = self.incoming.read().await.clone() {
             let kind = message.kind();
@@ -1568,6 +1616,9 @@ mod tests {
         // arrives (the loop is busy).
         let (tx, mut rx) = mpsc::channel(512);
         pm.set_incoming(tx).await;
+        // ADR CV-6: the serving lane, not drained either.
+        let (serve_tx, mut serve_rx) = mpsc::channel(inbound::SERVE_LANE_CAPACITY);
+        pm.set_serve_sink(serve_tx).await;
         let mut sent_blocks = 0usize;
         let mut sent_txs = 0usize;
         for i in 0..4_000u32 {
@@ -1614,6 +1665,21 @@ mod tests {
                 "{n} {kind} shed under serve load"
             );
         }
+        // The history requests took the serving lane: none reached the
+        // consensus queue, the lane filled, and what it shed is counted as
+        // serving drops, not as consensus-queue drops (the stall signal).
+        assert!(
+            got.iter()
+                .all(|(_, k)| *k != "GetBlocks" && *k != "GetHeaders"),
+            "a serve request reached the consensus queue"
+        );
+        let served = drain(&mut serve_rx);
+        assert_eq!(served.len(), inbound::SERVE_LANE_CAPACITY);
+        assert_eq!(
+            pm.serve_drops(),
+            4_000 - inbound::SERVE_LANE_CAPACITY as u64
+        );
+        assert_eq!(pm.inbound_drops(), 0);
     }
 
     /// CONNECTION DEDUP (fleet incident 2026-07-29).
