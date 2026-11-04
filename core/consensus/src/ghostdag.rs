@@ -14,6 +14,12 @@ pub enum GhostDagError {
     #[error("Block not found: {0}")]
     BlockNotFound(Hash),
 
+    /// S2-5: the fork-choice score of this block cannot be recomputed from the
+    /// blocks this node holds and no derived score is recorded for it. The block
+    /// is not ranked (never on its header score).
+    #[error("Fork-choice score unavailable for {0}")]
+    ScoreUnavailable(Hash),
+
     #[error("Invalid parent structure")]
     InvalidParents,
 
@@ -841,33 +847,50 @@ impl GhostDag {
         // score on a holed merge block cannot fork state, and the authoritative
         // `calculate_blue_set` still recomputes on demand where cardinality matters.
         let blue_set = match self.derive_score_and_work(block).await {
-            Ok(bs) => bs,
-            Err(e) => {
-                let fallback = self
-                    .dag_store
-                    .get_derived_blue_score(&block.hash())
-                    .unwrap_or(block.header.blue_score);
-                warn!(
-                    "register_existing_block: score derivation for {} @ {} failed ({}) — \
-                     falling back to score {} so the block still enters the tip set",
-                    block.hash(),
-                    block.header.height,
-                    e,
-                    fallback
-                );
-                BlueSet {
-                    blocks: std::collections::HashSet::new(),
-                    score: fallback,
-                    work: crate::types::blue_work_for_score(fallback),
-                }
+            Ok(bs) => {
+                // SYNC-S1 D3: same durable anchor as `add_block` — the rehydration
+                // path must record it too, or a node whose relations were built
+                // only by eager-load starts the next process with no anchors.
+                self.dag_store
+                    .put_derived_blue_score(&block.hash(), bs.score);
+                bs
             }
+            // S2-5 (H4): the score cannot be recomputed from the blocks this
+            // node holds (a pruned or holed ancestry). Use the durable derived
+            // anchor, which is in the same unit, and only if it is plausible.
+            // Never `header.blue_score`: that is the producer's `parent + 1`
+            // count, a different unit from the fork-choice score, and ranking a
+            // block on it next to derived scores mis-orders tips. With no
+            // usable anchor the block is NOT ranked: the caller gets the error.
+            Err(e) => match self.known_score(&block.hash()).await {
+                Some(score) => {
+                    warn!(
+                        "register_existing_block: score derivation for {} @ {} failed ({}) — \
+                         using its durable derived score {}",
+                        block.hash(),
+                        block.header.height,
+                        e,
+                        score
+                    );
+                    BlueSet {
+                        blocks: std::collections::HashSet::new(),
+                        score,
+                        work: crate::types::blue_work_for_score(score),
+                    }
+                }
+                None => {
+                    warn!(
+                        "register_existing_block: score derivation for {} @ {} failed ({}) and \
+                         no derived score is recorded — NOT ranking it (fork choice never uses \
+                         the header score)",
+                        block.hash(),
+                        block.header.height,
+                        e
+                    );
+                    return Err(GhostDagError::ScoreUnavailable(block.hash()));
+                }
+            },
         };
-
-        // SYNC-S1 D3: same durable anchor as `add_block` — the rehydration path
-        // must record it too, or a node whose relations were built only by
-        // eager-load starts the next process with no anchors at all.
-        self.dag_store
-            .put_derived_blue_score(&block.hash(), blue_set.score);
 
         let relation = DagRelation {
             block: block.hash(),
@@ -1240,7 +1263,24 @@ impl GhostDag {
         {
             return Some(score);
         }
-        self.dag_store.get_derived_blue_score(hash)
+        let score = self.dag_store.get_derived_blue_score(hash)?;
+        // S2-5: an anchor counts only for a block this node holds, and only if
+        // it is not below the header score + 1, which no derived score can be
+        // (genesis derives 1 from header 0; every block adds at least 1 to its
+        // selected parent while its header adds exactly 1). An entry on the
+        // header scale, as the pre-S2-5 fallback wrote, is caught here.
+        let header = self.dag_store.get_header(hash).await.ok()?;
+        let genesis =
+            header.selected_parent_hash == Hash::default() && header.merge_parent_hashes.is_empty();
+        if !genesis && score < header.blue_score.checked_add(1)? {
+            warn!(
+                "derived blue score anchor {} for {} is below its header score + 1 ({}): \
+                 not a fork-choice score; ignored",
+                score, hash, header.blue_score
+            );
+            return None;
+        }
+        Some(score)
     }
 
     /// The fork-choice score of an already-admitted block.
@@ -1643,6 +1683,56 @@ mod tests {
         ));
     }
     use crate::types::*;
+
+    /// Minimal in-memory KvStore, so a DAG store is genuinely "persistent"
+    /// across a simulated restart (a fresh GhostDag over the same store).
+    #[derive(Default)]
+    struct MemKv {
+        #[allow(clippy::type_complexity)]
+        data: std::sync::Mutex<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>,
+    }
+    impl crate::dag_store::KvStore for MemKv {
+        fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .get(cf)
+                .and_then(|m| m.get(key).cloned()))
+        }
+        fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+            self.data
+                .lock()
+                .unwrap()
+                .entry(cf.to_string())
+                .or_default()
+                .insert(key.to_vec(), value.to_vec());
+            Ok(())
+        }
+        fn kv_delete(&self, cf: &str, key: &[u8]) -> Result<(), String> {
+            if let Some(m) = self.data.lock().unwrap().get_mut(cf) {
+                m.remove(key);
+            }
+            Ok(())
+        }
+        fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String> {
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .get(cf)
+                .is_some_and(|m| m.contains_key(key)))
+        }
+        fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .get(cf)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default())
+        }
+    }
 
     fn create_test_block_with_parents(
         hash: [u8; 32],
@@ -2659,56 +2749,6 @@ mod tests {
     /// which the pre-D3 walk could not do.
     #[tokio::test]
     async fn persisted_score_anchor_survives_restart_and_a_pruned_ancestry() {
-        // Minimal in-memory KvStore so the store is genuinely "persistent"
-        // across the simulated restart below.
-        #[derive(Default)]
-        struct MemKv {
-            #[allow(clippy::type_complexity)]
-            data: std::sync::Mutex<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>,
-        }
-        impl crate::dag_store::KvStore for MemKv {
-            fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-                Ok(self
-                    .data
-                    .lock()
-                    .unwrap()
-                    .get(cf)
-                    .and_then(|m| m.get(key).cloned()))
-            }
-            fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
-                self.data
-                    .lock()
-                    .unwrap()
-                    .entry(cf.to_string())
-                    .or_default()
-                    .insert(key.to_vec(), value.to_vec());
-                Ok(())
-            }
-            fn kv_delete(&self, cf: &str, key: &[u8]) -> Result<(), String> {
-                if let Some(m) = self.data.lock().unwrap().get_mut(cf) {
-                    m.remove(key);
-                }
-                Ok(())
-            }
-            fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String> {
-                Ok(self
-                    .data
-                    .lock()
-                    .unwrap()
-                    .get(cf)
-                    .is_some_and(|m| m.contains_key(key)))
-            }
-            fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-                Ok(self
-                    .data
-                    .lock()
-                    .unwrap()
-                    .get(cf)
-                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default())
-            }
-        }
-
         let kv = Arc::new(MemKv::default());
         let dag_store = Arc::new(
             DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("persistent store"),
@@ -3520,5 +3560,272 @@ mod tests {
              {materialised} cumulative blue-ancestry entries (bound {bound}). This is the \
              live path that halted chain 40204."
         );
+    }
+
+    use crate::dag_store::KvStore as _;
+
+    /// A DAG with merges: `width` producers seal one block per height on the
+    /// best tip, each merging the previous height's other blocks (as producers
+    /// that hear each other do), `height` heights above genesis. Seeded, so a
+    /// failing seed reproduces. Returns the blocks in height order.
+    fn merging_dag(seed: u64, height: u64) -> Vec<Block> {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut id = 0u64;
+        let mut mk = |sp: Hash, merges: Vec<Hash>, h: u64| {
+            id += 1;
+            let mut b = [0u8; 32];
+            b[0..8].copy_from_slice(&id.to_le_bytes());
+            b[8..16].copy_from_slice(&seed.to_le_bytes());
+            b[31] = 0x5C;
+            create_test_block_with_parents(b, sp, merges, h)
+        };
+        let genesis = mk(Hash::default(), vec![], 0);
+        let mut all = vec![genesis.clone()];
+        let mut prev: Vec<Hash> = vec![genesis.hash()];
+        for h in 1..=height {
+            let width = 1 + (next() % 3) as usize;
+            let mut layer = Vec::new();
+            for _ in 0..width {
+                // Selected parent: one block of the previous height; the rest
+                // of that height (those this producer heard) as merge parents.
+                let sp = prev[(next() as usize) % prev.len()];
+                let merges: Vec<Hash> = prev
+                    .iter()
+                    .copied()
+                    .filter(|p| *p != sp && next() % 4 != 0)
+                    .collect();
+                let b = mk(sp, merges, h);
+                layer.push(b.hash());
+                all.push(b);
+            }
+            prev = layer;
+        }
+        all
+    }
+
+    /// What fork choice concludes on `gd`: the selected tip, and every tip
+    /// ranked the way `select_tip` ranks (score, then the smaller hash).
+    async fn fork_choice_view(gd: &GhostDag) -> Result<(Hash, Vec<(u64, Hash)>), GhostDagError> {
+        let tip = gd.select_tip().await?;
+        let mut ranked = Vec::new();
+        for t in gd.get_tips().await {
+            ranked.push((gd.get_blue_score(&t).await?, t));
+        }
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        Ok((tip, ranked))
+    }
+
+    /// A persistent strict-free store holding `blocks`, admitted through
+    /// `add_block` by a first process (which records the derived scores).
+    async fn admitted_store(blocks: &[Block]) -> (Arc<MemKv>, Arc<DagStore>) {
+        let kv = Arc::new(MemKv::default());
+        let dag_store = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("persistent store"),
+        );
+        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        for b in blocks {
+            dag_store.store_block(b.clone()).await.expect("store");
+            gd.add_block(b).await.expect("admit");
+        }
+        (kv, dag_store)
+    }
+
+    /// S2-5 (H4): when the derived-score anchor is missing and the score cannot
+    /// be recomputed (the selected parent is pruned), registration used to rank
+    /// the block on `header.blue_score`, a different unit from the fork-choice
+    /// score (which counts blue merge parents and starts at genesis = 1). Now it
+    /// fails closed: the block is not ranked, and the caller gets an error.
+    #[tokio::test]
+    async fn register_existing_block_never_ranks_on_header_scale() {
+        let blocks = merging_dag(0xA11CE, 40);
+        let (kv, dag_store) = admitted_store(&blocks).await;
+        let floor = blocks
+            .iter()
+            .find(|b| b.header.height == 30)
+            .expect("a block at the floor")
+            .clone();
+        let derived = dag_store
+            .get_derived_blue_score(&floor.hash())
+            .expect("the first process recorded a derived score");
+        assert_ne!(
+            derived, floor.header.blue_score,
+            "fixture: the two scales differ on this block"
+        );
+        dag_store
+            .update_pruning_point(floor.hash())
+            .await
+            .expect("pruning point");
+        dag_store.prune().await.expect("prune");
+        // The anchor for the floor block is gone (a torn write, an old data dir).
+        kv.kv_delete(
+            crate::dag_store::cf::DAG_METADATA,
+            &[b"score:".as_slice(), floor.hash().as_bytes()].concat(),
+        )
+        .expect("delete anchor");
+        assert_eq!(dag_store.get_derived_blue_score(&floor.hash()), None);
+
+        let gd = GhostDag::new(GhostDagParams::default(), dag_store.clone());
+        let out = gd.register_existing_block(&floor).await;
+        match out {
+            Err(_) => assert!(
+                gd.get_blue_score(&floor.hash()).await.is_err(),
+                "a block that failed registration must not be ranked"
+            ),
+            Ok(()) => {
+                let score = gd.get_blue_score(&floor.hash()).await.expect("ranked");
+                assert_eq!(
+                    score, derived,
+                    "the block was ranked on score {score}, not its fork-choice score \
+                     {derived} (header blue_score {})",
+                    floor.header.blue_score
+                );
+            }
+        }
+        assert_eq!(
+            dag_store.get_derived_blue_score(&floor.hash()),
+            None,
+            "a header-scale score must never be written back as the derived anchor"
+        );
+    }
+
+    /// How a rehydrating node's score anchors can differ from the ones it wrote.
+    #[derive(Debug, Clone, Copy)]
+    enum CacheFault {
+        Missing,
+        Corrupt,
+        HeaderScale,
+        Foreign,
+    }
+
+    /// Apply `fault` to every `score:` entry of `kv`. `foreign` holds the
+    /// entries of another node over a different DAG.
+    fn fault_cache(kv: &MemKv, blocks: &[Block], fault: CacheFault, foreign: &MemKv, seed: u64) {
+        let cf = crate::dag_store::cf::DAG_METADATA;
+        let key = |h: &Hash| [b"score:".as_slice(), h.as_bytes()].concat();
+        let mut x = seed | 1;
+        for (i, b) in blocks.iter().enumerate() {
+            let k = key(&b.hash());
+            match fault {
+                CacheFault::Missing => {
+                    kv.kv_delete(cf, &k).expect("delete");
+                }
+                CacheFault::Corrupt => {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let v = match i % 3 {
+                        0 => vec![0xFFu8; 3],                   // torn
+                        1 => x.to_be_bytes().to_vec(),          // garbage
+                        _ => (x as u32).to_be_bytes().to_vec(), // wrong length
+                    };
+                    kv.kv_put(cf, &k, &v).expect("put");
+                }
+                CacheFault::HeaderScale => {
+                    kv.kv_put(cf, &k, &b.header.blue_score.to_be_bytes())
+                        .expect("put");
+                }
+                CacheFault::Foreign => {
+                    kv.kv_delete(cf, &k).expect("delete");
+                }
+            }
+        }
+        if let CacheFault::Foreign = fault {
+            for (k, v) in foreign.kv_iter_cf(cf).expect("iter") {
+                if k.starts_with(b"score:") {
+                    kv.kv_put(cf, &k, &v).expect("put");
+                }
+            }
+            // And another node's anchors filed under OUR block hashes.
+            let theirs: Vec<Vec<u8>> = foreign
+                .kv_iter_cf(cf)
+                .expect("iter")
+                .into_iter()
+                .filter(|(k, _)| k.starts_with(b"score:"))
+                .map(|(_, v)| v)
+                .collect();
+            for (b, v) in blocks.iter().zip(theirs.iter().cycle()) {
+                kv.kv_put(cf, &key(&b.hash()), v).expect("put");
+            }
+        }
+    }
+
+    /// S2-5 (H4) property: fork choice is a function of block data. A node
+    /// whose score anchors are missing, corrupt, on the header scale, or copied
+    /// from another node rehydrates (the production order: every height, then
+    /// the authoritative tips) to the same selected tip and the same tip
+    /// ranking as a node with intact anchors, or, where the score cannot be
+    /// recomputed (a pruned store), refuses to rank. It never picks a
+    /// different tip.
+    #[tokio::test]
+    async fn fork_choice_score_is_a_function_of_block_data() {
+        let foreign_blocks = merging_dag(0xF0E1, 25);
+        let (foreign_kv, _) = admitted_store(&foreign_blocks).await;
+        for seed in 1..=12u64 {
+            let blocks = merging_dag(seed.wrapping_mul(0x9E37_79B9), 24 + seed % 7);
+            for pruned in [false, true] {
+                // Reference: intact anchors, rehydrated the production way.
+                let (ref_kv, ref_store) = admitted_store(&blocks).await;
+                let floor_height = 12u64;
+                let rehydrate = |store: Arc<DagStore>| {
+                    let blocks = blocks.clone();
+                    async move {
+                        let gd = GhostDag::new(GhostDagParams::default(), store.clone());
+                        let from = if pruned { floor_height } else { 0 };
+                        for b in blocks.iter().filter(|b| b.header.height >= from) {
+                            let _ = gd.register_existing_block(b).await;
+                        }
+                        gd.reconcile_tips_from_dag_store().await;
+                        fork_choice_view(&gd).await
+                    }
+                };
+                let prune = |store: Arc<DagStore>| {
+                    let floor = blocks
+                        .iter()
+                        .find(|b| b.header.height == floor_height)
+                        .expect("floor")
+                        .hash();
+                    async move {
+                        store.update_pruning_point(floor).await.expect("pp");
+                        store.prune().await.expect("prune");
+                    }
+                };
+                if pruned {
+                    prune(ref_store.clone()).await;
+                }
+                let _ = ref_kv;
+                let reference = rehydrate(ref_store)
+                    .await
+                    .expect("intact anchors always rank");
+                for fault in [
+                    CacheFault::Missing,
+                    CacheFault::Corrupt,
+                    CacheFault::HeaderScale,
+                    CacheFault::Foreign,
+                ] {
+                    let (kv, store) = admitted_store(&blocks).await;
+                    if pruned {
+                        prune(store.clone()).await;
+                    }
+                    fault_cache(&kv, &blocks, fault, &foreign_kv, seed);
+                    match rehydrate(store).await {
+                        Ok(view) => assert_eq!(
+                            view, reference,
+                            "seed {seed} pruned={pruned} {fault:?}: a different fork choice"
+                        ),
+                        Err(e) => assert!(
+                            pruned,
+                            "seed {seed} {fault:?}: an unpruned node must recompute every \
+                             score from block data, but refused to rank: {e}"
+                        ),
+                    }
+                }
+            }
+        }
     }
 }

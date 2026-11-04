@@ -230,6 +230,24 @@ pub struct DagStore {
 }
 
 /// Column family names for persistent DAG storage
+/// S2-5: the tag stored with a derived blue score anchor: the first 8 bytes of
+/// SHA3-256 over a domain label, the block hash and the score. It detects a torn
+/// or corrupted entry and an entry filed under the wrong block; it is not a
+/// defence against someone who can write the node's database.
+fn score_anchor_tag(hash: &Hash, score: u64) -> [u8; 8] {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(b"citrate/dag/score-anchor/v1");
+    h.update(hash.as_bytes());
+    h.update(score.to_be_bytes());
+    let out: [u8; 32] = h.finalize().into();
+    let mut tag = [0u8; 8];
+    for (t, o) in tag.iter_mut().zip(out.iter()) {
+        *t = *o;
+    }
+    tag
+}
+
 pub mod cf {
     pub const DAG_BLOCKS: &str = "dag_blocks";
     pub const DAG_CHILDREN: &str = "dag_children";
@@ -714,13 +732,16 @@ impl DagStore {
     /// Persist the derived blue score for `hash`. Best-effort (see
     /// [`Self::score_key`]): a failure is logged and the read path degrades to
     /// the walk.
+    ///
+    /// S2-5: the entry is the score plus a tag binding it to `hash`
+    /// ([`score_anchor_tag`]), so a torn or corrupted entry, or one copied in
+    /// from another block or node, reads back as absent instead of as a score.
     pub fn put_derived_blue_score(&self, hash: &Hash, score: u64) {
         if let Some(ref kv) = self.persistent {
-            if let Err(e) = kv.kv_put(
-                cf::DAG_METADATA,
-                &Self::score_key(hash),
-                &score.to_be_bytes(),
-            ) {
+            let mut value = Vec::with_capacity(16);
+            value.extend_from_slice(&score.to_be_bytes());
+            value.extend_from_slice(&score_anchor_tag(hash, score));
+            if let Err(e) = kv.kv_put(cf::DAG_METADATA, &Self::score_key(hash), &value) {
                 debug!("Failed to persist derived blue score for {}: {}", hash, e);
             }
         }
@@ -728,12 +749,30 @@ impl DagStore {
 
     /// The persisted derived blue score for `hash`, if one was recorded by a
     /// previous process. `None` on an in-memory store, a pre-D3 data directory,
-    /// or a torn write — all of which are handled by the caller's fallback.
+    /// a torn write, or a tag that does not bind this hash and score — all of
+    /// which are handled by the caller's fallback.
+    ///
+    /// An entry written before the tag (8 bytes, score only) is NOT returned:
+    /// it cannot be told apart from a corrupted or header-scale entry (the
+    /// pre-S2-5 fallback wrote header scores here). A block whose score can be
+    /// derived rewrites its anchor in the tagged form; one whose score cannot
+    /// (just above a prune floor) then fails closed instead of ranking on an
+    /// unverifiable number. Upgrade note: a pruned node restarted within one
+    /// retention window of upgrading can hit that and need a resync.
     pub fn get_derived_blue_score(&self, hash: &Hash) -> Option<u64> {
         let kv = self.persistent.as_ref()?;
         let raw = kv.kv_get(cf::DAG_METADATA, &Self::score_key(hash)).ok()??;
-        let bytes: [u8; 8] = raw.as_slice().try_into().ok()?;
-        Some(u64::from_be_bytes(bytes))
+        let (score, tag) = raw.split_first_chunk::<8>()?;
+        let score = u64::from_be_bytes(*score);
+        if tag.len() == 8 && *tag == score_anchor_tag(hash, score) {
+            Some(score)
+        } else {
+            debug!(
+                "Derived blue score anchor for {} does not bind it; ignored",
+                hash
+            );
+            None
+        }
     }
 
     /// Drop the persisted score for `hash` — used by `prune` so a pruned

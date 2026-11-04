@@ -203,6 +203,13 @@ pub(crate) struct Fleet {
     down: HashSet<usize>,
     /// Producers that seal nothing.
     quiet: HashSet<usize>,
+    /// serve_cut[i][j]: of what i sends j, only gossip (`NewBlock`) arrives;
+    /// requests and answers are lost. The state of a producer whose serving
+    /// is starved (H3): it hears its peers' new blocks but can never fetch
+    /// the ancestry it lacks, so it cannot admit them.
+    serve_cut: Vec<Vec<bool>>,
+    /// The producers' deferred-evidence refuse window (`None`: the default).
+    refuse_window: Option<std::time::Duration>,
     /// See [`Scenario::prune_retain`].
     prune_retain: Option<u64>,
     genesis: Block,
@@ -223,12 +230,17 @@ pub(crate) struct Fleet {
 }
 
 fn genesis_block(root: Hash) -> Block {
+    genesis_block_at(root, 1000)
+}
+
+/// [`genesis_block`] with header time `timestamp`.
+fn genesis_block_at(root: Hash, timestamp: u64) -> Block {
     let mut g = BlockBuilder::new()
         .version(2)
         .height(0)
         .parent(Hash::default())
         .coinbase([0x33; 20])
-        .timestamp(1000)
+        .timestamp(timestamp)
         .vrf_reveal(VrfProof {
             proof: vec![],
             output: Hash::new([0x5A; 32]),
@@ -273,6 +285,7 @@ impl Node {
         slot_no: u64,
         clock: std::time::Instant,
         clock_ms: Arc<AtomicU64>,
+        refuse_window: Option<std::time::Duration>,
     ) -> Self {
         if boot.is_none() {
             storage.blocks.put_block(genesis).expect("genesis");
@@ -363,6 +376,10 @@ impl Node {
         .with_produce_catchup_gate(&app)
         .with_network_height_gate(&attested)
         .with_initial_sync_gate(initial_sync.clone());
+        let producer = match refuse_window {
+            Some(w) => producer.with_deferred_refuse_window(w),
+            None => producer,
+        };
         let sync = SyncManager::new(SyncConfig::default())
             .with_local_height(app.applied_height_handle())
             .with_clock_offset(clock_ms);
@@ -406,8 +423,26 @@ impl Node {
 
 impl Fleet {
     pub(crate) async fn new(n: usize) -> Self {
+        Self::with_refuse_window(n, None).await
+    }
+
+    /// A fleet whose producers use `refuse_window` as their deferred-evidence
+    /// refuse window (the harness runs in real time, so the 60 s default never
+    /// elapses inside a run). With a window set, genesis carries the current wall
+    /// time, so block headers carry it too: deferred evidence is judged against
+    /// local wall time, and headers stamped at time 1000 would never count.
+    pub(crate) async fn with_refuse_window(
+        n: usize,
+        refuse_window: Option<std::time::Duration>,
+    ) -> Self {
         let empty_root = Executor::new(Arc::new(StateDB::new())).calculate_state_root();
-        let genesis = genesis_block(empty_root);
+        let genesis = match refuse_window {
+            Some(_) => genesis_block_at(
+                empty_root,
+                u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(1000),
+            ),
+            None => genesis_block(empty_root),
+        };
         let epoch = std::time::Instant::now();
         let clock_ms = Arc::new(AtomicU64::new(0));
         let mut nodes = Vec::new();
@@ -427,6 +462,7 @@ impl Fleet {
                     0,
                     epoch,
                     clock_ms.clone(),
+                    refuse_window,
                 )
                 .await,
             );
@@ -459,6 +495,8 @@ impl Fleet {
             sybils_active: false,
             down: HashSet::new(),
             quiet: HashSet::new(),
+            serve_cut: vec![vec![false; n]; n],
+            refuse_window,
             prune_retain: None,
             genesis,
             epoch,
@@ -629,6 +667,7 @@ impl Fleet {
             self.slot_no,
             self.now(),
             self.clock_ms.clone(),
+            self.refuse_window,
         )
         .await;
         self.nodes.insert(i, node);
@@ -661,7 +700,8 @@ impl Fleet {
                     continue;
                 };
                 while let Ok(m) = rx.try_recv() {
-                    if up {
+                    let cut = self.serve_cut[i][j] && !matches!(m, NetworkMessage::NewBlock { .. });
+                    if up && !cut {
                         out.push((i, j, m));
                     } else {
                         self.lost += 1;
@@ -1134,6 +1174,11 @@ impl Node {
             .map(|c| c.head_hash)
             .filter(|h| self.storage.blocks.has_block(h).unwrap_or(true))
             .collect();
+        if self.attested.take_resync_request() {
+            let _ = sync_rejoin::start_resync(&mut self.rejoin.lock(), &split, applied_tip, |h| {
+                held_heads.contains(h)
+            });
+        }
         let (source, _transition) = sync_rejoin::choose_source(
             &mut self.rejoin.lock(),
             &self.sel,
@@ -1746,6 +1791,80 @@ mod tests {
         );
     }
 
+    /// The highest applied height in each of `groups`.
+    async fn group_tops(fleet: &Fleet, groups: &[Vec<usize>]) -> Vec<u64> {
+        let heights = fleet.applied_heights().await;
+        groups
+            .iter()
+            .map(|g| g.iter().map(|i| heights[*i]).max().unwrap_or(0))
+            .collect()
+    }
+
+    /// CV-5 (H2): a 4v3 split, the three ahead, where both sides then hear
+    /// each other's new blocks but can never fetch the ancestry they lack
+    /// (serving between the sides is starved, H3), so neither can admit the
+    /// other's branch. Past
+    /// the refuse window at most one branch may keep growing: a producer that
+    /// cannot reconcile with a branch fork choice would prefer stops sealing
+    /// instead of extending its own, and the other side keeps the chain live.
+    ///
+    /// The harness runs in real time, so the producers' refuse window is set
+    /// to zero: every slot of the cut is past it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_two_branches_grow_while_producers_cannot_admit_each_other() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::no_two_branches_grow_while_producers_cannot_admit_each_other",
+            );
+        }
+        let n = 7;
+        let groups = vec![vec![0, 1, 2, 3], vec![4, 5, 6]];
+        let side = |i: usize| usize::from(i >= 4);
+        let mut fleet = Fleet::with_refuse_window(n, Some(std::time::Duration::ZERO)).await;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..ACT + 4 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // Partition: the three build a branch of their own while the four are
+        // held (a stall on their side), so the minority's branch leads. That is
+        // the case the base's 60 s cap sealed through: a branch backed by three
+        // of seven is evidence, but not a majority.
+        fleet.set_links(|i, j| side(i) == side(j));
+        fleet.quiet = groups[0].iter().copied().collect();
+        for _ in 0..6 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        fleet.quiet.clear();
+        // Gossip crosses again, requests and answers do not.
+        fleet.set_links(|_, _| true);
+        fleet.serve_cut = (0..n)
+            .map(|i| (0..n).map(|j| side(i) != side(j)).collect())
+            .collect();
+        for _ in 0..5 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        let settled = group_tops(&fleet, &groups).await;
+        for _ in 0..30 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        let end = group_tops(&fleet, &groups).await;
+        let grew: Vec<bool> = settled.iter().zip(&end).map(|(a, b)| b > a).collect();
+        assert!(
+            !(grew[0] && grew[1]),
+            "both branches kept growing while neither side could admit the other: \
+             {settled:?} -> {end:?}; {}",
+            fleet.describe().await
+        );
+        assert!(
+            grew[0] || grew[1],
+            "neither branch grew: the gate held both sides off ({settled:?} -> {end:?})"
+        );
+    }
+
     /// Tripwire: the harness mirrors main.rs's receive loop and sync tick. If
     /// main.rs stops making one of these calls, the harness no longer tests
     /// what the node runs.
@@ -1782,6 +1901,8 @@ mod tests {
             "peer_manager.set_serve_sink(serve_tx)",
             "serve_plane::spawn(storage.clone(), peer_manager.clone(), serve_rx)",
             // Sync tick.
+            "attested_for_sync.take_resync_request()",
+            "sync_rejoin::start_resync(",
             "sync_rejoin::choose_source(",
             ".note_sync_target(target, applied_tip.1)",
             "rejoin_for_loop.lock().anchor(",
