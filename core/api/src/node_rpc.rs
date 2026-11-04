@@ -114,7 +114,9 @@ pub fn node_identity_json(
 ///
 /// The node does not keep a blue/red classification count or a total block
 /// count, so `totalBlocks`, `blueBlocks` and `redBlocks` are `null` (they used
-/// to be estimated as height and height x 0.95). `ghostdagParams` are the
+/// to be estimated as height and height x 0.95, chain#317). A real blue/red
+/// tally needs the GhostDAG classification persisted per block, and a total
+/// is not knowable on a pruned store; until then `null` is the honest answer. `ghostdagParams` are the
 /// parameters the running `GhostDag` uses, or `null` if the embedding binary
 /// did not supply them.
 pub fn dag_stats_json(
@@ -123,6 +125,7 @@ pub fn dag_stats_json(
 ) -> Result<Value, jsonrpc_core::Error> {
     let api = ChainApi::new(storage.clone());
     // Source: BlockStore::get_tips() (blocks with no stored child), via ChainApi.
+    // O(tips): read from the maintained tips index, not a store scan (H7).
     let tips = block_on(api.get_tips()).map_err(|e| internal_error(e.to_string()))?;
     // Source: BlockStore::get_latest_height(), via ChainApi.
     let height = block_on(api.get_height()).map_err(|e| internal_error(e.to_string()))?;

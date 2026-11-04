@@ -87,6 +87,9 @@ mod producer;
 mod registration_proof;
 mod registry_sync;
 mod rollback;
+mod serve_plane;
+#[cfg(test)]
+mod serve_plane_tests;
 #[cfg(test)]
 mod split_heal_tests;
 mod startup_guards;
@@ -2684,6 +2687,29 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let (in_tx, mut in_rx) =
             tokio::sync::mpsc::channel::<(PeerId, citrate_network::NetworkMessage)>(512);
         peer_manager.set_incoming(in_tx).await;
+        // ADR CV-6 (planset H3): history serving has its own lane and task.
+        // GetBlocks/GetHeaders never enter the consensus queue above and are
+        // answered from storage off this loop, under per-peer and global
+        // budgets (`serve_plane.rs`).
+        let (serve_tx, serve_rx) =
+            tokio::sync::mpsc::channel(citrate_network::inbound::SERVE_LANE_CAPACITY);
+        peer_manager.set_serve_sink(serve_tx).await;
+        let serve_task = serve_plane::spawn(storage.clone(), peer_manager.clone(), serve_rx);
+        // The serving task is the node's only answer to peers' history
+        // requests; like the message loop (#146), it may not die quietly.
+        tokio::spawn(async move {
+            let reason = match serve_task.await {
+                Err(e) if e.is_panic() => format!("PANICKED ({})", e),
+                Err(e) => format!("was cancelled ({})", e),
+                Ok(()) => "exited (serve lane closed)".to_string(),
+            };
+            tracing::error!(
+                "FATAL: the history serving task {} — this node can no longer answer \
+                 peers' GetBlocks/GetHeaders. Exiting so the supervisor restarts it.",
+                reason
+            );
+            std::process::exit(1);
+        });
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
         // Peers still sending pre-activation-format blocks at or after the
@@ -3625,21 +3651,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                         // Requests are driven by periodic sync loop
                     }
-                    NetworkMessage::GetBlocks { from, count, .. } => {
-                        tracing::info!("Received GetBlocks request from peer {} for {} blocks starting from {:?}",
-                                     pid.0, count, from);
-                        // NET-2 (SECREM-01): `count` is attacker-supplied —
-                        // serve through the clamped, tip-bounded path only.
-                        let blocks = block_serve::serve_blocks(&storage_for_handler, &from, count);
-
-                        tracing::info!("Sending {} blocks to peer {}", blocks.len(), pid.0);
-                        let _ = pm_for_rx
-                            .send_to_peers(
-                                std::slice::from_ref(&pid),
-                                &NetworkMessage::Blocks { blocks },
-                            )
-                            .await;
-                    }
+                    // GetBlocks / GetHeaders: routed to the serving lane by
+                    // `forward_incoming` (ADR CV-6) and answered by
+                    // `serve_plane`, never on this loop.
                     NetworkMessage::GetPeers => {
                         // Serve a small list of peers from discovery
                         let peers = discovery.get_peers_for_exchange().await;
@@ -3652,28 +3666,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                     NetworkMessage::Peers { peers } => {
                         discovery.handle_peer_exchange(peers).await;
-                    }
-                    NetworkMessage::GetHeaders { from, count } => {
-                        tracing::info!(
-                            "Received GetHeaders request from peer {} starting {:?} count {}",
-                            pid.0,
-                            from,
-                            count
-                        );
-                        // NET-1 (SECREM-01 Critical): the previous inline
-                        // loop ran `while headers.len() < count` with no tip
-                        // bound and no break on missing heights — one packet
-                        // with a large `count` spun to u64::MAX storage
-                        // reads. All serving now goes through the clamped,
-                        // tip-bounded, gap-breaking path.
-                        let headers =
-                            block_serve::serve_headers(&storage_for_handler, &from, count);
-                        let _ = pm_for_rx
-                            .send_to_peers(
-                                std::slice::from_ref(&pid),
-                                &NetworkMessage::Headers { headers },
-                            )
-                            .await;
                     }
                     NetworkMessage::Headers { headers } => {
                         let _ = sync_for_rx.handle_headers(&pid, headers).await;
@@ -4484,6 +4476,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let processed = msgs_processed.load(std::sync::atomic::Ordering::Relaxed);
                 let drops = pm_for_stall.inbound_drops();
                 metrics::record_inbound_drops(&pm_for_stall.inbound_drops_by_kind());
+                // Serving-lane drops: reported, but not a stall signal (the
+                // consensus loop is not behind when history serving is).
+                metrics::record_serve_drops(&pm_for_stall.serve_drops_by_kind());
                 let shed_this_window = drops.saturating_sub(last_drops);
                 let starved = shed_this_window > 0 && processed == last_processed;
                 last_processed = processed;
