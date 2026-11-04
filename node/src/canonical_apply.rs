@@ -1033,7 +1033,8 @@ impl CanonicalApplicator {
         let mut abandoned: Vec<Vec<citrate_consensus::types::Transaction>> = Vec::new();
         let mut cursor = old_tip.hash;
         // The abandoned run is old_tip.height - fork.height blocks long (at most
-        // MAX_REORG_DEPTH: reorg_to refuses deeper reverts).
+        // MAX_REORG_DEPTH from reorg_to, which refuses deeper reverts; at most
+        // MAX_RECOVERY_SPINE from the from-genesis rebuild).
         let depth = old_tip.height.saturating_sub(fork.height);
         for _ in 0..depth {
             if cursor == fork.hash {
@@ -3435,6 +3436,9 @@ impl CanonicalApplicator {
         // keeps the ring bounded to the last MAX_REORG_DEPTH heights, so the rebuilt
         // ring ends populated across the recent window (future live reorgs work).
         let mut replayed: usize = 0;
+        // The head's tx hashes above the fork point, for the re-injection of the
+        // abandoned blocks' txs once the rebuild has converged (as `reorg_to`).
+        let mut carried: std::collections::HashSet<Hash> = std::collections::HashSet::new();
         for h in &spine {
             let block = match read_block(&self.storage, h) {
                 Ok(Some(b)) => b,
@@ -3457,6 +3461,9 @@ impl CanonicalApplicator {
             match apply_result {
                 Ok(_) => {
                     replayed = replayed.saturating_add(1);
+                    if block.header.height > plan.fork.height {
+                        carried.extend(block.transactions.iter().map(|t| t.hash));
+                    }
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
                     let snap = self.executor.state_snapshot();
@@ -3551,6 +3558,10 @@ impl CanonicalApplicator {
             "canonical recovery: converged to fork-choice head {} @ {}",
             state.tip.hash, state.tip.height
         );
+        // The rebuild switched branches as a reorg does: the abandoned blocks
+        // (plan.fork, pre_tip] go back to the pool, re-validated against the
+        // head's state (the executor holds it; the advance lock is held).
+        self.reinject_abandoned(pre_tip, plan.fork, &carried).await;
         Ok(true)
     }
 
