@@ -22,7 +22,6 @@ use citrate_consensus::types::{
 use citrate_execution::types::Address;
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 
 // FRESH-KEYS REROLL 2026-09-29 (pre-TOB-audit alpha re-baseline): treasury,
@@ -661,25 +660,10 @@ pub fn create_canonical_genesis_block(timestamp: u64) -> Block {
 }
 
 /// Calculate the canonical genesis/full block hash used by both standalone and GUI nodes.
+/// One definition: [`Block::canonical_genesis_hash`], which the consensus genesis
+/// exemption checks against.
 pub fn calculate_canonical_block_hash(block: &Block) -> Hash {
-    let mut hasher = Sha3_256::new();
-
-    hasher.update(block.header.version.to_le_bytes());
-    hasher.update(block.header.selected_parent_hash.as_bytes());
-    for parent in &block.header.merge_parent_hashes {
-        hasher.update(parent.as_bytes());
-    }
-    hasher.update(block.header.timestamp.to_le_bytes());
-    hasher.update(block.header.height.to_le_bytes());
-    hasher.update(block.header.blue_score.to_le_bytes());
-    hasher.update(block.header.blue_work.to_le_bytes());
-    hasher.update(block.header.pruning_point.as_bytes());
-    hasher.update(block.state_root.as_bytes());
-    hasher.update(block.tx_root.as_bytes());
-    hasher.update(block.receipt_root.as_bytes());
-    hasher.update(block.artifact_root.as_bytes());
-
-    Hash::new(hasher.finalize().into())
+    block.canonical_genesis_hash()
 }
 
 /// Initialize genesis state in the executor's state DB.

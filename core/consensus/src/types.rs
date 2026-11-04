@@ -431,14 +431,68 @@ impl Block {
     /// hash, and isolated unit tests) accepts the height-0 parentless shape; the
     /// height-0 requirement alone already rejects the shaped-height attack, and
     /// production wiring always configures the hash before admitting any block.
+    ///
+    /// CV-9: the content binding accepts either encoding a genesis is hashed
+    /// with: the block-hash encoding ([`Self::verify_hash`]) or the canonical
+    /// genesis encoding ([`Self::canonical_genesis_hash`]), which is how every
+    /// network genesis so far was hashed. Requiring only the first made the
+    /// exemption fail for the real genesis, so a strict store refused it when
+    /// it was re-offered at startup ("zero proposer public key"). The canonical
+    /// genesis encoding does not bind the proposer, VRF, coinbase, gas fields or
+    /// signature, so under it those must be inert (zero or empty) as the
+    /// canonical genesis builder leaves them.
     pub fn is_configured_genesis(&self, configured: Option<Hash>) -> bool {
         if self.header.height != 0 || !self.is_genesis() {
             return false;
         }
         match configured {
-            Some(h) => self.header.block_hash == h && self.verify_hash(),
+            Some(h) => {
+                self.header.block_hash == h
+                    && (self.verify_hash()
+                        || (self.canonical_genesis_hash() == h && self.genesis_fields_inert()))
+            }
             None => true,
         }
+    }
+
+    /// The canonical genesis encoding: the hash every network genesis is
+    /// identified by (`citrate_economics::genesis::calculate_canonical_block_hash`
+    /// delegates here). It binds the version, parents, timestamp, height, blue
+    /// score and work, pruning point and the four commitment roots, and nothing
+    /// else.
+    pub fn canonical_genesis_hash(&self) -> Hash {
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(self.header.version.to_le_bytes());
+        hasher.update(self.header.selected_parent_hash.as_bytes());
+        for parent in &self.header.merge_parent_hashes {
+            hasher.update(parent.as_bytes());
+        }
+        hasher.update(self.header.timestamp.to_le_bytes());
+        hasher.update(self.header.height.to_le_bytes());
+        hasher.update(self.header.blue_score.to_le_bytes());
+        hasher.update(self.header.blue_work.to_le_bytes());
+        hasher.update(self.header.pruning_point.as_bytes());
+        hasher.update(self.state_root.as_bytes());
+        hasher.update(self.tx_root.as_bytes());
+        hasher.update(self.receipt_root.as_bytes());
+        hasher.update(self.artifact_root.as_bytes());
+        Hash::new(hasher.finalize().into())
+    }
+
+    /// The fields [`Self::canonical_genesis_hash`] does not bind hold nothing a
+    /// genesis could use: no proposer, VRF, coinbase, gas used or signature.
+    fn genesis_fields_inert(&self) -> bool {
+        self.header
+            .proposer_pubkey
+            .as_bytes()
+            .iter()
+            .all(|b| *b == 0)
+            && self.header.vrf_reveal.proof.is_empty()
+            && self.header.vrf_reveal.output == Hash::default()
+            && self.header.coinbase == [0u8; 20]
+            && self.header.gas_used == 0
+            && self.signature.as_bytes().iter().all(|b| *b == 0)
     }
 }
 
