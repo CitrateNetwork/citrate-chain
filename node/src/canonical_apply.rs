@@ -798,6 +798,13 @@ pub struct CanonicalApplicator {
     /// The last fork-choice head a from-genesis rebuild was refused for, so the
     /// refusal is logged once per head rather than on every 1 s drain tick.
     refused_rebuild_head: parking_lot::Mutex<Option<Hash>>,
+    /// CV-7b (H6): set while the durable dead-branch marker
+    /// (`citrate_storage::chain::wedge`) is recorded: the applied tip is held
+    /// on a branch fork choice has left and this node cannot switch from (the
+    /// fork point is below the reorg window on a pruned DAG store). Seeded
+    /// from the store at construction, so it survives a restart. The producer
+    /// refuses to seal while it is set (`dead_branch_handle`).
+    dead_branch: Arc<AtomicBool>,
 }
 
 impl CanonicalApplicator {
@@ -882,6 +889,31 @@ impl CanonicalApplicator {
             snapshots.insert(height, (hash, snap));
         }
         let seeded_height = tip.height;
+        // CV-7b: a dead-branch marker recorded before a restart still holds.
+        let dead_branch = match citrate_storage::chain::wedge::read(&storage.db) {
+            Ok(Some(w)) => {
+                warn!(
+                    "SYNCSTATE wedged (recorded {}): applied tip {} @ {} is on a dead branch \
+                     {} block(s) above the fork point {} @ {}; not serving it as current",
+                    w.since_unix,
+                    w.dead_tip,
+                    w.dead_tip_height,
+                    w.fork_depth(),
+                    w.fork_point,
+                    w.fork_height
+                );
+                true
+            }
+            Ok(None) => false,
+            // Unreadable: fail toward "not serving / not sealing" rather than
+            // presenting a possibly dead branch as current.
+            Err(e) => {
+                warn!(
+                    "SYNCSTATE: dead-branch marker unreadable ({e}); treating the node as wedged"
+                );
+                true
+            }
+        };
         Self {
             executor,
             storage,
@@ -900,6 +932,7 @@ impl CanonicalApplicator {
             dag_hydrated: None,
             dag_prune_floor: None,
             refused_rebuild_head: parking_lot::Mutex::new(None),
+            dead_branch: Arc::new(AtomicBool::new(dead_branch)),
         }
     }
 
@@ -1477,6 +1510,108 @@ impl CanonicalApplicator {
     /// state of any committable tip.
     pub fn rebuild_in_progress_handle(&self) -> Arc<AtomicBool> {
         self.rebuild_in_progress.clone()
+    }
+
+    /// CV-7b: set while the applied tip is held on a dead branch (see the
+    /// `dead_branch` field). The producer refuses to seal while it is set.
+    pub fn dead_branch_handle(&self) -> Arc<AtomicBool> {
+        self.dead_branch.clone()
+    }
+
+    /// CV-7b: the durable dead-branch marker, or `None` when the applied tip
+    /// is not held on a dead branch. Source: `citrate_storage::chain::wedge`
+    /// in this node's chain database.
+    pub fn wedge(&self) -> anyhow::Result<Option<citrate_storage::chain::wedge::WedgeRecord>> {
+        citrate_storage::chain::wedge::read(&self.storage.db)
+    }
+
+    /// CV-7b: record that the switch from the applied tip to `head` was
+    /// refused for good (`RefusePruned`): the applied branch above `fork` is
+    /// dead. Idempotent per (dead tip, head): an unchanged record is not
+    /// rewritten, and the first refusal's time is kept.
+    fn record_dead_branch(&self, state: &AppliedState, head: Hash, fork: AppliedTip, why: &str) {
+        let head_height = match read_block(&self.storage, &head) {
+            Ok(Some(b)) => b.header.height,
+            _ => 0,
+        };
+        let previous = citrate_storage::chain::wedge::read(&self.storage.db)
+            .ok()
+            .flatten();
+        let since_unix = match &previous {
+            Some(p) if p.dead_tip == state.tip.hash => p.since_unix,
+            _ => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        let record = citrate_storage::chain::wedge::WedgeRecord {
+            dead_tip: state.tip.hash,
+            dead_tip_height: state.tip.height,
+            fork_point: fork.hash,
+            fork_height: fork.height,
+            head,
+            head_height,
+            reason: why.to_string(),
+            since_unix,
+        };
+        if previous.as_ref() == Some(&record) {
+            self.dead_branch.store(true, Ordering::SeqCst);
+            return;
+        }
+        match citrate_storage::chain::wedge::write(&self.storage.db, &record) {
+            Ok(()) => warn!(
+                "SYNCSTATE wedged: applied tip {} @ {} is on a dead branch {} block(s) above the \
+                 fork point {} @ {} (fork-choice head {} @ {}); this node stops serving, \
+                 advertising and sealing on it. Reason: {why}",
+                record.dead_tip,
+                record.dead_tip_height,
+                record.fork_depth(),
+                record.fork_point,
+                record.fork_height,
+                record.head,
+                record.head_height
+            ),
+            Err(e) => warn!("SYNCSTATE: could not record the dead-branch marker: {e}"),
+        }
+        self.dead_branch.store(true, Ordering::SeqCst);
+    }
+
+    /// CV-7b: clear the dead-branch marker once the applied tip has left the
+    /// dead branch (a reorg, a rebuild, or a rollback took it below or off the
+    /// recorded dead tip). A tip still at or above the dead tip on the same
+    /// branch keeps it. Called under the advance lock.
+    fn reconcile_dead_branch(&self, state: &AppliedState) {
+        if !self.dead_branch.load(Ordering::SeqCst) {
+            return;
+        }
+        let record = match citrate_storage::chain::wedge::read(&self.storage.db) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                self.dead_branch.store(false, Ordering::SeqCst);
+                return;
+            }
+            Err(_) => return,
+        };
+        let still_on_it = state.tip.hash == record.dead_tip
+            || (state.tip.height > record.dead_tip_height
+                && matches!(
+                    self.ancestor_hash_at_height(state.tip.hash, record.dead_tip_height),
+                    Ok(Some(h)) if h == record.dead_tip
+                ));
+        if still_on_it {
+            return;
+        }
+        match citrate_storage::chain::wedge::clear(&self.storage.db) {
+            Ok(()) => {
+                self.dead_branch.store(false, Ordering::SeqCst);
+                info!(
+                    "SYNCSTATE: applied tip {} @ {} has left the dead branch (was {} @ {}); \
+                     marker cleared",
+                    state.tip.hash, state.tip.height, record.dead_tip, record.dead_tip_height
+                );
+            }
+            Err(e) => warn!("SYNCSTATE: could not clear the dead-branch marker: {e}"),
+        }
     }
 
     /// #126 (producer catch-up gate): a handle to the "DAG hydration complete" signal
@@ -2414,6 +2549,7 @@ impl CanonicalApplicator {
                 }
             }
             self.publish_applied_height(&state);
+            self.reconcile_dead_branch(&state);
             if !out.applied.is_empty() {
                 info!(
                     "periodic drain: applied {} persisted block(s), tip now {} @ {}",
@@ -2700,6 +2836,12 @@ impl CanonicalApplicator {
             match rebuild_decision(below_ring, floor, head_w, tip_w, tip_held) {
                 RebuildDecision::Rebuild => {}
                 refused => {
+                    // H6: a pruned node forked below its reorg window can
+                    // never switch on its own. Mark the branch dead (CV-7b);
+                    // the guarded cold resync (cold_resync.rs) recovers it.
+                    if matches!(refused, RebuildDecision::RefusePruned { .. }) {
+                        self.record_dead_branch(&state, head, plan.fork, &refused.to_string());
+                    }
                     self.refuse_rebuild(head, &refused.to_string(), state.tip);
                     return Ok(false);
                 }

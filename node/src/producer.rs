@@ -191,6 +191,9 @@ pub struct ProduceCatchupGate {
     /// Set by the sync driver once this node's initial sync after start has completed
     /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
     initial_sync_done: Option<Arc<AtomicBool>>,
+    /// CV-7b: set while the applicator holds the applied tip on a dead branch
+    /// (`CanonicalApplicator::dead_branch_handle`). `None` ⇒ not wired.
+    dead_branch: Option<Arc<AtomicBool>>,
 }
 
 /// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
@@ -2105,6 +2108,7 @@ impl BlockProducer {
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            dead_branch: Some(app.dead_branch_handle()),
         });
         self
     }
@@ -2412,6 +2416,18 @@ impl BlockProducer {
                     "MP-S1/#126: refusing to produce — a canonical spine rebuild is in progress \
                      (the applied tip is being rewritten from genesis). Skipping this slot; \
                      the rebuild will converge the applied tip."
+                ));
+            }
+            // CV-7b (H6): never seal on a branch fork choice has left and this
+            // node cannot switch from; the cold resync recovers it.
+            if gate
+                .dead_branch
+                .as_ref()
+                .is_some_and(|d| d.load(Ordering::SeqCst))
+            {
+                return Err(anyhow::anyhow!(
+                    "CV-7b: refusing to produce — the applied tip is on a dead branch \
+                     (dead-branch marker set; see syncState). Skipping this slot."
                 ));
             }
             if let Some(hydrated) = &gate.dag_hydrated {
@@ -6886,6 +6902,7 @@ mod tests {
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            dead_branch: None,
         }
     }
 
@@ -7407,6 +7424,7 @@ mod tests {
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            dead_branch: None,
         }
     }
 

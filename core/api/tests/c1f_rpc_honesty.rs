@@ -144,6 +144,62 @@ fn node_identity_reports_genesis_chain_and_fingerprints() {
     assert_eq!(r["gitDirty"], false);
 }
 
+/// CV-7b: `citrate_nodeIdentity.syncState` reads the node's own sources: the
+/// durable dead-branch marker, the applied tip and the sync driver's highest
+/// seen height (the `eth_syncing` signal).
+#[test]
+fn node_identity_sync_state_reads_the_marker_and_the_sync_signal() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (storage, _tmp, g) = storage_with_genesis();
+    let tip = put(&storage, [0x01; 32], g, 1, 1);
+    storage.blocks.put_applied_tip(&tip, 1).expect("tip");
+    let highest = Arc::new(AtomicU64::new(1));
+    let mut io = jsonrpc_core::IoHandler::new();
+    node_rpc::register_node_methods_with_sync(
+        &mut io,
+        storage.clone(),
+        40204,
+        None,
+        Some(highest.clone()),
+    );
+    let st = |io: &jsonrpc_core::IoHandler| {
+        call(io, "citrate_nodeIdentity", "[]")["result"]["syncState"].clone()
+    };
+    let s = st(&io);
+    assert_eq!(s["state"], "synced", "{s}");
+    assert_eq!(s["appliedHeight"], 1, "{s}");
+    assert!(s["forkDepth"].is_null(), "{s}");
+    highest.store(40, Ordering::Relaxed);
+    let s = st(&io);
+    assert_eq!(s["state"], "catching_up", "{s}");
+    assert_eq!(s["highestSeen"], 40, "{s}");
+    citrate_storage::chain::wedge::write(
+        &storage.db,
+        &citrate_storage::chain::wedge::WedgeRecord {
+            dead_tip: tip,
+            dead_tip_height: 1,
+            fork_point: g,
+            fork_height: 0,
+            head: Hash::new([0x02; 32]),
+            head_height: 40,
+            reason: "refused".into(),
+            since_unix: 9,
+        },
+    )
+    .expect("marker");
+    let s = st(&io);
+    assert_eq!(s["state"], "wedged", "{s}");
+    assert_eq!(s["forkDepth"], 1, "{s}");
+    assert_eq!(s["reason"], "refused", "{s}");
+    assert_eq!(s["networkHead"]["height"], 40, "{s}");
+    assert_eq!(s["since"], 9, "{s}");
+    // Without a sync signal wired the highest seen height is unknown, not 0.
+    citrate_storage::chain::wedge::clear(&storage.db).expect("clear");
+    let s = st(&node_io(storage, None));
+    assert_eq!(s["state"], "synced", "{s}");
+    assert!(s["highestSeen"].is_null(), "{s}");
+}
+
 #[test]
 fn node_identity_is_null_where_unknown() {
     // No genesis stored and no identity supplied: nothing is invented.

@@ -41,6 +41,7 @@ mod block_serve;
 mod boot_state;
 pub mod bundled_model;
 mod canonical_apply;
+mod cold_resync;
 mod commands;
 mod config;
 mod consensus_manifest;
@@ -1798,6 +1799,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // encrypted-at-rest (AES-256-GCM per value) with the raw key from the parent
     // process's OS keyring; absent, the default plaintext path is used.
     let storage_encryption = at_rest_encryption_from_env()?;
+    // CV-7c: a cold resync the previous process requested (it was held on a
+    // dead branch it could not switch from) moves the chain database aside
+    // here, before it is opened; the node then syncs from genesis via peers.
+    let recovery_policy = cold_resync::Policy::from(&config.recovery);
+    cold_resync::apply_pending(&config.storage.data_dir, recovery_policy)?;
     let storage = Arc::new(StorageManager::with_config(
         &config.storage.data_dir,
         StorageConfig {
@@ -2388,6 +2394,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // block 1 against a zero selected-parent and orphans it.
     block_admission.seed_genesis().await;
 
+    // CV-7c: a node held on a dead branch (the applicator's dead-branch
+    // marker) for `[recovery] cold_resync_after_secs` requests a guarded cold
+    // resync and exits for the supervisor to restart it (cold_resync.rs).
+    if let Some(app) = canonical_applicator.clone() {
+        cold_resync::spawn_monitor(
+            app,
+            config.storage.data_dir.clone(),
+            recovery_policy,
+            finality_voting_on,
+        );
+    }
+
     // A database that followed a branch the release's canonical checkpoints
     // exclude stays on it: admission refuses the network's blocks above it.
     // Say so plainly; the fix is to move the chain data aside and resync.
@@ -2517,11 +2535,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // applied chain; advertising the stored max makes it look caught up to
         // peers (which then pick it as a sync source and it serves them nothing)
         // and mis-drives fork choice. The applied tip is our true synced head.
-        let (head_hash, head_height) = storage
-            .blocks
-            .get_applied_tip()
-            .ok()
-            .flatten()
+        // CV-7b: a node held on a dead branch advertises its fork point, not
+        // the dead tip (cold_resync::advertised_head).
+        let (head_hash, head_height) = cold_resync::advertised_head(&storage)
             .unwrap_or((citrate_consensus::types::Hash::default(), 0));
         max_seen_height.fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
         let genesis_hash = storage
@@ -2774,9 +2790,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
-                    if let Ok(Some((hash, height))) = storage_head.blocks.get_applied_tip() {
+                    if let Some((hash, height)) = cold_resync::advertised_head(&storage_head) {
                         let mut g = advertised_head.write().await;
-                        if g.0 != height {
+                        if *g != (height, hash) {
                             *g = (height, hash);
                         }
                     }

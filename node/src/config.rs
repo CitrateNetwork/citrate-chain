@@ -32,6 +32,54 @@ pub struct NodeConfig {
     /// Checkpoint configuration (WP-W.2)
     #[serde(default)]
     pub checkpoint: CheckpointNodeConfig,
+
+    /// Automatic recovery from a dead branch (ADR-2026-11-03 CV-7c).
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+}
+
+/// `[recovery]`: the guarded automatic cold resync (node/src/cold_resync.rs).
+///
+/// A node whose applied tip is held on a dead branch (the dead-branch marker,
+/// CV-7b) for `cold_resync_after_secs` moves its chain database aside (never
+/// deleted; the node identity keys stay) and resyncs from genesis via peers,
+/// at most once per `cold_resync_min_interval_hours`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// Allow the automatic cold resync. `false` leaves a wedged node wedged
+    /// (it still stops serving and sealing on the dead branch and reports
+    /// `syncState: wedged`) for an operator to resync by hand.
+    #[serde(default = "default_cold_resync")]
+    pub cold_resync: bool,
+    /// Minimum time between two automatic cold resyncs of this data dir.
+    #[serde(default = "default_cold_resync_min_interval_hours")]
+    pub cold_resync_min_interval_hours: u64,
+    /// How long the node must have been wedged before it resyncs.
+    #[serde(default = "default_cold_resync_after_secs")]
+    pub cold_resync_after_secs: u64,
+}
+
+fn default_cold_resync() -> bool {
+    true
+}
+
+fn default_cold_resync_min_interval_hours() -> u64 {
+    6
+}
+
+fn default_cold_resync_after_secs() -> u64 {
+    900
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            cold_resync: default_cold_resync(),
+            cold_resync_min_interval_hours: default_cold_resync_min_interval_hours(),
+            cold_resync_after_secs: default_cold_resync_after_secs(),
+        }
+    }
 }
 
 /// VRF configuration for proposer election verification.
@@ -473,6 +521,7 @@ impl Default for NodeConfig {
             validator: ValidatorConfig::default(),
             vrf: VrfConfig::default(),
             checkpoint: CheckpointNodeConfig::default(),
+            recovery: RecoveryConfig::default(),
         }
     }
 }
