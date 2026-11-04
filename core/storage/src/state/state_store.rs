@@ -1414,4 +1414,131 @@ mod tests {
         store.delete_storage(&address, b"key1").unwrap();
         assert!(store.get_storage(&address, b"key1").unwrap().is_none());
     }
+
+    /// S1-6 (ADR-2026-11-03 CV-7a, RT-4): the storage cost of keeping one undo
+    /// record per applied height for the whole DAG retention window (10,000)
+    /// instead of `REORG_UNDO_DEPTH` (100). Measures the encoded record of
+    /// three block shapes on a store where every touched account and slot
+    /// already exists (so every pre-image is a full value, the worst case for
+    /// a steady-state chain):
+    ///
+    /// - reward-only: the coinbase, the treasury and the reward minter;
+    /// - 100 native transfers: 100 senders + 100 recipients + those three;
+    /// - 50 token transfers: 50 senders (nonce) + those three, and two 32-byte
+    ///   balance slots per transfer on one contract.
+    ///
+    /// Prints `S1-6 undo record` lines (run with `--nocapture`). Asserts that
+    /// the record grows linearly with what the block touches, so the
+    /// projection (bytes per record x 10,000) holds.
+    #[test]
+    fn undo_record_size_per_block_shape_s1_6() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
+        let none = ReceiptIndexBatch::default();
+        let addr = |tag: u8, i: u32| {
+            let mut a = [tag; 20];
+            a[16..].copy_from_slice(&i.to_be_bytes());
+            Address(a)
+        };
+        let full = |nonce: u64| AccountState {
+            nonce,
+            balance: U256::from(10u128.pow(24)),
+            storage_root: Hash::new([0x5A; 32]),
+            code_hash: Hash::new([0xC0; 32]),
+            model_permissions: vec![],
+        };
+        let fixed = [addr(0xC0, 0), addr(0x11, 0), addr(0x1D, 0)];
+        let token = addr(0x7E, 0);
+        let word = |i: u32, tag: u8| {
+            let mut w = vec![tag; 32];
+            w[28..].copy_from_slice(&i.to_be_bytes());
+            w
+        };
+        // Height 1 writes every account and slot the blocks below touch, so
+        // each later pre-image is a full stored value.
+        let mut accounts: Vec<(Address, AccountState)> =
+            fixed.iter().map(|a| (*a, full(1))).collect();
+        for i in 0..100 {
+            accounts.push((addr(0xA0, i), full(1)));
+            accounts.push((addr(0xB0, i), full(1)));
+        }
+        accounts.push((token, full(1)));
+        let slots: Vec<StateStorageChange> = (0..100)
+            .map(|i| slot(token, &word(i, 0x01), Some(&word(i, 0x02))))
+            .collect();
+        store
+            .write_state_batch_with_applied_tip(
+                &accounts,
+                &slots,
+                Some((block_hash(1), 1)),
+                &none,
+                Some(&ModelJobUndo::default()),
+            )
+            .expect("seed");
+        let measure = |height: u64,
+                           accounts: Vec<(Address, AccountState)>,
+                           storage: Vec<StateStorageChange>|
+         -> (usize, usize, usize) {
+            let (na, ns) = (accounts.len(), storage.len());
+            store
+                .write_state_batch_with_applied_tip(
+                    &accounts,
+                    &storage,
+                    Some((block_hash(height), height)),
+                    &none,
+                    Some(&ModelJobUndo::default()),
+                )
+                .expect("commit");
+            let rec = store
+                .get_reorg_undo(height)
+                .expect("read")
+                .expect("record kept");
+            assert_eq!(rec.accounts.len(), na);
+            assert_eq!(rec.storage.len(), ns);
+            let bytes = bincode::serialize(&rec).expect("encode").len();
+            (bytes, na, ns)
+        };
+        let reward_only = measure(2, fixed.iter().map(|a| (*a, full(2))).collect(), Vec::new());
+        let mut transfers: Vec<(Address, AccountState)> =
+            fixed.iter().map(|a| (*a, full(3))).collect();
+        for i in 0..100 {
+            transfers.push((addr(0xA0, i), full(3)));
+            transfers.push((addr(0xB0, i), full(3)));
+        }
+        let native = measure(3, transfers, Vec::new());
+        let mut senders: Vec<(Address, AccountState)> =
+            fixed.iter().map(|a| (*a, full(4))).collect();
+        for i in 0..50 {
+            senders.push((addr(0xA0, i), full(4)));
+        }
+        let token_slots: Vec<StateStorageChange> = (0..100)
+            .map(|i| slot(token, &word(i, 0x01), Some(&word(i, 0x03))))
+            .collect();
+        let tokens = measure(4, senders, token_slots);
+        for (name, (bytes, na, ns)) in [
+            ("reward-only", reward_only),
+            ("100 native transfers", native),
+            ("50 token transfers", tokens),
+        ] {
+            println!(
+                "S1-6 undo record {name}: {bytes} bytes ({na} account(s), {ns} slot(s)); \
+                 x100 = {} KiB, x10000 = {:.1} MiB",
+                bytes * 100 / 1024,
+                (bytes * 10_000) as f64 / (1024.0 * 1024.0)
+            );
+        }
+        // Linear in what the block touches: a per-account and per-slot cost,
+        // plus a small fixed header.
+        let per_account = (native.0 - reward_only.0) / (native.1 - reward_only.1);
+        assert!(
+            (60..=200).contains(&per_account),
+            "per-account pre-image: {per_account} bytes"
+        );
+        assert!(
+            reward_only.0 < 1_024,
+            "reward-only record: {} bytes",
+            reward_only.0
+        );
+        assert!(native.0 < MAX_UNDO_RECORD_BYTES && tokens.0 < MAX_UNDO_RECORD_BYTES);
+    }
 }
