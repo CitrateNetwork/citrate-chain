@@ -191,6 +191,10 @@ pub struct ProduceCatchupGate {
     /// Set by the sync driver once this node's initial sync after start has completed
     /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
     initial_sync_done: Option<Arc<AtomicBool>>,
+    /// How long deferred evidence alone may hold production off before the gate
+    /// judges whether this node can reconcile with it. Defaults to
+    /// [`DEFERRED_ONLY_REFUSE_MAX`]; shrunk by tests.
+    deferred_refuse_max: Duration,
 }
 
 /// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
@@ -962,7 +966,7 @@ impl ProduceCatchupGate {
             .map(|o| o.now_instant())
             .unwrap_or_else(Instant::now);
         let since = *st.deferred_only_since.get_or_insert(now);
-        if now.saturating_duration_since(since) < DEFERRED_ONLY_REFUSE_MAX {
+        if now.saturating_duration_since(since) < self.deferred_refuse_max {
             return raw;
         }
         if majority.saturating_sub(local_tip) > CATCHUP_RESUME_GAP {
@@ -978,7 +982,7 @@ impl ProduceCatchupGate {
                      {}s. NOT sealing on this node's own tip: that would fork it off the network. \
                      Sync keeps trying; production resumes by itself once this node admits that \
                      branch or it goes quiet. Check this node's admission errors, peers and sync.",
-                    DEFERRED_ONLY_REFUSE_MAX.as_secs()
+                    self.deferred_refuse_max.as_secs()
                 );
             }
             return majority;
@@ -993,7 +997,7 @@ impl ProduceCatchupGate {
                 "F2/#126: signed blocks this node cannot admit have said it is behind \
                  (evidence at {raw}, applied tip {local_tip}) for over {}s with nothing it \
                  holds agreeing; sealing anyway. Check this node's peers and sync.",
-                DEFERRED_ONLY_REFUSE_MAX.as_secs()
+                self.deferred_refuse_max.as_secs()
             );
         }
         0
@@ -2105,6 +2109,7 @@ impl BlockProducer {
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
         });
         self
     }
@@ -2157,6 +2162,17 @@ impl BlockProducer {
     pub fn with_catchup_stall_alert_after(mut self, after: Duration) -> Self {
         if let Some(gate) = self.produce_gate.as_mut() {
             gate.stall_alert_after = after;
+        }
+        self
+    }
+
+    /// Shrink the deferred-evidence refuse window (tests only; production uses
+    /// [`DEFERRED_ONLY_REFUSE_MAX`]). The split-heal harness runs in real time, so
+    /// the 60 s window would never elapse inside a run.
+    #[allow(dead_code)]
+    pub fn with_deferred_refuse_window(mut self, window: Duration) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.deferred_refuse_max = window;
         }
         self
     }
@@ -6886,6 +6902,7 @@ mod tests {
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
         }
     }
 
@@ -7407,6 +7424,7 @@ mod tests {
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
         }
     }
 
