@@ -4,7 +4,8 @@
 //
 // A pruned node (DAG retain window) forked more than the reorg window below its
 // applied tip cannot switch to the heavier branch: the undo records cover
-// `MAX_REORG_DEPTH` heights and the rebuild from genesis is refused on a pruned
+// `MAX_REORG_DEPTH` heights (10,000 = the prune retention since S3-4, CV-7a;
+// 100 before) and the rebuild from genesis is refused on a pruned
 // store (`RebuildDecision::RefusePruned`). The applicator then records the
 // dead-branch marker (`citrate_storage::chain::wedge`, CV-7b). Before this
 // module the only way out was an operator moving the chain data aside by hand.

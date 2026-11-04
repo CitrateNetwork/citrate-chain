@@ -66,22 +66,43 @@ use primitive_types::U256;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-/// Reorg window: the number of most-recent applied blocks whose full state
-/// snapshots the ring retains. Bounds both memory (≤ this many full-state
-/// snapshots) and the deepest revertible reorg — a fork older than this is
-/// refused (treated like a finality violation). Matches `ChainSelector`'s
-/// default `max_reorg_depth`. See docs/consensus/EXECUTE_ON_RECEIVE §4 step 4.
+/// Reorg (undo) window: the deepest fork point, below the applied tip, the
+/// applied chain can be switched across in place. It equals the DAG prune
+/// retention (ADR-2026-11-03 CV-7a, spec 06 §4.2: undo window = PRUNING_DEPTH
+/// = 10,000), so any fork the DAG store still holds is revertible; before
+/// S3-4 it was 100 against a 10,000 retention, and a pruned node forked deeper
+/// than 100 was wedged for good (root cause H6). A fork deeper than this is
+/// `BeyondReorgWindow`: the from-genesis rebuild on an unpruned node, and on a
+/// pruned one the dead-branch marker and the guarded cold resync (CV-7b/c).
+///
+/// The most recent [`SNAPSHOT_RING_DEPTH`] heights are reverted from the
+/// in-memory snapshot ring; deeper fork points are rebuilt from the undo
+/// records the store keeps for every height of the window
+/// ([`revert_from_undo`]), checked against the fork block's state root.
 ///
 /// IMPORTANT: this bounds the REVERT distance (how far below the applied tip a
-/// fork point may sit and still have a retained snapshot to revert to). It does
-/// NOT bound the FORWARD reapply length — a shallow fork point beneath a long
-/// winning branch (the drain lagged the fork-choice tip) is cheap to revert and
-/// must reorg, not wedge. See `MAX_REORG_FORWARD` and `reorg_to`.
-pub(crate) const MAX_REORG_DEPTH: u64 = 100;
+/// fork point may sit). It does NOT bound the FORWARD reapply length — a
+/// shallow fork point beneath a long winning branch (the drain lagged the
+/// fork-choice tip) is cheap to revert and must reorg, not wedge. See
+/// `MAX_REORG_FORWARD` and `reorg_to`.
+pub(crate) const MAX_REORG_DEPTH: u64 = 10_000;
+
+/// Heights of full in-memory state snapshots the reorg ring keeps (the most
+/// recent ones). A snapshot copies every resident account (about 144 bytes
+/// each, `reorg_ring_memory_at_the_undo_window`), so a ring as deep as the
+/// undo window would hold 10,000 copies of the account map (1.4 GB per 1,000
+/// resident accounts). Deeper reverts read the undo records from disk instead.
+pub(crate) const SNAPSHOT_RING_DEPTH: u64 = 100;
 
 // The store keeps one undo record per applied height for exactly this window,
-// so a restart can rebuild the ring (see `restore_reorg_window`).
+// so a deep fork point (and a restart's ring) can be rebuilt from disk (see
+// `revert_from_undo`, `restore_reorg_window`).
 const _: () = assert!(MAX_REORG_DEPTH == citrate_storage::state::REORG_UNDO_DEPTH);
+const _: () = assert!(SNAPSHOT_RING_DEPTH <= MAX_REORG_DEPTH);
+// Undo window = prune retention (CV-7a): the default retention is the window,
+// and no retention below it is accepted.
+const _: () = assert!(MAX_REORG_DEPTH == crate::dag_prune::DEFAULT_RETAIN_BLOCKS);
+const _: () = assert!(crate::dag_prune::MIN_RETAIN_BLOCKS >= MAX_REORG_DEPTH);
 
 /// Memory guard on a single in-memory reorg's FORWARD reapply: the winning branch
 /// (fork point → new tip) is collected into a `Vec<Block>` and re-executed under
@@ -89,9 +110,12 @@ const _: () = assert!(MAX_REORG_DEPTH == citrate_storage::state::REORG_UNDO_DEPT
 /// fork-choice head would balloon memory and hold the lock a long time. Beyond
 /// this, `reorg_to` returns `BeyondReorgWindow` and the runtime driver falls back
 /// to the memory-light (hash-only) from-genesis spine rebuild (`recover_to_head`).
-/// Generous enough to cover realistic drain lag / short outages on the fast path;
-/// the 2026-08-09 wedge (winning branch 513) sits well inside it.
-const MAX_REORG_FORWARD: u64 = 10_000;
+/// The branch is collected as hashes (blocks are read one at a time during the
+/// reapply), so this bounds lock time more than memory. Twice the undo window,
+/// so a fork point anywhere inside the window is reachable under a winning
+/// branch that is up to a window longer than the abandoned one; the 2026-08-09
+/// wedge (winning branch 513) sits well inside it.
+const MAX_REORG_FORWARD: u64 = 2 * MAX_REORG_DEPTH;
 
 /// [`MAX_REORG_FORWARD`], or a test's override on this thread.
 fn reorg_forward_cap() -> u64 {
@@ -404,8 +428,9 @@ pub struct AppliedTip {
 pub struct AppliedState {
     tip: AppliedTip,
     /// height → (that block's hash, executor state AS-OF that block). Pruned to
-    /// the most recent `MAX_REORG_DEPTH` heights (below the reorg window is
-    /// unrevertible). One entry per applied height on the current applied chain.
+    /// the most recent `SNAPSHOT_RING_DEPTH` heights; deeper fork points inside
+    /// the reorg window are rebuilt from the store's undo records. One entry per
+    /// applied height on the current applied chain.
     snapshots: BTreeMap<u64, (Hash, StateSnapshot)>,
 }
 
@@ -423,7 +448,7 @@ impl AppliedState {
     fn record(&mut self, hash: Hash, height: u64, snapshot: StateSnapshot) {
         self.tip = AppliedTip { hash, height };
         self.snapshots.insert(height, (hash, snapshot));
-        let floor = height.saturating_sub(MAX_REORG_DEPTH);
+        let floor = height.saturating_sub(SNAPSHOT_RING_DEPTH);
         self.snapshots.retain(|h, _| *h >= floor);
     }
 }
@@ -523,9 +548,10 @@ pub enum ReorgOutcome {
     },
     /// `new_tip` is already the applied tip — nothing to do.
     NoChange,
-    /// The reorg cannot be done IN MEMORY: the fork point is deeper than the
-    /// retained snapshot window (`MAX_REORG_DEPTH` below the applied tip), or the
-    /// forward branch exceeds `MAX_REORG_FORWARD`. This is NOT a refusal — the
+    /// The reorg cannot be done in place: the fork point is deeper than the
+    /// reorg window (`MAX_REORG_DEPTH` below the applied tip), or below the ring
+    /// with an undo record missing or not reproducing the fork block's root, or
+    /// the forward branch exceeds `MAX_REORG_FORWARD`. This is NOT a refusal — the
     /// winning branch is valid and heavier; it just needs the memory-light
     /// from-genesis spine rebuild (`recover_to_head`) instead of an in-memory
     /// revert+reapply. World state is left byte-identical (nothing was mutated).
@@ -876,10 +902,11 @@ impl CanonicalApplicator {
         // Seed the reorg ring with the current state as-of the seeded tip: the
         // executor reflects this tip's state at construction, so it is the base a
         // reorg can revert to before any new block is applied. Below it, the ring
-        // is rebuilt from the undo records the store keeps for the last
-        // `MAX_REORG_DEPTH` applied blocks, so a restarted node reverts a fork
-        // inside the window exactly as a node that never stopped (no replay from
-        // genesis, which a pruned node refuses).
+        // is rebuilt from the undo records for the last `SNAPSHOT_RING_DEPTH`
+        // heights (deeper fork points inside the `MAX_REORG_DEPTH` window are
+        // rebuilt from the records when a reorg needs them), so a restarted node
+        // reverts a fork inside the window exactly as a node that never stopped
+        // (no replay from genesis, which a pruned node refuses).
         let at_tip = executor.state_snapshot();
         let restored = restore_reorg_window(&storage, tip, &at_tip);
         if let Some((lowest, _, _)) = restored.last() {
@@ -991,15 +1018,18 @@ impl CanonicalApplicator {
     /// lock), so a tx whose nonce the winning branch spent is refused there.
     ///
     /// Source: the abandoned blocks' bodies in `storage.blocks` (they stay
-    /// stored after a reorg); the winning branch's bodies are `branch`.
-    async fn reinject_abandoned(&self, old_tip: AppliedTip, fork: AppliedTip, branch: &[Block]) {
+    /// stored after a reorg); `carried` is the hashes of the transactions in
+    /// the winning branch's bodies, collected as the reapply read them (since
+    /// S3-4 the branch is held as hashes and read one block at a time).
+    async fn reinject_abandoned(
+        &self,
+        old_tip: AppliedTip,
+        fork: AppliedTip,
+        carried: &std::collections::HashSet<Hash>,
+    ) {
         let Some(mempool) = self.mempool.as_ref() else {
             return;
         };
-        let carried: std::collections::HashSet<Hash> = branch
-            .iter()
-            .flat_map(|b| b.transactions.iter().map(|t| t.hash))
-            .collect();
         let mut abandoned: Vec<Vec<citrate_consensus::types::Transaction>> = Vec::new();
         let mut cursor = old_tip.hash;
         // The abandoned run is old_tip.height - fork.height blocks long (at most
@@ -1419,7 +1449,7 @@ impl CanonicalApplicator {
     /// The block at `height` on the applied chain ending at `state.tip`, or
     /// `None` above the tip or where the chain steps over `height`.
     ///
-    /// The reorg ring answers the last `MAX_REORG_DEPTH` heights, but after a
+    /// The reorg ring answers the last `SNAPSHOT_RING_DEPTH` heights, but after a
     /// restart only as far down as the undo records rebuilt it (possibly the
     /// tip alone). Below it the canonical height index answers (rewritten with
     /// every durable tip write) when it describes this very tip; otherwise the
@@ -1997,8 +2027,21 @@ impl CanonicalApplicator {
         // only a fork point genuinely below the retained window is `BeyondReorgWindow`
         // (→ the runtime spine rebuild), and the forward length is bounded separately
         // by `MAX_REORG_FORWARD` purely to cap this Vec's memory.
+        //
+        // S3-4 (CV-7a): the revert floor is the undo window (`MAX_REORG_DEPTH`
+        // = the prune retention), not the in-memory ring. A fork point below the
+        // ring is recognised on the applied chain by one descending header walk
+        // (`AppliedWalk`), and its state is rebuilt from the undo records below.
         let revert_floor = state.tip.height.saturating_sub(MAX_REORG_DEPTH);
-        let mut branch: Vec<Block> = Vec::new(); // new_tip .. fork_point+1
+        let ring_low = state
+            .snapshots
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(state.tip.height);
+        let mut below_ring = AppliedWalk::new(&self.storage, state.tip);
+        // new_tip .. fork_point+1, as (hash, height, claimed state root).
+        let mut branch: Vec<(Hash, u64, Hash)> = Vec::new();
         let mut cursor = new_tip;
         let fork = loop {
             let block = match read_block(&self.storage, &cursor) {
@@ -2021,6 +2064,15 @@ impl CanonicalApplicator {
                             };
                         }
                     }
+                    // The sentinel below the ring: the fork point is genesis
+                    // and it has no stored block to check a rebuilt state
+                    // against, so the switch is the from-genesis rebuild.
+                    if cursor == Hash::default() {
+                        return ReorgOutcome::BeyondReorgWindow {
+                            new_tip,
+                            stopped_at: 0,
+                        };
+                    }
                     return ReorgOutcome::Rejected(format!(
                         "reorg to {new_tip}: missing block {cursor} on branch"
                     ));
@@ -2033,6 +2085,31 @@ impl CanonicalApplicator {
                         hash: cursor,
                         height: h,
                     }; // fork point (the base)
+                }
+            } else if h < ring_low && h > revert_floor && h <= state.tip.height {
+                // Below the ring, inside the window: on the applied chain?
+                match below_ring.hash_at(h) {
+                    Ok(Some(applied)) if applied == cursor => {
+                        break AppliedTip {
+                            hash: cursor,
+                            height: h,
+                        };
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // The applied chain cannot be followed below the ring
+                        // (a header missing, e.g. the tip purged at start-up):
+                        // no fork point can be proven here, so the switch is
+                        // the rebuild path's, as for any fork below the ring
+                        // before S3-4. Nothing has changed yet.
+                        debug!(
+                            "execute-on-receive: reorg to {new_tip}: applied chain unreadable below the ring at {h}: {e}"
+                        );
+                        return ReorgOutcome::BeyondReorgWindow {
+                            new_tip,
+                            stopped_at: h,
+                        };
+                    }
                 }
             }
             // NB: do NOT bail on `block.is_genesis()` — that is true for any
@@ -2060,7 +2137,7 @@ impl CanonicalApplicator {
                 };
             }
             cursor = block.selected_parent();
-            branch.push(block);
+            branch.push((block.header.block_hash, h, block.state_root));
         };
 
         // I4: never revert below the finalized floor (including a registered
@@ -2102,14 +2179,51 @@ impl CanonicalApplicator {
         // Revert IN-MEMORY state to the fork point. `base_snapshot` is RETAINED
         // (cloned into `state_restore`) because it is also the reconcile baseline for
         // both the success (forward) and abort (restore) store writes below.
+        // Below the ring the fork-point state is rebuilt from the undo records
+        // (S3-4), checked against the fork block's state root; a record that is
+        // missing or does not reproduce it leaves the reorg to the rebuild /
+        // dead-branch path, with nothing changed.
         let base_snapshot = match state.snapshots.get(&fork.height) {
             Some((_, snap)) => snap.clone(),
-            None => {
-                return ReorgOutcome::Rejected(format!(
-                    "reorg fork point snapshot missing at height {}",
-                    fork.height
-                ));
-            }
+            None => match state.snapshots.iter().next() {
+                Some((low_h, (low_hash, low_snap))) if *low_h > fork.height => {
+                    match revert_from_undo(
+                        &self.storage,
+                        AppliedTip {
+                            hash: *low_hash,
+                            height: *low_h,
+                        },
+                        low_snap,
+                        fork,
+                    ) {
+                        Ok(snap) => {
+                            info!(
+                                "execute-on-receive: reorg to {new_tip}: fork point {} @ {} rebuilt from {} undo record(s) below the ring",
+                                fork.hash,
+                                fork.height,
+                                low_h.saturating_sub(fork.height)
+                            );
+                            snap
+                        }
+                        Err(e) => {
+                            warn!(
+                                "execute-on-receive: reorg to {new_tip}: fork point {} @ {} cannot be rebuilt from the undo records: {e}",
+                                fork.hash, fork.height
+                            );
+                            return ReorgOutcome::BeyondReorgWindow {
+                                new_tip,
+                                stopped_at: fork.height,
+                            };
+                        }
+                    }
+                }
+                _ => {
+                    return ReorgOutcome::Rejected(format!(
+                        "reorg fork point snapshot missing at height {}",
+                        fork.height
+                    ));
+                }
+            },
         };
         self.executor.state_restore(base_snapshot.clone());
 
@@ -2179,7 +2293,21 @@ impl CanonicalApplicator {
         // reconciled ONCE, to the winning branch, only after the whole reorg succeeds.
         // Snapshots commit to the ring on success only.
         branch.reverse(); // fork_point+1 .. new_tip
-        let mut new_snaps: Vec<(u64, Hash, StateSnapshot)> = Vec::new();
+
+        // The last `SNAPSHOT_RING_DEPTH` reapplied states (for the ring) and one
+        // undo record per reapplied block inside the window at the new tip,
+        // computed as the reapply goes, so a branch as long as the window never
+        // holds more than a ring's worth of full snapshots.
+        let ring_cap = usize::try_from(SNAPSHOT_RING_DEPTH).unwrap_or(usize::MAX);
+        let mut new_snaps: std::collections::VecDeque<(u64, Hash, StateSnapshot)> =
+            std::collections::VecDeque::new();
+        let mut undo: Vec<citrate_execution::executor::BlockUndo> = Vec::new();
+        let undo_floor = branch
+            .last()
+            .map(|(_, h, _)| *h)
+            .unwrap_or(fork.height)
+            .saturating_sub(MAX_REORG_DEPTH);
+        let mut prev: (Hash, u64, StateSnapshot) = (fork.hash, fork.height, base_snapshot.clone());
         let mut tip = fork;
 
         // VALIDATOR-S1 §R' — ACTIVATION-BOUNDARY FIX (chain 40204 cold-sync wedge at
@@ -2238,7 +2366,39 @@ impl CanonicalApplicator {
 
         // C1-R: the winning branch's receipts, committed with its state + tip below.
         let mut win_index = ReceiptIndexBatch::default();
-        for block in &branch {
+        // The winning branch's tx hashes, for the re-injection after the commit.
+        let mut carried: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        for (branch_hash, _, _) in &branch {
+            let block = match read_block(&self.storage, branch_hash) {
+                Ok(Some(b)) => b,
+                other => {
+                    let e = match other {
+                        Err(e) => e.to_string(),
+                        _ => "not stored".to_string(),
+                    };
+                    self.executor.state_restore(pre_state.clone());
+                    self.executor.restore_reward_policy(pre_policy.clone());
+                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                        &base_snapshot,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &restore_index,
+                    ) {
+                        warn!(
+                            "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
+                            new_tip
+                        );
+                    }
+                    warn!(
+                        "execute-on-receive: reorg to {new_tip} aborted — branch block {branch_hash} unreadable: {e} (reverted to {})",
+                        pre_tip.hash
+                    );
+                    return ReorgOutcome::Rejected(format!(
+                        "reorg to {new_tip}: branch block {branch_hash}: {e}"
+                    ));
+                }
+            };
+            let block = &block;
+            carried.extend(block.transactions.iter().map(|t| t.hash));
             let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
                 self.reward_credits(b, r)
             };
@@ -2255,7 +2415,23 @@ impl CanonicalApplicator {
                         hash: hh,
                         height: h,
                     };
-                    new_snaps.push((h, hh, self.executor.state_snapshot()));
+                    let snap = self.executor.state_snapshot();
+                    if h > undo_floor {
+                        let (accounts, storage) = snap.pre_images_since(&prev.2);
+                        undo.push(citrate_execution::executor::BlockUndo {
+                            height: h,
+                            hash: hh,
+                            parent: Some((prev.0, prev.1)),
+                            accounts,
+                            storage,
+                            models_jobs: Some(snap.model_job_pre_images_since(&prev.2)),
+                        });
+                    }
+                    if new_snaps.len() >= ring_cap {
+                        new_snaps.pop_front();
+                    }
+                    new_snaps.push_back((h, hh, snap.clone()));
+                    prev = (hh, h, snap);
                     // VALIDATOR-S1 §R': if this reapplied block is a snapshot boundary
                     // S(E), re-materialize the REWARD-POLICY half NOW (against the just-
                     // reapplied new-branch state), so every subsequent reapplied block's
@@ -2339,10 +2515,10 @@ impl CanonicalApplicator {
         // reconcile (and came AFTER a state batch that OMITTED the tip) was the bug. The
         // `put_applied_tip` below is kept only as a redundant idempotent re-write (and as
         // the durable write for store-less test executors); see its comment.
-        // The undo records of the winning branch's last `MAX_REORG_DEPTH` blocks,
-        // from the states the reapply just produced, commit with it, so a restart
-        // keeps the window on the new branch.
-        let undo = branch_undo(fork, &base_snapshot, &new_snaps, tip.height);
+        // The undo records of the winning branch's blocks inside the window,
+        // computed from the states the reapply produced, commit with it, so a
+        // restart (and a later deep reorg) keeps the window on the new branch.
+        drop(prev);
         if let Err(e) = self.executor.reconcile_store_from_with_undo(
             &base_snapshot,
             Some((tip.hash, tip.height)),
@@ -2374,28 +2550,26 @@ impl CanonicalApplicator {
         }
         // Persist the new branch's state roots + re-sync the selector at any S(E)
         // the reorg crossed (deferred to here so an abort writes nothing durable).
-        for block in &branch {
-            if let Err(e) = self
-                .storage
-                .state
-                .put_state_root(&block.header.block_hash, &block.state_root)
-            {
+        for (block_hash, height, state_root) in &branch {
+            if let Err(e) = self.storage.state.put_state_root(block_hash, state_root) {
                 warn!(
                     "execute-on-receive: failed to persist state root for {}: {}",
-                    block.header.block_hash, e
+                    block_hash, e
                 );
             }
-            self.maybe_sync_registry(block.header.height).await;
+            self.maybe_sync_registry(*height).await;
         }
 
-        // Commit: adopt the new tip, merge new-branch snapshots, drop the stale
-        // abandoned-branch snapshots (heights above the new tip) and prune the
-        // window, then persist the pointer once.
+        // Commit: adopt the new tip, drop every abandoned-branch snapshot (all
+        // heights above the fork point), merge the new-branch snapshots and
+        // prune the ring, then persist the pointer once.
         state.tip = tip;
+        let fork_height = fork.height;
+        state.snapshots.retain(|h, _| *h <= fork_height);
         for (h, hh, snap) in new_snaps {
             state.snapshots.insert(h, (hh, snap));
         }
-        let floor = tip.height.saturating_sub(MAX_REORG_DEPTH);
+        let floor = tip.height.saturating_sub(SNAPSHOT_RING_DEPTH);
         state
             .snapshots
             .retain(|h, _| *h <= tip.height && *h >= floor);
@@ -2426,7 +2600,7 @@ impl CanonicalApplicator {
             pre_tip.height.saturating_sub(fork.height),
             branch.len()
         );
-        self.reinject_abandoned(pre_tip, fork, &branch).await;
+        self.reinject_abandoned(pre_tip, fork, &carried).await;
         ReorgOutcome::Reorged {
             new_tip: tip.hash,
             height: tip.height,
@@ -3748,8 +3922,9 @@ fn hydrated_pre_images(storage: &[StoragePreImage], full: bool) -> Vec<StoragePr
 /// block is stored at the height below, and the rebuilt state reproduces that
 /// block's state root. The walk stops at the first height that fails (a
 /// missing record only shortens the window; it never yields a wrong state),
-/// where the storage-root hydration rule changes, or `MAX_REORG_DEPTH` below
-/// the tip. Nothing is rebuilt unless `at_tip` reproduces the tip's own root.
+/// where the storage-root hydration rule changes, or `SNAPSHOT_RING_DEPTH`
+/// below the tip (deeper heights are rebuilt on demand by
+/// [`revert_from_undo`], never held in memory). Nothing is rebuilt unless `at_tip` reproduces the tip's own root.
 /// Returned highest first.
 ///
 /// LIMIT (models and training jobs): they are outside the state root, are not
@@ -3791,7 +3966,7 @@ fn restore_reorg_window(
     }
     let activation = storage_root_hardening_height();
     let full = active_at(activation, tip.height.saturating_add(1));
-    let floor = tip.height.saturating_sub(MAX_REORG_DEPTH);
+    let floor = tip.height.saturating_sub(SNAPSHOT_RING_DEPTH);
     let mut above = at_tip.clone();
     while block.header.height > floor {
         let height = block.header.height;
@@ -3876,34 +4051,138 @@ fn restore_reorg_window(
     out
 }
 
-/// The undo records of a reorg's winning branch: for each reapplied block in
-/// the window at the new tip `tip`, the pre-images, in the state of its
-/// parent, of what it changed. `fork`/`base` are the fork point and its state;
-/// `branch` the reapplied blocks with their post-states, in order.
-fn branch_undo(
+/// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2): the state of the applied
+/// block `fork`, rebuilt from the state `from_state` of the applied block
+/// `from` above it and the undo records of every height in
+/// `fork.height+1 ..= from.height`, read from the store (disk-backed: nothing
+/// deeper than the snapshot ring is held in memory).
+///
+/// Each record is checked the way [`restore_reorg_window`] checks it: it names
+/// the block the walk is on (a selected-parent walk of the stored headers from
+/// `from`) and that block's parent one height below, it carries model/job
+/// pre-images, and the storage-root hydration rule does not change across the
+/// range. The pre-images are merged lowest-height-wins (the value before the
+/// first block above `fork` changed it) and applied once, and the result must
+/// reproduce the fork block's committed state root. Any failure is an `Err`
+/// and nothing is changed: a missing record never yields a wrong state.
+///
+/// Data source: `StateStore::get_reorg_undo` (`CF_METADATA reorg_undo:`),
+/// `BlockStore::get_header` / `get_block` (`CF_HEADERS`, `CF_BLOCKS`).
+///
+/// LIMIT (models and training jobs) as in [`restore_reorg_window`].
+fn revert_from_undo(
+    storage: &StorageManager,
+    from: AppliedTip,
+    from_state: &StateSnapshot,
     fork: AppliedTip,
-    base: &StateSnapshot,
-    branch: &[(u64, Hash, StateSnapshot)],
-    tip: u64,
-) -> Vec<citrate_execution::executor::BlockUndo> {
-    let floor = tip.saturating_sub(MAX_REORG_DEPTH);
-    let mut out = Vec::new();
-    let mut prev: (Hash, u64, &StateSnapshot) = (fork.hash, fork.height, base);
-    for (height, hash, snap) in branch {
-        if *height > floor {
-            let (accounts, storage) = snap.pre_images_since(prev.2);
-            out.push(citrate_execution::executor::BlockUndo {
-                height: *height,
-                hash: *hash,
-                parent: Some((prev.0, prev.1)),
-                accounts,
-                storage,
-                models_jobs: Some(snap.model_job_pre_images_since(prev.2)),
-            });
-        }
-        prev = (*hash, *height, snap);
+) -> Result<StateSnapshot, String> {
+    use citrate_execution::state::state_db::{AccountPreImage, StoragePreImage};
+    use citrate_execution::storage_root_hardening::{active_at, storage_root_hardening_height};
+    use std::collections::HashMap;
+    if fork.height >= from.height {
+        return Err(format!(
+            "fork point {} is not below {}",
+            fork.height, from.height
+        ));
     }
-    out
+    let fork_block = read_block(storage, &fork.hash)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("fork block {} not stored", fork.hash))?;
+    if fork_block.header.height != fork.height {
+        return Err(format!(
+            "fork block {} is stored at {}, not {}",
+            fork.hash, fork_block.header.height, fork.height
+        ));
+    }
+    let activation = storage_root_hardening_height();
+    let full = active_at(activation, from.height.saturating_add(1));
+    let mut accounts: HashMap<citrate_execution::types::Address, AccountPreImage> = HashMap::new();
+    let mut slots: HashMap<(citrate_execution::types::Address, Vec<u8>), StoragePreImage> =
+        HashMap::new();
+    let mut models = HashMap::new();
+    let mut jobs = HashMap::new();
+    let mut cursor = from.hash;
+    let mut height = from.height;
+    while height > fork.height {
+        let below = height
+            .checked_sub(1)
+            .ok_or_else(|| "walk passed genesis".to_string())?;
+        let record = storage
+            .state
+            .get_reorg_undo(height)
+            .map_err(|e| format!("undo record at {height}: {e}"))?
+            .ok_or_else(|| format!("no undo record at {height}"))?;
+        if record.hash != cursor || record.height != height {
+            return Err(format!(
+                "the record at {height} names {} @ {}, not {cursor}",
+                record.hash, record.height
+            ));
+        }
+        let header = storage
+            .blocks
+            .get_header(&cursor)
+            .map_err(|e| format!("header {cursor}: {e}"))?
+            .ok_or_else(|| format!("header {cursor} not stored"))?;
+        if header.height != height {
+            return Err(format!(
+                "header {cursor} is at {}, not {height}",
+                header.height
+            ));
+        }
+        let parent = header.selected_parent_hash;
+        if record.parent != Some((parent, below)) {
+            return Err(format!(
+                "the record at {height} names another parent, or none"
+            ));
+        }
+        if active_at(activation, height) != full {
+            return Err(format!(
+                "the storage-root hydration rule changes at {height}"
+            ));
+        }
+        let models_jobs = record
+            .models_jobs
+            .as_ref()
+            .ok_or_else(|| format!("the record at {height} has no model/job pre-images"))?;
+        // Descending heights: a later (lower) record's pre-image wins.
+        for pre in &record.accounts {
+            accounts.insert(pre.0, pre.clone());
+        }
+        for pre in hydrated_pre_images(&record.storage, full) {
+            slots.insert((pre.0, pre.1.clone()), pre);
+        }
+        for (id, m) in &models_jobs.models {
+            models.insert(*id, m.clone());
+        }
+        for (id, j) in &models_jobs.jobs {
+            jobs.insert(*id, j.clone());
+        }
+        cursor = parent;
+        height = below;
+    }
+    if cursor != fork.hash {
+        return Err(format!(
+            "the applied chain from {} reaches {cursor} at {}, not the fork point {}",
+            from.hash, fork.height, fork.hash
+        ));
+    }
+    let accounts: Vec<AccountPreImage> = accounts.into_values().collect();
+    let slots: Vec<StoragePreImage> = slots.into_values().collect();
+    let models_jobs = citrate_execution::executor::ModelJobUndo {
+        models: models.into_iter().collect(),
+        jobs: jobs.into_iter().collect(),
+    };
+    let reverted = from_state
+        .with_pre_images(&accounts, &slots, fork.height)
+        .with_model_job_pre_images(&models_jobs);
+    let (root, snap) = rooted(reverted, fork.height);
+    if root != fork_block.state_root {
+        return Err(format!(
+            "the rebuilt state does not reproduce the root of {} @ {} (got {root}, block has {})",
+            fork.hash, fork.height, fork_block.state_root
+        ));
+    }
+    Ok(snap)
 }
 
 /// Whether a from-genesis rebuild the node triggers itself
@@ -4088,6 +4367,16 @@ pub(crate) mod tests {
             .calculate_reward(block)
             .expect("canonical reward");
         (r.validator_reward, r.treasury_reward)
+    }
+
+    /// S3-3c: the replay harness restates the block-reward rule so it never
+    /// imports the node (spec 06 §8.3). It must be this rule.
+    #[test]
+    fn replay_reference_reward_rule_matches_the_node() {
+        assert_eq!(
+            serde_json::to_value(citrate_replay_ref::reference_reward_config()).expect("reference"),
+            serde_json::to_value(canonical_reward_config()).expect("node"),
+        );
     }
 
     /// Post-execution state root a reward-only block must produce, computed on a
@@ -5596,8 +5885,8 @@ pub(crate) mod tests {
         let (exec, storage, _dir) = fresh();
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
 
-        // Winning branch far longer than MAX_REORG_DEPTH, forking at genesis.
-        const N: u64 = MAX_REORG_DEPTH + 30; // 130 > 100
+        // Winning branch far longer than the snapshot ring, forking at genesis.
+        const N: u64 = SNAPSHOT_RING_DEPTH + 30; // 130 > 100
         let r = roots(N);
 
         // Applied tip: a single losing sibling a1 @ 1 (forks at genesis, like the
@@ -5666,7 +5955,9 @@ pub(crate) mod tests {
         let (exec, storage, _dir) = fresh();
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
 
-        const DEPTH: u64 = MAX_REORG_DEPTH + 5; // losing branch deeper than the ring
+        // Losing branch deeper than the ring. This executor has no state store,
+        // so there are no undo records below the ring (S3-4).
+        const DEPTH: u64 = SNAPSHOT_RING_DEPTH + 5;
         let r = roots(DEPTH + 1);
 
         // Apply a losing A-branch DEPTH blocks deep (fork point = genesis, now far
@@ -5710,7 +6001,7 @@ pub(crate) mod tests {
             } => {
                 assert_eq!(new_tip, b_tip);
                 assert!(
-                    stopped_at <= state.tip.height.saturating_sub(MAX_REORG_DEPTH),
+                    stopped_at <= state.tip.height.saturating_sub(SNAPSHOT_RING_DEPTH),
                     "stopped at/below the retained floor (stopped_at={stopped_at})"
                 );
             }
@@ -5736,7 +6027,7 @@ pub(crate) mod tests {
         let (exec, storage, _dir) = fresh();
         let genesis_state = exec.state_snapshot(); // empty genesis world state
 
-        const DEPTH: u64 = MAX_REORG_DEPTH + 5;
+        const DEPTH: u64 = SNAPSHOT_RING_DEPTH + 5; // store-less: no undo records
         let r = roots(DEPTH + 1);
 
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
@@ -5817,9 +6108,10 @@ pub(crate) mod tests {
         let genesis_state = exec.state_snapshot();
 
         // LOSING branch is LONGER than the ring — its top pins get_latest_height.
-        const LOSER_DEPTH: u64 = MAX_REORG_DEPTH + 5; // 105
-                                                      // WINNING (fork-choice) branch is SHORTER — heavier by blue score in reality,
-                                                      // but at a LOWER height. Forks at genesis, below the retained ring.
+        // 105, store-less (no undo records below the ring).
+        const LOSER_DEPTH: u64 = SNAPSHOT_RING_DEPTH + 5;
+        // WINNING (fork-choice) branch is SHORTER — heavier by blue score in reality,
+        // but at a LOWER height. Forks at genesis, below the retained ring.
         const WINNER_DEPTH: u64 = 50;
         let r = roots(LOSER_DEPTH + 1);
 
@@ -5890,7 +6182,7 @@ pub(crate) mod tests {
         let (exec, storage, _dir) = fresh();
         let genesis_state = exec.state_snapshot();
 
-        const DEPTH: u64 = MAX_REORG_DEPTH + 5;
+        const DEPTH: u64 = SNAPSHOT_RING_DEPTH + 5; // store-less: no undo records
         let r = roots(DEPTH + 1);
         let hydrated = Arc::new(AtomicBool::new(false));
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone())
@@ -8515,7 +8807,7 @@ pub(crate) mod tests {
 
     /// TRACK 1 — RESIDUAL CLOSED AT SCALE (§R' vesting). Randomize fork depth and
     /// vest amounts over many seeds; the victim must converge with the golden node
-    /// every time. Includes explicit near-`MAX_REORG_DEPTH` fork depths.
+    /// every time. Includes explicit near-`SNAPSHOT_RING_DEPTH` fork depths.
     #[tokio::test]
     async fn refuzz_vesting_reorg_converges_at_scale() {
         let mut seed = 0xCAFE_F00D_1234_5678u64;
@@ -8529,7 +8821,7 @@ pub(crate) mod tests {
             cases += 1;
         }
         assert_eq!(cases, 40);
-        // Explicit deep fork depths near MAX_REORG_DEPTH=100 (must still converge).
+        // Explicit deep fork depths near the snapshot ring (100; must still converge).
         for &(da, db) in &[(1u64, 20u64), (3, 50), (2, 90), (1, 99)] {
             run_vesting_convergence(da, db, 1, 1).await;
         }
@@ -13825,9 +14117,11 @@ pub(crate) mod tests {
         /// the window: `reorg_to` reports it as before and changes nothing.
         #[tokio::test]
         async fn restarted_node_still_refuses_a_fork_deeper_than_the_window() {
-            let (main, snaps) = rsr_main(150).await;
-            let fork = 150 - MAX_REORG_DEPTH - 5;
-            let side = rsr_fork(&main, &snaps, fork, 120, [0x5B; 32], CAROL).await;
+            let top = MAX_REORG_DEPTH + 50;
+            let (main, snaps) = rsr_main(top).await;
+            let fork = top - MAX_REORG_DEPTH - 5;
+            let side = rsr_fork(&main, &snaps, fork, MAX_REORG_DEPTH + 20, [0x5B; 32], CAROL).await;
+            drop(snaps);
             let head = side.last().expect("side").clone();
             let (storage, _dir) = rsr_node().await;
             let exec = rsr_hydrated(&storage);
@@ -13845,20 +14139,214 @@ pub(crate) mod tests {
                 app.reorg_to(&mut state, head.header.block_hash).await
             };
             assert!(
-                matches!(out, ReorgOutcome::BeyondReorgWindow { stopped_at, .. } if stopped_at <= 150 - MAX_REORG_DEPTH),
+                matches!(out, ReorgOutcome::BeyondReorgWindow { stopped_at, .. } if stopped_at <= top - MAX_REORG_DEPTH),
                 "a fork {} below the tip is beyond the window: {out:?}",
-                150 - fork
+                top - fork
             );
-            assert_eq!(app.applied_tip().await.height, 150);
+            assert_eq!(app.applied_tip().await.height, top);
             assert_eq!(exec.calculate_state_root(), before, "state untouched");
             assert_eq!(
                 storage.blocks.get_applied_tip().expect("tip").map(|t| t.1),
-                Some(150)
+                Some(top)
+            );
+        }
+
+        /// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2, root cause H6): the
+        /// undo window equals the DAG prune retention. A running node forked
+        /// `retention - 1` blocks below its tip (far below the in-memory
+        /// snapshot ring) switches to the heavier branch in place, from the
+        /// undo records on disk: the durable tip never goes below the fork
+        /// point (no rebuild from genesis, which a pruned node refuses), and
+        /// memory and the durable store end on the winner's state root.
+        #[tokio::test]
+        async fn reorg_at_retention_minus_one_succeeds() {
+            let retain = crate::dag_prune::DEFAULT_RETAIN_BLOCKS;
+            let tip_height = retain + 50;
+            let depth = retain - 1;
+            let fork = tip_height - depth;
+            let (main, snaps) = rsr_main(tip_height).await;
+            let side = rsr_fork(&main, &snaps, fork, depth + 1, [0x5B; 32], CAROL).await;
+            drop(snaps);
+            let head = side.last().expect("side").clone();
+
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                assert!(
+                    matches!(app.apply_received(b).await, ApplyOutcome::Applied { .. }),
+                    "fixture: block {} applies",
+                    b.header.height
+                );
+            }
+            assert_eq!(app.applied_tip().await.height, tip_height, "fixture: tip");
+            for b in &side {
+                persist(&storage, b);
+            }
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            let watch = LowestTip::start(storage.clone());
+            app.drive_drain().await;
+            let lowest = watch.finish();
+
+            assert_eq!(
+                app.applied_tip().await,
+                AppliedTip {
+                    hash: head.header.block_hash,
+                    height: head.header.height
+                },
+                "a fork {depth} below the tip (retention {retain} minus one) is switched in place"
+            );
+            assert!(
+                lowest >= fork,
+                "the switch went below the fork point {fork} (lowest durable tip {lowest})"
+            );
+            assert_eq!(exec.calculate_state_root(), head.state_root, "memory");
+            assert_eq!(
+                rsr_hydrated(&storage).calculate_state_root(),
+                head.state_root,
+                "durable state"
+            );
+            let ring = ring_heights(&app).await;
+            assert!(
+                ring.len() as u64 <= SNAPSHOT_RING_DEPTH + 1,
+                "the deep reorg left {} full snapshots in memory",
+                ring.len()
+            );
+            assert_eq!(ring.last().copied(), Some(head.header.height));
+            assert_eq!(
+                storage.state.reorg_undo_heights().expect("heights").len() as u64,
+                MAX_REORG_DEPTH,
+                "the new branch's undo records cover the whole window"
+            );
+        }
+
+        /// S3-3c (spec 06 §8.3, I6): a node that switched a fork deeper than
+        /// the snapshot ring from its undo records, then restarted and kept
+        /// applying, is recorded from its data dir (read-only, while open)
+        /// and replayed by the independent reference path
+        /// (`tools/replay-ref`): every applied block's committed root matches
+        /// a plain linear replay from genesis. A recording with one block of
+        /// the winning branch changed is reported at exactly that height.
+        #[tokio::test]
+        async fn a_deep_reorg_replays_with_zero_divergence() {
+            use citrate_replay_ref::{record_data_dir, replay, ReplayConfig, SelectedChain};
+            let tip_height = 400u64;
+            let fork = tip_height - 300;
+            let (main, snaps) = rsr_main(tip_height).await;
+            let side = rsr_fork(&main, &snaps, fork, 320, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            let (storage, dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                app.apply_received(b).await;
+            }
+            for b in &side {
+                persist(&storage, b);
+            }
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.drive_drain().await;
+            assert_eq!(
+                app.applied_tip().await.hash,
+                head.header.block_hash,
+                "fixture: the 300-deep switch"
+            );
+            drop(app);
+            // Restart, then keep applying on the winner.
+            let exec = rsr_hydrated(&storage);
+            let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let more = rsr_extend(
+                exec.state_snapshot(),
+                head.header.block_hash,
+                head.header.height + 1,
+                5,
+                [0x5B; 32],
+                CAROL,
+            )
+            .await
+            .0;
+            for b in &more {
+                persist(&storage, b);
+                assert!(matches!(
+                    app.apply_received(b).await,
+                    ApplyOutcome::Applied { .. }
+                ));
+            }
+            let mut cfg = ReplayConfig::from_process(exec.chain_id());
+            let mut fund = [0u8; 32];
+            U256::from(FUND).to_big_endian(&mut fund);
+            cfg.genesis_alloc = vec![(ALICE, fund)];
+            let rec = record_data_dir(dir.path(), cfg).expect("record the live data dir");
+            let top = head.header.height + 5;
+            assert_eq!(rec.applied_tip.1, top);
+            assert_eq!(rec.chain.len() as u64, top + 1, "genesis sentinel..=tip");
+            let report = replay(&rec, &SelectedChain).await.expect("replay");
+            assert_eq!(report.divergence, None, "{report:?}");
+            assert_eq!(report.matched, top);
+            assert!(
+                report.committed_compared >= top - fork,
+                "every block of the winning branch has a committed root: {report:?}"
+            );
+            let k = fork + 150;
+            let mut bad = rec.clone();
+            bad.chain_block_mut(k).expect("block k").transactions[0].value += 1;
+            let report = replay(&bad, &SelectedChain).await.expect("replay");
+            assert_eq!(
+                report.divergence.as_ref().map(|d| d.height),
+                Some(k),
+                "{report:?}"
+            );
+        }
+
+        /// S3-4 open question from the recovery lane: the memory of an
+        /// in-memory reorg ring as deep as the undo window. Each ring entry is
+        /// a full `StateSnapshot`, which copies every resident account (storage
+        /// tries are shared copy-on-write), so the cost is the account map
+        /// times the depth. Measured on a 1,000-account state; prints
+        /// `S3-4 ring memory` (run with `--nocapture`). At 10,000 heights it
+        /// is over a gigabyte per thousand resident accounts, so the ring stays
+        /// at `SNAPSHOT_RING_DEPTH` and the window below it is read from the
+        /// undo records on disk (`revert_from_undo`).
+        #[test]
+        fn reorg_ring_memory_at_the_undo_window() {
+            let exec = Executor::new(Arc::new(StateDB::new()));
+            const ACCOUNTS: u32 = 1_000;
+            for i in 0..ACCOUNTS {
+                let mut a = [0xA5u8; 20];
+                a[16..].copy_from_slice(&i.to_be_bytes());
+                exec.set_balance(&Address(a), U256::from(1_000u64 + u64::from(i)));
+            }
+            let snap = exec.state_snapshot();
+            let n = snap.account_entries().len();
+            assert_eq!(n, ACCOUNTS as usize, "fixture: resident accounts");
+            let per_account =
+                std::mem::size_of::<(Address, citrate_execution::types::AccountState)>();
+            let per_snapshot = std::mem::size_of_val(snap.account_entries());
+            let ring_at_window = per_snapshot as u64 * MAX_REORG_DEPTH;
+            let ring_now = per_snapshot as u64 * SNAPSHOT_RING_DEPTH;
+            println!(
+                "S3-4 ring memory: {per_account} bytes per resident account, {per_snapshot} \
+                 bytes per snapshot of {n} accounts; ring of {SNAPSHOT_RING_DEPTH} = {:.1} MiB, \
+                 ring of {MAX_REORG_DEPTH} = {:.2} GiB (per 1,000 resident accounts)",
+                ring_now as f64 / (1024.0 * 1024.0),
+                ring_at_window as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+            assert!(per_account >= 100, "account entry: {per_account} bytes");
+            assert!(
+                ring_at_window >= 1_000_000_000,
+                "a window-deep ring is {ring_at_window} bytes per 1,000 accounts"
+            );
+            assert!(
+                ring_now * 50 <= ring_at_window,
+                "the in-memory ring is not bounded well below the window"
             );
         }
 
         /// The store keeps undo records for exactly the last MAX_REORG_DEPTH
-        /// applied heights, through linear growth and through a reorg.
+        /// applied heights (all of them while the chain is shorter than the
+        /// window), through linear growth and through a reorg.
         #[tokio::test]
         async fn undo_records_cover_exactly_the_last_window() {
             let (main, snaps) = rsr_main(150).await;
@@ -13871,7 +14359,7 @@ pub(crate) mod tests {
             }
             assert_eq!(
                 storage.state.reorg_undo_heights().expect("heights"),
-                (151 - MAX_REORG_DEPTH..=150).collect::<Vec<u64>>(),
+                ((150u64.saturating_sub(MAX_REORG_DEPTH) + 1)..=150).collect::<Vec<u64>>(),
                 "linear: the last {MAX_REORG_DEPTH} heights"
             );
             // A reorg 30 below the tip onto a longer branch (to 160).
@@ -13885,7 +14373,7 @@ pub(crate) mod tests {
             assert_eq!(app.applied_tip().await.height, 160, "fixture: reorged");
             assert_eq!(
                 storage.state.reorg_undo_heights().expect("heights"),
-                (161 - MAX_REORG_DEPTH..=160).collect::<Vec<u64>>(),
+                ((160u64.saturating_sub(MAX_REORG_DEPTH) + 1)..=160).collect::<Vec<u64>>(),
                 "after a reorg: the last {MAX_REORG_DEPTH} heights of the new chain"
             );
             for h in 121..=160u64 {
@@ -13927,8 +14415,8 @@ pub(crate) mod tests {
             let app = CanonicalApplicator::new(exec, storage.clone());
             assert_eq!(
                 ring_heights(&app).await,
-                (130 - MAX_REORG_DEPTH..=130).collect::<Vec<u64>>(),
-                "the restart rebuilds the whole reorg window"
+                (130 - SNAPSHOT_RING_DEPTH..=130).collect::<Vec<u64>>(),
+                "the restart rebuilds the whole snapshot ring (deeper heights stay on disk)"
             );
             let state = app.lock.lock().await;
             for (h, (hash, snap)) in &state.snapshots {
@@ -14583,7 +15071,19 @@ pub(crate) mod tests {
                 1,
                 "reorg_to commits the winning branch with its undo records"
             );
-            assert!(reorg.contains("branch_undo(fork, &base_snapshot, &new_snaps, tip.height)"));
+            // S3-4: each reapplied block's record is computed from its parent's
+            // state as the reapply goes (no full branch of snapshots is held),
+            // and a fork point below the ring is rebuilt from the records.
+            assert!(
+                reorg.contains("snap.pre_images_since(&prev.2)")
+                    && reorg.contains("undo.push(")
+                    && reorg.contains("&undo,"),
+                "reorg_to commits one undo record per reapplied block"
+            );
+            assert!(
+                reorg.contains("revert_from_undo("),
+                "reorg_to rebuilds a fork point below the ring from the undo records"
+            );
             assert!(
                 body(apply, "pub fn new(executor: Arc<Executor>").contains("restore_reorg_window(")
             );
