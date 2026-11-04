@@ -1,3 +1,6 @@
+
+> **Launch tokenomics: TBD before launch.** Supply, allocations, vesting, emissions, staking requirements, fees, and rewards are not finalized. More announcements coming soon. See the [current status and notice about earlier exploratory materials](https://docs.citrate.ai/chain/economics). Feedback: [support@citrate.ai](mailto:support@citrate.ai).
+
 # Citrate Smart Contracts
 
 30+ Solidity contracts powering Citrate's on-chain AI infrastructure, compute marketplace, learning center, and token economics. Built and tested with [Foundry](https://book.getfoundry.sh/).
