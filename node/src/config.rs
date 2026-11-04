@@ -1103,6 +1103,10 @@ mod tests {
         let main = include_str!("main.rs");
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
+        assert!(
+            include_str!("boot_state.rs").contains("storage.state.get_all_storage()"),
+            "hydrate_state_db reads the stored slots"
+        );
         let init = body
             .find("citrate_execution::storage_root_hardening::init_for_genesis(")
             .expect("start_node must publish the storage root hardening height");
@@ -1110,7 +1114,9 @@ mod tests {
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
             "ConsensusManifest::for_node(",
-            "storage.state.get_all_storage()",
+            // Hydration moved into boot_state::hydrate_state_db (S1-5);
+            // start_node's call to it is the hydration point.
+            "boot_state::hydrate_state_db(",
         ] {
             let at = body
                 .find(marker)
