@@ -1331,8 +1331,16 @@ pub(crate) mod tests {
             .find("hardening_rejoin::purge_invalid_post_activation(")
             .expect("start-up check");
         assert!(init < purge);
+        // State hydration lives in boot_state::hydrate_state_db (S1-5 shares it
+        // with the disk-reload harness); start_node must still call it after
+        // the check, and it must still read the stored accounts.
+        let hydrate = include_str!("boot_state.rs");
+        assert!(
+            hydrate.contains("storage.state.get_all_accounts()"),
+            "hydrate_state_db reads the stored accounts"
+        );
         for later in [
-            "storage.state.get_all_accounts()",
+            "boot_state::hydrate_state_db(",
             "DagStore::persistent_with_strict_vrf(",
             "CanonicalApplicator::new(",
             "BlockAdmission::new(",

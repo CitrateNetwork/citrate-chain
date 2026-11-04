@@ -698,6 +698,7 @@ impl RpcServer {
         // network height the sync driver has seen, so a stalled follower reads as
         // "syncing", not a bare "false". Falls back to the register_eth_methods stub
         // behaviour (false) when no sync signal is wired or we are at the tip.
+        let sync_highest_for_identity = sync_highest.clone();
         {
             let storage_syncing = storage.clone();
             io_handler.add_sync_method("eth_syncing", move |_params: jsonrpc_core::Params| {
@@ -1420,11 +1421,12 @@ impl RpcServer {
 
         // web3_clientVersion, citrate_nodeIdentity and citrate_getDagStats: the
         // node's real build + consensus identity (crate::node_rpc).
-        node_rpc::register_node_methods(
+        node_rpc::register_node_methods_with_sync(
             &mut io_handler,
             storage.clone(),
             chain_id,
             node_identity.map(Arc::new),
+            sync_highest_for_identity,
         );
 
         // eth_chainId (compatibility)

@@ -32,6 +32,54 @@ pub struct NodeConfig {
     /// Checkpoint configuration (WP-W.2)
     #[serde(default)]
     pub checkpoint: CheckpointNodeConfig,
+
+    /// Automatic recovery from a dead branch (ADR-2026-11-03 CV-7c).
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+}
+
+/// `[recovery]`: the guarded automatic cold resync (node/src/cold_resync.rs).
+///
+/// A node whose applied tip is held on a dead branch (the dead-branch marker,
+/// CV-7b) for `cold_resync_after_secs` moves its chain database aside (never
+/// deleted; the node identity keys stay) and resyncs from genesis via peers,
+/// at most once per `cold_resync_min_interval_hours`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// Allow the automatic cold resync. `false` leaves a wedged node wedged
+    /// (it still stops serving and sealing on the dead branch and reports
+    /// `syncState: wedged`) for an operator to resync by hand.
+    #[serde(default = "default_cold_resync")]
+    pub cold_resync: bool,
+    /// Minimum time between two automatic cold resyncs of this data dir.
+    #[serde(default = "default_cold_resync_min_interval_hours")]
+    pub cold_resync_min_interval_hours: u64,
+    /// How long the node must have been wedged before it resyncs.
+    #[serde(default = "default_cold_resync_after_secs")]
+    pub cold_resync_after_secs: u64,
+}
+
+fn default_cold_resync() -> bool {
+    true
+}
+
+fn default_cold_resync_min_interval_hours() -> u64 {
+    6
+}
+
+fn default_cold_resync_after_secs() -> u64 {
+    900
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            cold_resync: default_cold_resync(),
+            cold_resync_min_interval_hours: default_cold_resync_min_interval_hours(),
+            cold_resync_after_secs: default_cold_resync_after_secs(),
+        }
+    }
 }
 
 /// VRF configuration for proposer election verification.
@@ -473,6 +521,7 @@ impl Default for NodeConfig {
             validator: ValidatorConfig::default(),
             vrf: VrfConfig::default(),
             checkpoint: CheckpointNodeConfig::default(),
+            recovery: RecoveryConfig::default(),
         }
     }
 }
@@ -1054,6 +1103,10 @@ mod tests {
         let main = include_str!("main.rs");
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
+        assert!(
+            include_str!("boot_state.rs").contains("storage.state.get_all_storage()"),
+            "hydrate_state_db reads the stored slots"
+        );
         let init = body
             .find("citrate_execution::storage_root_hardening::init_for_genesis(")
             .expect("start_node must publish the storage root hardening height");
@@ -1061,7 +1114,9 @@ mod tests {
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
             "ConsensusManifest::for_node(",
-            "storage.state.get_all_storage()",
+            // Hydration moved into boot_state::hydrate_state_db (S1-5);
+            // start_node's call to it is the hydration point.
+            "boot_state::hydrate_state_db(",
         ] {
             let at = body
                 .find(marker)

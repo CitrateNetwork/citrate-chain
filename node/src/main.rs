@@ -31,15 +31,17 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod adapters;
 mod admission;
 mod artifact;
 mod block_serve;
+mod boot_state;
 pub mod bundled_model;
 mod canonical_apply;
+mod cold_resync;
 mod commands;
 mod config;
 mod consensus_manifest;
@@ -1800,6 +1802,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // encrypted-at-rest (AES-256-GCM per value) with the raw key from the parent
     // process's OS keyring; absent, the default plaintext path is used.
     let storage_encryption = at_rest_encryption_from_env()?;
+    // CV-7c: a cold resync the previous process requested (it was held on a
+    // dead branch it could not switch from) moves the chain database aside
+    // here, before it is opened; the node then syncs from genesis via peers.
+    let recovery_policy = cold_resync::Policy::from(&config.recovery);
+    cold_resync::apply_pending(&config.storage.data_dir, recovery_policy)?;
     let storage = Arc::new(StorageManager::with_config(
         &config.storage.data_dir,
         StorageConfig {
@@ -1883,154 +1890,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         storage.db.clone(),
     ));
 
-    // Load existing state from storage into memory
-    info!("Loading state from storage...");
-    match storage.state.get_all_accounts() {
-        Ok(accounts) => {
-            info!(
-                "Found {} accounts in storage, loading into memory...",
-                accounts.len()
-            );
-            for (address, account) in accounts {
-                debug!(
-                    "Loaded account: 0x{} with balance {}",
-                    hex::encode(address.0),
-                    account.balance
-                );
-                state_db.accounts.load_account(address, account);
-            }
-            info!("State loaded successfully");
-        }
-        Err(e) => {
-            warn!("Failed to load accounts from storage: {}", e);
-        }
-    }
-
-    // The applied tip = the block whose committed state the store holds. Fall back to
-    // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
-    // genesis), preserving the prior behavior for those.
-    let (boot_tip_hash, boot_tip_height) = storage
-        .blocks
-        .get_applied_tip()
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| {
-            let h = storage.blocks.get_latest_height().unwrap_or(0);
-            let hash = storage
-                .blocks
-                .get_block_by_height(h)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            (hash, h)
-        });
-
-    // C6 fix: Also load contract storage slots from persistent storage.
-    // From the storage-root hardening height (the next block this node executes)
-    // every persisted record is restored byte for byte; below it the legacy view
-    // (32-byte keys, values cut or padded to 32 bytes) is kept, so a restarted
-    // node rebuilds exactly the state it rebuilt before.
-    let full_hydration = citrate_execution::storage_root_hardening::active_at(
-        citrate_execution::storage_root_hardening::storage_root_hardening_height(),
-        boot_tip_height.saturating_add(1),
-    );
-    match storage.state.get_all_storage() {
-        Ok(records) => {
-            let storage_slots = boot_storage_view(
-                records,
-                citrate_execution::storage_root_hardening::storage_root_hardening_height(),
-                boot_tip_height,
-            );
-            info!(
-                "Found {} storage slots in storage, loading into memory ({} hydration)...",
-                storage_slots.len(),
-                if full_hydration { "full" } else { "legacy" }
-            );
-            for ((address, storage_key), storage_value) in storage_slots {
-                state_db.set_storage(
-                    address,
-                    storage_key.as_bytes().to_vec(),
-                    storage_value.as_bytes().to_vec(),
-                );
-            }
-            // Clear dirty flags since these are loaded from storage, not new writes
-            let _ = state_db.take_dirty_storage();
-            info!("Storage slots loaded successfully");
-        }
-        Err(e) => {
-            // Starting without contract storage would execute and root against
-            // a state this node never committed. Refuse instead.
-            error!("Failed to load storage slots from storage: {}", e);
-            return Err(anyhow::anyhow!(
-                "refusing to start: contract storage could not be hydrated: {e}"
-            ));
-        }
-    }
-
-    // SRP-S3b: verify the hydrated in-memory root reproduces the committed root of the
-    // APPLIED TIP — the block whose post-execution state the durable store reflects — NOT
-    // the latest stored block. A node legitimately stores blocks AHEAD of what it has
-    // applied (execute-on-receive downloads then drains; the producer persists the block
-    // before atomically advancing state+tip). Comparing against the latest BLOCK would
-    // false-positive whenever blocks lead the applied tip; the applied-tip pointer and the
-    // durable state are advanced ATOMICALLY (persist_state_changes_with_tip), so they must
-    // always agree — a mismatch means a genuinely corrupt/divergent reconstruction.
-    {
-        let (tip_hash, tip_height) = (boot_tip_hash, boot_tip_height);
-        // The hydrated state is the post-state of the applied tip: root it under
-        // that height's storage-root rule.
-        state_db.set_root_height(tip_height);
-        let memory_root = state_db.calculate_state_root();
-        if tip_height > 0 && tip_hash != citrate_consensus::types::Hash::default() {
-            let committed_root = storage
-                .state
-                .get_state_root(&tip_hash)
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    storage
-                        .blocks
-                        .get_block(&tip_hash)
-                        .ok()
-                        .flatten()
-                        .map(|b| b.state_root)
-                });
-            match committed_root {
-                Some(root) if root != citrate_consensus::types::Hash::default() => {
-                    if memory_root == root {
-                        info!(
-                            "State root verification PASSED (applied tip height {}, root={})",
-                            tip_height,
-                            hex::encode(&memory_root.as_bytes()[..8])
-                        );
-                    } else {
-                        // SRP-S3: a node whose hydrated root does NOT reproduce the applied
-                        // tip's committed root MUST NOT start — it would seal/verify against
-                        // a divergent root and fork the fleet. HARD-FAIL (safe local stop),
-                        // never warn-and-continue. See ADR-2026-07-21-restart-produce-purity.
-                        error!("SRP-S3 BOOT HALT: state root MISMATCH at applied tip height {}: memory={} committed={} — refusing to start (a node that cannot reconstruct the committed root would fork the fleet)",
-                            tip_height,
-                            hex::encode(memory_root.as_bytes()),
-                            hex::encode(root.as_bytes()));
-                        return Err(anyhow::anyhow!(
-                            "SRP-S3 boot halt: hydrated state root {} != committed root {} at applied tip height {}",
-                            hex::encode(memory_root.as_bytes()),
-                            hex::encode(root.as_bytes()),
-                            tip_height
-                        ));
-                    }
-                }
-                _ => {
-                    debug!(
-                        "No committed state root for applied tip height {} — skipping verification",
-                        tip_height
-                    );
-                }
-            }
-        }
-        // Clear dirty flags from state root calculation
-        state_db.accounts.clear_dirty();
-    }
+    // Load existing state from storage into memory and verify it against the
+    // applied tip's committed root (boot_state.rs; the split-heal harness's
+    // disk-reload restart runs the same function).
+    boot_state::hydrate_state_db(&storage, &state_db)?;
 
     // MCP + inference service
     let mcp = Arc::new(citrate_mcp::MCPService::new(storage.clone()));
@@ -2534,6 +2397,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // block 1 against a zero selected-parent and orphans it.
     block_admission.seed_genesis().await;
 
+    // CV-7c: a node held on a dead branch (the applicator's dead-branch
+    // marker) for `[recovery] cold_resync_after_secs` requests a guarded cold
+    // resync and exits for the supervisor to restart it (cold_resync.rs).
+    if let Some(app) = canonical_applicator.clone() {
+        cold_resync::spawn_monitor(
+            app,
+            config.storage.data_dir.clone(),
+            recovery_policy,
+            finality_voting_on,
+        );
+    }
+
     // A database that followed a branch the release's canonical checkpoints
     // exclude stays on it: admission refuses the network's blocks above it.
     // Say so plainly; the fix is to move the chain data aside and resync.
@@ -2663,11 +2538,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // applied chain; advertising the stored max makes it look caught up to
         // peers (which then pick it as a sync source and it serves them nothing)
         // and mis-drives fork choice. The applied tip is our true synced head.
-        let (head_hash, head_height) = storage
-            .blocks
-            .get_applied_tip()
-            .ok()
-            .flatten()
+        // CV-7b: a node held on a dead branch advertises its fork point, not
+        // the dead tip (cold_resync::advertised_head).
+        let (head_hash, head_height) = cold_resync::advertised_head(&storage)
             .unwrap_or((citrate_consensus::types::Hash::default(), 0));
         max_seen_height.fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
         let genesis_hash = storage
@@ -2943,9 +2816,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
-                    if let Ok(Some((hash, height))) = storage_head.blocks.get_applied_tip() {
+                    if let Some((hash, height)) = cold_resync::advertised_head(&storage_head) {
                         let mut g = advertised_head.write().await;
-                        if g.0 != height {
+                        if *g != (height, hash) {
                             *g = (height, hash);
                         }
                     }

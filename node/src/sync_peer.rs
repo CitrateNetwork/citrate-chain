@@ -536,7 +536,7 @@ impl SyncPeerSelector {
         // order of decreasing authority:
         //
         //   1. usefulness score  — what the peer has actually DONE for us
-        //   2. served watermark  — how far it has actually carried us
+        //   2. served watermark  — how far it has actually carried us ABOVE our tip
         //   3. advertised head   — the weakest evidence, gossip-inflatable (I4)
         //   4. peer id           — deterministic tie-break, never oscillates
         //
@@ -554,13 +554,21 @@ impl SyncPeerSelector {
         // filter: a peer with failures is ranked below an equal peer without them,
         // and can still be selected when it is all we have — which is what
         // unfreezes its counter.
+        //
+        // The served watermark counts only ABOVE our applied tip: a peer that
+        // carried us to a height we have since passed says nothing about
+        // whether it can carry us now. Two dead-fork bootnodes that served the
+        // shared history before a split otherwise outrank, forever, the one
+        // peer actually ahead on the network's chain once every score has
+        // bottomed out (r1006 bootnodes, 2026-11-03).
+        let lead = |id: &str| self.served(id).saturating_sub(applied_height);
         useful.into_iter().max_by(|a, b| {
             let fa = i32::from(self.failures(&a.id) >= DEPREFER_AT_FAILURES);
             let fb = i32::from(self.failures(&b.id) >= DEPREFER_AT_FAILURES);
             // Lower penalty flag is better, so compare b to a.
             fb.cmp(&fa)
                 .then_with(|| self.score(&a.id).cmp(&self.score(&b.id)))
-                .then_with(|| self.served(&a.id).cmp(&self.served(&b.id)))
+                .then_with(|| lead(&a.id).cmp(&lead(&b.id)))
                 .then_with(|| a.head_height.cmp(&b.head_height))
                 .then_with(|| b.id.cmp(&a.id))
         })
@@ -677,6 +685,51 @@ mod tests {
         assert_eq!(sel.select(&cands, 50).map(|c| c.id.as_str()), Some("b"));
         let only_a = vec![cands[0].clone()];
         assert_eq!(sel.select(&only_a, 50).map(|c| c.id.as_str()), Some("a"));
+    }
+
+    /// The r1006 bootnodes, 2026-11-03 (boot journals, read-only): boot-2's
+    /// peers were boot-1 and boot-3, each on its own dead fork, and rpc-1 on
+    /// the network's chain, far ahead. boot-1 and boot-3 had carried boot-2
+    /// along the shared history before the split, so their served watermark
+    /// was high; since the split every answer from any of them admitted
+    /// nothing (each node's tip anchor is unknown to the others). Once the
+    /// scores bottom out equal, the watermark decides, and it names a
+    /// dead-fork peer forever: `SYNCPEER switched` between the dead forks,
+    /// never to rpc-1.
+    ///
+    /// A watermark at or below our applied tip says nothing about whether a
+    /// peer can carry us now. Among equally barren peers, the one that is
+    /// actually ahead must be chosen.
+    #[test]
+    fn sync_peer_choice_converges_on_the_far_ahead_peer_over_dead_forks() {
+        let applied = 303_704u64;
+        let mut sel = SyncPeerSelector::new();
+        for p in ["boot-1", "boot-3"] {
+            for _ in 0..SCORE_MAX {
+                sel.record_serve(p, 32, 298_000, 1_000, 32, false);
+            }
+        }
+        let peers = [
+            cand("boot-1", 303_900),
+            cand("boot-3", 304_100),
+            cand("rpc-1", 312_000),
+        ];
+        // Every answer since the split admits nothing.
+        let mut chosen = Vec::new();
+        for _ in 0..60 {
+            let pick = sel
+                .select(&peers, applied)
+                .expect("a peer is ahead")
+                .id
+                .clone();
+            sel.record_serve(&pick, 0, 0, 312_000 - applied, 32, false);
+            chosen.push(pick);
+        }
+        let tail = &chosen[chosen.len() - 20..];
+        assert!(
+            tail.iter().all(|p| p == "rpc-1"),
+            "the selector settled on a dead-fork peer: last picks {tail:?}"
+        );
     }
 
     fn cand(id: &str, head_height: u64) -> SyncCandidate {

@@ -285,6 +285,16 @@ pub struct RejoinTracker {
     pin_live_at: Option<Instant>,
     /// The pinned peer gave a consumed answer since `pin_live_at`.
     pin_answered: bool,
+    /// Peers whose pinned search went silent (no matching answer for
+    /// [`MAX_UNANSWERED`] rounds). A search is not pinned to them again until
+    /// the node has caught up or a search elsewhere found the fork point.
+    silent: Vec<String>,
+    /// A search is wanted against a peer other than the silent ones, from
+    /// this top: set when a pinned search went silent (or a silent peer's
+    /// strikes would have started one). [`choose_source`] pins it to another
+    /// peer ahead on the next tick, or, with none, applies the ordinary
+    /// backoff.
+    failover: Option<u64>,
 }
 
 impl Default for RejoinTracker {
@@ -314,6 +324,8 @@ impl RejoinTracker {
             follow_unsent: false,
             pin_live_at: None,
             pin_answered: false,
+            silent: Vec::new(),
+            failover: None,
         }
     }
 
@@ -442,7 +454,7 @@ impl RejoinTracker {
             self.unanswered = self.unanswered.saturating_add(1);
             if self.unanswered >= MAX_UNANSWERED {
                 self.unanswered = 0;
-                out = self.give_up(anchor.1);
+                out = self.silent_give_up(anchor.1);
             }
         }
         self.asked = Some((peer.to_string(), anchor.0, anchor.1));
@@ -482,7 +494,7 @@ impl RejoinTracker {
         self.unanswered = self.unanswered.saturating_add(1);
         if self.unanswered >= MAX_UNANSWERED {
             self.unanswered = 0;
-            return self.give_up(at);
+            return self.silent_give_up(at);
         }
         self.count_probe_request(at)
     }
@@ -536,6 +548,8 @@ impl RejoinTracker {
         if !behind {
             self.give_ups = 0;
             self.cooldown = 0;
+            self.silent.clear();
+            self.failover = None;
             return self.reset("caught up");
         }
         match (self.mode.clone(), answer) {
@@ -563,6 +577,18 @@ impl RejoinTracker {
                     return None;
                 }
                 let top = anchor_height;
+                // A search is never pinned to a peer that went silent on the
+                // last one: ask for it elsewhere (see `choose_source`).
+                if self
+                    .strike_peer
+                    .as_ref()
+                    .is_some_and(|p| self.silent.contains(p))
+                {
+                    self.strike_peer = None;
+                    self.mode = Mode::Tip { strikes: 0 };
+                    self.failover = Some(top);
+                    return None;
+                }
                 self.peer = self.strike_peer.take();
                 self.start_search(top);
                 self.mode = Mode::Probe {
@@ -610,8 +636,10 @@ impl RejoinTracker {
                         }
                     }
                 }
-                // The search found the fork point: no backoff owed.
+                // The search found the fork point: no backoff owed, and the
+                // peers that went silent on earlier searches may be asked again.
                 self.give_ups = 0;
+                self.silent.clear();
                 self.mode = Mode::Follow { cursor };
                 if was_following {
                     None
@@ -741,12 +769,64 @@ impl RejoinTracker {
             // must not wait behind this one.
             return Some(Transition::GaveUp { at });
         }
+        self.back_off();
+        Some(Transition::GaveUp { at })
+    }
+
+    /// The rejoin backoff after a search that failed on its merits.
+    fn back_off(&mut self) {
         let shift = self.give_ups.min(31);
         self.cooldown = BACKOFF_BASE_ANSWERS
             .saturating_mul(2u32.saturating_pow(shift))
             .min(BACKOFF_MAX_ANSWERS);
         self.give_ups = self.give_ups.saturating_add(1);
+    }
+
+    /// The running search's peer stopped answering ([`MAX_UNANSWERED`]
+    /// rounds). That says nothing about the fork point, so no backoff yet:
+    /// the peer is marked silent and [`choose_source`] carries the search to
+    /// another peer ahead on the next tick (or backs off when there is none).
+    /// A split pull ends as before (its gate rate-limits pulls).
+    fn silent_give_up(&mut self, at: u64) -> Option<Transition> {
+        if self.split {
+            return self.give_up(at);
+        }
+        let top = match &self.mode {
+            Mode::Probe { top, .. } => *top,
+            Mode::Follow { cursor } => cursor.1,
+            Mode::Tip { .. } => at,
+        };
+        if let Some(p) = self.peer.take() {
+            if !self.silent.contains(&p) {
+                self.silent.push(p);
+            }
+        }
+        self.mode = Mode::Tip { strikes: 0 };
+        self.strike_peer = None;
+        self.clear_pin_clock();
+        self.failover = Some(top);
         Some(Transition::GaveUp { at })
+    }
+
+    /// Pin the wanted search ([`Self::failover`]) to `peer`, from the applied
+    /// height `top`.
+    fn start_failover_probe(&mut self, peer: &str, top: u64) -> Option<Transition> {
+        self.failover = None;
+        if top == 0 {
+            return None;
+        }
+        self.peer = Some(peer.to_string());
+        self.strike_peer = None;
+        self.unanswered = 0;
+        self.start_search(top);
+        self.mode = Mode::Probe {
+            top,
+            unconnected: top,
+            known: None,
+            step: 1,
+            height: top.saturating_sub(1),
+        };
+        Some(Transition::StartedProbe { top })
     }
 }
 
@@ -815,6 +895,26 @@ pub fn choose_source(
                 }
             }
             None => transition = tracker.abandon(),
+        }
+    }
+    // A search whose peer went silent moves to another peer ahead at once
+    // (never back to a silent one); with none, it ends with the ordinary
+    // backoff.
+    if tracker.failover.is_some() && matches!(tracker.mode, Mode::Tip { .. }) {
+        let others: Vec<SyncCandidate> = candidates
+            .iter()
+            .filter(|c| !tracker.silent.contains(&c.id))
+            .cloned()
+            .collect();
+        match selector.select(&others, applied.1) {
+            Some(c) => {
+                let started = tracker.start_failover_probe(&c.id, applied.1);
+                return (Source::Pinned(c.id.clone()), transition.or(started));
+            }
+            None => {
+                tracker.failover = None;
+                tracker.back_off();
+            }
         }
     }
     if let Some(c) = selector.select(candidates, applied.1) {
@@ -2236,6 +2336,178 @@ mod tests {
         assert_eq!(lowest, 500, "the durable tip never moved");
         assert_eq!(n.applied(), Some((h(own_tip), 500)));
         assert_eq!(n.executor.calculate_state_root(), root);
+    }
+
+    /// H6 (ADR-2026-11-03 CV-7, the r1006 bootnodes on 2026-11-03). A node
+    /// with its DAG store pruned (retain 5,000 here; 10,000 on the fleet) is
+    /// forked 5,000 blocks deep: its own branch runs 5,000 above the fork
+    /// point and the network's heavier chain reaches it (the fork-point search
+    /// found it). The undo records cover `MAX_REORG_DEPTH` = 100 heights and
+    /// the rebuild from genesis is refused on a pruned store
+    /// (`RebuildDecision::RefusePruned`), so the switch can never happen in
+    /// place. Before CV-7b/c the applied tip stayed on the dead branch for
+    /// good and the node kept serving and advertising it as its chain.
+    ///
+    /// It must recover with no operator action:
+    /// (a) the refused switch marks the branch dead, durably: the node stops
+    ///     serving it as current (`serve_blocks` / `serve_headers`), stops
+    ///     advertising it as its head, and the producer gate is raised;
+    /// (b) `syncState` reports `wedged` with the fork depth;
+    /// (c) after the grace period the guarded cold resync moves the chain
+    ///     database aside (kept, not deleted), keeps the node identity, and
+    ///     the restarted node syncs from genesis via its peer onto the
+    ///     network's chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_node_forked_beyond_undo_window_recovers() {
+        use crate::cold_resync::{self, Decision, Policy};
+        let fork = 100u64;
+        let side_tip = fork + 5_000;
+        let main_tip_height = side_tip + 50;
+        let net = net(fork, side_tip, main_tip_height);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        let (n, ndir) = restarted_node_retaining(&net, &own, Some(5_000)).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let main_tip = net.main.last().expect("main");
+        let dead_tip = net.side.last().expect("side");
+        let fork_hash = h(net.prefix.last().expect("prefix"));
+        n.app.drive_drain().await;
+        assert_eq!(
+            n.applied(),
+            Some((h(dead_tip), side_tip)),
+            "fixture: the switch is refused on the pruned node"
+        );
+
+        // (a) The dead branch is marked, durably.
+        let wedge = n
+            .app
+            .wedge()
+            .expect("marker read")
+            .expect("the refused switch marks the applied branch dead");
+        assert_eq!(
+            (wedge.dead_tip, wedge.dead_tip_height),
+            (h(dead_tip), side_tip)
+        );
+        assert_eq!((wedge.fork_point, wedge.fork_height), (fork_hash, fork));
+        assert_eq!(
+            (wedge.head, wedge.head_height),
+            (h(main_tip), main_tip_height)
+        );
+        assert_eq!(wedge.fork_depth(), 5_000);
+        assert!(
+            n.app
+                .dead_branch_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the producer gate's dead-branch flag is raised"
+        );
+        let reopened = CanonicalApplicator::new(n.executor.clone(), n.storage.clone());
+        assert!(
+            reopened
+                .dead_branch_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the marker survives a restart"
+        );
+        drop(reopened);
+        let side: HashSet<Hash> = net.side.iter().map(h).collect();
+        let served = block_serve::serve_blocks(&n.storage, &fork_hash, 512);
+        assert!(
+            served.iter().all(|b| !side.contains(&h(b))),
+            "a dead-branch block was served as this node's chain"
+        );
+        assert!(
+            served.iter().any(|b| b.header.height > fork),
+            "the network's blocks the node holds are still served"
+        );
+        assert!(
+            block_serve::serve_headers(&n.storage, &fork_hash, 2_048).is_empty(),
+            "headers above the fork point come from the dead branch's height index"
+        );
+        assert_eq!(
+            cold_resync::advertised_head(&n.storage),
+            Some((fork_hash, fork)),
+            "the node advertises its fork point, not the dead tip"
+        );
+
+        // (b) syncState over RPC.
+        let state = citrate_api::node_rpc::sync_state_json(&n.storage, Some(main_tip_height))
+            .expect("syncState");
+        assert_eq!(state["state"], "wedged", "{state}");
+        assert_eq!(state["forkDepth"], 5_000, "{state}");
+        assert_eq!(state["appliedHeight"], side_tip, "{state}");
+
+        // (c) The guarded cold resync: not before the grace period, then a
+        // request the next start carries out.
+        let policy = Policy::from(&crate::config::RecoveryConfig::default());
+        assert!(matches!(
+            cold_resync::evaluate(&n.app, ndir.path(), policy, false, wedge.since_unix)
+                .expect("evaluate"),
+            Decision::Waiting { .. }
+        ));
+        let now = wedge.since_unix + policy.after_secs;
+        assert!(matches!(
+            cold_resync::evaluate(&n.app, ndir.path(), policy, false, now).expect("evaluate"),
+            Decision::Resync(_)
+        ));
+        std::fs::write(ndir.path().join("noise.key"), b"node identity").expect("identity");
+        // The process exits (every handle on the chain database closes) and
+        // the supervisor starts it again: start_node runs apply_pending
+        // before it opens the chain database.
+        drop(n);
+        let aside = cold_resync::apply_pending_at(ndir.path(), policy, now + 1)
+            .expect("apply")
+            .expect("the chain database is moved aside");
+        assert_eq!(
+            std::fs::read(ndir.path().join("noise.key")).expect("identity kept"),
+            b"node identity"
+        );
+        {
+            let old = StorageManager::new(&aside, PruningConfig::default()).expect("aside opens");
+            assert_eq!(
+                old.blocks.get_applied_tip().expect("read"),
+                Some((h(dead_tip), side_tip)),
+                "the old chain database is kept intact"
+            );
+        }
+        let storage = Arc::new(
+            StorageManager::new(ndir.path(), PruningConfig::default()).expect("fresh store"),
+        );
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("read"),
+            None,
+            "the node starts on an empty chain database"
+        );
+        storage.blocks.put_block(&net.genesis).expect("genesis");
+        storage
+            .blocks
+            .put_applied_tip(&h(&net.genesis), 0)
+            .expect("genesis tip");
+        let (fresh, _dag) = wire_persistent(storage, &net.genesis, None).await;
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let mut tracker = RejoinTracker::new();
+        let run = drive(
+            &fresh,
+            &mut tracker,
+            &peer,
+            h(main_tip),
+            main_tip_height,
+            400,
+        )
+        .await;
+        assert_eq!(
+            fresh.applied(),
+            Some((h(main_tip), main_tip_height)),
+            "the resynced node did not reach the network's chain after {} rounds",
+            run.rounds
+        );
+        assert_eq!(fresh.executor.calculate_state_root(), main_tip.state_root);
+        assert!(fresh.app.wedge().expect("read").is_none());
+        let state = citrate_api::node_rpc::sync_state_json(&fresh.storage, Some(main_tip_height))
+            .expect("syncState");
+        assert_eq!(state["state"], "synced", "{state}");
     }
 
     /// The node's applicator is built with the DAG prune floor wired, on the
@@ -4169,6 +4441,111 @@ mod tests {
         }
         assert!(ended, "a silent pin held the tick: {:?}", t.mode());
         assert_eq!(t.search_peer(), None);
+    }
+
+    /// The r1006 bootnodes, 2026-11-03 20:00Z to 11-04 01:30Z (boot journals,
+    /// read-only): `SYNCREJOIN GaveUp { at: 298381 } (re-sends to a silent
+    /// peer)` 11x on boot-1, 33x on boot-2, 8x on boot-3, each followed by a
+    /// `SYNCPEER switched`. A fork-point search pinned to a peer that stops
+    /// answering gave up with the rejoin backoff, so the next search, against
+    /// any peer, first had to sit out the cooldown, and the strikes that
+    /// start it had to come from one peer twice in a row.
+    ///
+    /// A silent peer is not evidence about the fork point. While another
+    /// connected peer is ahead, the search must move to it on the next tick,
+    /// with no backoff, and must not go back to the silent peer.
+    #[test]
+    fn a_search_pinned_to_a_silent_peer_fails_over_to_another_peer_ahead() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let applied = (hx(1), 1_000u64);
+        let cands = [
+            SyncCandidate {
+                id: "silent".into(),
+                head_height: 1_200,
+            },
+            SyncCandidate {
+                id: "live".into(),
+                head_height: 1_200,
+            },
+        ];
+        t.note_sync_target(1_200, applied.1);
+        // Two unconnected tip answers from "silent" start a search pinned to it.
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        assert_eq!(t.search_peer(), Some("silent"));
+        let now = Instant::now();
+        let (src, _) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(src, Source::Pinned("silent".into()));
+        let a = t.anchor(applied, |_| Some(hx(2)));
+        assert_eq!(t.note_asked("silent", a), None);
+        // It never answers: every later tick its anchor is still pending.
+        let mut ended = None;
+        for _ in 0..MAX_UNANSWERED {
+            if let Some(tr) = t.note_unsent("silent") {
+                ended = Some(tr);
+                break;
+            }
+        }
+        assert!(ended.is_some(), "a silent pin must end: {:?}", t.mode());
+        assert_eq!(
+            t.cooldown(),
+            0,
+            "a silent peer is not a failed search: no rejoin backoff"
+        );
+        // The next tick carries the search to the other peer ahead, at once.
+        let (src, tr) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(
+            src,
+            Source::Pinned("live".into()),
+            "the search did not fail over: {tr:?} mode={:?}",
+            t.mode()
+        );
+        assert!(matches!(t.mode(), Mode::Probe { .. }), "{:?}", t.mode());
+        // Ending that search never re-pins the silent peer while "live" is
+        // still ahead.
+        let _ = t.abandon();
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        assert_ne!(t.search_peer(), Some("silent"), "{:?}", t.mode());
+    }
+
+    /// With no other peer ahead, a silent pin ends with the ordinary backoff.
+    #[test]
+    fn a_silent_pin_with_no_other_peer_ahead_backs_off() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let applied = (hx(1), 1_000u64);
+        let cands = [SyncCandidate {
+            id: "silent".into(),
+            head_height: 1_200,
+        }];
+        t.note_sync_target(1_200, applied.1);
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        let now = Instant::now();
+        let a = t.anchor(applied, |_| Some(hx(2)));
+        t.note_asked("silent", a);
+        for _ in 0..MAX_UNANSWERED {
+            if t.note_unsent("silent").is_some() {
+                break;
+            }
+        }
+        let (src, _) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(src, Source::Ahead("silent".into()));
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+        assert_eq!(t.cooldown(), BACKOFF_BASE_ANSWERS);
     }
 
     /// P1-2: a slow peer answering one request in seven keeps `unanswered`

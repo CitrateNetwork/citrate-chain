@@ -202,6 +202,9 @@ pub struct ProduceCatchupGate {
     /// judges whether this node can reconcile with it. Defaults to
     /// [`DEFERRED_ONLY_REFUSE_MAX`]; shrunk by tests.
     deferred_refuse_max: Duration,
+    /// CV-7b: set while the applicator holds the applied tip on a dead branch
+    /// (`CanonicalApplicator::dead_branch_handle`). `None` ⇒ not wired.
+    dead_branch: Option<Arc<AtomicBool>>,
 }
 
 /// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
@@ -2364,6 +2367,7 @@ impl BlockProducer {
             cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
             deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
+            dead_branch: Some(app.dead_branch_handle()),
         });
         self
     }
@@ -2700,6 +2704,18 @@ impl BlockProducer {
                     "MP-S1/#126: refusing to produce — a canonical spine rebuild is in progress \
                      (the applied tip is being rewritten from genesis). Skipping this slot; \
                      the rebuild will converge the applied tip."
+                ));
+            }
+            // CV-7b (H6): never seal on a branch fork choice has left and this
+            // node cannot switch from; the cold resync recovers it.
+            if gate
+                .dead_branch
+                .as_ref()
+                .is_some_and(|d| d.load(Ordering::SeqCst))
+            {
+                return Err(anyhow::anyhow!(
+                    "CV-7b: refusing to produce — the applied tip is on a dead branch \
+                     (dead-branch marker set; see syncState). Skipping this slot."
                 ));
             }
             if let Some(hydrated) = &gate.dag_hydrated {
@@ -7180,6 +7196,7 @@ mod tests {
             cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
             deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
+            dead_branch: None,
         }
     }
 
@@ -7705,6 +7722,7 @@ mod tests {
             cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
             deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
+            dead_branch: None,
         }
     }
 

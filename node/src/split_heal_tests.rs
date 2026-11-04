@@ -137,6 +137,23 @@ pub(crate) struct Scenario {
     /// nothing, and from the heal on gossips, every slot, a block it signed
     /// itself on a parent nobody holds (P1-1).
     pub sybils: usize,
+    /// How a restarted node comes back (see [`RestartMode`]).
+    pub restart_mode: RestartMode,
+}
+
+/// How [`Fleet::restart`] brings a stopped node back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartMode {
+    /// The new process keeps the old one's open store and is handed the old
+    /// executor's in-memory state snapshot.
+    Snapshot,
+    /// CV-9: the old process is dropped entirely (every handle on its RocksDB
+    /// closed) and the new one reopens the data dir from disk as `start_node`
+    /// does: the start-up hardening purge, world state hydrated and checked
+    /// against the applied tip's committed root (`boot_state`), the DAG store,
+    /// GhostDAG tips and the applicator's reorg window all reloaded from the
+    /// store.
+    Disk,
 }
 
 /// See [`Scenario::require_producing`].
@@ -212,6 +229,8 @@ pub(crate) struct Fleet {
     refuse_window: Option<std::time::Duration>,
     /// See [`Scenario::prune_retain`].
     prune_retain: Option<u64>,
+    /// See [`Scenario::restart_mode`].
+    restart_mode: RestartMode,
     genesis: Block,
     /// Simulated time, in slots, from `epoch`.
     epoch: std::time::Instant,
@@ -271,9 +290,26 @@ fn policy(n: usize) -> citrate_execution::block_rewards::EpochRewardPolicy {
     }
 }
 
+/// What a starting node process is handed.
+enum Boot {
+    /// A new data dir: genesis is written.
+    Fresh,
+    /// The stopped process's open store and in-memory state.
+    Snapshot(citrate_execution::state::StateSnapshot),
+    /// A store reopened from disk; state is hydrated from it.
+    Disk,
+}
+
 impl Node {
-    /// A node process as `start_node` wires one, on `storage` (fresh, or the
-    /// store of a stopped process with its hydrated state `boot`).
+    /// Stop the process: every handle it holds (on its store too) is
+    /// dropped; only the data dir is kept.
+    fn stop(self) -> TempDir {
+        self.dir
+    }
+
+    /// A node process as `start_node` wires one, on `storage`: fresh, the
+    /// still-open store of a stopped process with its state snapshot, or a
+    /// store reopened from disk (see [`Boot`]).
     #[allow(clippy::too_many_arguments)]
     async fn start(
         i: usize,
@@ -281,25 +317,41 @@ impl Node {
         genesis: &Block,
         storage: Arc<StorageManager>,
         dir: TempDir,
-        boot: Option<citrate_execution::state::StateSnapshot>,
+        boot: Boot,
         slot_no: u64,
         clock: std::time::Instant,
         clock_ms: Arc<AtomicU64>,
         refuse_window: Option<std::time::Duration>,
     ) -> Self {
-        if boot.is_none() {
-            storage.blocks.put_block(genesis).expect("genesis");
-            storage
-                .blocks
-                .put_applied_tip(&genesis.header.block_hash, 0)
-                .expect("genesis tip");
+        let state_db = Arc::new(StateDB::new());
+        match &boot {
+            Boot::Fresh => {
+                storage.blocks.put_block(genesis).expect("genesis");
+                storage
+                    .blocks
+                    .put_applied_tip(&genesis.header.block_hash, 0)
+                    .expect("genesis tip");
+            }
+            Boot::Snapshot(_) => {}
+            Boot::Disk => {
+                // start_node's order: the start-up hardening purge before
+                // anything loads, then the world state from the store.
+                crate::hardening_rejoin::purge_invalid_post_activation(
+                    &storage,
+                    citrate_consensus::hardening::PbaHardening::from_process(),
+                    CHAIN_ID,
+                )
+                .expect("start-up hardening check");
+                crate::boot_state::hydrate_state_db(&storage, &state_db)
+                    .expect("boot hydration from disk");
+            }
         }
         let executor = Arc::new(Executor::with_storage_and_chain_id(
-            Arc::new(StateDB::new()),
+            state_db,
             Some(storage.state.clone()),
             CHAIN_ID,
         ));
-        if let Some(state) = boot {
+        if let Boot::Snapshot(state) = boot {
             executor.state_restore(state);
         }
         executor.set_validator_activation_height(ACT);
@@ -458,7 +510,7 @@ impl Fleet {
                     &genesis,
                     storage,
                     dir,
-                    None,
+                    Boot::Fresh,
                     0,
                     epoch,
                     clock_ms.clone(),
@@ -498,6 +550,7 @@ impl Fleet {
             serve_cut: vec![vec![false; n]; n],
             refuse_window,
             prune_retain: None,
+            restart_mode: RestartMode::Snapshot,
             genesis,
             epoch,
             clock_ms,
@@ -655,15 +708,28 @@ impl Fleet {
                 );
             }
         }
-        let boot = old.executor.state_snapshot();
-        let Node { storage, dir, .. } = old;
+        let (storage, dir, boot) = match self.restart_mode {
+            RestartMode::Snapshot => {
+                let boot = old.executor.state_snapshot();
+                let Node { storage, dir, .. } = old;
+                (storage, dir, Boot::Snapshot(boot))
+            }
+            RestartMode::Disk => {
+                let dir = old.stop();
+                let storage = Arc::new(
+                    StorageManager::new(dir.path(), PruningConfig::default())
+                        .expect("reopen the stopped node's store"),
+                );
+                (storage, dir, Boot::Disk)
+            }
+        };
         let node = Node::start(
             i,
             n,
             &self.genesis,
             storage,
             dir,
-            Some(boot),
+            boot,
             self.slot_no,
             self.now(),
             self.clock_ms.clone(),
@@ -1269,6 +1335,7 @@ pub(crate) async fn run(s: Scenario) -> Outcome {
     let n = s.producers;
     let mut fleet = Fleet::new(n).await;
     fleet.prune_retain = s.prune_retain;
+    fleet.restart_mode = s.restart_mode;
     fleet.add_sybils(s.sybils).await;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     for _ in 0..s.warmup {
@@ -1506,6 +1573,7 @@ mod tests {
             require_producing: true,
             prune_retain: None,
             sybils: 0,
+            restart_mode: RestartMode::Snapshot,
         }
     }
 
@@ -1650,6 +1718,94 @@ mod tests {
                 require_merged: false,
                 prune_retain: Some(crate::dag_prune::MIN_RETAIN_BLOCKS),
                 ..base(7)
+            },
+        )
+        .await;
+    }
+
+    // CV-9 (S1-5): every scenario above that restarts a node, again with the
+    // restart dropping the process and reopening its data dir from RocksDB
+    // (`RestartMode::Disk`). A scenario that heals from the in-memory snapshot
+    // and not from disk is a restart the network cannot rely on.
+
+    fn four_three_with_restarts() -> Scenario {
+        Scenario {
+            groups: vec![vec![0, 1, 2, 3], vec![4, 5, 6]],
+            partition: 9,
+            restart_all: true,
+            solo: Some((4, 60)),
+            require_merged: false,
+            ..base(7)
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_with_restarts_and_a_lone_producer_heals_from_disk() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_three_partition_with_restarts_and_a_lone_producer_heals_from_disk",
+            );
+        }
+        assert_heals(
+            "4v3 + restarts from disk + lone producer",
+            Scenario {
+                restart_mode: RestartMode::Disk,
+                ..four_three_with_restarts()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_heals_under_silent_sybils_from_disk() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_three_partition_heals_under_silent_sybils_from_disk",
+            );
+        }
+        assert_heals(
+            "4v3 + restarts from disk + lone producer + 8 silent sybils",
+            Scenario {
+                sybils: 8,
+                restart_mode: RestartMode::Disk,
+                ..four_three_with_restarts()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_far_behind_heals_from_disk() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_three_partition_far_behind_heals_from_disk",
+            );
+        }
+        assert_heals(
+            "4v3 + restarts from disk + lone producer, far behind",
+            Scenario {
+                solo: Some((4, 250)),
+                restart_mode: RestartMode::Disk,
+                ..four_three_with_restarts()
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_three_partition_with_restarts_past_prune_retention_heals_from_disk() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_three_partition_with_restarts_past_prune_retention_heals_from_disk",
+            );
+        }
+        assert_heals(
+            "4v3 + restarts from disk + lone producer, pruned DAG stores",
+            Scenario {
+                warmup: ACT + 152,
+                prune_retain: Some(crate::dag_prune::MIN_RETAIN_BLOCKS),
+                restart_mode: RestartMode::Disk,
+                ..four_three_with_restarts()
             },
         )
         .await;
@@ -1913,5 +2069,79 @@ mod tests {
                 "main.rs no longer contains `{needle}`"
             );
         }
+    }
+
+    /// H1 (lead, from the CHAIN-SAFETY lane): a 4v3 split, then the sides hear
+    /// each other's new blocks but serving between them is starved, and the
+    /// three have stopped sealing (held quiet, as a producer that cannot
+    /// reconcile does). When serving returns, the stopped side must rejoin the
+    /// four's chain as a follower within 60 slots, without sealing first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_side_rejoins_after_serving_returns() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::stopped_side_rejoins_after_serving_returns",
+            );
+        }
+        let n = 7;
+        let side_a = [0usize, 1, 2, 3];
+        let side_b = [4usize, 5, 6];
+        let in_a = |i: usize| i < 4;
+        let mut fleet = Fleet::new(n).await;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..ACT + 4 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // Partition: both sides build their own branch.
+        fleet.set_links(|i, j| in_a(i) == in_a(j));
+        for _ in 0..10 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // Links back, but across the split only gossip arrives; the three stop
+        // sealing.
+        fleet.set_links(|_, _| true);
+        for i in 0..n {
+            for j in 0..n {
+                fleet.serve_cut[i][j] = in_a(i) != in_a(j);
+            }
+        }
+        fleet.quiet.extend(side_b);
+        for _ in 0..30 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // Serving returns. The three stay stopped: they must follow.
+        fleet.serve_cut = vec![vec![false; n]; n];
+        let heights = fleet.applied_heights().await;
+        let (top_node, top) = side_a
+            .iter()
+            .map(|i| (*i, heights[*i]))
+            .max_by_key(|(_, h)| *h)
+            .expect("side a");
+        let target = *fleet.chain(top_node).await.get(&top).expect("a's head");
+        let mut rejoined_at = None;
+        for slot in 1..=60u64 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            let mut all = true;
+            for i in side_b {
+                if fleet.chain(i).await.get(&top) != Some(&target) {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                rejoined_at = Some(slot);
+                break;
+            }
+        }
+        assert!(
+            rejoined_at.is_some(),
+            "the stopped side did not rejoin within 60 slots of serving returning \
+             (target height {top}): {}",
+            fleet.describe().await
+        );
     }
 }

@@ -86,13 +86,83 @@ fn genesis_hash(storage: &StorageManager) -> Result<Option<String>, jsonrpc_core
         .map_err(|e| internal_error(format!("genesis lookup failed: {e}")))
 }
 
+/// The `syncState` object of `citrate_nodeIdentity` (ADR-2026-11-03 CV-7b).
+///
+/// - `wedged`: the node's applied tip is held on a dead branch it cannot
+///   switch from. Source: the durable dead-branch marker
+///   (`citrate_storage::chain::wedge`) the node's applicator records when it
+///   refuses the switch. `reason`, `forkDepth`, `deadTip`, `forkPoint`,
+///   `networkHead` and `since` come from that record.
+/// - `catching_up`: not wedged, and the highest network height the node's
+///   sync driver has seen (`highest_seen`, the same signal `eth_syncing`
+///   reads) is above the applied tip (`BlockStore::get_applied_tip`).
+/// - `synced`: neither.
+///
+/// `highestSeen` is `null` when no sync signal is wired.
+pub fn sync_state_json(
+    storage: &StorageManager,
+    highest_seen: Option<u64>,
+) -> Result<Value, jsonrpc_core::Error> {
+    let applied = storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?
+        .map(|(_, h)| h)
+        .unwrap_or(0);
+    let hex_hash = |h: &citrate_consensus::types::Hash| format!("0x{}", hex::encode(h.as_bytes()));
+    let wedge = citrate_storage::chain::wedge::read(&storage.db)
+        .map_err(|e| internal_error(format!("dead-branch marker unreadable: {e}")))?;
+    if let Some(w) = wedge {
+        return Ok(json!({
+            "state": "wedged",
+            "reason": w.reason,
+            "forkDepth": w.fork_depth(),
+            "appliedHeight": applied,
+            "highestSeen": highest_seen,
+            "deadTip": { "hash": hex_hash(&w.dead_tip), "height": w.dead_tip_height },
+            "forkPoint": { "hash": hex_hash(&w.fork_point), "height": w.fork_height },
+            "networkHead": { "hash": hex_hash(&w.head), "height": w.head_height },
+            "since": w.since_unix,
+        }));
+    }
+    let (state, reason) = match highest_seen {
+        Some(h) if h > applied => (
+            "catching_up",
+            Some(format!(
+                "applied tip {applied} is below the highest network height seen {h}"
+            )),
+        ),
+        _ => ("synced", None),
+    };
+    Ok(json!({
+        "state": state,
+        "reason": reason,
+        "forkDepth": Value::Null,
+        "appliedHeight": applied,
+        "highestSeen": highest_seen,
+    }))
+}
+
 /// The `citrate_nodeIdentity` result.
 pub fn node_identity_json(
     storage: &StorageManager,
     chain_id: u64,
     identity: Option<&NodeIdentity>,
 ) -> Result<Value, jsonrpc_core::Error> {
+    node_identity_with_sync_json(storage, chain_id, identity, None)
+}
+
+/// The `citrate_nodeIdentity` result, with the sync driver's highest seen
+/// network height for `syncState` (see [`sync_state_json`]).
+pub fn node_identity_with_sync_json(
+    storage: &StorageManager,
+    chain_id: u64,
+    identity: Option<&NodeIdentity>,
+    highest_seen: Option<u64>,
+) -> Result<Value, jsonrpc_core::Error> {
     Ok(json!({
+        // Source: see `sync_state_json` (dead-branch marker, applied tip, sync driver).
+        "syncState": sync_state_json(storage, highest_seen)?,
         // Source: the node's configured `[chain] chain_id` (same value eth_chainId serves).
         "chainId": format!("0x{chain_id:x}"),
         // Source: BlockStore::get_block_by_height(0); null before genesis is stored.
@@ -180,6 +250,18 @@ pub fn register_node_methods(
     chain_id: u64,
     identity: Option<Arc<NodeIdentity>>,
 ) {
+    register_node_methods_with_sync(io_handler, storage, chain_id, identity, None)
+}
+
+/// [`register_node_methods`], with the sync driver's highest seen network
+/// height (the `eth_syncing` signal) for `citrate_nodeIdentity.syncState`.
+pub fn register_node_methods_with_sync(
+    io_handler: &mut IoHandler,
+    storage: Arc<StorageManager>,
+    chain_id: u64,
+    identity: Option<Arc<NodeIdentity>>,
+    sync_highest: Option<Arc<std::sync::atomic::AtomicU64>>,
+) {
     let version = client_version(identity.as_deref());
     io_handler.add_sync_method("web3_clientVersion", move |_params: Params| {
         rpc_request("web3_clientVersion");
@@ -190,7 +272,10 @@ pub fn register_node_methods(
     let identity_id = identity.clone();
     io_handler.add_sync_method("citrate_nodeIdentity", move |_params: Params| {
         rpc_request("citrate_nodeIdentity");
-        node_identity_json(&storage_id, chain_id, identity_id.as_deref())
+        let highest = sync_highest
+            .as_ref()
+            .map(|h| h.load(std::sync::atomic::Ordering::Relaxed));
+        node_identity_with_sync_json(&storage_id, chain_id, identity_id.as_deref(), highest)
     });
 
     io_handler.add_sync_method("citrate_getDagStats", move |_params: Params| {
