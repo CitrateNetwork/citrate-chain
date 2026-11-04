@@ -2144,4 +2144,230 @@ mod tests {
             fleet.describe().await
         );
     }
+
+    /// What one run of the stopped-side scenario ended with
+    /// ([`stopped_side`]).
+    struct StoppedSide {
+        /// The three's tip height minus the highest height the two sides
+        /// still agree on, when serving returns.
+        fork_depth: u64,
+        /// The three's highest applied height 5 slots into the cut and at its
+        /// end.
+        cut_tops: (u64, u64),
+        /// Slots after serving returned until all three hold the four's chain
+        /// at the four's height of that moment (None: not within 60).
+        rejoined_at: Option<u64>,
+        detail: String,
+    }
+
+    /// H1 family (see `stopped_side_rejoins_after_serving_returns`): warm up,
+    /// a 4v3 split for `partition` slots, then the links come back with only
+    /// gossip crossing the split for `cut` slots, then serving returns and the
+    /// three get 60 slots to follow the four. With `gate`, the three are not
+    /// held quiet: they run the real producer gate (CV-5, refuse window zero
+    /// as the harness runs in real time), which must stop them on its own;
+    /// without it they are held quiet, as a follower or a producer whose
+    /// operator stopped it. With `pruned`, the warm-up runs past the DAG
+    /// prune retention and the three restart at the end of the partition with
+    /// their stores pruned to it (a replay from genesis is then refused).
+    async fn stopped_side(partition: u64, cut: u64, gate: bool, pruned: bool) -> StoppedSide {
+        let n = 7;
+        let side_a = [0usize, 1, 2, 3];
+        let side_b = vec![4usize, 5, 6];
+        let in_a = |i: usize| i < 4;
+        let mut fleet = if gate {
+            Fleet::with_refuse_window(n, Some(std::time::Duration::ZERO)).await
+        } else {
+            Fleet::new(n).await
+        };
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let retain = crate::dag_prune::MIN_RETAIN_BLOCKS;
+        loop {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            let low = *fleet.applied_heights().await.iter().min().expect("nodes");
+            if fleet.slot_no >= ACT + 4 && (!pruned || low > retain + 50) {
+                break;
+            }
+        }
+        fleet.set_links(|i, j| in_a(i) == in_a(j));
+        for _ in 0..partition {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        if pruned {
+            fleet.prune_retain = Some(retain);
+            for i in side_b.iter().copied() {
+                fleet.restart(i).await;
+            }
+            fleet.prune_retain = None;
+        }
+        fleet.set_links(|_, _| true);
+        for i in 0..n {
+            for j in 0..n {
+                fleet.serve_cut[i][j] = in_a(i) != in_a(j);
+            }
+        }
+        if !gate {
+            fleet.quiet.extend(side_b.iter().copied());
+        }
+        let b = [side_b.clone()];
+        let mut settled = 0;
+        for k in 0..cut {
+            if k == 5 {
+                settled = group_tops(&fleet, &b).await[0];
+            }
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        let cut_end = group_tops(&fleet, &b).await[0];
+        fleet.serve_cut = vec![vec![false; n]; n];
+        let heights = fleet.applied_heights().await;
+        let (top_node, top) = side_a
+            .iter()
+            .map(|i| (*i, heights[*i]))
+            .max_by_key(|(_, h)| *h)
+            .expect("side a");
+        let a_chain = fleet.chain(top_node).await;
+        let target = *a_chain.get(&top).expect("a's head");
+        let b_chain = fleet.chain(side_b[0]).await;
+        let b_tip = heights[side_b[0]];
+        let fork = (0..=b_tip)
+            .rev()
+            .find(|h| b_chain.get(h).is_some() && b_chain.get(h) == a_chain.get(h))
+            .unwrap_or(0);
+        let mut rejoined_at = None;
+        for slot in 1..=60u64 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            let mut all = true;
+            for i in side_b.iter().copied() {
+                if fleet.chain(i).await.get(&top) != Some(&target) {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                rejoined_at = Some(slot);
+                break;
+            }
+        }
+        StoppedSide {
+            fork_depth: b_tip.saturating_sub(fork),
+            cut_tops: (settled, cut_end),
+            rejoined_at,
+            detail: format!(
+                "target {top}, fork at {fork}, three at {b_tip}: {}",
+                fleet.describe().await
+            ),
+        }
+    }
+
+    /// H1, made independent of the wall clock: the same as
+    /// `stopped_side_rejoins_after_serving_returns` with a 90-slot cut, long
+    /// enough that every one of the four times out past the de-prefer
+    /// threshold at the three even when the run takes no wall time (the
+    /// 30-slot cut gets there only when slots take real time, as on a loaded
+    /// CI runner). The three's siblings keep answering with nothing new and
+    /// bottom out; the three must still ask the four again once serving
+    /// returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_side_rejoins_after_a_long_serving_cut() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::stopped_side_rejoins_after_a_long_serving_cut",
+            );
+        }
+        let r = stopped_side(10, 90, false, false).await;
+        assert!(
+            r.rejoined_at.is_some(),
+            "the stopped side did not rejoin within 60 slots of serving returning \
+             after a 90-slot cut ({})",
+            r.detail
+        );
+    }
+
+    /// H1 against the real CV-5 producer gate instead of a held-quiet model:
+    /// nobody is told to stop. While the three hear the four's heavier branch
+    /// and cannot fetch it, their gate must stop them (cannot reconcile); when
+    /// serving returns they must follow the four within 60 slots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gate_stopped_side_rejoins_after_serving_returns() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::gate_stopped_side_rejoins_after_serving_returns",
+            );
+        }
+        let r = stopped_side(10, 90, true, false).await;
+        assert_eq!(
+            r.cut_tops.0, r.cut_tops.1,
+            "the three kept sealing on their branch while they could not admit \
+             the four's heavier one (CV-5): {}",
+            r.detail
+        );
+        assert!(
+            r.rejoined_at.is_some(),
+            "the gate-stopped side did not rejoin within 60 slots of serving \
+             returning ({})",
+            r.detail
+        );
+    }
+
+    /// CV-7: the same, with the three's branch more than `MAX_REORG_DEPTH`
+    /// (100) blocks above the fork point when serving returns. The undo
+    /// records cover only the reorg window (`REORG_UNDO_DEPTH`); on an
+    /// unpruned store the applicator can still rebuild from genesis.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopped_side_forked_beyond_the_reorg_window_rejoins() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::stopped_side_forked_beyond_the_reorg_window_rejoins",
+            );
+        }
+        let r = stopped_side(45, 30, false, false).await;
+        assert!(
+            r.fork_depth > crate::canonical_apply::MAX_REORG_DEPTH,
+            "fixture: the three's branch is only {} deep ({})",
+            r.fork_depth,
+            r.detail
+        );
+        assert!(
+            r.rejoined_at.is_some(),
+            "a side forked {} deep did not rejoin within 60 slots of serving \
+             returning ({})",
+            r.fork_depth,
+            r.detail
+        );
+    }
+
+    /// CV-7 (H6) on a pruned store: the same >100-deep fork, with the three
+    /// restarted at the end of the partition on stores pruned to the minimum
+    /// retention, so the rebuild from genesis is refused
+    /// (`RebuildDecision::RefusePruned`) and the switch needs undo records
+    /// for the whole depth. Red on r1007/candidate: the three fetch the four's
+    /// whole chain (stored tip 1597) but the applied tip stays on their branch
+    /// at 1192. Ignored until S3-4 (undo window = prune retention, CV-7a).
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "needs S3-4 (CV-7a undo window = prune retention); red on r1007/candidate"]
+    async fn pruned_stopped_side_forked_beyond_the_reorg_window_rejoins() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::pruned_stopped_side_forked_beyond_the_reorg_window_rejoins",
+            );
+        }
+        let r = stopped_side(45, 30, false, true).await;
+        assert!(
+            r.fork_depth > crate::canonical_apply::MAX_REORG_DEPTH,
+            "fixture: the three's branch is only {} deep ({})",
+            r.fork_depth,
+            r.detail
+        );
+        assert!(
+            r.rejoined_at.is_some(),
+            "a pruned side forked {} deep did not rejoin within 60 slots of \
+             serving returning ({})",
+            r.fork_depth,
+            r.detail
+        );
+    }
 }

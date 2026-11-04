@@ -1160,6 +1160,80 @@ mod tests {
         );
     }
 
+    /// H1 (split_heal `stopped_side_rejoins_after_a_long_serving_cut`): after a
+    /// 4v3 split the three hear the four's blocks, but answers across the split
+    /// are lost for a while, so every one of the four reaches the timeout
+    /// threshold. The three's own siblings answer every request, with nothing
+    /// above the tip (they are on the same branch): they bottom out but never
+    /// time out. A timeout penalty clears only when the peer is asked again, so
+    /// if the bottomed-out siblings still count as clean, the four are never
+    /// asked again and the three stay on their branch after serving returns.
+    ///
+    /// A peer whose every answer carried nothing (score at the floor) is no
+    /// cleaner a source than one that timed out: both are de-preferred, and
+    /// among de-preferred peers the one that has not proven useless is asked.
+    #[test]
+    fn a_bottomed_out_peer_does_not_shut_out_timed_out_peers_ahead() {
+        let applied = 107u64;
+        let mut sel = SyncPeerSelector::new();
+        for p in ["p0", "p1", "p2", "p3"] {
+            for _ in 0..DEPREFER_AT_FAILURES {
+                sel.record_timeout(p);
+            }
+        }
+        for p in ["p5", "p6"] {
+            for _ in 0..8 {
+                // Nothing new on a current anchor: Barren.
+                sel.record_serve(p, 0, 0, 370, 32, false);
+            }
+            assert_eq!(sel.score(p), SCORE_MIN);
+        }
+        // Relayed gossip: every peer advertises the four's head.
+        let peers = [
+            cand("p0", 477),
+            cand("p1", 477),
+            cand("p2", 477),
+            cand("p3", 477),
+            cand("p5", 477),
+            cand("p6", 477),
+        ];
+        let pick = sel.select(&peers, applied).map(|c| c.id.clone());
+        assert!(
+            pick.as_deref().is_some_and(|p| p < "p4"),
+            "a timed-out peer ahead must be asked again once the clean peers \
+             have bottomed out, got {pick:?}"
+        );
+        // Its answer clears its timeouts; even an empty one (it lacks our tip)
+        // keeps it ahead of the bottomed-out siblings, so the strikes that
+        // start the fork-point search count against one peer.
+        let p = pick.expect("a peer");
+        sel.record_serve(&p, 0, 0, 370, 32, false);
+        assert_eq!(
+            sel.select(&peers, applied).map(|c| c.id.as_str()),
+            Some(p.as_str())
+        );
+    }
+
+    /// The floor rule does not override a clean peer that still serves: a
+    /// bottomed-out peer and a timed-out peer both lose to it.
+    #[test]
+    fn a_clean_serving_peer_outranks_both_de_preferred_kinds() {
+        let mut sel = SyncPeerSelector::new();
+        for _ in 0..DEPREFER_AT_FAILURES {
+            sel.record_timeout("flaky");
+        }
+        for _ in 0..8 {
+            sel.record_serve("barren", 0, 0, 500, 32, false);
+        }
+        sel.record_serve("good", 1, 101, 500, 32, false);
+        let peers = [
+            cand("flaky", 9_000),
+            cand("barren", 9_000),
+            cand("good", 900),
+        ];
+        assert_eq!(sel.select(&peers, 100).map(|c| c.id.as_str()), Some("good"));
+    }
+
     /// RED TEST — #150, at boot1's measured shape. A node 33,000 blocks behind
     /// receives the live tip by gossip. Pre-fix this queued an ancestry request
     /// for a parent 33,000 blocks deep, and did so for EVERY gossiped block:
