@@ -285,6 +285,16 @@ pub struct RejoinTracker {
     pin_live_at: Option<Instant>,
     /// The pinned peer gave a consumed answer since `pin_live_at`.
     pin_answered: bool,
+    /// Peers whose pinned search went silent (no matching answer for
+    /// [`MAX_UNANSWERED`] rounds). A search is not pinned to them again until
+    /// the node has caught up or a search elsewhere found the fork point.
+    silent: Vec<String>,
+    /// A search is wanted against a peer other than the silent ones, from
+    /// this top: set when a pinned search went silent (or a silent peer's
+    /// strikes would have started one). [`choose_source`] pins it to another
+    /// peer ahead on the next tick, or, with none, applies the ordinary
+    /// backoff.
+    failover: Option<u64>,
 }
 
 impl Default for RejoinTracker {
@@ -314,6 +324,8 @@ impl RejoinTracker {
             follow_unsent: false,
             pin_live_at: None,
             pin_answered: false,
+            silent: Vec::new(),
+            failover: None,
         }
     }
 
@@ -442,7 +454,7 @@ impl RejoinTracker {
             self.unanswered = self.unanswered.saturating_add(1);
             if self.unanswered >= MAX_UNANSWERED {
                 self.unanswered = 0;
-                out = self.give_up(anchor.1);
+                out = self.silent_give_up(anchor.1);
             }
         }
         self.asked = Some((peer.to_string(), anchor.0, anchor.1));
@@ -482,7 +494,7 @@ impl RejoinTracker {
         self.unanswered = self.unanswered.saturating_add(1);
         if self.unanswered >= MAX_UNANSWERED {
             self.unanswered = 0;
-            return self.give_up(at);
+            return self.silent_give_up(at);
         }
         self.count_probe_request(at)
     }
@@ -536,6 +548,8 @@ impl RejoinTracker {
         if !behind {
             self.give_ups = 0;
             self.cooldown = 0;
+            self.silent.clear();
+            self.failover = None;
             return self.reset("caught up");
         }
         match (self.mode.clone(), answer) {
@@ -563,6 +577,18 @@ impl RejoinTracker {
                     return None;
                 }
                 let top = anchor_height;
+                // A search is never pinned to a peer that went silent on the
+                // last one: ask for it elsewhere (see `choose_source`).
+                if self
+                    .strike_peer
+                    .as_ref()
+                    .is_some_and(|p| self.silent.contains(p))
+                {
+                    self.strike_peer = None;
+                    self.mode = Mode::Tip { strikes: 0 };
+                    self.failover = Some(top);
+                    return None;
+                }
                 self.peer = self.strike_peer.take();
                 self.start_search(top);
                 self.mode = Mode::Probe {
@@ -610,8 +636,10 @@ impl RejoinTracker {
                         }
                     }
                 }
-                // The search found the fork point: no backoff owed.
+                // The search found the fork point: no backoff owed, and the
+                // peers that went silent on earlier searches may be asked again.
                 self.give_ups = 0;
+                self.silent.clear();
                 self.mode = Mode::Follow { cursor };
                 if was_following {
                     None
@@ -741,12 +769,64 @@ impl RejoinTracker {
             // must not wait behind this one.
             return Some(Transition::GaveUp { at });
         }
+        self.back_off();
+        Some(Transition::GaveUp { at })
+    }
+
+    /// The rejoin backoff after a search that failed on its merits.
+    fn back_off(&mut self) {
         let shift = self.give_ups.min(31);
         self.cooldown = BACKOFF_BASE_ANSWERS
             .saturating_mul(2u32.saturating_pow(shift))
             .min(BACKOFF_MAX_ANSWERS);
         self.give_ups = self.give_ups.saturating_add(1);
+    }
+
+    /// The running search's peer stopped answering ([`MAX_UNANSWERED`]
+    /// rounds). That says nothing about the fork point, so no backoff yet:
+    /// the peer is marked silent and [`choose_source`] carries the search to
+    /// another peer ahead on the next tick (or backs off when there is none).
+    /// A split pull ends as before (its gate rate-limits pulls).
+    fn silent_give_up(&mut self, at: u64) -> Option<Transition> {
+        if self.split {
+            return self.give_up(at);
+        }
+        let top = match &self.mode {
+            Mode::Probe { top, .. } => *top,
+            Mode::Follow { cursor } => cursor.1,
+            Mode::Tip { .. } => at,
+        };
+        if let Some(p) = self.peer.take() {
+            if !self.silent.contains(&p) {
+                self.silent.push(p);
+            }
+        }
+        self.mode = Mode::Tip { strikes: 0 };
+        self.strike_peer = None;
+        self.clear_pin_clock();
+        self.failover = Some(top);
         Some(Transition::GaveUp { at })
+    }
+
+    /// Pin the wanted search ([`Self::failover`]) to `peer`, from the applied
+    /// height `top`.
+    fn start_failover_probe(&mut self, peer: &str, top: u64) -> Option<Transition> {
+        self.failover = None;
+        if top == 0 {
+            return None;
+        }
+        self.peer = Some(peer.to_string());
+        self.strike_peer = None;
+        self.unanswered = 0;
+        self.start_search(top);
+        self.mode = Mode::Probe {
+            top,
+            unconnected: top,
+            known: None,
+            step: 1,
+            height: top.saturating_sub(1),
+        };
+        Some(Transition::StartedProbe { top })
     }
 }
 
@@ -815,6 +895,26 @@ pub fn choose_source(
                 }
             }
             None => transition = tracker.abandon(),
+        }
+    }
+    // A search whose peer went silent moves to another peer ahead at once
+    // (never back to a silent one); with none, it ends with the ordinary
+    // backoff.
+    if tracker.failover.is_some() && matches!(tracker.mode, Mode::Tip { .. }) {
+        let others: Vec<SyncCandidate> = candidates
+            .iter()
+            .filter(|c| !tracker.silent.contains(&c.id))
+            .cloned()
+            .collect();
+        match selector.select(&others, applied.1) {
+            Some(c) => {
+                let started = tracker.start_failover_probe(&c.id, applied.1);
+                return (Source::Pinned(c.id.clone()), transition.or(started));
+            }
+            None => {
+                tracker.failover = None;
+                tracker.back_off();
+            }
         }
     }
     if let Some(c) = selector.select(candidates, applied.1) {

@@ -536,7 +536,7 @@ impl SyncPeerSelector {
         // order of decreasing authority:
         //
         //   1. usefulness score  — what the peer has actually DONE for us
-        //   2. served watermark  — how far it has actually carried us
+        //   2. served watermark  — how far it has actually carried us ABOVE our tip
         //   3. advertised head   — the weakest evidence, gossip-inflatable (I4)
         //   4. peer id           — deterministic tie-break, never oscillates
         //
@@ -554,13 +554,21 @@ impl SyncPeerSelector {
         // filter: a peer with failures is ranked below an equal peer without them,
         // and can still be selected when it is all we have — which is what
         // unfreezes its counter.
+        //
+        // The served watermark counts only ABOVE our applied tip: a peer that
+        // carried us to a height we have since passed says nothing about
+        // whether it can carry us now. Two dead-fork bootnodes that served the
+        // shared history before a split otherwise outrank, forever, the one
+        // peer actually ahead on the network's chain once every score has
+        // bottomed out (r1006 bootnodes, 2026-11-03).
+        let lead = |id: &str| self.served(id).saturating_sub(applied_height);
         useful.into_iter().max_by(|a, b| {
             let fa = i32::from(self.failures(&a.id) >= DEPREFER_AT_FAILURES);
             let fb = i32::from(self.failures(&b.id) >= DEPREFER_AT_FAILURES);
             // Lower penalty flag is better, so compare b to a.
             fb.cmp(&fa)
                 .then_with(|| self.score(&a.id).cmp(&self.score(&b.id)))
-                .then_with(|| self.served(&a.id).cmp(&self.served(&b.id)))
+                .then_with(|| lead(&a.id).cmp(&lead(&b.id)))
                 .then_with(|| a.head_height.cmp(&b.head_height))
                 .then_with(|| b.id.cmp(&a.id))
         })
