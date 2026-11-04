@@ -3048,6 +3048,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let rejoin_for_loop = rejoin.clone();
         let tip_reask_for_loop = tip_reask.clone();
         let initial_sync_for_sync = initial_sync_done.clone();
+        let attested_for_sync = attested_network_head.clone();
         tokio::spawn(async move {
             // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
             // ever timed out — also a slow leak) and `pending_retries` are gone
@@ -3180,6 +3181,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         .map(|c| c.head_hash)
                         .filter(|h| storage_for_sync.blocks.has_block(h).unwrap_or(true))
                         .collect();
+                // CV-5: the producer gate cannot reconcile with a branch it hears;
+                // start a fork-point search against a peer whose head we lack.
+                if attested_for_sync.take_resync_request() {
+                    if let Some(t) = sync_rejoin::start_resync(
+                        &mut rejoin_for_loop.lock(),
+                        &split_candidates,
+                        applied_tip_now,
+                        |h| held_heads.contains(h),
+                    ) {
+                        tracing::warn!("SYNCREJOIN {:?}: resync asked by the producer gate", t);
+                    }
+                }
                 let chosen_id = {
                     let sel = sync_peers_for_loop.lock().await;
                     let (source, transition) = sync_rejoin::choose_source(

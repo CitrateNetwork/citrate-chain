@@ -1149,6 +1149,11 @@ impl Node {
             .map(|c| c.head_hash)
             .filter(|h| self.storage.blocks.has_block(h).unwrap_or(true))
             .collect();
+        if self.attested.take_resync_request() {
+            let _ = sync_rejoin::start_resync(&mut self.rejoin.lock(), &split, applied_tip, |h| {
+                held_heads.contains(h)
+            });
+        }
         let (source, _transition) = sync_rejoin::choose_source(
             &mut self.rejoin.lock(),
             &self.sel,
@@ -1771,6 +1776,8 @@ mod tests {
             "sync_rejoin::classify(",
             "sel.record_serve(",
             // Sync tick.
+            "attested_for_sync.take_resync_request()",
+            "sync_rejoin::start_resync(",
             "sync_rejoin::choose_source(",
             ".note_sync_target(target, applied_tip.1)",
             "rejoin_for_loop.lock().anchor(",

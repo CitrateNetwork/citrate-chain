@@ -832,6 +832,33 @@ pub fn choose_source(
     }
 }
 
+/// CV-5 resync: the producer gate cannot reconcile with a branch it hears
+/// (`AttestedNetworkHead::take_resync_request`). Unless a search is already
+/// running (that is the resync), start a fork-point search against the
+/// connected peer advertising the highest head this node does not hold
+/// (ties: the smallest id). `holds(h)` says whether this node stores `h`.
+/// Fetching only, like any split pull: the blocks go through admission.
+pub fn start_resync(
+    tracker: &mut RejoinTracker,
+    split: &[SplitCandidate],
+    applied: (Hash, u64),
+    holds: impl Fn(&Hash) -> bool,
+) -> Option<Transition> {
+    if !tracker.can_start_split(applied.1) {
+        return None;
+    }
+    let unknown = Hash::new([0u8; 32]);
+    let peer = split
+        .iter()
+        .filter(|c| c.head_hash != unknown && c.head_hash != applied.0 && !holds(&c.head_hash))
+        .max_by(|a, b| {
+            a.head_height
+                .cmp(&b.head_height)
+                .then_with(|| b.id.cmp(&a.id))
+        })?;
+    tracker.start_split_pull(&peer.id, applied.1)
+}
+
 /// Bound on `SYNCREJOIN` info lines: [`REJOIN_LOG_PER_WINDOW`] per
 /// [`REJOIN_LOG_WINDOW`]; the rest are counted.
 #[derive(Debug)]
@@ -3963,6 +3990,53 @@ mod tests {
             t0,
         );
         assert_eq!(src, Source::Nobody);
+    }
+
+    /// CV-5 resync: a request starts a fork-point search pinned to the peer
+    /// advertising the highest head this node does not hold; a held head, our
+    /// own tip and an unknown head never qualify; a running search is left as
+    /// it is (it already is the resync).
+    #[test]
+    fn a_resync_request_searches_against_the_highest_unheld_head() {
+        let applied = (hx(1), 40);
+        let split = [
+            SplitCandidate {
+                id: "held".into(),
+                head_height: 90,
+                head_hash: hx(7),
+            },
+            SplitCandidate {
+                id: "low".into(),
+                head_height: 45,
+                head_hash: hx(8),
+            },
+            SplitCandidate {
+                id: "high".into(),
+                head_height: 60,
+                head_hash: hx(9),
+            },
+            SplitCandidate {
+                id: "ours".into(),
+                head_height: 99,
+                head_hash: hx(1),
+            },
+            SplitCandidate {
+                id: "unknown".into(),
+                head_height: 99,
+                head_hash: Hash::new([0u8; 32]),
+            },
+        ];
+        let holds = |h: &Hash| *h == hx(7);
+        let mut t = RejoinTracker::new();
+        assert!(start_resync(&mut t, &split, applied, holds).is_some());
+        assert_eq!(t.search_peer(), Some("high"));
+        // A search is running: a second request changes nothing.
+        assert!(start_resync(&mut t, &split, applied, holds).is_none());
+        assert_eq!(t.search_peer(), Some("high"));
+        // Nobody advertises a head we lack: nothing to search against.
+        let mut idle = RejoinTracker::new();
+        assert!(start_resync(&mut idle, &split[..1], applied, holds).is_none());
+        assert_eq!(idle.search_peer(), None);
     }
 
     /// A split pull is a search against one peer: while it runs, the tick

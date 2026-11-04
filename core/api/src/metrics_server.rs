@@ -171,7 +171,8 @@ pub static NETWORK_BYTES_SENT: Lazy<prometheus::CounterVec> = Lazy::new(|| {
 
 // Producer F2 catch-up gate (VERIFY-255-F2-M1: read-only ops status the fleet monitor
 // scrapes off the loopback-bound metrics server). `state` is producing|refusing|latched,
-// plus split_guard (see `update_producer_split_guard`).
+// plus split_guard (see `update_producer_split_guard`) and cannot_reconcile (see
+// `update_producer_cannot_reconcile`).
 pub static PRODUCER_CATCHUP_STATE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     crate::metrics::must(
         register_gauge_vec!(
@@ -355,6 +356,16 @@ pub fn update_producer_catchup_status(
 pub fn update_producer_split_guard(active: bool) {
     PRODUCER_CATCHUP_STATE
         .with_label_values(&["split_guard"])
+        .set(active as u8 as f64);
+}
+
+/// CV-5: publish `citrate_producer_catchup_state{state="cannot_reconcile"}`: 1 while
+/// the producer holds off sealing because more than a third of the producers extend a
+/// branch it cannot admit and fork choice ranks that branch above its own tip. The
+/// node has stopped producing and asked for a resync. Page on it.
+pub fn update_producer_cannot_reconcile(active: bool) {
+    PRODUCER_CATCHUP_STATE
+        .with_label_values(&["cannot_reconcile"])
         .set(active as u8 as f64);
 }
 

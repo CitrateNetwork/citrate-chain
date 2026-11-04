@@ -188,6 +188,13 @@ pub struct ProduceCatchupGate {
     /// Raised while the split guard holds production off (see
     /// [`ProduceCatchupGate::deferred_for_round`]); read by the status surface.
     split_guard: Arc<AtomicBool>,
+    /// Per-round scratch: the branch this node cannot admit that fork choice ranks
+    /// at least as high as this node's best tip (see [`AttestedInner::contender`]).
+    /// Wired with the F2 gate.
+    contender: Arc<Mutex<Option<Contender>>>,
+    /// CV-5: raised while production is held off because this node cannot
+    /// reconcile with a branch fork choice prefers; read by the status surface.
+    cannot_reconcile: Arc<AtomicBool>,
     /// Set by the sync driver once this node's initial sync after start has completed
     /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
     initial_sync_done: Option<Arc<AtomicBool>>,
@@ -215,6 +222,8 @@ struct CatchupBehindState {
     deferred_only_warned: Option<Instant>,
     /// Last time the split-guard alarm was logged.
     split_guard_alarmed: Option<Instant>,
+    /// Last time the CV-5 cannot-reconcile alarm was logged (and a resync asked).
+    unreconciled_alarmed: Option<Instant>,
 }
 
 impl Default for CatchupBehindState {
@@ -227,6 +236,7 @@ impl Default for CatchupBehindState {
             deferred_only_since: None,
             deferred_only_warned: None,
             split_guard_alarmed: None,
+            unreconciled_alarmed: None,
         }
     }
 }
@@ -290,6 +300,9 @@ pub struct AttestedInner {
     /// own: `block_hash -> DeferredBlock`. First-heard time only; a repeat never
     /// renews it. Bounded to [`DEFERRED_BLOCK_CAP`] by evicting the oldest.
     deferred_blocks: Mutex<HashMap<Hash, DeferredBlock>>,
+    /// CV-5: set by the producer gate when it cannot reconcile with a branch it
+    /// hears; taken by the sync tick, which then starts a fork-point search.
+    resync_requested: AtomicBool,
     /// Test clock offset (both the monotonic and the wall clock), so tests can age
     /// evidence without sleeping.
     #[cfg(test)]
@@ -332,9 +345,11 @@ pub const DEFERRED_EVIDENCE_TTL: Duration = Duration::from_secs(30);
 /// cannot make the rest of the fleet stop producing. The quorum also scales with the
 /// producer set (see [`deferred_quorum_size`]).
 pub const DEFERRED_EVIDENCE_MIN_PROPOSERS: usize = 2;
-/// Longest a producer refuses on deferred evidence ALONE (no held, chained evidence
-/// says it is behind). Past it the producer seals anyway and warns, until that
-/// evidence stops being the only reason to refuse.
+/// How long deferred evidence holds production off before the gate judges whether
+/// this node can reconcile with it ([`ProduceCatchupGate::deferred_for_round`]).
+/// Past it the producer keeps refusing when it cannot reconcile with a branch fork
+/// choice prefers (CV-5: no "seal anyway"), and stops counting evidence that names
+/// no such branch.
 pub const DEFERRED_ONLY_REFUSE_MAX: Duration = Duration::from_secs(60);
 /// Spacing of the warning logged while sealing despite deferred evidence.
 pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
@@ -378,6 +393,13 @@ impl AttestedNetworkHead {
     /// sites through [`AttestedNetworkHead::observe`].
     pub fn handle(&self) -> Arc<AttestedInner> {
         self.inner.clone()
+    }
+
+    /// CV-5: whether the producer gate asked for a resync since the last call
+    /// (it cannot reconcile with a branch it hears). The sync tick takes it and
+    /// starts a fork-point search ([`crate::sync_rejoin::start_resync`]).
+    pub fn take_resync_request(&self) -> bool {
+        self.inner.resync_requested.swap(false, Ordering::SeqCst)
     }
 
     /// The current best attested-ahead height (monitor/telemetry surface). NOTE: this is
@@ -601,11 +623,78 @@ impl AttestedInner {
         holds: impl Fn(&Hash) -> bool,
     ) -> Option<MajorityBranch> {
         let needed = deferred_majority_size(self.known_proposers.lock().len());
+        self.deferred_branches(now, |b| b.parents.iter().any(&holds))
+            .into_iter()
+            .filter(|b| b.proposers >= needed)
+            .max_by_key(|b| (b.proposers, b.height))
+            .map(|b| MajorityBranch {
+                height: b.height,
+                blue_score: b.blue_score,
+                proposers: b.proposers,
+            })
+    }
+
+    /// CV-5: the branch this node cannot admit that fork choice would rank at
+    /// least as high as `own_top`, backed by more than a third of the producer set
+    /// ([`deferred_quorum_size`]), if there is one.
+    ///
+    /// `own_top` is this node's best tip by the same header measure the branch is
+    /// judged by (header blue score, then the smaller hash, as `select_tip` breaks
+    /// ties): both sides are header values, because the branch cannot be scored
+    /// without its ancestry. Judging both sides by their best tip makes the
+    /// verdict antisymmetric: of two sides that hear each other, at most one finds
+    /// the other preferred.
+    ///
+    /// A branch backed by fewer producers never counts, so one key (or two of
+    /// seven) cannot hold the rest of the fleet off by signing blocks on parents
+    /// nobody serves.
+    ///
+    /// Unlike the majority check, a block that MERGES a block this node holds
+    /// still takes part: a branch that merges this node's blocks while extending
+    /// a selected chain this node lacks is the branch fork choice put this node's
+    /// work under, and the one this node fails to follow. Only a block whose
+    /// SELECTED parent this node holds (it extends this node's own chain) is left
+    /// out.
+    pub(crate) fn contender(
+        &self,
+        now: Instant,
+        holds: impl Fn(&Hash) -> bool,
+        own_top: (u64, Hash),
+    ) -> Option<Contender> {
+        let needed = deferred_quorum_size(self.known_proposers.lock().len());
+        self.deferred_branches(now, |b| b.parents.first().is_some_and(&holds))
+            .into_iter()
+            .filter(|b| b.proposers >= needed && b.blue_score >= own_top.0)
+            .max_by(|a, b| {
+                (a.blue_score, std::cmp::Reverse(a.top))
+                    .cmp(&(b.blue_score, std::cmp::Reverse(b.top)))
+            })
+            .map(|b| Contender {
+                height: b.height,
+                preferred: (b.blue_score, std::cmp::Reverse(b.top))
+                    > (own_top.0, std::cmp::Reverse(own_top.1)),
+            })
+    }
+
+    /// Mark that the producer gate wants the sync driver to resync (a fork-point
+    /// search against a peer whose head this node does not hold). Read once by
+    /// [`AttestedNetworkHead::take_resync_request`].
+    fn request_resync(&self) {
+        self.resync_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// The branches fresh deferred blocks form (see [`Self::majority_branch`] for
+    /// what links). Blocks `excluded` says to leave out take no part.
+    fn deferred_branches(
+        &self,
+        now: Instant,
+        excluded: impl Fn(&DeferredBlock) -> bool,
+    ) -> Vec<DeferredBranch> {
         let blocks = self.deferred_blocks.lock();
         let fresh: HashMap<Hash, &DeferredBlock> = blocks
             .iter()
             .filter(|(_, b)| now.saturating_duration_since(b.first_heard) < DEFERRED_EVIDENCE_TTL)
-            .filter(|(_, b)| !b.parents.iter().any(&holds))
+            .filter(|(_, b)| !excluded(b))
             .map(|(h, b)| (*h, b))
             .collect();
         // Undirected selected-parent links between fresh blocks.
@@ -618,24 +707,41 @@ impl AttestedInner {
                 }
             }
         }
-        // Connected components: (proposers, highest height, highest blue score).
+        // Connected components: proposers, highest height, and the top block by
+        // (blue score, smaller hash).
+        struct Component {
+            proposers: HashSet<PublicKey>,
+            height: u64,
+            blue: u64,
+            top: Hash,
+        }
         let mut component_of: HashMap<Hash, usize> = HashMap::new();
-        let mut components: Vec<(HashSet<PublicKey>, u64, u64)> = Vec::new();
+        let mut components: Vec<Component> = Vec::new();
         for start in fresh.keys() {
             if component_of.contains_key(start) {
                 continue;
             }
             let id = components.len();
-            let mut proposers = HashSet::new();
-            let mut top = 0u64;
-            let mut blue = 0u64;
+            let mut c = Component {
+                proposers: HashSet::new(),
+                height: 0,
+                blue: 0,
+                top: *start,
+            };
+            let mut first = true;
             let mut queue = std::collections::VecDeque::from([*start]);
             component_of.insert(*start, id);
             while let Some(h) = queue.pop_front() {
                 if let Some(b) = fresh.get(&h) {
-                    proposers.insert(b.proposer);
-                    top = top.max(b.height);
-                    blue = blue.max(b.blue_score);
+                    c.proposers.insert(b.proposer);
+                    c.height = c.height.max(b.height);
+                    if first
+                        || (b.blue_score, std::cmp::Reverse(h)) > (c.blue, std::cmp::Reverse(c.top))
+                    {
+                        c.blue = b.blue_score;
+                        c.top = h;
+                        first = false;
+                    }
                 }
                 for next in links.get(&h).map(Vec::as_slice).unwrap_or(&[]) {
                     if !component_of.contains_key(next) {
@@ -644,29 +750,52 @@ impl AttestedInner {
                     }
                 }
             }
-            components.push((proposers, top, blue));
+            components.push(c);
         }
         // A proposer on more than one branch counts on none.
         let mut branches_of: HashMap<PublicKey, usize> = HashMap::new();
-        for (proposers, _, _) in &components {
-            for p in proposers {
+        for c in &components {
+            for p in &c.proposers {
                 let n = branches_of.entry(*p).or_insert(0);
                 *n = n.saturating_add(1);
             }
         }
         components
             .iter()
-            .map(|(proposers, top, blue)| MajorityBranch {
-                height: *top,
-                blue_score: *blue,
-                proposers: proposers
+            .map(|c| DeferredBranch {
+                height: c.height,
+                blue_score: c.blue,
+                top: c.top,
+                proposers: c
+                    .proposers
                     .iter()
                     .filter(|p| branches_of.get(*p).copied().unwrap_or(0) == 1)
                     .count(),
             })
-            .filter(|b| b.proposers >= needed)
-            .max_by_key(|b| (b.proposers, b.height))
+            .collect()
     }
+}
+
+/// One branch of fresh deferred blocks ([`AttestedInner::deferred_branches`]).
+#[derive(Debug, Clone, Copy)]
+struct DeferredBranch {
+    height: u64,
+    /// Highest blue score claimed on the branch.
+    blue_score: u64,
+    /// The branch's top block by (blue score, smaller hash).
+    top: Hash,
+    /// Distinct proposers with a fresh block on it (equivocators excluded).
+    proposers: usize,
+}
+
+/// A branch this node cannot admit that fork choice ranks at least as high as
+/// this node's own best tip ([`AttestedInner::contender`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contender {
+    /// Highest block height heard on the branch.
+    pub height: u64,
+    /// Fork choice strictly prefers the branch over this node's own best tip.
+    pub preferred: bool,
 }
 
 /// M1 (VERIFY-255-F2-M1): read-only snapshot of the F2 catch-up gate for the node's
@@ -692,6 +821,42 @@ pub struct CatchupGateStatus {
     /// True while the split guard holds production off: a majority of producers keep
     /// extending a branch this node cannot admit, and sealing would fork it off.
     pub split_guard: bool,
+    /// CV-5: true while production is held off because this node cannot reconcile
+    /// with a branch fork choice prefers (more than a third of the producers on it).
+    pub cannot_reconcile: bool,
+}
+
+/// What deferred evidence means for one round ([`ProduceCatchupGate::deferred_for_round`]).
+#[derive(Debug, Clone, Copy)]
+struct DeferredVerdict {
+    /// The deferred watermark the hysteresis compares against (0: ignored).
+    watermark: u64,
+    /// CV-5: refuse this round whatever the gap (see `deferred_for_round`).
+    cannot_reconcile: bool,
+}
+
+impl DeferredVerdict {
+    fn watermark(watermark: u64) -> Self {
+        Self {
+            watermark,
+            cannot_reconcile: false,
+        }
+    }
+
+    /// CV-5: this node cannot reconcile with a branch fork choice prefers (see
+    /// `deferred_for_round`). Refuse whatever the height gap: the branches can be
+    /// level while this node still cannot follow the preferred one.
+    fn refuse_if_unreconciled(&self, attested: u64, local_tip: u64) -> anyhow::Result<()> {
+        if !self.cannot_reconcile {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "CV-5: refusing to produce — more than a third of the producers extend a \
+             branch this node cannot admit and fork choice ranks it above this node's own \
+             tip (heard up to {attested}, applied tip {local_tip}). Sealing would grow a \
+             second branch; waiting for sync to admit it."
+        ))
+    }
 }
 
 impl ProduceCatchupGate {
@@ -712,6 +877,18 @@ impl ProduceCatchupGate {
     /// Candidates at/below the finalized floor are pruned in passing (bounded record).
     /// No-op unless both the candidate record and the scratch watermark are wired.
     fn recompute_attested_ahead(&self, selected: Option<(Hash, u64)>, storage: &StorageManager) {
+        self.recompute_with_own_top(selected, None, storage);
+    }
+
+    /// [`Self::recompute_attested_ahead`] with this node's best tip by header measure
+    /// (`(header blue score, hash)`, the best of its DAG tips; `None`: the selected
+    /// head's). The contender check ([`AttestedInner::contender`]) compares against it.
+    fn recompute_with_own_top(
+        &self,
+        selected: Option<(Hash, u64)>,
+        own_top: Option<(u64, Hash)>,
+        storage: &StorageManager,
+    ) {
         let (Some(scratch), Some(observed)) = (
             self.attested_ahead.as_ref(),
             self.attested_observed.as_ref(),
@@ -734,6 +911,7 @@ impl ProduceCatchupGate {
                 if let Some(m) = self.deferred_majority_ahead.as_ref() {
                     m.store(0, Ordering::SeqCst);
                 }
+                *self.contender.lock() = None;
                 return;
             }
         };
@@ -755,6 +933,25 @@ impl ProduceCatchupGate {
         // branch fork choice would not prefer is not one this node is behind on. Both
         // sides are header values (the branch cannot be recomputed without its
         // ancestry), so the comparison is like for like.
+        // CV-5: a branch this node cannot admit that fork choice ranks at least as
+        // high as this node's own best tip. Header measure on both sides, as above.
+        {
+            let own = own_top.unwrap_or_else(|| {
+                let blue = storage
+                    .blocks
+                    .get_block(&sel_hash)
+                    .ok()
+                    .flatten()
+                    .map(|b| b.header.blue_score)
+                    .unwrap_or(u64::MAX);
+                (blue, sel_hash)
+            });
+            *self.contender.lock() = observed.contender(
+                observed.now_instant(),
+                |h| storage.blocks.has_block(h).unwrap_or(false),
+                own,
+            );
+        }
         if let Some(m) = self.deferred_majority_ahead.as_ref() {
             let sel_blue = storage
                 .blocks
@@ -911,6 +1108,7 @@ impl ProduceCatchupGate {
             applied_tip: st.last_applied_tip,
             gap: attested.saturating_sub(st.last_applied_tip),
             split_guard: self.split_guard.load(Ordering::SeqCst),
+            cannot_reconcile: self.cannot_reconcile.load(Ordering::SeqCst),
         }
     }
 
@@ -925,6 +1123,13 @@ impl ProduceCatchupGate {
             .unwrap_or(0)
     }
 
+    /// Ask the sync tick for a resync (no-op when the F2 record is not wired).
+    fn request_resync(&self) {
+        if let Some(o) = self.attested_observed.as_ref() {
+            o.request_resync();
+        }
+    }
+
     /// The majority-branch watermark of the last recompute (0 when not wired or none).
     fn majority_watermark(&self) -> u64 {
         self.deferred_majority_ahead
@@ -933,32 +1138,44 @@ impl ProduceCatchupGate {
             .unwrap_or(0)
     }
 
-    /// The deferred watermark this round may use.
+    /// What deferred (heard-but-unadmitted) evidence means for this round.
     ///
-    /// While deferred evidence ALONE would make the producer refuse, that is allowed
-    /// for [`DEFERRED_ONLY_REFUSE_MAX`]. After it:
-    ///   * if a strict majority of the producer set is extending ONE branch this node
-    ///     cannot admit (the majority watermark), the producer keeps refusing and
-    ///     raises the split guard. Sealing would only put a block on a branch of its
-    ///     own, which the majority will never build on: that is how one node's
-    ///     admission failure turns into a permanent split. Refusing costs the network
-    ///     nothing, because that majority is producing; and since refusing producers
-    ///     produce nothing, a guard that held every producer off would lose its own
-    ///     evidence within [`DEFERRED_EVIDENCE_TTL`]. Sync keeps running meanwhile,
-    ///     and the guard ends when the branch is admitted or goes quiet;
-    ///   * otherwise (a total split, a minority, unlinked blocks) the evidence is
-    ///     ignored and the producer seals, with a rate-limited warning, until it stops
-    ///     being the only reason to refuse. This is the 10-29 bound: evidence that no
-    ///     majority stands behind must not idle producers network-wide.
-    fn deferred_for_round(&self, st: &mut CatchupBehindState, local_tip: u64, held: u64) -> u64 {
+    /// While deferred evidence is the only reason to refuse, or a branch this node
+    /// cannot admit ranks at least as high as its own best tip (a contender, see
+    /// [`AttestedInner::contender`]), the gate gives sync [`Self::deferred_refuse_max`]
+    /// to admit it, refusing on the deferred watermark as usual. After that:
+    ///   * if a strict majority of the producer set is extending ONE branch this
+    ///     node cannot admit (the majority watermark), the producer keeps refusing
+    ///     and raises the split guard (unchanged from the base);
+    ///   * otherwise, if fork choice strictly prefers a contender backed by more
+    ///     than a third of the producer set over this node's own best tip, this node
+    ///     cannot reconcile (CV-5): it stops sealing until it admits that branch or
+    ///     the branch goes quiet, raises `cannot_reconcile` (metric), logs a
+    ///     rate-limited ERROR and asks the sync tick for a resync. Sealing would only
+    ///     grow a second branch next to the one fork choice prefers. There is no
+    ///     "seal anyway" past the window any more;
+    ///   * otherwise the evidence names no branch fork choice would prefer over this
+    ///     node's own tip (a branch lighter than ours, single-proposer or unlinked
+    ///     blocks, a total split into singletons): this node is not behind on any
+    ///     branch, so the evidence does not hold production off. A branch backed by
+    ///     a third of the producers or fewer never stops the rest, so one key cannot
+    ///     halt the fleet by signing blocks on parents nobody serves.
+    fn deferred_for_round(
+        &self,
+        st: &mut CatchupBehindState,
+        local_tip: u64,
+        held: u64,
+    ) -> DeferredVerdict {
         let majority = self.majority_watermark();
         let raw = self.deferred_watermark().max(majority);
+        let contender = *self.contender.lock();
         let deferred_only = raw.saturating_sub(local_tip) > CATCHUP_RESUME_GAP
             && held.saturating_sub(local_tip) <= CATCHUP_RESUME_GAP;
-        if !deferred_only {
+        if !deferred_only && contender.is_none() {
             st.deferred_only_since = None;
             self.split_guard.store(false, Ordering::SeqCst);
-            return raw;
+            self.cannot_reconcile.store(false, Ordering::SeqCst);
+            return DeferredVerdict::watermark(raw);
         }
         let now = self
             .attested_observed
@@ -967,15 +1184,17 @@ impl ProduceCatchupGate {
             .unwrap_or_else(Instant::now);
         let since = *st.deferred_only_since.get_or_insert(now);
         if now.saturating_duration_since(since) < self.deferred_refuse_max {
-            return raw;
+            return DeferredVerdict::watermark(raw);
         }
         if majority.saturating_sub(local_tip) > CATCHUP_RESUME_GAP {
             self.split_guard.store(true, Ordering::SeqCst);
+            self.cannot_reconcile.store(false, Ordering::SeqCst);
             let due = st
                 .split_guard_alarmed
                 .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
             if due {
                 st.split_guard_alarmed = Some(now);
+                self.request_resync();
                 error!(
                     "F2/#126 SPLIT GUARD: a majority of producers keep extending a branch this \
                      node cannot admit (evidence at {majority}, applied tip {local_tip}) for over \
@@ -985,22 +1204,51 @@ impl ProduceCatchupGate {
                     self.deferred_refuse_max.as_secs()
                 );
             }
-            return majority;
+            return DeferredVerdict::watermark(majority);
         }
         self.split_guard.store(false, Ordering::SeqCst);
-        let due = st
-            .deferred_only_warned
-            .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
-        if due {
-            st.deferred_only_warned = Some(now);
-            warn!(
-                "F2/#126: signed blocks this node cannot admit have said it is behind \
-                 (evidence at {raw}, applied tip {local_tip}) for over {}s with nothing it \
-                 holds agreeing; sealing anyway. Check this node's peers and sync.",
-                self.deferred_refuse_max.as_secs()
-            );
+        if let Some(c) = contender.filter(|c| c.preferred) {
+            self.cannot_reconcile.store(true, Ordering::SeqCst);
+            let due = st
+                .unreconciled_alarmed
+                .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+            if due {
+                st.unreconciled_alarmed = Some(now);
+                self.request_resync();
+                error!(
+                    "CV-5 CANNOT RECONCILE: more than a third of the producers extend a branch \
+                     this node cannot admit (heard up to height {}, applied tip {local_tip}) and \
+                     fork choice ranks it above this node's own tip, for over {}s. NOT sealing: \
+                     that would grow a second branch. Resync requested; production resumes once \
+                     this node admits that branch or it goes quiet. Check this node's admission \
+                     errors, peers and sync.",
+                    c.height,
+                    self.deferred_refuse_max.as_secs()
+                );
+            }
+            return DeferredVerdict {
+                watermark: raw.max(c.height),
+                cannot_reconcile: true,
+            };
         }
-        0
+        self.cannot_reconcile.store(false, Ordering::SeqCst);
+        if deferred_only {
+            let due = st
+                .deferred_only_warned
+                .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+            if due {
+                st.deferred_only_warned = Some(now);
+                warn!(
+                    "F2/#126: signed blocks this node cannot admit have said it is behind \
+                     (evidence at {raw}, applied tip {local_tip}) for over {}s, but they name no \
+                     branch that fork choice ranks above this node's own tip with more than a \
+                     third of the producers behind it; not holding production on them. Check \
+                     this node's peers and sync.",
+                    self.deferred_refuse_max.as_secs()
+                );
+            }
+        }
+        DeferredVerdict::watermark(0)
     }
 
     /// F2: decide whether the node is too far BEHIND its peers to seal this slot.
@@ -1018,7 +1266,8 @@ impl ProduceCatchupGate {
         // kind can latch the stall alert (see `deferred_watermark`).
         let held = attested.load(Ordering::SeqCst);
         let mut st = self.behind.lock();
-        let attested = held.max(self.deferred_for_round(&mut st, local_tip, held));
+        let verdict = self.deferred_for_round(&mut st, local_tip, held);
+        let attested = held.max(verdict.watermark);
         let gap = attested.saturating_sub(local_tip);
         let held_behind = held.saturating_sub(local_tip) > CATCHUP_RESUME_GAP;
 
@@ -1060,6 +1309,8 @@ impl ProduceCatchupGate {
                 self.stall_alert_after.as_secs()
             ));
         }
+
+        verdict.refuse_if_unreconciled(attested, local_tip)?; // CV-5
 
         // Hysteresis on the gap to the best attested-ahead head.
         if st.refusing {
@@ -2108,6 +2359,8 @@ impl BlockProducer {
             deferred_ahead: None,
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
+            contender: Arc::new(Mutex::new(None)),
+            cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
             deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
         });
@@ -2347,7 +2600,25 @@ impl BlockProducer {
                         .map(|b| (hash, b.header.height)),
                     Err(_) => None,
                 };
-                gate.recompute_attested_ahead(selected, &self.storage);
+                // CV-5: this node's best tip by header measure, the yardstick the
+                // contender check holds a branch it cannot admit against.
+                let own_top = self
+                    .ghostdag
+                    .get_tips()
+                    .await
+                    .into_iter()
+                    .filter_map(|h| {
+                        self.storage
+                            .blocks
+                            .get_block(&h)
+                            .ok()
+                            .flatten()
+                            .map(|b| (b.header.blue_score, h))
+                    })
+                    .max_by(|a, b| {
+                        (a.0, std::cmp::Reverse(a.1)).cmp(&(b.0, std::cmp::Reverse(b.1)))
+                    });
+                gate.recompute_with_own_top(selected, own_top, &self.storage);
             }
         }
 
@@ -2483,6 +2754,9 @@ impl BlockProducer {
                 );
                 citrate_api::metrics_server::update_producer_split_guard(
                     gate.split_guard.load(Ordering::SeqCst),
+                );
+                citrate_api::metrics_server::update_producer_cannot_reconcile(
+                    gate.cannot_reconcile.load(Ordering::SeqCst),
                 );
             }
             gate_result?;
@@ -6901,6 +7175,8 @@ mod tests {
             deferred_ahead: None,
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
+            contender: Arc::new(Mutex::new(None)),
+            cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
             deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
         }
@@ -7218,7 +7494,8 @@ mod tests {
         let ev = src
             .find("fn evaluate_network_height(")
             .expect("evaluate_network_height present");
-        let ebody = &src[ev..ev + 3000];
+        // The body, up to the hysteresis (it grew by the CV-5 refusal).
+        let ebody = &src[ev..ev + 3400];
         assert!(
             ebody.contains("self.attested_ahead")
                 && ebody.contains("CATCHUP_REFUSE_GAP")
@@ -7423,6 +7700,8 @@ mod tests {
             deferred_ahead: None,
             deferred_majority_ahead: None,
             split_guard: Arc::new(AtomicBool::new(false)),
+            contender: Arc::new(Mutex::new(None)),
+            cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
             deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
         }
@@ -8406,13 +8685,14 @@ mod tests {
 
     /// The seal gate when producers this node cannot follow keep extending a branch.
     ///
-    /// The 60 s cap on deferred-only refusal (`DEFERRED_ONLY_REFUSE_MAX`) exists so
+    /// The 60 s window on deferred-only refusal (`DEFERRED_ONLY_REFUSE_MAX`) exists so
     /// that unadmittable evidence cannot idle producers network-wide. These tests pin
-    /// where the cap must still apply (no single branch backed by a majority of the
-    /// producer set: a total split, a minority, an equivocating proposer) and where it
-    /// must not (a majority of producers agree on one branch this node cannot admit:
-    /// sealing then only forks this node off, and refusing cannot stall the network,
-    /// because that majority is producing).
+    /// where the evidence stops counting past it (no branch fork choice would prefer
+    /// backed by more than a third of the producers: a total split, unlinked blocks, a
+    /// lighter branch) and where B must keep refusing: a majority on one branch it
+    /// cannot admit (the split guard), and, since CV-5, any branch backed by more
+    /// than a third that fork choice ranks above B's tip (cannot reconcile). Sealing
+    /// there only grows a second branch.
     mod split_guard {
         use super::seal_gate_and_parent_walk::{applied, gossip, node, produce, N};
         use super::*;
@@ -8501,6 +8781,15 @@ mod tests {
             for blk in blocks {
                 assert_eq!(gossip(b, None, blk).await, "deferred");
             }
+        }
+
+        fn cannot_reconcile_on(b: &N) -> bool {
+            b.producer
+                .produce_gate
+                .as_ref()
+                .expect("gate wired")
+                .status_snapshot()
+                .cannot_reconcile
         }
 
         fn split_guard_on(b: &N) -> bool {
@@ -8602,9 +8891,13 @@ mod tests {
             assert!(!split_guard_on(&b));
         }
 
-        /// Three of seven agreeing (more than a third, not a majority): the cap
-        /// applies. This is the 10-29 stranded-minority case: the majority must not
-        /// be held off by a minority it cannot follow.
+        /// Three of seven agreeing (more than a third, not a majority) on a branch
+        /// fork choice ranks above B's tip. Before CV-5 the 60 s cap applied and B
+        /// sealed on its own tip, growing a second branch next to the one fork
+        /// choice prefers (the 10-29 stranded-minority case, kept live that way).
+        /// CV-5 trades that liveness for safety: B cannot reconcile, so it keeps
+        /// refusing, raises `cannot_reconcile` and asks for a resync. The split
+        /// guard (a majority) stays down; the chain stays live on the three.
         #[tokio::test(flavor = "current_thread")]
         async fn rcseal_minority_branch_keeps_the_cap() {
             let (_others, mut b, templates) = seven().await;
@@ -8624,14 +8917,27 @@ mod tests {
                 }
                 b.attested.advance_clock_for_test(Duration::from_secs(10));
             }
-            let at = first_seal.expect("a minority held B off past the cap");
-            assert!((60..=70).contains(&at), "sealed at {at}s");
-            assert!(!split_guard_on(&b));
+            assert_eq!(
+                first_seal, None,
+                "CV-5: B sealed on its own tip past the window while three of seven extend a \
+                 branch it cannot admit that fork choice prefers"
+            );
+            assert!(!split_guard_on(&b), "three of seven are not a majority");
+            assert!(
+                cannot_reconcile_on(&b),
+                "the cannot-reconcile alarm is not raised"
+            );
+            assert!(
+                b.attested.take_resync_request(),
+                "B did not ask the sync tick for a resync"
+            );
         }
 
         /// A proposer that signs on two branches is not counted on either: with it,
-        /// each branch would show four proposers (a "majority" each), and both sides
-        /// would stop. Without it each shows three, so the cap applies.
+        /// each branch would show four proposers (a "majority" each). Without it
+        /// neither is a majority, so the split guard stays down. Branch P still has
+        /// three honest proposers (more than a third) and fork choice ranks it above
+        /// B's tip, so under CV-5 B cannot reconcile and does not seal.
         #[tokio::test(flavor = "current_thread")]
         async fn rcseal_equivocating_proposer_counts_on_no_branch() {
             let (_others, mut b, templates) = seven().await;
@@ -8650,8 +8956,12 @@ mod tests {
                 }
                 b.attested.advance_clock_for_test(Duration::from_secs(10));
             }
-            let at = first_seal.expect("an equivocator made a majority");
-            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert_eq!(
+                first_seal, None,
+                "CV-5: B sealed next to a branch it cannot admit"
+            );
+            assert!(!split_guard_on(&b), "an equivocator made a majority");
+            assert!(cannot_reconcile_on(&b));
         }
 
         /// Blocks from four proposers that do not link to each other (same height
@@ -8747,9 +9057,13 @@ mod tests {
         /// (node 4) whose block each round names the branch tip as its selected
         /// parent AND this node's own tip as a merge parent. Linking through any
         /// parent counted key 4 on the branch, which made it a "majority" here,
-        /// while the same block also follows this node's own history. A block
-        /// that names a parent this node holds is not evidence that this node
-        /// is behind, and only selected-parent links make a branch.
+        /// while the same block also follows this node's own history. For the
+        /// split guard a block that names a parent this node holds does not count,
+        /// and only selected-parent links make a branch: no majority.
+        ///
+        /// CV-5: the branch is still one fork choice ranks above B's tip, extended
+        /// by more than a third of the producers on a selected chain B lacks (it
+        /// even merges B's tip), so B cannot reconcile and does not seal.
         #[tokio::test(flavor = "current_thread")]
         async fn rcseal_red_bridging_key_does_not_complete_a_majority() {
             let (_others, mut b, templates) = seven().await;
@@ -8777,8 +9091,29 @@ mod tests {
                 }
                 b.attested.advance_clock_for_test(Duration::from_secs(10));
             }
-            let at = first_seal.expect("a bridging key held a minority node off past the cap");
-            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert_eq!(
+                first_seal, None,
+                "CV-5: B sealed next to a branch it cannot admit"
+            );
+            assert!(!split_guard_on(&b), "a bridging key completed a majority");
+            assert!(cannot_reconcile_on(&b));
+        }
+
+        /// CV-5 liveness: a producer at the tip with no unadmittable evidence keeps
+        /// sealing every round past the refuse window, alone or among peers it
+        /// follows. Here B follows six producers on one chain, then seals alone.
+        #[tokio::test(flavor = "current_thread")]
+        async fn cv5_a_producer_at_the_tip_keeps_sealing() {
+            let (_others, mut b, _templates) = seven().await;
+            for step in 0..12u64 {
+                b.producer
+                    .produce_block()
+                    .await
+                    .unwrap_or_else(|e| panic!("B at the tip refused at {}s: {e}", step * 10));
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert!(!split_guard_on(&b));
+            assert!(!cannot_reconcile_on(&b));
         }
 
         /// Merge-parent links alone do not make a branch: four producers whose
