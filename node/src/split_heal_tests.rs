@@ -2286,6 +2286,12 @@ mod tests {
             let k = fork + 10;
             for i in side_b.iter().copied() {
                 let rec = fleet.record(i);
+                // Optional: keep the recording for the `replay-diff` CLI
+                // (tools/replay-ref), e.g. for a release-gate run. Off by default.
+                if let Ok(out) = std::env::var("CITRATE_SPLIT_HEAL_RECORDING_DIR") {
+                    let path = std::path::Path::new(&out).join(format!("stopped-side-node{i}.rec"));
+                    rec.write_to(&path).expect("write the recording");
+                }
                 let clean = replay(&rec, &SelectedChain).await.expect("replay");
                 let mut bad = rec.clone();
                 if let Some(b) = bad.chain_block_mut(k) {
