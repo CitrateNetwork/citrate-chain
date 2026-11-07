@@ -1,3 +1,6 @@
+
+> **Launch tokenomics: TBD before launch.** Supply, allocations, vesting, emissions, staking requirements, fees, and rewards are not finalized. More announcements coming soon. See the [current status and notice about earlier exploratory materials](https://docs.citrate.ai/chain/economics). Feedback: [support@citrate.ai](mailto:support@citrate.ai).
+
 # Core
 
 Rust workspace crates implementing the Citrate blockchain core. Contains consensus, execution, networking, storage, and AI-native subsystems that together form the Layer-1 BlockDAG.

@@ -161,69 +161,11 @@ These addresses handle runtime AI operations (inference, ZK proofs):
 
 ---
 
-## 4. Token Economics
+## 4. Launch network economics
 
-### SALT Token
-- **Type**: Native gas token (not ERC-20)
-- **Total supply**: 1,000,000,000,000 (1 trillion)
-- **Decimals**: 18
-- **Distribution**: 50% mining, 25% ecosystem, 10% treasury, 15% team
+**Launch tokenomics: TBD before launch.** Supply, allocations, vesting, emissions, staking requirements, fees, and rewards are not finalized. More announcements coming soon. See the [current status and notice about earlier exploratory materials](https://docs.citrate.ai/chain/economics). Feedback: [support@citrate.ai](mailto:support@citrate.ai).
 
-### Block Rewards
-- **Base reward**: 10 SALT/block
-- **Halving**: Every 2,100,000 blocks (~4 years)
-- **Schedule**: 10 → 5 → 2.5 → 1.25 → 0.625 → ... → 0.1 (tail emission)
-- **Bonus**: +1% per inference in block, +0.5% per GB artifacts pinned
-
-### Revenue Distribution (7-way + market maker)
-```
-Gas Fees → 10% Market Maker (pre-split)
-         → 90% × { Validators 23%, Creators 30%, Infra 15%,
-                    Treasury 12%, Stakers 15%, x402 Facilitators 5% }
-```
-
-### Staking (stSALT)
-- **Model**: Lido-style liquid staking with shares
-- **Minimum stake**: 32,000 SALT (validators), 100 SALT (delegation)
-- **Withdrawal lockup**: 7 days (50,400 blocks)
-- **Oracle committee**: 67/100 quorum for reward reporting
-- **Provider collateral**: 10% of delegated SALT
-
-### Contribution Weights (Shapley)
-| Type | Weight | Description |
-|------|--------|-------------|
-| Validation | 1.0x | Block proposal + BFT signatures |
-| ModelHosting | 1.5x | Inference requests served |
-| AdapterCreation | 2.0x | LoRA adapters improving models |
-| DataProvision | 1.5x | Training data contributed |
-| AppDevelopment | 1.0x | Tools/UIs deployed |
-| BridgeInfra | 1.0x | Cross-chain relay operations |
-| Governance | 0.5x | Votes cast + proposals |
-
-### Slashing (NematocystSlashing)
-| Tier | Name | Penalty | Trigger |
-|------|------|---------|---------|
-| 1 | Spirocyst | 5% of stake | Latency, missed checkpoints |
-| 2 | Mastigophore | 20% of stake | Inconsistency, high Belnap Both |
-| 3 | Penetrant | 100% of stake | Byzantine (double-signing), permanent ban |
-| — | Correlation | Up to 3x multiplier | Multiple slashes in 50-block window |
-
-### Compute Pricing
-- **Oracle**: BFT quorum (67%) updates FLOP/SALT rate
-- **Reference**: A100 x8 = ~$20/hr = $0.13/PFLOP-hour
-- **BME burn**: 2.5% of every compute job value
-- **Treasury fee**: 2.5% of every compute job value
-- **Verification multipliers**: Commitment 1.0x, ZKProof 1.5x, TEE 2.0x
-- **Staleness**: Oracle prices expire after 7,200 blocks (~1 day)
-
-### Governance
-- **Proposal threshold**: 10,000 SALT
-- **Quorum**: 10% of supply
-- **Approval**: 60% of votes
-- **Voting period**: 50,400 blocks (~7 days)
-- **Execution delay**: 7,200 blocks (~1 day, timelock)
-- **Voting power**: SALT balance + stSALT shares × sharePrice
-- **Proposal types**: TreasurySpend, ParameterChange, OracleUpdate, Emergency
+Existing testnet implementations are experimental engineering configurations, not launch commitments. Economic simulations retain their explicit assumptions.
 
 ---
 

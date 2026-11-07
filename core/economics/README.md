@@ -1,10 +1,13 @@
+
+> **Launch tokenomics: TBD before launch.** Supply, allocations, vesting, emissions, staking requirements, fees, and rewards are not finalized. More announcements coming soon. See the [current status and notice about earlier exploratory materials](https://docs.citrate.ai/chain/economics). Feedback: [support@citrate.ai](mailto:support@citrate.ai).
+
 # citrate-economics
 
 Tokenomics, reward distribution, governance, and economic policy for the Citrate blockchain.
 
 ## Overview
 
-This crate implements the complete economic layer for Citrate's SALT token (1 trillion total supply, 18 decimals). It covers the full lifecycle of network economics: genesis configuration with initial token distribution, block reward calculation with halving schedules, enhanced multi-factor reward distribution based on validator performance and AI contributions, dynamic gas pricing that responds to network utilization, on-chain governance with proposal/vote mechanics, and multi-party revenue sharing across validators, model creators, infrastructure providers, and the treasury.
+This crate implements the complete economic layer for Citrate's SALT token (experimental testnet accounting). It covers the full lifecycle of network economics: genesis configuration with initial token distribution, block reward calculation with halving schedules, enhanced multi-factor reward distribution based on validator performance and AI contributions, dynamic gas pricing that responds to network utilization, on-chain governance with proposal/vote mechanics, and multi-party revenue sharing across validators, model creators, infrastructure providers, and the treasury.
 
 The crate also provides specialized support for institutional operators (e.g., school node pilots) with tailored reward profiles covering block validation, model hosting, adapter creation, and data provision. A lenient slashing policy accommodates institutional scheduling constraints while maintaining network security through equivocation penalties. The estimator module enables forward-looking reward projections for institutional onboarding.
 
@@ -14,16 +17,16 @@ All economic parameters are configurable and can be modified through the governa
 
 | Module | File | Purpose |
 |--------|------|---------|
-| `token` | `src/token.rs` | SALT token: `Token` struct with balances, minting, burning, transfers; `TokenConfig` with 18 decimals and 1B supply |
+| `token` | `src/token.rs` | SALT token: `Token` struct with balances, minting, burning, transfers; `TokenConfig` with configurable testnet accounting |
 | `rewards` | `src/rewards.rs` | Base block reward calculation with halving schedule, inference bonuses, model deployment bonuses, treasury allocation |
 | `genesis` | `src/genesis.rs` | Genesis configuration: initial account balances, treasury address, team allocations, ecosystem fund, mining pool cap |
 | `governance` | `src/governance.rs` | On-chain governance: `GovernanceManager` for proposals, voting, delegation, execution; proposal types include parameter changes, network upgrades, treasury spending, emergency actions, marketplace governance |
 | `dynamic_pricing` | `src/dynamic_pricing.rs` | EIP-1559-style dynamic gas pricing: `DynamicPricingManager` adjusts prices based on block utilization, supports AI inference and model deployment cost multipliers |
-| `enhanced_rewards` | `src/enhanced_rewards.rs` | Multi-factor reward distribution: performance bonuses (30%), AI contribution rewards (25%), network health bonuses (20%), long-term staking bonuses (25%) |
-| `revenue_sharing` | `src/revenue_sharing.rs` | Multi-party revenue sharing: splits fees across validators (23%), model creators (30%), infrastructure (15%), treasury (12%), stakers (15%), x402 facilitators (5%) |
+| `enhanced_rewards` | `src/enhanced_rewards.rs` | Multi-factor reward distribution: performance bonuses, AI contribution rewards, network health bonuses, long-term staking bonuses |
+| `revenue_sharing` | `src/revenue_sharing.rs` | Multi-party revenue sharing: splits fees across validators, model creators, infrastructure, treasury, stakers, x402 facilitators |
 | `unified_economics` | `src/unified_economics.rs` | Unified economic manager: integrates token, governance, pricing, rewards, and revenue sharing; computes quadratic voting power combining token holdings, gas usage, staking, and reputation |
 | `institutional` | `src/institutional.rs` | Institutional operator reward profiles: block validation, model hosting, adapter creation, data provision rewards with configurable caps and uptime requirements |
-| `slashing` | `src/slashing.rs` | Institutional slashing policy: equivocation (10%), invalid state transition (15%), censorship (5%) penalties; grace periods, cooldowns, no downtime penalties for institutions |
+| `slashing` | `src/slashing.rs` | Institutional slashing policy: equivocation, invalid state transition, censorship penalties; grace periods, cooldowns, no downtime penalties for institutions |
 | `estimator` | `src/estimator.rs` | Monthly reward projection calculator for institutional operators based on expected uptime, model count, adapter and dataset contributions |
 | `lib` | `src/lib.rs` | Module declarations, public re-exports, constants (`TOKEN_SYMBOL`, `TOKEN_NAME`, `TOTAL_SUPPLY`), unit conversion helpers (`latt_to_wei`, `wei_to_latt`) |
 
@@ -31,7 +34,7 @@ All economic parameters are configurable and can be modified through the governa
 
 ### Token
 - **`Token::new(config)`** -- Create token with initial distribution
-- **`TokenConfig`** -- Name ("Citrate"), symbol ("SALT"), 18 decimals, 1B total supply
+- **`TokenConfig`** -- Name ("Citrate"), symbol ("SALT"), experimental testnet accounting
 - **`DECIMALS`** -- Constant: 18
 
 ### Rewards
@@ -58,7 +61,7 @@ All economic parameters are configurable and can be modified through the governa
 - **`OperationType`** -- Enum: `StandardTransfer`, `ContractCall`, `AIInference`, `ModelDeployment`, `Training`, `Storage`
 
 ### Enhanced Rewards
-- **`EnhancedRewardConfig`** -- Multi-factor reward pools: performance (30%), AI (25%), health (20%), staking (25%)
+- **`EnhancedRewardConfig`** -- Multi-factor reward pools: performance, AI, health, staking
 - **`ValidatorPerformance`** -- Uptime, blocks proposed, latency, attestation rate
 - **`AIContribution`** -- Models hosted, inference quality, training contributions
 - **`NetworkHealth`** -- Peer count, propagation time, fork rate
@@ -94,7 +97,7 @@ All economic parameters are configurable and can be modified through the governa
 ### Constants & Helpers
 - **`TOKEN_SYMBOL`** -- `"SALT"`
 - **`TOKEN_NAME`** -- `"Citrate"`
-- **`TOTAL_SUPPLY`** -- `1_000_000_000_000`
+- **`TOTAL_SUPPLY`** -- implementation configuration; launch supply TBD
 - **`latt_to_wei(latt)`** -- Convert SALT to wei (smallest unit)
 - **`wei_to_latt(wei)`** -- Convert wei to SALT
 
