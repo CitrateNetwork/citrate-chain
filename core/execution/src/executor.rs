@@ -256,6 +256,11 @@ pub struct Executor {
     /// (`citrate_consensus::hardening`); tests override it with
     /// [`Executor::set_pba_hardening`].
     pba_hardening_height: std::sync::atomic::AtomicU64,
+    /// S3-7: the RPC call tracer (`crate::trace`). `None` on every executor
+    /// except one built for an RPC trace (`Executor::replay_executor` +
+    /// [`Executor::with_call_tracer`]), so the consensus executor always takes
+    /// the untraced REVM path.
+    call_tracer: Option<crate::trace::CallTraceHandle>,
 }
 
 /// Height at which contract-initiated native value transfers start working.
@@ -960,6 +965,7 @@ impl Executor {
             pba_hardening_height: std::sync::atomic::AtomicU64::new(
                 citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
             ),
+            call_tracer: None,
         }
     }
 
@@ -1106,6 +1112,7 @@ impl Executor {
             pba_hardening_height: std::sync::atomic::AtomicU64::new(
                 citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
             ),
+            call_tracer: None,
         }
     }
 
@@ -2390,6 +2397,8 @@ impl Executor {
 
         // -- Fast path: bounded CAS retries with NO exec_lock held --
         for _attempt in 0..MAX_RETRIES {
+            // S3-7: a traced replay keeps the frames of the committed attempt.
+            self.trace_begin_attempt();
             let mut context = ExecutionContext::new(block, tx);
             let pin = coord.current_version();
             context.journal.lock().pin_at(pin);
@@ -2427,6 +2436,7 @@ impl Executor {
         // we then commit unconditionally (no read-set validation needed).
         // Progress is guaranteed (TLA+ `Progress` temporal property).
         let _guard = coord.acquire_exec_lock().await;
+        self.trace_begin_attempt();
         let mut context = ExecutionContext::new(block, tx);
         context.journal.lock().pin_at(coord.current_version());
         let (receipt, writes) = self
@@ -2436,6 +2446,14 @@ impl Executor {
         self.drain_journal(&context.journal);
         self.persist_account_versions(&writes, new_version);
         Ok(receipt)
+    }
+
+    /// S3-7: start a new attempt on the RPC call tracer, if one is attached
+    /// (never on the consensus executor, whose `call_tracer` is `None`).
+    fn trace_begin_attempt(&self) {
+        if let Some(t) = &self.call_tracer {
+            t.lock().begin_attempt();
+        }
     }
 
     /// Persist per-account + global MVCC versions to RocksDB.
@@ -2780,7 +2798,66 @@ impl Executor {
                 self.pba_hardening_height
                     .load(std::sync::atomic::Ordering::SeqCst),
             ),
+            // S3-7: a traced replay executor's simulation stays traced
+            // (`debug_traceCall`); `None` on every other executor.
+            call_tracer: self.call_tracer.clone(),
         }
+    }
+
+    /// S3-7 (CNV-RPC): a throwaway executor over `state` for an RPC replay
+    /// (historical `eth_call`, `debug_traceTransaction`, `debug_traceCall`).
+    ///
+    /// Isolated from the node by construction:
+    /// - its own `StateDB`, restored from `state` (nothing is shared with the
+    ///   consensus state, not even the code map);
+    /// - its own MVCC `CommitCoordinator`, so committing replayed transactions
+    ///   never bumps the node's versions;
+    /// - `store` in place of the node's state store. The caller passes a
+    ///   store whose writes are discarded (the RPC passes a code-only reader,
+    ///   `citrate_api::historical_state`), or `None`.
+    ///
+    /// Chain id, gas schedule, reward policy, activation heights and the
+    /// inference/artifact adapters are copied from `self`, so a replayed
+    /// transaction runs under the rules the node runs it under.
+    pub fn replay_executor(
+        &self,
+        state: crate::state::StateSnapshot,
+        store: Option<Arc<dyn StateStoreTrait>>,
+    ) -> Executor {
+        let db = StateDB::new();
+        db.restore(state);
+        Executor {
+            state_db: Arc::new(db),
+            state_store: store,
+            gas_schedule: self.gas_schedule.clone(),
+            inference_service: self.inference_service.clone(),
+            artifact_service: self.artifact_service.clone(),
+            ai_storage: self.ai_storage.clone(),
+            model_registry: self.model_registry.clone(),
+            precompile_executor: self.precompile_executor.clone(),
+            chain_id: self.chain_id,
+            block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
+            commit_coordinator: Arc::new(CommitCoordinator::new()),
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
+            reward_policy: self.reward_policy.clone(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(
+                self.validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                self.pba_hardening_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            call_tracer: None,
+        }
+    }
+
+    /// S3-7: attach an RPC call tracer (`crate::trace`). Every REVM call or
+    /// create this executor runs for a transaction is recorded into `tracer`.
+    /// The inspector only observes; results are those of the untraced path.
+    pub fn with_call_tracer(mut self, tracer: crate::trace::CallTraceHandle) -> Self {
+        self.call_tracer = Some(tracer);
+        self
     }
 
     pub async fn simulate_transaction(
@@ -3369,7 +3446,7 @@ impl Executor {
         // Revm will calculate the correct CREATE address and create the account
         // WP-Z.2: Pass block context so PREVRANDAO opcode returns real VRF output
         let gas_remaining = context.gas_limit.saturating_sub(context.gas_used);
-        let result = crate::revm_adapter::execute_contract_create_with_context(
+        let result = crate::revm_adapter::execute_contract_create_traced(
             self.state_db.clone(),
             from,
             code,
@@ -3386,6 +3463,8 @@ impl Executor {
             // above), but constructor code can still CALL out with value, so
             // the same height gate applies.
             crate::executor::value_semantics_at(context.block_number),
+            // S3-7: `None` except on an RPC trace replay executor.
+            self.call_tracer.as_ref(),
         );
 
         match result {
@@ -3540,7 +3619,7 @@ impl Executor {
             );
             let available_gas = context.gas_limit.saturating_sub(context.gas_used);
             // WP-Z.2: Pass block context so PREVRANDAO opcode returns real VRF output
-            match crate::revm_adapter::execute_contract_call_with_context(
+            match crate::revm_adapter::execute_contract_call_traced(
                 self.state_db.clone(),
                 from,
                 to,
@@ -3558,6 +3637,8 @@ impl Executor {
                 // hydrate account / code / storage on cold cache miss.
                 self.state_store.clone(),
                 value_semantics,
+                // S3-7: `None` except on an RPC trace replay executor.
+                self.call_tracer.as_ref(),
             ) {
                 Ok((output, gas_used, revm_logs)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();
