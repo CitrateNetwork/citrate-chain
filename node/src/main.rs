@@ -92,6 +92,7 @@ mod rollback;
 mod serve_plane;
 #[cfg(test)]
 mod serve_plane_tests;
+mod slot_stats;
 #[cfg(test)]
 mod split_heal_tests;
 mod startup_guards;
@@ -2560,6 +2561,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // merely shaped like genesis (parentless, arbitrary height) cannot
         // bypass the admission gates.
         shared_dag_store.set_configured_genesis(genesis_hash);
+        // r1007 G9 (#184): bind the slot origin (the genesis timestamp) from
+        // the same block. A DAG store that holds neither genesis nor the
+        // origin key (an in-memory store over a pruned chain) could otherwise
+        // slot-check nothing, and a store whose origin disagrees with this
+        // genesis would mis-slot every block: refuse to start.
+        if genesis_hash != citrate_consensus::types::Hash::default() {
+            match storage.blocks.get_block(&genesis_hash) {
+                Ok(Some(genesis)) => shared_dag_store
+                    .set_slot_origin(&genesis.header)
+                    .map_err(|e| anyhow::anyhow!("G9 slot origin: {e}"))?,
+                Ok(None) => warn!(
+                    "G9: genesis {genesis_hash} is indexed at height 0 but its block is not                      stored; the slot origin comes from the DAG store alone"
+                ),
+                Err(e) => return Err(anyhow::anyhow!("G9: read genesis {genesis_hash}: {e}")),
+            }
+        }
         let network_id: u32 = config.chain.chain_id as u32;
 
         // Incoming message channel (log-only for now)

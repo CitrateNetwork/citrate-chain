@@ -239,7 +239,8 @@ mod tests {
                 .height(height)
                 .parent(parent)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -249,6 +250,10 @@ mod tests {
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
             b
         }
@@ -284,6 +289,8 @@ mod tests {
         let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
         let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("reload"));
         dag.set_configured_genesis(chain[0].header.block_hash);
+        dag.set_slot_origin(&chain[0].header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         let floor = pruned_below(&dag).await;
         assert_eq!(floor, 500, "the pruning point survives the restart");
@@ -390,7 +397,8 @@ mod tests {
                 .height(height)
                 .parent(parent)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -400,6 +408,10 @@ mod tests {
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
             b
         }
@@ -537,7 +549,8 @@ mod tests {
                 .height(height)
                 .parent(parent)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -547,6 +560,10 @@ mod tests {
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
             b
         }
@@ -648,7 +665,8 @@ mod tests {
                 .parent(parent)
                 .merge_parents(merges)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -658,6 +676,10 @@ mod tests {
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
             b
         }
@@ -799,7 +821,8 @@ mod tests {
                 .parent(parent)
                 .merge_parents(merges)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -809,6 +832,10 @@ mod tests {
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
             b
         }
@@ -890,7 +917,8 @@ mod tests {
                 .parent(parent)
                 .merge_parents(merges)
                 .coinbase([coinbase; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -900,6 +928,10 @@ mod tests {
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
             b
         }

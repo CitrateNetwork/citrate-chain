@@ -4348,7 +4348,8 @@ pub(crate) mod tests {
             .height(height)
             .parent(parent)
             .coinbase(CB)
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + height)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new(vrf),
@@ -4356,6 +4357,10 @@ pub(crate) mod tests {
             .transactions(vec![])
             .state_root(state_root)
             .build_unhashed();
+        // r1007 G10: a proposer of its own (from its content), so honest siblings
+        // in one slot are not equivocation.
+        b.header.proposer_pubkey =
+            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
         b.header.block_hash = b.compute_hash();
         b
     }
@@ -4442,6 +4447,8 @@ pub(crate) mod tests {
             .put_applied_tip(&genesis.header.block_hash, 0)
             .expect("persist genesis applied tip");
         dag.set_configured_genesis(genesis.header.block_hash);
+        dag.set_slot_origin(&genesis.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         dag.store_block(genesis.clone())
             .await
             .expect("genesis into DAG");
@@ -5086,7 +5093,8 @@ pub(crate) mod tests {
             .height(height)
             .parent(parent)
             .coinbase(CB)
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + height)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new(vrf),
@@ -5096,6 +5104,10 @@ pub(crate) mod tests {
             .blue_score(blue_score)
             .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
             .build_unhashed();
+        // r1007 G10: a proposer of its own (from its content), so honest siblings
+        // in one slot are not equivocation.
+        b.header.proposer_pubkey =
+            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
         b.header.block_hash = b.compute_hash();
         b
     }
@@ -7156,7 +7168,8 @@ pub(crate) mod tests {
             .parent(parent)
             .coinbase(CB)
             .proposer(PublicKey::new(PROPOSER))
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + height)
             .base_fee_per_gas(citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS)
             .vrf_reveal(VrfProof {
                 proof: vec![],
@@ -8507,7 +8520,8 @@ pub(crate) mod tests {
             .height(height)
             .parent(parent)
             .coinbase(coinbase)
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + height)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new(vrf),
@@ -8515,6 +8529,10 @@ pub(crate) mod tests {
             .transactions(vec![])
             .state_root(state_root)
             .build_unhashed();
+        // r1007 G10: a proposer of its own (from its content), so honest siblings
+        // in one slot are not equivocation.
+        b.header.proposer_pubkey =
+            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
         b.header.block_hash = b.compute_hash();
         b
     }
@@ -9526,7 +9544,8 @@ pub(crate) mod tests {
             .parent(parent)
             .coinbase(coinbase)
             .proposer(PublicKey::new(proposer))
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + height)
             .base_fee_per_gas(citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS)
             .vrf_reveal(VrfProof {
                 proof: vec![],

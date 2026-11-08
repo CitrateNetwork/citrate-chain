@@ -383,6 +383,8 @@ impl Node {
                 .with_enforcement_activation_height(ACT),
         );
         dag.set_configured_genesis(genesis.header.block_hash);
+        dag.set_slot_origin(&genesis.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         let dag_handle = dag.clone();
         let app = Arc::new(
@@ -407,7 +409,19 @@ impl Node {
             require_valid_signature: false,
             ..Default::default()
         }));
-        let attested = AttestedNetworkHead::new();
+        // r1007 G9: the producers below stamp the harness's simulated time, so
+        // the deferred-evidence check judges header timestamps against it too
+        // (before G9 the producer stamped the real clock).
+        let sim_wall: crate::producer::SlotClock = {
+            let base_ms = genesis
+                .header
+                .timestamp
+                .saturating_add(citrate_consensus::slots::SLOT_DURATION_SECS)
+                .saturating_mul(1_000);
+            let sim = clock_ms.clone();
+            Arc::new(move || base_ms.saturating_add(sim.load(Ordering::Relaxed)))
+        };
+        let attested = AttestedNetworkHead::new().with_wall_clock_for_test(sim_wall.clone());
         let initial_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let producer = BlockProducer::with_shared_dag(
             storage.clone(),
@@ -433,7 +447,12 @@ impl Node {
         })
         .with_produce_catchup_gate(&app)
         .with_network_height_gate(&attested)
-        .with_initial_sync_gate(initial_sync.clone());
+        .with_initial_sync_gate(initial_sync.clone())
+        // r1007 G9: producers read the harness's simulated time (one harness
+        // slot = SLOT), starting one chain slot after genesis, so every
+        // producer of a harness slot stamps the same chain slot and the next
+        // harness slot is a later one, however fast the harness runs.
+        .with_slot_clock(sim_wall);
         let producer = match refuse_window {
             Some(w) => producer.with_deferred_refuse_window(w),
             None => producer,

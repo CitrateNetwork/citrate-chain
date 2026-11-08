@@ -78,6 +78,19 @@ pub enum GhostDagError {
     )]
     MergeDepthViolation { block: Hash, merge_depth_root: Hash },
 
+    /// G9 (#184): the block's slot is not after a parent's slot.
+    #[error("Slot {slot} is not after parent {parent}'s slot {parent_slot}")]
+    SlotNotIncreasing {
+        parent: Hash,
+        parent_slot: u64,
+        slot: u64,
+    },
+
+    /// G9: the timestamp has no slot (before genesis), or the slot origin
+    /// (the genesis timestamp) is not known to this node.
+    #[error("Timestamp {timestamp} has no slot (slot origin {origin:?})")]
+    NoSlot { timestamp: u64, origin: Option<u64> },
+
     #[error("Invalid linkage: {0}")]
     InvalidLinkage(String),
 }
@@ -280,6 +293,20 @@ impl GhostDag {
     /// Get consensus parameters
     pub fn params(&self) -> &GhostDagParams {
         &self.params
+    }
+
+    /// G9: the slot of a block stamped `timestamp` on this node's chain (the
+    /// slot origin is the genesis timestamp, held by the DAG store).
+    pub fn slot_of(&self, timestamp: u64) -> Result<u64, GhostDagError> {
+        let origin = self.dag_store.slot_origin();
+        origin
+            .and_then(|o| crate::slots::slot_of(timestamp, o))
+            .ok_or(GhostDagError::NoSlot { timestamp, origin })
+    }
+
+    /// G9: the slot origin (genesis timestamp), once genesis is stored.
+    pub fn slot_origin(&self) -> Option<u64> {
+        self.dag_store.slot_origin()
     }
 
     // -----------------------------------------------------------------------
@@ -668,14 +695,16 @@ impl GhostDag {
 
             // G6: color Mergeset*(B) in ascending Key, which is topological
             // (Key strictly grows along every parent edge of admitted blocks).
-            let mut candidates: Vec<(ForkChoiceKey, u64)> = Vec::with_capacity(mergeset.len());
+            let mut candidates: Vec<(ForkChoiceKey, u64, BlockHeader)> =
+                Vec::with_capacity(mergeset.len());
             for (h, (_, ht)) in &mergeset {
-                candidates.push((ForkChoiceKey::of_header(&self.header_of(h).await?), *ht));
+                let header = self.header_of(h).await?;
+                candidates.push((ForkChoiceKey::of_header(&header), *ht, header));
             }
-            candidates.sort_unstable();
-            for (c, ch) in candidates {
+            candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            for (c, ch, header) in candidates {
                 if self
-                    .is_blue_candidate(&mut data, c.hash, ch, k, window_floor)
+                    .is_blue_candidate(&mut data, &header, ch, k, window_floor)
                     .await?
                 {
                     continue;
@@ -704,17 +733,28 @@ impl GhostDag {
     /// stops at the first chain block in past(candidate): every blue older
     /// than it is in past(candidate) too. By G5 that happens at MDR(B) at the
     /// latest.
+    ///
+    /// G10 (r1007): a candidate that equivocates (same proposer, same slot)
+    /// with a blue block met in the walk is red. Such a blue block is always
+    /// in the candidate's anticone: G9 makes two blocks of one slot unable to
+    /// be in each other's past. So an equivocating pair adds weight, and earns
+    /// a blue share, at most once.
     async fn is_blue_candidate(
         &self,
         data: &mut GhostdagData,
-        candidate: Hash,
+        candidate_header: &BlockHeader,
         candidate_height: u64,
         k: u32,
         window_floor: u64,
     ) -> Result<bool, GhostDagError> {
+        let candidate = candidate_header.block_hash;
         if data.mergeset_blues.len() as u64 == u64::from(k).saturating_add(1) {
             return Ok(false);
         }
+        let origin = self.dag_store.slot_origin().ok_or(GhostDagError::NoSlot {
+            timestamp: candidate_header.timestamp,
+            origin: None,
+        })?;
         let mut past = LazyPast::new(candidate, window_floor, candidate_height.saturating_sub(2));
 
         let mut sizes: BTreeMap<Hash, u32> = BTreeMap::new();
@@ -733,6 +773,14 @@ impl GhostDag {
             for b in &blues {
                 if past.contains(self, b, self.height_of(b).await?).await? {
                     continue;
+                }
+                // G10: equivocation with a blue in the anticone is red.
+                if crate::slots::equivocates(&self.header_of(b).await?, candidate_header, origin) {
+                    debug!(
+                        "GHOSTDAG: {} equivocates with blue {} (same proposer, same slot): red",
+                        candidate, b
+                    );
+                    return Ok(false);
                 }
                 let s = self.blue_anticone_size(b, data).await?;
                 sizes.insert(*b, s);
@@ -934,8 +982,11 @@ impl GhostDag {
         // Parents must already be admitted locally (headers only).
         let sp = self.header_of(&sp_hash).await?;
         let mut parent_keys = vec![ForkChoiceKey::of_header(&sp)];
+        let mut parent_stamps = vec![(sp_hash, sp.timestamp)];
         for mp in merge_parents {
-            parent_keys.push(ForkChoiceKey::of_header(&self.header_of(mp).await?));
+            let mh = self.header_of(mp).await?;
+            parent_keys.push(ForkChoiceKey::of_header(&mh));
+            parent_stamps.push((*mp, mh.timestamp));
         }
 
         // Height linkage is exact and inductive from genesis.
@@ -957,20 +1008,39 @@ impl GhostDag {
             )));
         }
 
+        // r1007 G9 (#184): the slot strictly increases along EVERY parent
+        // edge, so one proposer adds at most one block per slot to any chain.
+        // `timestamp == parent` (accepted by FWA-C1-03) is the same slot.
+        let slot = self.slot_of(header.timestamp)?;
+        for (parent, parent_ts) in &parent_stamps {
+            let parent_slot = self.slot_of(*parent_ts)?;
+            if parent_slot >= slot {
+                return Err(GhostDagError::SlotNotIncreasing {
+                    parent: *parent,
+                    parent_slot,
+                    slot,
+                });
+            }
+        }
+
         // PBA-L1b-003: and it may not run more than
         // MAX_BLOCK_TIMESTAMP_ADVANCE_SECS ahead of it.
-        if self.pba_hardening.active_at(header.height) {
-            let max_ts = sp
-                .timestamp
-                .saturating_add(crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS);
-            if header.timestamp > max_ts {
-                return Err(GhostDagError::InvalidLinkage(format!(
-                    "timestamp {} is more than {}s past selected parent's {} (PBA-L1b-003)",
-                    header.timestamp,
-                    crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS,
-                    sp.timestamp
-                )));
-            }
+        //
+        // r1007 G9 (#184): not height-gated. G9 needs a later slot for every
+        // child, so without this bound one block stamped near u64::MAX would
+        // have no valid child and would halt every chain that selects it. The
+        // spec makes it a block-0 constant (§1.2 MAX_TS_ADVANCE); the PBA-R2
+        // height is unset on any genesis without a compiled entry.
+        let max_ts = sp
+            .timestamp
+            .saturating_add(crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS);
+        if header.timestamp > max_ts {
+            return Err(GhostDagError::InvalidLinkage(format!(
+                "timestamp {} is more than {}s past selected parent's {} (PBA-L1b-003)",
+                header.timestamp,
+                crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS,
+                sp.timestamp
+            )));
         }
 
         // G3: the selected parent is derived, not chosen.
@@ -1415,6 +1485,11 @@ mod tests {
         // canonical score→work relation; these fixtures are all linear
         // (or near-linear) chains where height == blue_score, and work
         // must be the canonical derivation.
+        //
+        // r1007 G9/G10: the timestamp is the height (slot h on a genesis at
+        // timestamp 0), so the slot rises along every parent edge of these
+        // fixtures, and each block has its own proposer, so siblings never
+        // equivocate.
         BlockBuilder::new()
             .hash(Hash::new(hash))
             .parent(selected_parent)
@@ -1422,6 +1497,8 @@ mod tests {
             .height(blue_score)
             .blue_score(blue_score)
             .blue_work(crate::types::blue_work_for_score(blue_score))
+            .timestamp(blue_score * crate::slots::SLOT_DURATION_SECS)
+            .proposer(PublicKey::new(hash))
             .build_unhashed()
     }
 
@@ -1436,6 +1513,11 @@ mod tests {
             .compute_ghostdag(sp, &merges, height)
             .await
             .expect("valid parents");
+        // r1007 G9/G10: one slot after the latest parent, own proposer.
+        let mut latest = 0u64;
+        for p in std::iter::once(&sp).chain(merges.iter()) {
+            latest = latest.max(gd.header_of(p).await.expect("parent header").timestamp);
+        }
         BlockBuilder::new()
             .hash(Hash::new(hash))
             .parent(sp)
@@ -1443,6 +1525,8 @@ mod tests {
             .height(height)
             .blue_score(data.blue_score)
             .blue_work(data.blue_work)
+            .timestamp(latest + crate::slots::SLOT_DURATION_SECS)
+            .proposer(PublicKey::new(hash))
             .build_unhashed()
     }
 
@@ -1536,10 +1620,15 @@ mod tests {
             .is_err());
     }
 
-    /// PBA-L1b-003: the parent-relative timestamp bound, both sides of the
-    /// activation height and both edges of the bound.
+    /// PBA-L1b-003: the parent-relative timestamp bound, at every activation
+    /// setting and at both edges of the bound.
+    ///
+    /// r1007 G9 (#184): this test used to assert the legacy rule (no upper
+    /// bound) below the activation height and with the height unset. Under G9
+    /// that rule lets one u64::MAX-stamped block halt the chain (no later slot
+    /// exists for its child), so the bound holds at every height.
     #[tokio::test]
-    async fn pba_l1b_003_timestamp_bound_is_height_gated_and_inclusive() {
+    async fn pba_l1b_003_timestamp_bound_holds_at_every_activation_and_is_inclusive() {
         use crate::hardening::{PbaHardening, MAX_BLOCK_TIMESTAMP_ADVANCE_SECS as MAX};
         let dag_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let mut genesis = create_test_block_with_parents([0x01; 32], Hash::default(), vec![], 0);
@@ -1568,22 +1657,29 @@ mod tests {
             on.validate_block_consistency(&child(999, 5)).await.is_err(),
             "monotonic"
         );
-        // Activation above this height: legacy rule (no upper bound).
+        // Activation above this height, or none: the same bound (r1007 G9).
         let later = GhostDag::new(GhostDagParams::default(), dag_store.clone())
             .with_pba_hardening(PbaHardening::at(2));
-        assert!(later
-            .validate_block_consistency(&child(u64::MAX, 6))
-            .await
-            .is_ok());
         let off = GhostDag::new(GhostDagParams::default(), dag_store.clone())
             .with_pba_hardening(PbaHardening::off());
-        assert!(off
-            .validate_block_consistency(&child(u64::MAX, 7))
-            .await
-            .is_ok());
-        // A u64::MAX parent: the bound saturates, never panics.
+        for (gd, tag) in [(&later, 6u8), (&off, 7)] {
+            assert!(gd
+                .validate_block_consistency(&child(u64::MAX, tag))
+                .await
+                .is_err());
+            assert!(gd
+                .validate_block_consistency(&child(1_000 + MAX + 1, tag + 0x10))
+                .await
+                .is_err());
+            assert!(gd
+                .validate_block_consistency(&child(1_000 + MAX, tag + 0x20))
+                .await
+                .is_ok());
+        }
+        // A parent one slot below u64::MAX: the bound saturates, never panics.
+        // (r1007 G9: the child must be in a later slot, so not both u64::MAX.)
         let mut far = create_test_block_with_parents([0x08; 32], genesis.hash(), vec![], 1);
-        far.header.timestamp = u64::MAX;
+        far.header.timestamp = u64::MAX - crate::slots::SLOT_DURATION_SECS;
         dag_store.store_block(far.clone()).await.unwrap();
         let mut grandchild = create_test_block_with_parents([0x09; 32], far.hash(), vec![], 2);
         grandchild.header.timestamp = u64::MAX;

@@ -63,10 +63,14 @@ pub const PBA_HARDENING_ENV: &str = "CITRATE_PBA_HARDENING_HEIGHT";
 pub const MAX_BLOCK_TIMESTAMP_ADVANCE_SECS: u64 = 3_600;
 
 /// Wall-clock future-drift tolerance applied at every block ingress (gossip,
-/// sync). The same value gossip has always used. This one is local policy
-/// (it depends on the local clock), so it is NOT height-gated: a block
-/// rejected for it now is accepted once its time arrives.
-pub const MAX_FUTURE_BLOCK_DRIFT_SECS: u64 = 900;
+/// sync). This one is local policy (it depends on the local clock), so it is
+/// NOT height-gated: a block rejected for it now is accepted once its time
+/// arrives (a later child names it, and sync fetches it).
+///
+/// r1007 G9: the spec's 15 s ([`crate::slots::MAX_FUTURE_SLOT_DRIFT_SECS`]),
+/// down from 900 s. With one block per proposer per slot, this window is how
+/// far ahead of the honest clock a lone proposer can run a chain.
+pub const MAX_FUTURE_BLOCK_DRIFT_SECS: u64 = crate::slots::MAX_FUTURE_SLOT_DRIFT_SECS;
 
 const UNSET: u64 = u64::MAX;
 
@@ -750,8 +754,10 @@ mod tests {
 
     #[test]
     fn future_drift_window() {
-        assert!(within_future_drift(1_900, 1_000));
-        assert!(!within_future_drift(1_901, 1_000));
+        // r1007 G9: the window is MAX_FUTURE_BLOCK_DRIFT_SECS (15 s, was 900 s).
+        let edge = 1_000 + MAX_FUTURE_BLOCK_DRIFT_SECS;
+        assert!(within_future_drift(edge, 1_000));
+        assert!(!within_future_drift(edge + 1, 1_000));
         assert!(!within_future_drift(u64::MAX, 1_000));
         assert!(within_future_drift(u64::MAX, u64::MAX));
     }

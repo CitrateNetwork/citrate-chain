@@ -602,7 +602,7 @@ impl GossipProtocol {
     /// Checks performed (in order):
     /// 1. BLOCK_OVERSIZED — serialized size exceeds transport limit
     /// 2. INVALID_HEIGHT — height=0 on non-genesis
-    /// 3. TIMESTAMP_FUTURE — timestamp > now + 15min
+    /// 3. TIMESTAMP_FUTURE — timestamp > now + MAX_FUTURE_BLOCK_DRIFT_SECS (15 s, r1007 G9)
     /// 4. ZERO_BLUE_SCORE — non-genesis with blue_score=0
     /// 5. MISSING_VRF — non-genesis without VRF proof
     /// 6. MISSING_PARENT — non-genesis with zero selected_parent_hash

@@ -1,8 +1,9 @@
 // citrate/core/consensus/src/dag_store.rs
 
-use crate::types::{Block, BlockHeader, Hash, Tip};
+use crate::slots::{self, EquivocationEvidence};
+use crate::types::{Block, BlockHeader, Hash, PublicKey, Tip};
 use crate::vrf::VrfProposerSelector;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -227,6 +228,22 @@ pub struct DagStore {
 
     /// Body residency bookkeeping (see [`BodyResidency`]).
     residency: Arc<Mutex<BodyResidency>>,
+
+    /// r1007 G9: the slot origin, the timestamp of this chain's genesis block.
+    /// Learned when the genesis block is stored (and persisted with the DAG
+    /// metadata under [`slots::SLOT_ORIGIN_KEY`]), so it survives a restart
+    /// and the pruning of genesis. Write-once.
+    slot_origin: Arc<OnceLock<u64>>,
+
+    /// r1007 G10: every stored non-genesis block by slot, with its proposer:
+    /// the index that finds an equivocating pair when its second block is
+    /// stored. Pruned with the blocks.
+    slot_index: Arc<RwLock<BTreeMap<u64, Vec<(PublicKey, Hash)>>>>,
+
+    /// r1007 G10 / O8: equivocation evidence recorded so far, keyed by
+    /// (proposer, slot), loaded from and written to the DAG metadata. Never
+    /// pruned: it is what the slashing path needs after the blocks are gone.
+    equivocations: Arc<RwLock<BTreeMap<([u8; 32], u64), EquivocationEvidence>>>,
 }
 
 /// G12: the tag stored with a persisted GhostdagData record: the first 8
@@ -291,6 +308,9 @@ impl DagStore {
             configured_genesis: Arc::new(OnceLock::new()),
             resident_body_cap: DEFAULT_RESIDENT_BODY_CAP,
             residency: Arc::new(Mutex::new(BodyResidency::default())),
+            slot_origin: Arc::new(OnceLock::new()),
+            slot_index: Arc::new(RwLock::new(BTreeMap::new())),
+            equivocations: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -384,6 +404,75 @@ impl DagStore {
         self.configured_genesis.get().copied()
     }
 
+    /// r1007 G9: the slot origin (this chain's genesis timestamp), once the
+    /// genesis block has been stored here (or loaded from the metadata).
+    pub fn slot_origin(&self) -> Option<u64> {
+        self.slot_origin.get().copied()
+    }
+
+    /// r1007 G9: bind the slot origin to this chain's genesis header, the one
+    /// the node loaded at start-up (it binds [`Self::set_configured_genesis`]
+    /// from the same block). A DAG store learns the origin when it stores the
+    /// genesis block, or from its metadata after a restart; this covers a
+    /// store that has neither (an in-memory store over a pruned chain, or a
+    /// rehydration that holds only the retained range). Persisted with the DAG
+    /// metadata when the store has a backend.
+    ///
+    /// Write-once and fail-closed: a header that is not a genesis header, or
+    /// whose timestamp disagrees with the origin already known, is refused (a
+    /// wrong origin would mis-slot every block).
+    pub fn set_slot_origin(&self, genesis: &BlockHeader) -> Result<(), DagStoreError> {
+        if genesis.height != 0
+            || genesis.selected_parent_hash != Hash::default()
+            || !genesis.merge_parent_hashes.is_empty()
+        {
+            return Err(DagStoreError::StorageError(format!(
+                "slot origin: block {} at height {} is not a genesis header",
+                genesis.block_hash, genesis.height
+            )));
+        }
+        let origin = genesis.timestamp;
+        if let Some(known) = self.slot_origin() {
+            if known != origin {
+                return Err(DagStoreError::StorageError(format!(
+                    "slot origin: genesis {} is stamped {origin}, but this store's origin is {known}",
+                    genesis.block_hash
+                )));
+            }
+            return Ok(());
+        }
+        if let Some(ref kv) = self.persistent {
+            kv.kv_put(
+                cf::DAG_METADATA,
+                slots::SLOT_ORIGIN_KEY,
+                &origin.to_be_bytes(),
+            )
+            .map_err(|e| DagStoreError::StorageError(format!("persist slot origin: {e}")))?;
+        }
+        match self.slot_origin.set(origin) {
+            Ok(()) => Ok(()),
+            // Another caller won the race; it must have bound the same value.
+            Err(_) if self.slot_origin() == Some(origin) => Ok(()),
+            Err(_) => Err(DagStoreError::StorageError(format!(
+                "slot origin: concurrently bound to {:?}, not {origin}",
+                self.slot_origin()
+            ))),
+        }
+    }
+
+    /// r1007 G9: the slot of a block stamped `timestamp` on this chain.
+    /// `None` while the slot origin is unknown or for a timestamp before it.
+    pub fn slot_of(&self, timestamp: u64) -> Option<u64> {
+        slots::slot_of(timestamp, self.slot_origin()?)
+    }
+
+    /// r1007 G10 / O8: every equivocation recorded, ordered by (proposer,
+    /// slot). Source: the DAG metadata column (`equivocation/v1/` keys),
+    /// written in the same batch as the block that revealed it.
+    pub async fn equivocation_evidence(&self) -> Vec<EquivocationEvidence> {
+        self.equivocations.read().await.values().cloned().collect()
+    }
+
     /// Create a DagStore with explicit VRF strictness.
     /// WP-K.5: In strict mode, blocks failing VRF admission are rejected.
     pub fn with_strict_vrf(strict_vrf: bool) -> Self {
@@ -422,6 +511,9 @@ impl DagStore {
             configured_genesis: Arc::new(OnceLock::new()),
             resident_body_cap: DEFAULT_RESIDENT_BODY_CAP,
             residency: Arc::new(Mutex::new(BodyResidency::default())),
+            slot_origin: Arc::new(OnceLock::new()),
+            slot_index: Arc::new(RwLock::new(BTreeMap::new())),
+            equivocations: Arc::new(RwLock::new(BTreeMap::new())),
         };
         store.load_from_persistent()?;
         Ok(store)
@@ -593,6 +685,70 @@ impl DagStore {
             _ => Hash::default(),
         };
 
+        // r1007 G9: the slot origin, from the metadata, or from a stored
+        // genesis block if this store predates the key. Fail closed on a
+        // corrupt value: a wrong origin would mis-slot every block.
+        let origin = match kv.kv_get(cf::DAG_METADATA, slots::SLOT_ORIGIN_KEY) {
+            Ok(Some(bytes)) => {
+                let raw: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                    DagStoreError::StorageError(format!(
+                        "slot origin entry has {} bytes, expected 8",
+                        bytes.len()
+                    ))
+                })?;
+                Some(u64::from_be_bytes(raw))
+            }
+            Ok(None) => {
+                let roots: Vec<u64> = blocks
+                    .values()
+                    .filter(|b| b.header.height == 0 && b.is_genesis())
+                    .map(|b| b.header.timestamp)
+                    .collect();
+                match roots.as_slice() {
+                    [only] => Some(*only),
+                    _ => None,
+                }
+            }
+            Err(e) => {
+                return Err(DagStoreError::StorageError(format!(
+                    "load slot origin: {e}"
+                )))
+            }
+        };
+        if let Some(o) = origin {
+            let _ = self.slot_origin.set(o);
+        }
+
+        // r1007 G10: the slot index over the stored blocks, and the recorded
+        // equivocation evidence.
+        let mut slot_index: BTreeMap<u64, Vec<(PublicKey, Hash)>> = BTreeMap::new();
+        if let Some(o) = origin {
+            for (hash, block) in &blocks {
+                if block.header.height == 0 && block.is_genesis() {
+                    continue;
+                }
+                if let Some(slot) = slots::slot_of(block.header.timestamp, o) {
+                    slot_index
+                        .entry(slot)
+                        .or_default()
+                        .push((block.header.proposer_pubkey, *hash));
+                }
+            }
+        }
+        let mut equivocations = BTreeMap::new();
+        for (key, value) in kv
+            .kv_iter_cf(cf::DAG_METADATA)
+            .map_err(|e| DagStoreError::StorageError(format!("load metadata: {e}")))?
+        {
+            if !key.starts_with(slots::EQUIVOCATION_KEY_PREFIX) {
+                continue;
+            }
+            let ev: EquivocationEvidence = bincode::deserialize(&value).map_err(|e| {
+                DagStoreError::StorageError(format!("decode equivocation evidence: {e}"))
+            })?;
+            equivocations.insert((ev.proposer.0, ev.slot), ev);
+        }
+
         // PIL-42: Reconstruct the tip set from authoritative block-header
         // parentage rather than trusting the persisted `dag_tips` CF, and drop
         // the orphaned genesis block if present.
@@ -668,6 +824,12 @@ impl DagStore {
         *self.pruning_point.try_write().map_err(|_| {
             DagStoreError::StorageError("lock contention on pruning_point during load".into())
         })? = pruning_point;
+        *self.slot_index.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on slot_index during load".into())
+        })? = slot_index;
+        *self.equivocations.try_write().map_err(|_| {
+            DagStoreError::StorageError("lock contention on equivocations during load".into())
+        })? = equivocations;
         *self.residency.lock().map_err(|_| {
             DagStoreError::StorageError("residency lock poisoned during load".into())
         })? = BodyResidency {
@@ -858,11 +1020,21 @@ impl DagStore {
             }
         };
 
-        match vrf_selector.verify_vrf_with_block_signature(
+        // r1007 G9: the alpha binds the block's time slot, not its height.
+        // No slot (origin unknown, or a timestamp before genesis) is no proof.
+        let slot = self.slot_of(block.header.timestamp).ok_or_else(|| {
+            format!(
+                "VRF verification: block timestamp {} has no slot (slot origin {:?})",
+                block.header.timestamp,
+                self.slot_origin()
+            )
+        })?;
+        match vrf_selector.verify_vrf_with_block_signature_at(
             &block.header.proposer_pubkey,
             &block.header.vrf_reveal,
             &prev_vrf_output,
             block.header.height,
+            slot,
             block.header.block_hash.as_bytes(),
             &block.signature,
         ) {
@@ -911,38 +1083,26 @@ impl DagStore {
         }
     }
 
-    /// FWA-C1-04: equivocation / double-proposal detection hook.
+    /// FWA-C1-04 / r1007 G10: equivocation detection.
     ///
-    /// Returns the hash of an EXISTING, distinct block at the same height
-    /// proposed by the same proposer, if one is present — i.e. evidence
-    /// that `block`'s proposer is equivocating (signing two different
-    /// blocks for one slot). `blocks_by_height` is `HashMap<u64, Vec<Hash>>`
-    /// with no (proposer,height) uniqueness, so without this check one
-    /// actor (especially combined with the FWA-C1-01 eligibility gap) can
-    /// flood sibling blocks per height.
+    /// Returns the hash of an EXISTING, distinct block of the same proposer in
+    /// the same time slot, if one is stored: evidence that `block`'s proposer
+    /// signed two blocks for one slot. (Before r1007 this compared heights;
+    /// the spec defines equivocation by slot, and two honest blocks of one
+    /// proposer at one height in different slots are not equivocation.)
     ///
-    /// This is a detection primitive: the network layer calls it to feed
-    /// peer-scoring / slashing (the gossip peer-score already has a
-    /// `SCORE_INVALID_BLOCK` bucket). It is read-only and side-effect free.
+    /// Read-only and side-effect free. `store_block` records the evidence
+    /// durably itself ([`Self::equivocation_evidence`]).
     pub async fn detect_equivocation(&self, block: &Block) -> Option<Hash> {
         let candidate_hash = block.hash();
-        let height = block.header.height;
         let proposer = block.header.proposer_pubkey;
-
-        let by_height = self.blocks_by_height.read().await;
-        let siblings = by_height.get(&height)?;
-        let blocks = self.blocks.read().await;
-        for &h in siblings {
-            if h == candidate_hash {
-                continue; // same block, not equivocation
-            }
-            if let Some(existing) = blocks.get(&h) {
-                if existing.header.proposer_pubkey == proposer {
-                    return Some(h);
-                }
-            }
-        }
-        None
+        let slot = self.slot_of(block.header.timestamp)?;
+        let index = self.slot_index.read().await;
+        index
+            .get(&slot)?
+            .iter()
+            .find(|(p, h)| *p == proposer && *h != candidate_hash)
+            .map(|(_, h)| *h)
     }
 
     /// Store a block in the DAG.
@@ -979,6 +1139,54 @@ impl DagStore {
             if let Err(e) = self.verify_block_vrf_crypto(&block).await {
                 return Err(DagStoreError::InvalidVrf(e));
             }
+        }
+
+        // r1007 G9 / G10: the genesis block fixes the slot origin; every other
+        // block goes into the slot index, and a second block of one proposer
+        // in one slot is recorded as equivocation evidence (O8: red AND
+        // slashed; the slashing path reads the evidence). Storing it is not
+        // refused: both blocks stay in the DAG, GHOSTDAG colors one red.
+        let mut new_origin: Option<u64> = None;
+        let mut indexed_slot: Option<u64> = None;
+        let mut evidence: Option<EquivocationEvidence> = None;
+        if block.is_configured_genesis(self.configured_genesis()) {
+            if self.slot_origin().is_none() {
+                new_origin = Some(block.header.timestamp);
+            }
+        } else if let Some(slot) = self.slot_of(block.header.timestamp) {
+            indexed_slot = Some(slot);
+            let proposer = block.header.proposer_pubkey;
+            if !self
+                .equivocations
+                .read()
+                .await
+                .contains_key(&(proposer.0, slot))
+            {
+                let first = self.slot_index.read().await.get(&slot).and_then(|v| {
+                    v.iter()
+                        .find(|(p, h)| *p == proposer && *h != hash)
+                        .map(|(_, h)| *h)
+                });
+                if let Some(first) = first {
+                    if let Some(fb) = self.blocks.read().await.get(&first) {
+                        evidence = Some(EquivocationEvidence {
+                            proposer,
+                            slot,
+                            first: fb.header.clone(),
+                            first_signature: fb.signature,
+                            second: block.header.clone(),
+                            second_signature: block.signature,
+                        });
+                    }
+                }
+            }
+        } else {
+            debug!(
+                "block {} has no slot (origin {:?}, timestamp {}); not slot-indexed",
+                hash,
+                self.slot_origin(),
+                block.header.timestamp
+            );
         }
 
         // RM-I / WP-I2.2 (re-audit Stream 1 finding REM-N-04):
@@ -1079,6 +1287,29 @@ impl DagStore {
             }
         }
 
+        // 4b. Slot origin and equivocation evidence (r1007 G9 / G10).
+        if let Some(origin) = new_origin {
+            ops.push(KvOp::Put {
+                cf: cf::DAG_METADATA.to_string(),
+                key: slots::SLOT_ORIGIN_KEY.to_vec(),
+                value: origin.to_be_bytes().to_vec(),
+            });
+        }
+        if let Some(ev) = &evidence {
+            match bincode::serialize(ev) {
+                Ok(bytes) => ops.push(KvOp::Put {
+                    cf: cf::DAG_METADATA.to_string(),
+                    key: slots::equivocation_evidence_key(&ev.proposer, ev.slot),
+                    value: bytes,
+                }),
+                Err(e) => {
+                    return Err(DagStoreError::StorageError(format!(
+                        "encode equivocation evidence for {hash}: {e}"
+                    )))
+                }
+            }
+        }
+
         // 5. Atomic commit. If a persistent backend is configured and the
         // batch fails, return an error WITHOUT mutating the in-memory
         // state. If no backend is configured (test stores), proceed
@@ -1133,6 +1364,33 @@ impl DagStore {
             .entry(height)
             .or_insert_with(Vec::new)
             .push(hash);
+
+        if let Some(origin) = new_origin {
+            let _ = self.slot_origin.set(origin);
+        }
+        if let Some(slot) = indexed_slot {
+            self.slot_index
+                .write()
+                .await
+                .entry(slot)
+                .or_default()
+                .push((block.header.proposer_pubkey, hash));
+        }
+        if let Some(ev) = evidence {
+            let (a, b) = ev.hashes();
+            warn!(
+                "EQUIVOCATION: proposer {} signed two blocks for slot {}: {} and {} \
+                 (evidence recorded; GHOSTDAG colors the later one red)",
+                hex::encode(ev.proposer.as_bytes()),
+                ev.slot,
+                a,
+                b
+            );
+            self.equivocations
+                .write()
+                .await
+                .insert((ev.proposer.0, ev.slot), ev);
+        }
 
         let stored_height = block.header.height;
         {
@@ -1299,10 +1557,14 @@ impl DagStore {
             .copied()
             .collect();
 
+        let mut unindexed: Vec<(u64, Hash)> = Vec::new();
         for height in heights_to_remove {
             if let Some(hashes) = blocks_by_height.remove(&height) {
                 for hash in hashes {
-                    if blocks.remove(&hash).is_some() {
+                    if let Some(removed) = blocks.remove(&hash) {
+                        if let Some(slot) = self.slot_of(removed.header.timestamp) {
+                            unindexed.push((slot, hash));
+                        }
                         self.forget_residency(&hash);
                         self.persist_delete_block(&hash);
                         // G12: the GHOSTDAG record must not outlive its block,
@@ -1314,6 +1576,20 @@ impl DagStore {
                 // Remove height index from persistence
                 if let Some(ref kv) = self.persistent {
                     let _ = kv.kv_delete(cf::DAG_HEIGHT_INDEX, &height.to_be_bytes());
+                }
+            }
+        }
+
+        drop(blocks);
+        drop(blocks_by_height);
+        if !unindexed.is_empty() {
+            let mut index = self.slot_index.write().await;
+            for (slot, hash) in unindexed {
+                if let Some(v) = index.get_mut(&slot) {
+                    v.retain(|(_, h)| *h != hash);
+                    if v.is_empty() {
+                        index.remove(&slot);
+                    }
                 }
             }
         }
@@ -1522,9 +1798,13 @@ mod tests {
         let block_hash = Hash::new(hash);
         let signature = Signature::new(signing_key.sign(block_hash.as_bytes()).to_bytes());
 
+        // r1007 G9: the alpha's slot is the block's time slot. Stamping the
+        // block at `height` seconds on a genesis at 0 keeps slot == height, the
+        // value the proof above is built over.
         BlockBuilder::new()
             .hash(block_hash)
             .height(height)
+            .timestamp(height * crate::slots::SLOT_DURATION_SECS)
             .parent(parent)
             .proposer(proposer)
             .vrf_reveal(VrfProof {
@@ -2202,11 +2482,26 @@ mod tests {
             "rejection reason must be the timestamp monotonicity check, got: {msg}"
         );
 
-        // A non-decreasing timestamp (== parent) passes the consistency gate.
-        let ok = linear_block([0x02; 32], genesis.hash(), 1, 1_000);
+        // r1007 G9 (#184) supersedes FWA-C1-03's "timestamp == parent is
+        // allowed": an equal timestamp is the parent's slot and is rejected;
+        // the next slot passes.
+        let equal = linear_block([0x02; 32], genesis.hash(), 1, 1_000);
+        assert!(
+            matches!(
+                ghostdag.validate_block_consistency(&equal).await,
+                Err(crate::ghostdag::GhostDagError::SlotNotIncreasing { .. })
+            ),
+            "G9: timestamp == parent is the same slot and must be rejected"
+        );
+        let ok = linear_block(
+            [0x03; 32],
+            genesis.hash(),
+            1,
+            1_000 + crate::slots::SLOT_DURATION_SECS,
+        );
         assert!(
             ghostdag.validate_block_consistency(&ok).await.is_ok(),
-            "FWA-C1-03: timestamp == parent must be allowed"
+            "G9: the next slot passes"
         );
     }
 }

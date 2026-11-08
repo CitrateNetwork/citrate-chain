@@ -39,6 +39,9 @@ fn block(id: Hash, sp: Hash, merges: Vec<Hash>, height: u64, score: u64, vrf: Ha
         .parent(sp)
         .merge_parents(merges)
         .height(height)
+        // r1007 G9/G10: slot = height (genesis at 0), own proposer.
+        .timestamp(height * citrate_consensus::slots::SLOT_DURATION_SECS)
+        .proposer(citrate_consensus::types::PublicKey::new(*id.as_bytes()))
         .blue_score(score)
         .blue_work(blue_work_for_score(score))
         .vrf_reveal(VrfProof {
@@ -549,6 +552,11 @@ async fn coloring_matches_kaspa_vectors() {
         admit_ok(&store, &gd, &g).await;
         let mut height: HashMap<String, u64> = HashMap::new();
         height.insert(dag.genesis_id.clone(), 0);
+        // r1007 G9: a vector block's merge parents can sit above its selected
+        // parent's height, so slot = height does not rise along every edge.
+        // Stamp each block one slot after its latest parent instead.
+        let mut stamp: HashMap<String, u64> = HashMap::new();
+        stamp.insert(dag.genesis_id.clone(), 0);
         for kb in &dag.blocks {
             let sp = kaspa_hash(&kb.selected_parent);
             let merges: Vec<Hash> = kb
@@ -558,15 +566,19 @@ async fn coloring_matches_kaspa_vectors() {
                 .map(|p| kaspa_hash(p))
                 .collect();
             let h = height[&kb.selected_parent] + 1;
+            let ts = kb.parents.iter().map(|p| stamp[p]).max().unwrap_or(0)
+                + citrate_consensus::slots::SLOT_DURATION_SECS;
             let mk = |score| {
-                block(
+                let mut b = block(
                     kaspa_hash(&kb.id),
                     sp,
                     merges.clone(),
                     h,
                     score,
                     Hash::default(),
-                )
+                );
+                b.header.timestamp = ts;
+                b
             };
             for wrong in [kb.score.saturating_sub(1), kb.score + 1] {
                 if wrong != kb.score {
@@ -586,7 +598,7 @@ async fn coloring_matches_kaspa_vectors() {
                     .map(|p| kaspa_hash(p))
                     .collect();
                 swapped_merges.sort();
-                let swapped = block(
+                let mut swapped = block(
                     kaspa_hash(&kb.id),
                     kaspa_hash(other),
                     swapped_merges,
@@ -594,6 +606,7 @@ async fn coloring_matches_kaspa_vectors() {
                     kb.score,
                     Hash::default(),
                 );
+                swapped.header.timestamp = ts;
                 assert!(
                     verdict(&gd, &swapped).await.is_err(),
                     "dag{n} {}: {other} named as selected parent, Kaspa says {}",
@@ -606,6 +619,7 @@ async fn coloring_matches_kaspa_vectors() {
                 panic!("dag{n} {}: Kaspa's score {} rejected: {e}", kb.id, kb.score);
             }
             height.insert(kb.id.clone(), h);
+            stamp.insert(kb.id.clone(), ts);
         }
         // The persisted records match Kaspa's mergeset coloring and order
         // (SP first, then ascending Key), read back by a fresh engine.

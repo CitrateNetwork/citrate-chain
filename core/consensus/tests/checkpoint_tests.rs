@@ -53,6 +53,9 @@ fn make_block(hash: Hash, parent: Hash, merge: Vec<Hash>, height: u64, blue_scor
         .merge_parents(merge)
         .height(height)
         .timestamp(height)
+        // r1007 G10: each block its own proposer, so siblings in one slot
+        // are honest width, not equivocation.
+        .proposer(citrate_consensus::types::PublicKey::new(*hash.as_bytes()))
         .blue_score(blue_score)
         // SECREM-01: admission enforces the canonical score→work relation.
         .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))

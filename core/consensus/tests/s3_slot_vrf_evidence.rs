@@ -37,12 +37,7 @@ fn genesis() -> Block {
 fn signed_block(tag: &[u8], key: &SigningKey, timestamp: u64, vrf_slot: u64, g: &Block) -> Block {
     let pk = PublicKey::new(key.verifying_key().to_bytes());
     let proof = VrfProposerSelector::production()
-        .generate_vrf_proof(
-            &key.to_bytes(),
-            &pk,
-            &g.header.vrf_reveal.output,
-            vrf_slot,
-        )
+        .generate_vrf_proof(&key.to_bytes(), &pk, &g.header.vrf_reveal.output, vrf_slot)
         .expect("ECVRF proof");
     let hash = id(tag);
     BlockBuilder::new()
@@ -153,7 +148,10 @@ async fn equivocation_evidence_recorded() {
             store.equivocation_evidence().await.is_empty(),
             "honest width and a later slot are not equivocation"
         );
-        store.store_block(a2.clone()).await.expect("stored, not rejected");
+        store
+            .store_block(a2.clone())
+            .await
+            .expect("stored, not rejected");
         let ev = store.equivocation_evidence().await;
         assert_eq!(ev.len(), 1, "one equivocation recorded");
         let e = &ev[0];

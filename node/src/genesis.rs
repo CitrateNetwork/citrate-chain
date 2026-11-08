@@ -604,6 +604,8 @@ mod tests {
         );
         let dag = DagStore::new(); // strict VRF, as start_node builds it
         dag.set_configured_genesis(genesis.header.block_hash);
+        dag.set_slot_origin(&genesis.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         dag.store_block(genesis.clone())
             .await
             .expect("the configured genesis must be admitted by the strict store");
@@ -632,6 +634,8 @@ mod tests {
             );
             let dag = DagStore::new();
             dag.set_configured_genesis(genesis.header.block_hash);
+            dag.set_slot_origin(&genesis.header)
+                .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
             assert!(
                 dag.store_block(forged).await.is_err(),
                 "the strict store admitted a genesis with a forged {name}"

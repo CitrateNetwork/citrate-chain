@@ -8,13 +8,113 @@
 //! configured block time. The loops below must not do that, so they build
 //! their timers here instead of calling `interval` directly.
 
-use tokio::time::{interval, Duration, Interval, MissedTickBehavior};
+use tokio::time::{interval, interval_at, Duration, Interval, MissedTickBehavior};
 
-/// Block-production timer: one tick per `target_block_time_secs`, and after a
-/// delay it resumes on the next cadence boundary without replaying the ticks
-/// it missed (`Skip`). This is the timer `BlockProducer::start` runs on.
-pub(crate) fn production_interval(target_block_time_secs: u64) -> Interval {
-    cadence_interval(Duration::from_secs(target_block_time_secs))
+/// How far before a slot boundary (by the wall clock) a production tick may
+/// fire and still count as that slot's. The tick is scheduled on tokio's
+/// monotonic clock from a wall-clock reading taken when the timer was built,
+/// so the two can disagree by a few milliseconds; without this allowance a
+/// tick a hair early would stamp the previous slot, which the selected parent
+/// already holds, and the round would be skipped.
+pub(crate) const SLOT_TICK_EARLY_ALLOWANCE_MS: u64 = 250;
+
+const _: () = assert!(
+    SLOT_TICK_EARLY_ALLOWANCE_MS < citrate_consensus::slots::SLOT_DURATION_SECS * 1_000 / 2
+);
+
+/// The production period: `target_block_time_secs` rounded UP to a whole
+/// number of slots, and at least one slot (r1007 G9: one block per proposer
+/// per slot, sealed at a slot boundary).
+pub(crate) fn production_period_secs(target_block_time_secs: u64) -> u64 {
+    let slot = citrate_consensus::slots::SLOT_DURATION_SECS;
+    target_block_time_secs
+        .div_ceil(slot)
+        .max(1)
+        .saturating_mul(slot)
+}
+
+/// Block-production timer: one tick per production period
+/// ([`production_period_secs`]), on the wall-clock slot grid anchored at the
+/// genesis timestamp `slot_origin_secs` (ticks at `origin + k * period`), and
+/// after a delay it resumes on the next grid boundary without replaying the
+/// ticks it missed (`Skip`). This is the timer `BlockProducer::start` runs on.
+///
+/// Why the wall clock: every producer seals once per slot. A timer anchored at
+/// process start gives each producer its own phase within the slot, fixed for
+/// its whole uptime. A producer whose phase falls just after another's seal,
+/// inside the propagation delay, then always builds a sibling of a block it
+/// has not yet received, while producers nearer the first one extend that
+/// block. Its blocks never get a child, are only ever merged, and earn
+/// nothing. Anchoring every producer to the same NTP-synced grid makes them
+/// all build on the previous slot's blocks and compete on equal terms. And
+/// under G9 a block's slot is a function of its timestamp, so a round that
+/// starts at the slot boundary stamps the slot it was scheduled for.
+pub(crate) fn production_interval(target_block_time_secs: u64, slot_origin_secs: u64) -> Interval {
+    production_interval_at(
+        target_block_time_secs,
+        slot_origin_secs,
+        wall_clock_since_epoch(),
+    )
+}
+
+/// [`production_interval`] for a given wall-clock reading (time since the
+/// UNIX epoch), so tests can place a producer anywhere in the slot.
+///
+/// The interval runs on tokio's monotonic clock from the first aligned tick.
+/// On Linux NTP slews the monotonic clock along with the wall clock, so the
+/// two stay together; only a wall-clock step (which needs a restart to pick
+/// up) would move the grid.
+pub(crate) fn production_interval_at(
+    target_block_time_secs: u64,
+    slot_origin_secs: u64,
+    wall_now: Duration,
+) -> Interval {
+    let period = Duration::from_secs(production_period_secs(target_block_time_secs));
+    let now = tokio::time::Instant::now();
+    let first = now
+        .checked_add(delay_to_next_boundary(
+            wall_now,
+            Duration::from_secs(slot_origin_secs),
+            period,
+        ))
+        .unwrap_or(now);
+    let mut timer = interval_at(first, period);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    timer
+}
+
+/// Time from `wall_now` until the next grid boundary `origin + k * period`
+/// (k >= 0): zero when `wall_now` is on a boundary, the time until `origin`
+/// when the clock is still before it, and zero for a zero period.
+pub(crate) fn delay_to_next_boundary(
+    wall_now: Duration,
+    origin: Duration,
+    period: Duration,
+) -> Duration {
+    let Some(since_origin) = wall_now.checked_sub(origin) else {
+        return origin.saturating_sub(wall_now);
+    };
+    let period_ns = period.as_nanos();
+    let Some(into_slot) = since_origin.as_nanos().checked_rem(period_ns) else {
+        return Duration::ZERO; // zero period
+    };
+    if into_slot == 0 {
+        return Duration::ZERO;
+    }
+    // 0 < remaining < period_ns, so it fits back into a Duration.
+    let remaining = period_ns.saturating_sub(into_slot);
+    let secs = remaining.checked_div(1_000_000_000).unwrap_or(0);
+    let nanos = remaining.checked_rem(1_000_000_000).unwrap_or(0);
+    Duration::new(
+        u64::try_from(secs).unwrap_or(u64::MAX),
+        u32::try_from(nanos).unwrap_or(0),
+    )
+}
+
+fn wall_clock_since_epoch() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
 }
 
 /// A fixed-cadence timer that drops missed ticks (`Skip`): after an overrun
@@ -59,8 +159,12 @@ mod tests {
     /// start, each kept its own phase for its whole uptime.
     #[tokio::test(start_paused = true)]
     async fn producers_tick_together_on_the_genesis_slot_grid() {
-        for (origin, block_time) in [(ORIGIN, 2u64), (ODD_ORIGIN, 2), (ORIGIN, 1), (ODD_ORIGIN, 5)]
-        {
+        for (origin, block_time) in [
+            (ORIGIN, 2u64),
+            (ODD_ORIGIN, 2),
+            (ORIGIN, 1),
+            (ODD_ORIGIN, 5),
+        ] {
             let period = production_period_secs(block_time);
             // A grid boundary of this origin, then each producer's phase
             // within one period.
@@ -145,14 +249,20 @@ mod tests {
         );
         // An origin off the 2 s epoch grid moves the grid with it.
         let odd = Duration::from_secs(ODD_ORIGIN);
-        assert_eq!(delay_to_next_boundary(ON_SLOT, odd, two), Duration::from_secs(1));
+        assert_eq!(
+            delay_to_next_boundary(ON_SLOT, odd, two),
+            Duration::from_secs(1)
+        );
         // Before genesis: wait for genesis itself.
         assert_eq!(
             delay_to_next_boundary(o - Duration::from_secs(5), o, two),
             Duration::from_secs(5)
         );
         // Degenerate inputs never panic.
-        assert_eq!(delay_to_next_boundary(ON_SLOT, o, Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            delay_to_next_boundary(ON_SLOT, o, Duration::ZERO),
+            Duration::ZERO
+        );
         assert!(delay_to_next_boundary(Duration::MAX, o, two) < two);
     }
 
