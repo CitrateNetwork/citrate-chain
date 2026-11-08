@@ -68,6 +68,11 @@ pub struct BlockStore {
     /// False only when the rebuild on open failed; `get_tips` then falls back
     /// to the full scan rather than answer from an incomplete index.
     tips_indexed: AtomicBool,
+    /// S3-7: whether the sibling height index (`HEIGHT_SIBLINGS_PREFIX`) and
+    /// the stored-block count (`BLOCK_COUNT_KEY`) describe this store. False
+    /// only when the rebuild on open failed; the readers then answer `None`
+    /// (unknown) instead of an incomplete answer.
+    height_indexed: AtomicBool,
 }
 
 impl BlockStore {
@@ -85,6 +90,7 @@ impl BlockStore {
             cached_latest_height: Arc::new(AtomicU64::new(initial)),
             put_lock: std::sync::Mutex::new(()),
             tips_indexed: AtomicBool::new(false),
+            height_indexed: AtomicBool::new(false),
         };
         match store.ensure_tips_index() {
             Ok(()) => store.tips_indexed.store(true, AtomicOrdering::SeqCst),
@@ -92,7 +98,123 @@ impl BlockStore {
                 "tips index could not be built ({e}); get_tips falls back to a full store scan"
             ),
         }
+        match store.ensure_height_index() {
+            Ok(()) => store.height_indexed.store(true, AtomicOrdering::SeqCst),
+            Err(e) => warn!(
+                "sibling height index could not be built ({e}); citrate_getBlocksAtHeight and \
+                 the stored-block count answer unknown"
+            ),
+        }
         store
+    }
+
+    /// S3-7: make the sibling height index and the stored-block count describe
+    /// the store. A no-op when the marker names the current latest height;
+    /// otherwise (a data dir written by a binary without them) one scan of
+    /// `CF_HEADERS` and an atomic rewrite of every entry, the count and the
+    /// marker, as [`Self::ensure_tips_index`] does for the tips index.
+    fn ensure_height_index(&self) -> Result<()> {
+        let _put_guard = self.put_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let latest = self.cached_latest_height.load(AtomicOrdering::SeqCst);
+        if self
+            .db
+            .get_cf(CF_METADATA, HEIGHT_INDEX_MARKER_KEY)?
+            .as_deref()
+            == Some(latest.to_be_bytes().as_slice())
+        {
+            return Ok(());
+        }
+        let mut entries: Vec<(u64, Hash)> = Vec::new();
+        for (key, value) in self.db.iter_cf(CF_HEADERS)? {
+            let Some(hash) = Hash::try_from_bytes(key.as_ref()) else {
+                continue;
+            };
+            // A block counts (and is indexed) only when its body is stored too.
+            if !self.db.exists_cf(CF_BLOCKS, hash.as_bytes())? {
+                continue;
+            }
+            if let Ok(header) = bincode::deserialize::<BlockHeader>(&value) {
+                entries.push((header.height, hash));
+            }
+        }
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+        self.db
+            .for_each_prefix_key_cf(CF_METADATA, HEIGHT_SIBLINGS_PREFIX, |key| {
+                stale.push(key.to_vec());
+                Ok(())
+            })?;
+        let mut batch = self.db.batch();
+        for key in &stale {
+            self.db.batch_delete_cf(&mut batch, CF_METADATA, key)?;
+        }
+        for (height, hash) in &entries {
+            self.db
+                .batch_put_cf(&mut batch, CF_METADATA, &sibling_key(*height, hash), &[])?;
+        }
+        let count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            BLOCK_COUNT_KEY,
+            &count.to_be_bytes(),
+        )?;
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            HEIGHT_INDEX_MARKER_KEY,
+            &latest.to_be_bytes(),
+        )?;
+        self.db.write_batch_sync(batch)?;
+        info!(
+            "sibling height index rebuilt from a full scan: {} block(s) at latest height {}",
+            count, latest
+        );
+        Ok(())
+    }
+
+    fn read_block_count(&self) -> Result<u64> {
+        Ok(self
+            .db
+            .get_cf(CF_METADATA, BLOCK_COUNT_KEY)?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0))
+    }
+
+    /// S3-7 (`citrate_getBlocksAtHeight`): the hash of every stored block at
+    /// `height`, siblings included, ascending by hash. Data source: the
+    /// sibling height index (`CF_METADATA` `hsib:` ‖ height ‖ hash), written in
+    /// the same batch as the block by [`Self::put_block`] and removed in the
+    /// same batch by [`Self::delete_block`] / [`Self::purge_blocks`]. Unlike
+    /// [`Self::get_block_by_height`] it never drops a sibling. An error when
+    /// the index could not be built on open (never a partial answer).
+    pub fn get_blocks_at_height(&self, height: u64) -> Result<Vec<Hash>> {
+        if !self.height_indexed.load(AtomicOrdering::SeqCst) {
+            anyhow::bail!("the sibling height index is not built on this node");
+        }
+        let prefix = sibling_prefix(height);
+        let mut out = Vec::new();
+        self.db
+            .for_each_prefix_key_cf(CF_METADATA, &prefix, |key| {
+                if let Some(hash) = key.get(prefix.len()..).and_then(Hash::try_from_bytes) {
+                    out.push(hash);
+                }
+                Ok(())
+            })?;
+        out.sort();
+        Ok(out)
+    }
+
+    /// S3-7 (`citrate_getDagStats.totalBlocks`): the number of blocks in this
+    /// node's chain store (`CF_BLOCKS`). Data source: the `block_count_v1`
+    /// counter, changed in the same batch as every block write or removal.
+    /// `None` when the counter could not be built on open. A pruned store
+    /// counts only what it still holds.
+    pub fn stored_block_count(&self) -> Result<Option<u64>> {
+        if !self.height_indexed.load(AtomicOrdering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(Some(self.read_block_count()?))
     }
 
     /// Make the tips index describe the store: a no-op when its marker names
@@ -153,8 +275,27 @@ impl BlockStore {
 
         let hash = block.hash();
         let block_bytes = bincode::serialize(block)?;
+        // S3-7: a re-put of a stored block does not count it twice.
+        let is_new = !self.db.exists_cf(CF_BLOCKS, hash.as_bytes())?;
 
         let mut batch = self.db.batch();
+
+        // S3-7: sibling height index and stored-block count, same batch.
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            &sibling_key(block.header.height, &hash),
+            &[],
+        )?;
+        if is_new {
+            let count = self.read_block_count()?.saturating_add(1);
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                BLOCK_COUNT_KEY,
+                &count.to_be_bytes(),
+            )?;
+        }
 
         // Store full block
         self.db
@@ -231,6 +372,15 @@ impl BlockStore {
                 TIPS_INDEX_MARKER_KEY,
                 &new_height.to_be_bytes(),
             )?;
+            // So do the sibling height index and the count, once built.
+            if self.height_indexed.load(AtomicOrdering::SeqCst) {
+                self.db.batch_put_cf(
+                    &mut batch,
+                    CF_METADATA,
+                    HEIGHT_INDEX_MARKER_KEY,
+                    &new_height.to_be_bytes(),
+                )?;
+            }
         }
 
         // REM-2 / WP-H1.3 (audit M-API-01): producer-path commit MUST
@@ -632,6 +782,20 @@ impl BlockStore {
             self.db
                 .batch_delete_cf(&mut batch, CF_METADATA, &height_key)?;
 
+            // S3-7: sibling height index and stored-block count.
+            self.db.batch_delete_cf(
+                &mut batch,
+                CF_METADATA,
+                &sibling_key(block.header.height, hash),
+            )?;
+            let count = self.read_block_count()?.saturating_sub(1);
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                BLOCK_COUNT_KEY,
+                &count.to_be_bytes(),
+            )?;
+
             // Clean up parent relationships
             for parent in block.parents() {
                 let parent_children_key = parent_children_key(&parent);
@@ -681,10 +845,18 @@ impl BlockStore {
         let mut batch = self.db.batch();
         let mut vacated_heights: HashSet<u64> = HashSet::new();
         let mut parents: HashSet<Hash> = HashSet::new();
+        let mut purged: u64 = 0;
         for hash in doomed {
             let Some(block) = self.get_block(hash)? else {
                 continue;
             };
+            purged = purged.saturating_add(1);
+            // S3-7: sibling height index.
+            self.db.batch_delete_cf(
+                &mut batch,
+                CF_METADATA,
+                &sibling_key(block.header.height, hash),
+            )?;
             self.db
                 .batch_delete_cf(&mut batch, CF_BLOCKS, hash.as_bytes())?;
             self.db
@@ -763,6 +935,22 @@ impl BlockStore {
             TIPS_INDEX_MARKER_KEY,
             &latest.to_be_bytes(),
         )?;
+        // S3-7: stored-block count and the sibling-index marker.
+        let count = self.read_block_count()?.saturating_sub(purged);
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_METADATA,
+            BLOCK_COUNT_KEY,
+            &count.to_be_bytes(),
+        )?;
+        if self.height_indexed.load(AtomicOrdering::SeqCst) {
+            self.db.batch_put_cf(
+                &mut batch,
+                CF_METADATA,
+                HEIGHT_INDEX_MARKER_KEY,
+                &latest.to_be_bytes(),
+            )?;
+        }
         self.db.write_batch_sync(batch)?;
         self.cached_latest_height
             .store(latest, AtomicOrdering::SeqCst);
@@ -960,6 +1148,32 @@ fn relation_has_child(value: Option<&[u8]>) -> bool {
             Err(_) => true,
         },
     }
+}
+
+/// S3-7 sibling height index (`CF_METADATA`): this prefix, the 8-byte
+/// big-endian height, then the 32-byte block hash; empty value. One entry per
+/// stored block, so every sibling at a height is listed (the `h` ‖ height
+/// index keeps only the last one stored). Non-consensus RPC metadata.
+const HEIGHT_SIBLINGS_PREFIX: &[u8] = b"hsib:";
+
+/// S3-7: number of blocks in `CF_BLOCKS`, 8-byte big-endian.
+const BLOCK_COUNT_KEY: &[u8] = b"block_count_v1";
+
+/// S3-7: the latest height at which the sibling index and the count were known
+/// to describe the store (as [`TIPS_INDEX_MARKER_KEY`] for the tips index).
+const HEIGHT_INDEX_MARKER_KEY: &[u8] = b"hsib_idx_v1";
+
+fn sibling_prefix(height: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(HEIGHT_SIBLINGS_PREFIX.len().saturating_add(8));
+    k.extend_from_slice(HEIGHT_SIBLINGS_PREFIX);
+    k.extend_from_slice(&height.to_be_bytes());
+    k
+}
+
+fn sibling_key(height: u64, hash: &Hash) -> Vec<u8> {
+    let mut k = sibling_prefix(height);
+    k.extend_from_slice(hash.as_bytes());
+    k
 }
 
 fn height_to_key(height: u64) -> Vec<u8> {
