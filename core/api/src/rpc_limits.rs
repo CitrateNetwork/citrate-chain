@@ -46,6 +46,11 @@ pub fn heavy_method_cost(method: &str) -> u32 {
         | "citrate_getTextEmbedding"
         | "citrate_semanticSearch"
         | "citrate_pinArtifact" => 100,
+        // S3-7: a trace rebuilds a verified historical state (one full state
+        // root) and replays a block prefix.
+        "debug_traceTransaction" | "debug_traceCall" => crate::trace_rpc::TRACE_COST,
+        // S3-7: a walk of the undo window plus a traced replay of one block.
+        "ots_getContractCreator" => crate::trace_rpc::CREATOR_LOOKUP_COST,
         _ => 0,
     }
 }
