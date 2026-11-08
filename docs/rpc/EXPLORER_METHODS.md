@@ -30,6 +30,7 @@ chain, the blocks reached by `selectedParent` from the applied tip.
 | historical `eth_getBalance` / `eth_getTransactionCount` / `eth_getCode` / `eth_getStorageAt` / `eth_call` | implemented, tested | no |
 | `debug_traceTransaction`, `debug_traceCall` (`callTracer`, `prestateTracer`) | implemented, tested | S3-3b changes what is replayed, not the output |
 | `ots_getContractCreator` | implemented, tested | no |
+| `net_peerInfo` (extended: each peer's last-known head) | implemented, tested | no |
 
 "Implemented, tested" means unit and conformance tests against a real executor and a
 real RocksDB store. It does not mean runtime-proven on a live network.
@@ -350,6 +351,30 @@ internal CREATE or CREATE2.
 - A genesis allocation returns `{"hash":null,"creator":null,"genesis":true}`.
 - A creation older than the undo window is refused (`-32000`). An explorer that needs
   older creators must index them from `callTracer` output as blocks arrive.
+
+## `net_peerInfo` (extended, core#605)
+
+This method returns every peer the node holds, with the head the node's sync scoring
+reads for it. 0.5.3's sync-truth check uses it. `net_peerInfo` is a Citrate method, not
+an Ethereum one, so it is extended in place. The fields it already returned (`id`,
+`addr`, `direction`) are unchanged.
+
+- **Data source:** `PeerManager::get_all_peers()` → `PeerInfo`.
+  - `headHeight` and `headHash` are `PeerInfo.head_height` and `head_hash`.
+  - They are seeded from the peer's Hello/HelloAck at the handshake.
+  - Every gossiped block from that peer raises them.
+  - These are the values the 2 s sync tick selects on (`node/src/sync_peer.rs`).
+- **Advertised, not proven held:** see `sync_peer.rs` invariant I4. That is why
+  `headSource` is `"advertised"`.
+- **Before the handshake completes** (`connecting`, `handshaking`), no head is known and
+  both fields are `null`, not 0.
+
+```json
+→ {"method":"net_peerInfo","params":[]}
+← [{"id":"12D3…","addr":"10.0.0.1:30303","direction":"outbound","state":"connected",
+    "headHeight":"0x4d2","headHash":"0xabab…","headSource":"advertised",
+    "lastSeenSecsAgo":2,"connectedSecs":3600,"score":0}]
+```
 
 ## Not served here (follow-ups)
 
