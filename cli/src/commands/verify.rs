@@ -856,9 +856,7 @@ impl ExplorerClient {
                 }
                 Err(e) if e.is_transient() => {
                     transient_errors = transient_errors.saturating_add(1);
-                    let factor = 1u32
-                        .checked_shl(transient_errors.saturating_sub(1))
-                        .unwrap_or(u32::MAX);
+                    let factor = 2u32.saturating_pow(transient_errors.saturating_sub(1));
                     delay = cfg
                         .interval
                         .saturating_mul(factor)
