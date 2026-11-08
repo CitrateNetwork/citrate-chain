@@ -1123,6 +1123,7 @@ mod tests {
                 coinbase: CB,
                 prevrandao: [0x5A; 32],
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let provisional = seal(key, height, Hash::default(), Hash::default());
             let r = rewards.calculate_reward(&provisional).expect("reward");

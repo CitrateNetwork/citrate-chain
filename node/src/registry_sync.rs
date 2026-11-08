@@ -1235,6 +1235,7 @@ mod tests {
             coinbase: CB,
             prevrandao: [0x5A; 32],
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
         let tmpl = seal_block(FWD_HEIGHT, txs.to_vec(), Hash::default());
         let mut receipts = Vec::new();

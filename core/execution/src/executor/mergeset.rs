@@ -103,7 +103,8 @@ impl Executor {
         let _defer = DeferGuard::engage(&self.defer_persist);
         // The EVM context for every tx C accepts (spec 06 §3.7): NUMBER and
         // TIMESTAMP from C, COINBASE = C.coinbase, PREVRANDAO = C's VRF output,
-        // BLOCKHASH(n) = C's selected-chain ancestor at n.
+        // BLOCKHASH(n) = C's selected-chain ancestor at n, GASLIMIT =
+        // ACCEPT_GAS_LIMIT.
         let ctx_block = Block {
             header: header.clone(),
             ..citrate_consensus::types::BlockBuilder::new().build_unhashed()
@@ -112,6 +113,8 @@ impl Executor {
             coinbase: header.coinbase,
             prevrandao: *header.vrf_reveal.output.as_bytes(),
             block_hashes,
+            // GASLIMIT (spec 06 §3.7): the budget C executes under.
+            gas_limit: Some(ACCEPT_GAS_LIMIT),
         });
         let pba = self.pba_hardening();
         let base_fee = header.base_fee_per_gas;

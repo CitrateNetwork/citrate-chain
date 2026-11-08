@@ -1854,6 +1854,7 @@ impl Executor {
             coinbase,
             prevrandao: *block.header.vrf_reveal.output.as_bytes(),
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
 
         // Capture receipts so §R' can levy the priority fee on the EXACT gas each
@@ -4888,6 +4889,7 @@ mod tests {
                 coinbase: CB,
                 prevrandao: [0x5A; 32],
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let tx = create_test_tx(alice, Some(bob), 1000, 0);
             let blk = block_with(vec![tx.clone()], Hash::default());
@@ -5010,6 +5012,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: vrf_output,
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
 
         let block = create_test_block();

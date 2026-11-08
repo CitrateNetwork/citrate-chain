@@ -4691,6 +4691,7 @@ pub(crate) mod tests {
             coinbase: CB,
             prevrandao: VRF_OUT,
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
         let (validator, treasury) = reward_for(block);
         for (addr, amt) in [(Address(CB), validator), (Address(TREASURY_ADDR), treasury)] {
@@ -4752,6 +4753,7 @@ pub(crate) mod tests {
                 coinbase: CB,
                 prevrandao: VRF_OUT,
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let tmpl = mk_block(h, parent, Hash::default());
             let (v, t) = reward_for(&tmpl);
@@ -7085,6 +7087,7 @@ pub(crate) mod tests {
             coinbase: CB,
             prevrandao: VRF_OUT,
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
         let provisional = mk_block_txs(
             height,

@@ -580,6 +580,10 @@ pub struct BlockContext {
     pub prevrandao: [u8; 32],
     /// Recent block hashes for BLOCKHASH opcode (up to 256)
     pub block_hashes: HashMap<u64, [u8; 32]>,
+    /// GASLIMIT opcode. r1007 S3-3b (spec 06 §3.7): ACCEPT_GAS_LIMIT for the
+    /// transactions an accepting block executes. `None` keeps REVM's default
+    /// (simulation, the legacy single-block apply).
+    pub gas_limit: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +870,7 @@ pub fn execute_contract_create_with_context(
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
     let prevrandao = block_ctx.prevrandao;
+    let block_gas_limit = block_ctx.gas_limit;
     // PBA-R2: consensus activation for the hardened precompile semantics.
     let pba_hardened = crate::activation::pba_hardening_active(block_number);
     // HUP-S7.2: the agent precompile fork (default: not activated).
@@ -934,6 +939,9 @@ pub fn execute_contract_create_with_context(
             // WP-X.4: Real coinbase and prevrandao
             block.coinbase = RevmAddress::from_slice(&coinbase);
             block.prevrandao = Some(B256::from_slice(&prevrandao));
+            if let Some(limit) = block_gas_limit {
+                block.gas_limit = RevmU256::from(limit);
+            }
         })
         .build();
 
@@ -1085,6 +1093,7 @@ pub fn execute_contract_call_with_context(
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
     let prevrandao = block_ctx.prevrandao;
+    let block_gas_limit = block_ctx.gas_limit;
     // PBA-R2: consensus activation for the hardened precompile semantics.
     let pba_hardened = crate::activation::pba_hardening_active(block_number);
     // HUP-S7.2: the agent precompile fork (default: not activated).
@@ -1153,6 +1162,9 @@ pub fn execute_contract_call_with_context(
             // WP-X.4: Real coinbase and prevrandao
             block.coinbase = RevmAddress::from_slice(&coinbase);
             block.prevrandao = Some(B256::from_slice(&prevrandao));
+            if let Some(limit) = block_gas_limit {
+                block.gas_limit = RevmU256::from(limit);
+            }
         })
         .build();
 
@@ -1357,6 +1369,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: [0xBE; 32],
             block_hashes: HashMap::new(),
+            gas_limit: None,
         };
 
         // Minimal init code: PUSH1 0x00 PUSH1 0x00 RETURN (deploys empty contract)
@@ -1406,6 +1419,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: [0xBE; 32],
             block_hashes,
+            gas_limit: None,
         };
 
         let result = execute_contract_call_with_context(
@@ -1470,6 +1484,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: vrf_output,
             block_hashes: HashMap::new(),
+            gas_limit: None,
         };
 
         let (output, _gas, _logs) = execute_contract_call_with_context(
