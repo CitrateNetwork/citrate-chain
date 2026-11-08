@@ -2,6 +2,23 @@
 
 All notable changes in this PR are documented here. This follows a Keep‑a‑Changelog‑style summary grouped by impact. Please add an entry in every substantive PR going forward.
 
+## Unreleased
+
+### Changed (breaking, CLI)
+- `citrate contract verify` submits to CitrateScan's Etherscan-compatible API
+  (`--explorer-url`, default `https://explorer.citrate.ai/api`) instead of the node's
+  operator-only `citrate_verifyContract` method. Input is a forge/hardhat build-info, a hardhat
+  artifact, a standard JSON input, or one source file; `--watch` polls `checkverifystatus`.
+- **Removed flags:** `--runtime-bytecode` and `--runtime-bytecode-file`. They only fed the node
+  method; the explorer recompiles the source. Scripts passing them now fail at argument parsing.
+- `contract verify-get` (and `verify --get`) read the explorer's `getsourcecode`, not the node.
+
+### Added
+- `contract verify` flags `--api-key`, `--constructor-args`, `--creation-tx`, `--chain-id`
+  (sends Etherscan v2 `chainid` only when given), `--watch`, `--poll-interval-ms`,
+  `--watch-timeout-secs`; single-file `--runs`, `--evm-version`, `--library`.
+- `contract verify-status <guid>` (with `--chain-id`, `--watch`).
+
 ## v0.4.0 — 2026-04-22
 
 Phase A (parallel execution), Phase B (genesis hardening), Phase C (GUI polish) all closed. First release where the executor layer is no longer the serialization bottleneck.

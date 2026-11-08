@@ -77,6 +77,7 @@ citrate contract verify-get 0xYourContractAddress
 | `--explorer-url` | `https://explorer.citrate.ai/api` | also `CITRATE_EXPLORER_URL` |
 | `--api-key` | none | sent as `apikey`; also `CITRATE_EXPLORER_API_KEY`. Verification needs no key |
 | `--constructor-args` | none | ABI-encoded hex. Optional: the explorer reads the arguments from the creation transaction |
+| `--chain-id` | none | sent as Etherscan v2 `chainid` (e.g. `40204`) on submit and polls; omit it for a local devnet. Also on `verify-status` and `verify-get` |
 | `--creation-tx` | none | creation transaction hash, sent as `creationtxhash` |
 | `--watch` | off | poll `checkverifystatus` until `Pass - Verified` or `Fail - Unable to verify` |
 | `--poll-interval-ms`, `--watch-timeout-secs` | 3000, 300 | polling cadence and deadline |
@@ -86,6 +87,9 @@ explorer accepts at most 64 files and 2 MiB, with inline content only. A submiss
 explorer refuses (`Contract source code already verified`,
 `Unable to locate ContractCode at 0x…`) is reported with the explorer's own message. After
 `Max rate limit reached` the CLI waits 5 s and retries, up to 3 times.
+
+**Breaking:** `--runtime-bytecode` and `--runtime-bytecode-file` are gone. They only fed the
+node method; the explorer recompiles the source itself.
 
 The node's `citrate_verifyContract` RPC method is an operator tool that needs the operator
 token. The CLI no longer uses it. `citrate contract verify-list` still lists the records stored
