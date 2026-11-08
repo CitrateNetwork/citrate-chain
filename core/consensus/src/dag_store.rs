@@ -237,7 +237,7 @@ pub struct DagStore {
 
     /// r1007 G10: every stored non-genesis block by slot, with its proposer:
     /// the index that finds an equivocating pair when its second block is
-    /// stored. Pruned with the blocks.
+    /// stored, and that the slot statistics read. Pruned with the blocks.
     slot_index: Arc<RwLock<BTreeMap<u64, Vec<(PublicKey, Hash)>>>>,
 
     /// r1007 G10 / O8: equivocation evidence recorded so far, keyed by
@@ -471,6 +471,27 @@ impl DagStore {
     /// written in the same batch as the block that revealed it.
     pub async fn equivocation_evidence(&self) -> Vec<EquivocationEvidence> {
         self.equivocations.read().await.values().cloned().collect()
+    }
+
+    /// r1007 instrumentation: for each slot in `[from, to]` that holds at
+    /// least one stored block, the number of merge parents of each block
+    /// (source: the slot index, i.e. the stored headers).
+    pub async fn merge_counts_by_slot(&self, from: u64, to: u64) -> Vec<(u64, Vec<usize>)> {
+        if from > to {
+            return Vec::new();
+        }
+        let index = self.slot_index.read().await;
+        let blocks = self.blocks.read().await;
+        index
+            .range(from..=to)
+            .map(|(slot, entries)| {
+                let merges = entries
+                    .iter()
+                    .filter_map(|(_, h)| blocks.get(h).map(|b| b.header.merge_parent_hashes.len()))
+                    .collect();
+                (*slot, merges)
+            })
+            .collect()
     }
 
     /// Create a DagStore with explicit VRF strictness.

@@ -20,6 +20,308 @@
 //! `citrate_equivocations_recorded`, and logged as one `slot-stats:` line per
 //! window.
 
+use citrate_consensus::slots::SLOT_DURATION_SECS;
+use citrate_consensus::types::Hash;
+use citrate_consensus::DagStore;
+use citrate_storage::StorageManager;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{info, warn};
+
+/// Slots per summary window (one `slot-stats:` line per window).
+pub const SLOT_STATS_WINDOW_SLOTS: u64 = 60;
+
+/// The most recent slots left out of a window: their blocks may still be
+/// propagating, so counting them would understate blocks per slot.
+pub const SLOT_STATS_SETTLE_SLOTS: u64 = 3;
+
+/// Longest selected-chain walk the reorg detector makes per sample. A move
+/// that needs a longer walk is reported as [`TipMove::Unknown`], not counted.
+pub const REORG_WALK_CAP: u64 = 10_000;
+
+/// One window of slots.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotWindow {
+    pub from: u64,
+    pub to: u64,
+    pub slots: u64,
+    pub blocks: u64,
+    pub max_blocks_in_a_slot: u64,
+    pub empty_slots: u64,
+    pub blocks_with_merges: u64,
+    pub merge_parents: u64,
+}
+
+impl SlotWindow {
+    pub fn blocks_per_slot(&self) -> f64 {
+        ratio(self.blocks, self.slots)
+    }
+    pub fn empty_slot_rate(&self) -> f64 {
+        ratio(self.empty_slots, self.slots)
+    }
+    pub fn merge_rate(&self) -> f64 {
+        ratio(self.blocks_with_merges, self.blocks)
+    }
+    pub fn merge_parents_mean(&self) -> f64 {
+        ratio(self.merge_parents, self.blocks)
+    }
+}
+
+fn ratio(n: u64, d: u64) -> f64 {
+    if d == 0 {
+        0.0
+    } else {
+        n as f64 / d as f64
+    }
+}
+
+/// Summarise the slots `[from, to]` from the merge-parent counts of the blocks
+/// in each non-empty slot (`DagStore::merge_counts_by_slot`).
+pub fn summarize(from: u64, to: u64, by_slot: &[(u64, Vec<usize>)]) -> SlotWindow {
+    let slots = if to >= from {
+        to.saturating_sub(from).saturating_add(1)
+    } else {
+        0
+    };
+    let mut w = SlotWindow {
+        from,
+        to,
+        slots,
+        blocks: 0,
+        max_blocks_in_a_slot: 0,
+        empty_slots: slots,
+        blocks_with_merges: 0,
+        merge_parents: 0,
+    };
+    for (slot, merges) in by_slot {
+        if *slot < from || *slot > to || merges.is_empty() {
+            continue;
+        }
+        let n = merges.len() as u64;
+        w.blocks = w.blocks.saturating_add(n);
+        w.max_blocks_in_a_slot = w.max_blocks_in_a_slot.max(n);
+        w.empty_slots = w.empty_slots.saturating_sub(1);
+        for m in merges {
+            if *m > 0 {
+                w.blocks_with_merges = w.blocks_with_merges.saturating_add(1);
+            }
+            w.merge_parents = w.merge_parents.saturating_add(*m as u64);
+        }
+    }
+    w
+}
+
+/// What one applied-tip sample showed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TipMove {
+    /// First sample, or the tip did not move.
+    None,
+    /// The tip moved forward along its own selected chain by `n` blocks.
+    Extended(u64),
+    /// The tip left its selected chain: `depth` blocks of the old chain were
+    /// abandoned, and the new chain added `added` blocks above the fork.
+    Reorg { depth: u64, added: u64 },
+    /// The tip moved, but the walk to the common block met a header this node
+    /// does not hold (pruned, or not yet admitted) or hit [`REORG_WALK_CAP`].
+    /// Neither an extension nor a reorg is counted: guessing either would
+    /// bias the measurement the sortition decision reads.
+    Unknown,
+}
+
+/// Selected-chain reorg detector over applied-tip samples.
+#[derive(Debug, Default)]
+pub struct ReorgTracker {
+    last: Option<(Hash, u64)>,
+    pub reorgs: u64,
+    pub max_depth: u64,
+    pub applied: u64,
+}
+
+impl ReorgTracker {
+    /// Feed the applied tip `(hash, height)`. `selected_parent` maps a block
+    /// to its selected parent from the stored headers (`None` if unknown).
+    pub async fn observe<F, Fut>(&mut self, tip: (Hash, u64), selected_parent: F) -> TipMove
+    where
+        F: Fn(Hash) -> Fut,
+        Fut: std::future::Future<Output = Option<Hash>>,
+    {
+        let Some((old, old_h)) = self.last.replace(tip) else {
+            return TipMove::None;
+        };
+        let (new, new_h) = tip;
+        if new == old {
+            return TipMove::None;
+        }
+        // Walk the higher chain down to the lower height, then both down
+        // together to their common block.
+        let (mut a, mut a_h, mut b, mut b_h) = (new, new_h, old, old_h);
+        let mut steps = 0u64;
+        while a_h > b_h {
+            if steps >= REORG_WALK_CAP {
+                return TipMove::Unknown;
+            }
+            match selected_parent(a).await {
+                Some(p) => a = p,
+                None => return TipMove::Unknown,
+            }
+            a_h = a_h.saturating_sub(1);
+            steps = steps.saturating_add(1);
+        }
+        while b_h > a_h {
+            if steps >= REORG_WALK_CAP {
+                return TipMove::Unknown;
+            }
+            match selected_parent(b).await {
+                Some(p) => b = p,
+                None => return TipMove::Unknown,
+            }
+            b_h = b_h.saturating_sub(1);
+            steps = steps.saturating_add(1);
+        }
+        if a == b && b_h == old_h {
+            let n = new_h.saturating_sub(old_h);
+            self.applied = self.applied.saturating_add(n);
+            return TipMove::Extended(n);
+        }
+        while a != b {
+            if a_h == 0 || steps >= REORG_WALK_CAP {
+                return TipMove::Unknown;
+            }
+            match (selected_parent(a).await, selected_parent(b).await) {
+                (Some(pa), Some(pb)) => {
+                    a = pa;
+                    b = pb;
+                }
+                _ => return TipMove::Unknown,
+            }
+            a_h = a_h.saturating_sub(1);
+            steps = steps.saturating_add(1);
+        }
+        let fork_h = a_h;
+        let depth = old_h.saturating_sub(fork_h).max(1);
+        let added = new_h.saturating_sub(fork_h);
+        self.reorgs = self.reorgs.saturating_add(1);
+        self.max_depth = self.max_depth.max(depth);
+        self.applied = self.applied.saturating_add(added);
+        TipMove::Reorg { depth, added }
+    }
+
+    /// Reorgs per applied block since the last reset.
+    pub fn reorg_rate(&self) -> f64 {
+        ratio(self.reorgs, self.applied)
+    }
+
+    /// Start a new window (keeps the last sample).
+    pub fn reset_window(&mut self) {
+        self.reorgs = 0;
+        self.max_depth = 0;
+        self.applied = 0;
+    }
+}
+
+/// The `slot-stats:` log line for a window.
+pub fn report_line(w: &SlotWindow, reorgs: &ReorgTracker, equivocations: usize) -> String {
+    format!(
+        "slot-stats: slots {}..={} ({}), blocks {}, blocks/slot {:.2} (max {}), empty-slot rate \
+         {:.3}, merge rate {:.3} (mean merge parents {:.2}), reorgs {} over {} applied (rate \
+         {:.4}, max depth {}), equivocations recorded {}",
+        w.from,
+        w.to,
+        w.slots,
+        w.blocks,
+        w.blocks_per_slot(),
+        w.max_blocks_in_a_slot,
+        w.empty_slot_rate(),
+        w.merge_rate(),
+        w.merge_parents_mean(),
+        reorgs.reorgs,
+        reorgs.applied,
+        reorgs.reorg_rate(),
+        reorgs.max_depth,
+        equivocations
+    )
+}
+
+/// Publish a window to the metrics surface.
+fn publish(w: &SlotWindow, reorgs: &ReorgTracker, equivocations: usize) {
+    citrate_api::metrics_server::update_slot_stats(&[
+        ("blocks_per_slot", w.blocks_per_slot()),
+        ("blocks_per_slot_max", w.max_blocks_in_a_slot as f64),
+        ("empty_slot_rate", w.empty_slot_rate()),
+        ("merge_rate", w.merge_rate()),
+        ("merge_parents_mean", w.merge_parents_mean()),
+        ("reorg_rate", reorgs.reorg_rate()),
+        ("reorg_depth_max", reorgs.max_depth as f64),
+        ("window_slots", w.slots as f64),
+    ]);
+    citrate_api::metrics_server::update_equivocations_recorded(equivocations);
+}
+
+/// [`publish`] for the slot-stats task's own tests.
+#[cfg(test)]
+fn publish_for_test(w: &SlotWindow, reorgs: &ReorgTracker, equivocations: usize) {
+    publish(w, reorgs, equivocations)
+}
+
+/// Spawn the slot-stats task.
+pub fn spawn(storage: Arc<StorageManager>, dag: Arc<DagStore>) {
+    tokio::spawn(async move {
+        let mut tick = crate::timing::cadence_interval(Duration::from_secs(SLOT_DURATION_SECS));
+        let mut reorgs = ReorgTracker::default();
+        let mut ticks = 0u64;
+        loop {
+            tick.tick().await;
+            match storage.blocks.get_applied_tip() {
+                Ok(Some(tip)) => {
+                    let d = dag.clone();
+                    let mv =
+                        reorgs
+                            .observe(tip, |h| {
+                                let d = d.clone();
+                                async move {
+                                    d.get_header(&h).await.ok().map(|x| x.selected_parent_hash)
+                                }
+                            })
+                            .await;
+                    if let TipMove::Reorg { depth, added } = mv {
+                        citrate_api::metrics_server::record_selected_chain_reorg(depth);
+                        info!(
+                            "slot-stats: selected-chain reorg to {} @ {}: depth {}, {} added",
+                            tip.0, tip.1, depth, added
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!("slot-stats: applied tip unreadable: {e}"),
+            }
+            ticks = ticks.saturating_add(1);
+            if ticks % SLOT_STATS_WINDOW_SLOTS != 0 {
+                continue;
+            }
+            let Some(origin) = dag.slot_origin() else {
+                continue;
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let Some(now_slot) = citrate_consensus::slots::slot_of(now, origin) else {
+                continue;
+            };
+            let to = now_slot.saturating_sub(SLOT_STATS_SETTLE_SLOTS);
+            let from = to
+                .saturating_sub(SLOT_STATS_WINDOW_SLOTS)
+                .saturating_add(1)
+                .max(1);
+            let w = summarize(from, to, &dag.merge_counts_by_slot(from, to).await);
+            let equivocations = dag.equivocation_evidence().await.len();
+            publish(&w, &reorgs, equivocations);
+            info!("{}", report_line(&w, &reorgs, equivocations));
+            reorgs.reset_window();
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

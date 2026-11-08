@@ -2437,6 +2437,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
     memory_bounds::spawn_report(storage.clone(), shared_dag_store.clone());
+    // r1007 CV-4b: slot statistics for the S1 sortition decision (measure only).
+    slot_stats::spawn(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
     // pre-D2 binary can be carrying a chain-store hole with the block sitting
