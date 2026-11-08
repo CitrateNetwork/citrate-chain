@@ -4457,7 +4457,7 @@ mod tests {
     /// fixtures. Production startup writes and applies this block before the
     /// first producer round; keeping it in the fixture makes A001 exercise the
     /// configured-genesis path rather than the legacy zero-hash sentinel.
-    fn test_genesis() -> Block {
+    pub(super) fn test_genesis() -> Block {
         let mut genesis = BlockBuilder::new()
             .version(2)
             .height(0)
@@ -4481,7 +4481,7 @@ mod tests {
     /// producer fixture. Genesis is seeded before any applicator or producer
     /// can select a parent, so the first block is height 1 with the real
     /// genesis hash.
-    async fn seed_test_genesis(
+    pub(super) async fn seed_test_genesis(
         storage: &StorageManager,
         dag: &DagStore,
         ghostdag: &GhostDag,
@@ -5044,6 +5044,8 @@ mod tests {
             test_signing_key(),
             2,
         );
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         let hash = producer.produce_block().await.expect("produce");
         let block = storage
             .blocks
@@ -5085,19 +5087,33 @@ mod tests {
             .set_balance(a, U256::from(10u64).pow(U256::from(21u64)));
     }
 
-    fn test_producer(
+    /// A producer over `producer_fixture`'s stores, with the genesis block in
+    /// its DAG (r1007 G9: the slot origin is genesis's timestamp).
+    async fn test_producer(
         storage: &Arc<StorageManager>,
         executor: &Arc<Executor>,
         mempool: &Arc<Mempool>,
     ) -> BlockProducer {
-        BlockProducer::new(
+        let producer = BlockProducer::new(
             storage.clone(),
             executor.clone(),
             mempool.clone(),
             embedded_pubkey(Address([0x44; 20])),
             test_signing_key(),
             2,
-        )
+        );
+        let genesis = test_genesis();
+        let dag = producer.dag_store();
+        dag.set_configured_genesis(genesis.header.block_hash);
+        dag.store_block(genesis.clone())
+            .await
+            .expect("store test genesis in DAG");
+        producer
+            .ghostdag()
+            .add_block(&genesis)
+            .await
+            .expect("admit test genesis to GhostDAG");
+        producer
     }
 
     fn producer_fixture() -> (
@@ -5110,6 +5126,16 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        // r1007 G9: a producer builds on genesis (the slot origin), so the
+        // fixture holds it as node startup does: the chain-store half here,
+        // before any applicator reads the durable tip; `test_producer` adds the
+        // DAG half.
+        let genesis = test_genesis();
+        storage.blocks.put_block(&genesis).expect("persist test genesis");
+        storage
+            .blocks
+            .put_applied_tip(&genesis.header.block_hash, 0)
+            .expect("persist test genesis applied tip");
         let state_db = Arc::new(citrate_execution::StateDB::new());
         let executor = Arc::new(Executor::with_storage_and_chain_id(
             state_db.clone(),
@@ -5136,6 +5162,7 @@ mod tests {
             storage.clone(),
         ));
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app);
         let rebuild = app.rebuild_in_progress_handle();
@@ -5189,7 +5216,7 @@ mod tests {
                 .await
                 .expect("admit");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let sel: Vec<Hash> = producer
             .select_transactions_with_ai_priority()
             .await
@@ -5226,7 +5253,7 @@ mod tests {
                 .await
                 .expect("admit");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let hash = producer.produce_block().await.expect("produce");
         let block = storage
             .blocks
@@ -5280,7 +5307,7 @@ mod tests {
             t.data = data;
             let _ = mempool.add_transaction(t, TxClass::Standard).await;
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
         block.transactions.iter().any(|t| t.hash == honest_tx.hash)
@@ -5384,7 +5411,7 @@ mod tests {
                 .await
                 .expect("candidate admitted");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
         assert!(
@@ -5423,7 +5450,7 @@ mod tests {
                 .await
                 .expect("candidate admitted");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
         let declared_total: u64 = block.transactions.iter().map(|t| t.gas_limit).sum();
@@ -5458,7 +5485,7 @@ mod tests {
                 .expect("admit");
             hashes.push(t.hash);
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
         // 30M / 21k = 1428 transfers fit by gas; the count cap is not binding.
@@ -5518,7 +5545,7 @@ mod tests {
                 .await
                 .expect("admit");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let sel: Vec<Hash> = producer
             .select_transactions_with_ai_priority()
             .await
@@ -5599,6 +5626,8 @@ mod tests {
             signing_key,
             2,
         );
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
 
         let block_hash = producer.produce_block().await.unwrap();
         let block = storage.blocks.get_block(&block_hash).unwrap().unwrap();
@@ -5741,6 +5770,8 @@ mod tests {
             economics,
         )
         .await;
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
 
         // One empty block at height 1 — post-activation, single-parent: block 2209's shape.
         let block_hash = producer.produce_block().await.expect("produce empty block");
@@ -5862,6 +5893,8 @@ mod tests {
             2,
         )
         .with_v2_headers(true);
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         let applicator = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
             executor.clone(),
             storage.clone(),
@@ -6474,6 +6507,8 @@ mod tests {
             2,
         )
         .with_v2_headers(true);
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         let applicator = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
             executor.clone(),
             storage.clone(),
@@ -7191,6 +7226,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7248,6 +7284,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
             .with_network_height_gate(&attested);
@@ -7287,6 +7324,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
             .with_network_height_gate(&attested);
@@ -7323,6 +7361,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
             .with_network_height_gate(&attested);
@@ -7522,6 +7561,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7567,6 +7607,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7702,6 +7743,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7778,6 +7820,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -9612,13 +9655,23 @@ mod pba_l1b_003_producer_timestamp {
             .find("let mut header = BlockHeader {")
             .expect("producer header construction");
         let body = &src[hdr..hdr + 1_500];
+        // r1007 G9: the header carries the slot timestamp `round_slot`
+        // computed, and `round_slot` is where the PBA-L1b-003 clamp lives.
         assert!(
-            body.contains("hardening::producer_timestamp(now, pts)"),
-            "PBA-L1b-003: header.timestamp must be producer_timestamp(now, parent.ts)"
+            body.contains("timestamp: block_timestamp,"),
+            "PBA-L1b-003 / G9: header.timestamp must be round_slot's clamped slot start"
         );
         assert!(
             !body.contains("timestamp: chrono::Utc::now().timestamp() as u64"),
             "PBA-L1b-003: bare `now` stamping reintroduced"
+        );
+        let rs = src
+            .find("fn round_slot(&self, parent_ts: Option<u64>)")
+            .expect("round_slot");
+        let rs_body = &src[rs..rs + 1_600];
+        assert!(
+            rs_body.contains("hardening::producer_timestamp(start, pts)"),
+            "PBA-L1b-003: the slot start must go through producer_timestamp(start, parent.ts)"
         );
     }
 }
@@ -9968,6 +10021,8 @@ mod producer_panic_breaker {
             citrate_consensus::crypto::generate_keypair(),
             2,
         ));
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        super::tests::seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         Node {
             _dir: dir,
             storage,
@@ -10251,6 +10306,8 @@ mod producer_vrf_fail_closed {
             Ed25519SigningKey::from_bytes(&[42u8; 32]),
             2,
         );
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        super::tests::seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         producer.vrf_prover = prover;
         Node {
             _dir: dir,
@@ -10301,6 +10358,13 @@ mod producer_vrf_fail_closed {
             .flatten()
     }
 
+    /// The parent VRF output of a block sealed on the fixture genesis.
+    fn genesis_vrf() -> Hash {
+        super::tests::test_genesis().header.vrf_reveal.output
+    }
+
+    /// r1007 G9: the alpha binds the block's time slot (from the fixture
+    /// genesis's timestamp), not its height.
     fn assert_real_ecvrf(block: &Block, parent_vrf: &Hash) {
         let proof = &block.header.vrf_reveal;
         assert_eq!(
@@ -10308,10 +10372,15 @@ mod producer_vrf_fail_closed {
             114,
             "sealed proof must be a full ECVRF proof"
         );
+        let slot = citrate_consensus::slots::slot_of(
+            block.header.timestamp,
+            super::tests::test_genesis().header.timestamp,
+        )
+        .expect("a sealed block has a slot");
         let mut alpha = Vec::with_capacity(72);
         alpha.extend_from_slice(block.header.proposer_pubkey.as_bytes());
         alpha.extend_from_slice(parent_vrf.as_bytes());
-        alpha.extend_from_slice(&block.header.height.to_le_bytes());
+        alpha.extend_from_slice(&slot.to_le_bytes());
         let ecvrf = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&proof.proof)
             .expect("decodes as ECVRF");
         let beta = citrate_consensus::ecvrf::verify(&alpha, &ecvrf).expect("ECVRF verifies");
@@ -10348,9 +10417,12 @@ mod producer_vrf_fail_closed {
             None,
             "no block may be stored for a slot whose VRF prove failed"
         );
-        assert!(
-            n.producer.dag_store.get_tips().await.is_empty(),
-            "no block may enter the DAG for a skipped slot"
+        // r1007: the fixture's DAG holds genesis (the slot origin); a skipped
+        // slot adds nothing to it.
+        assert_eq!(
+            n.producer.dag_store.get_tips().await.len(),
+            1,
+            "no block may enter the DAG for a skipped slot (genesis is the only tip)"
         );
         assert!(
             next_broadcast(&mut n.peer_rx).await.is_none(),
@@ -10373,6 +10445,83 @@ mod producer_vrf_fail_closed {
             citrate_api::metrics_server::producer_vrf_prove_failures() >= failures_before + 1.0,
             "the skip must be counted on citrate_producer_vrf_prove_failures_total"
         );
+    }
+
+    /// A clock fixed at `ms` milliseconds since the UNIX epoch.
+    fn fixed_clock(ms: Arc<AtomicU64>) -> SlotClock {
+        Arc::new(move || ms.load(Ordering::SeqCst))
+    }
+
+    /// #184 / r1007 G9: a round seals at its slot boundary: the header carries
+    /// the first second of the slot the clock is in (a tick a few ms early
+    /// counts for the slot it was scheduled for), and the VRF alpha binds that
+    /// slot, not the height.
+    #[tokio::test]
+    async fn a_block_is_stamped_at_its_slot_start_with_a_slot_bound_vrf() {
+        let g = super::tests::test_genesis().header.timestamp;
+        let slot_ms = citrate_consensus::slots::SLOT_DURATION_SECS * 1_000;
+        let ms = Arc::new(AtomicU64::new(g * 1_000 + 7 * slot_ms + 300));
+        let mut n = node(real_vrf_prover()).await;
+        n.producer = n.producer.with_slot_clock(fixed_clock(ms.clone()));
+        let hash = n.producer.produce_block().await.expect("slot 7");
+        let b = n.storage.blocks.get_block(&hash).expect("read").expect("stored");
+        assert_eq!(b.header.height, 1);
+        assert_eq!(
+            b.header.timestamp,
+            g + 7 * citrate_consensus::slots::SLOT_DURATION_SECS,
+            "stamped at the first second of slot 7"
+        );
+        assert_real_ecvrf(&b, &genesis_vrf());
+
+        // A tick that fires just before the boundary of slot 9 seals slot 9.
+        ms.store(
+            g * 1_000 + 9 * slot_ms - (crate::timing::SLOT_TICK_EARLY_ALLOWANCE_MS - 50),
+            Ordering::SeqCst,
+        );
+        let hash = n.producer.produce_block().await.expect("slot 9");
+        let b = n.storage.blocks.get_block(&hash).expect("read").expect("stored");
+        assert_eq!(
+            citrate_consensus::slots::slot_of(b.header.timestamp, g),
+            Some(9)
+        );
+    }
+
+    /// #184 / r1007 G9, G10: one block per proposer per slot. A second round
+    /// in the slot of its own last block seals nothing (its selected parent is
+    /// in that slot) and signs nothing. The next slot seals normally.
+    #[tokio::test]
+    async fn a_second_round_in_the_same_slot_seals_nothing() {
+        let g = super::tests::test_genesis().header.timestamp;
+        let slot_ms = citrate_consensus::slots::SLOT_DURATION_SECS * 1_000;
+        let ms = Arc::new(AtomicU64::new(g * 1_000 + 3 * slot_ms));
+        let mut n = node(real_vrf_prover()).await;
+        n.producer = n.producer.with_slot_clock(fixed_clock(ms.clone()));
+        let first = n.producer.produce_block().await.expect("slot 3");
+        let _ = next_broadcast(&mut n.peer_rx).await;
+
+        ms.fetch_add(slot_ms / 2, Ordering::SeqCst); // still slot 3
+        let err = n
+            .producer
+            .produce_block()
+            .await
+            .expect_err("a second block in slot 3 must not be sealed");
+        assert!(err.to_string().contains("G9"), "named the slot rule: {err}");
+        assert_eq!(
+            n.storage.blocks.get_block_by_height(2).expect("read"),
+            None,
+            "nothing sealed on top of slot 3 within slot 3"
+        );
+        assert!(next_broadcast(&mut n.peer_rx).await.is_none());
+
+        // The refused round signed nothing: the last signed slot is still 3.
+        assert_eq!(n.producer.last_signed_slot.load(Ordering::SeqCst), 3);
+
+        ms.store(g * 1_000 + 4 * slot_ms, Ordering::SeqCst);
+        let second = n.producer.produce_block().await.expect("slot 4");
+        let b = n.storage.blocks.get_block(&second).expect("read").expect("stored");
+        assert_eq!(b.header.height, 2);
+        assert_eq!(b.header.selected_parent_hash, first);
+        assert_eq!(n.producer.last_signed_slot.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
@@ -10405,7 +10554,7 @@ mod producer_vrf_fail_closed {
             "the skipped slot left no gap or block"
         );
         assert_eq!(block.transactions.len(), 1, "the pending tx is included");
-        assert_real_ecvrf(&block, &Hash::default());
+        assert_real_ecvrf(&block, &genesis_vrf());
         match next_broadcast(&mut n.peer_rx).await {
             Some(NetworkMessage::NewBlock { block: sent }) => {
                 assert_eq!(sent.header.block_hash, hash)
@@ -10562,7 +10711,7 @@ mod producer_vrf_fail_closed {
             "the skip must name the output mismatch, got: {err:#}"
         );
         assert_eq!(n.storage.blocks.get_block_by_height(1).expect("read"), None);
-        assert!(n.producer.dag_store.get_tips().await.is_empty());
+        assert_eq!(n.producer.dag_store.get_tips().await.len(), 1, "genesis only");
         assert!(next_broadcast(&mut n.peer_rx).await.is_none());
     }
 

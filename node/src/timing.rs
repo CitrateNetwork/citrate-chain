@@ -39,7 +39,122 @@ pub(crate) fn sampling_interval(period: Duration) -> Interval {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use citrate_consensus::slots::SLOT_DURATION_SECS;
     use tokio::time::{advance, Instant};
+
+    /// A genesis timestamp (slot origin) that sits on a slot boundary, as the
+    /// canonical one does, and one that does not sit on a 2 s boundary.
+    const ORIGIN: u64 = 1_767_225_600;
+    const ODD_ORIGIN: u64 = 1_767_225_601;
+
+    /// A wall-clock reading exactly on a 2 s grid boundary from ORIGIN.
+    const ON_SLOT: Duration = Duration::from_secs(ORIGIN + 3_600);
+
+    /// Slot-start phases (ms past the even second) the seven r1006 producers
+    /// ran at on 2026-10-28, each fixed by when its process started.
+    const FLEET_PHASES_MS: [u64; 7] = [1_617, 1_227, 292, 433, 1_059, 1_341, 261];
+
+    /// #184: producers started at different instants tick at the same
+    /// wall-clock moment, on a slot boundary from genesis. Anchored at process
+    /// start, each kept its own phase for its whole uptime.
+    #[tokio::test(start_paused = true)]
+    async fn producers_tick_together_on_the_genesis_slot_grid() {
+        for (origin, block_time) in [(ORIGIN, 2u64), (ODD_ORIGIN, 2), (ORIGIN, 1), (ODD_ORIGIN, 5)]
+        {
+            let period = production_period_secs(block_time);
+            // A grid boundary of this origin, then each producer's phase
+            // within one period.
+            let base = Duration::from_secs(origin + 1_000 * period);
+            let mut ticks = Vec::new();
+            for phase_ms in FLEET_PHASES_MS {
+                let phase_ms = phase_ms % (period * 1_000);
+                let wall_now = base + Duration::from_millis(phase_ms);
+                let started = Instant::now();
+                let mut timer = production_interval_at(block_time, origin, wall_now);
+                timer.tick().await;
+                let tick_wall = wall_now + started.elapsed();
+                let since = tick_wall - Duration::from_secs(origin);
+                assert_eq!(
+                    since.as_nanos() % u128::from(period * 1_000_000_000),
+                    0,
+                    "producer started {phase_ms} ms in ticked off the grid of origin {origin}"
+                );
+                assert_eq!(
+                    since.as_nanos() % u128::from(SLOT_DURATION_SECS * 1_000_000_000),
+                    0,
+                    "a production tick is always a slot boundary"
+                );
+                ticks.push(tick_wall);
+            }
+            assert!(
+                ticks.windows(2).all(|w| w[0] == w[1]),
+                "first ticks differ across producers: {ticks:?}"
+            );
+        }
+    }
+
+    /// After the first aligned tick the timer stays on the grid, including
+    /// after an overrun (one late tick, then back on a boundary).
+    #[tokio::test(start_paused = true)]
+    async fn aligned_production_interval_stays_on_the_slot_grid() {
+        let wall_now = ON_SLOT + Duration::from_millis(1_227);
+        let started = Instant::now();
+        let mut timer = production_interval_at(2, ORIGIN, wall_now);
+        let wall = |s: Instant| wall_now + s.elapsed() - Duration::from_secs(ORIGIN);
+        for _ in 0..3 {
+            timer.tick().await;
+            assert_eq!(wall(started).as_millis() % 2_000, 0);
+        }
+        advance(Duration::from_millis(3_300)).await;
+        assert_eq!(ready_ticks(&mut timer).await, 1);
+        timer.tick().await;
+        assert_eq!(
+            wall(started).as_millis() % 2_000,
+            0,
+            "left the grid after an overrun"
+        );
+    }
+
+    /// The period is a whole number of slots, never zero.
+    #[test]
+    fn production_period_is_whole_slots() {
+        for t in [0u64, 1, 2, 3, 5, 7, 60] {
+            let p = production_period_secs(t);
+            assert!(p >= SLOT_DURATION_SECS && p >= t);
+            assert_eq!(p % SLOT_DURATION_SECS, 0);
+            assert!(p < t.max(1) + SLOT_DURATION_SECS);
+        }
+    }
+
+    #[test]
+    fn delay_to_next_boundary_edges() {
+        let two = Duration::from_secs(2);
+        let o = Duration::from_secs(ORIGIN);
+        assert_eq!(delay_to_next_boundary(ON_SLOT, o, two), Duration::ZERO);
+        assert_eq!(
+            delay_to_next_boundary(ON_SLOT + Duration::from_millis(1_227), o, two),
+            Duration::from_millis(773)
+        );
+        assert_eq!(
+            delay_to_next_boundary(ON_SLOT + Duration::from_nanos(1), o, two),
+            two - Duration::from_nanos(1)
+        );
+        assert_eq!(
+            delay_to_next_boundary(ON_SLOT - Duration::from_nanos(1), o, two),
+            Duration::from_nanos(1)
+        );
+        // An origin off the 2 s epoch grid moves the grid with it.
+        let odd = Duration::from_secs(ODD_ORIGIN);
+        assert_eq!(delay_to_next_boundary(ON_SLOT, odd, two), Duration::from_secs(1));
+        // Before genesis: wait for genesis itself.
+        assert_eq!(
+            delay_to_next_boundary(o - Duration::from_secs(5), o, two),
+            Duration::from_secs(5)
+        );
+        // Degenerate inputs never panic.
+        assert_eq!(delay_to_next_boundary(ON_SLOT, o, Duration::ZERO), Duration::ZERO);
+        assert!(delay_to_next_boundary(Duration::MAX, o, two) < two);
+    }
 
     /// Ticks that are ready right now, without letting time move.
     async fn ready_ticks(timer: &mut Interval) -> usize {
@@ -61,7 +176,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn delayed_producer_resumes_at_cadence_without_burst() {
         const BLOCK_TIME: u64 = 2;
-        let mut timer = production_interval(BLOCK_TIME);
+        let mut timer = production_interval_at(BLOCK_TIME, ORIGIN, ON_SLOT);
         assert_eq!(timer.missed_tick_behavior(), MissedTickBehavior::Skip);
         assert_eq!(timer.period(), Duration::from_secs(BLOCK_TIME));
 
@@ -110,7 +225,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn production_interval_stays_on_grid_after_partial_overrun() {
         let start = Instant::now();
-        let mut timer = production_interval(2);
+        let mut timer = production_interval_at(2, ORIGIN, ON_SLOT);
         timer.tick().await; // t = 0
         advance(Duration::from_millis(5_500)).await; // round ran 5.5 s
         assert_eq!(ready_ticks(&mut timer).await, 1);
