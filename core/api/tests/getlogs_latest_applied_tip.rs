@@ -124,6 +124,7 @@ fn write_receipt(storage: &StorageManager, b: &Block) {
         eth_tx_type: 0,
         effective_gas_price: 2_000_000_000,
         revert_reason: None,
+        acceptance: None,
     };
     storage
         .transactions

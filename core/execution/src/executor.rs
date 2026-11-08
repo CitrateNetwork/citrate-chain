@@ -197,6 +197,9 @@ impl ExecutionContext {
 /// Default chain ID for Citrate network
 pub const DEFAULT_CHAIN_ID: u64 = 40204;
 
+mod mergeset;
+pub use mergeset::{Emission, EmissionFn};
+
 /// Transaction executor
 pub struct Executor {
     state_db: Arc<StateDB>,
@@ -568,6 +571,29 @@ impl ReceiptIndexBatch {
             removals: Vec::new(),
             receipts,
             transactions: block.transactions.clone(),
+            reconcile_marker: None,
+        }
+    }
+
+    /// r1007 S3-3b: the index entries of one ACCEPTING block: the receipts of
+    /// the transactions its mergeset execution ran (keyed by tx hash, indexed
+    /// under the accepting block, carrying the including block), and those
+    /// transactions' bodies. Skipped occurrences have no receipt.
+    pub fn for_accepting_block(block: &Block, exec: &crate::acceptance::MergesetExecution) -> Self {
+        let receipts = exec
+            .receipts
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.block_hash = block.header.block_hash;
+                r.block_number = block.header.height;
+                r
+            })
+            .collect();
+        Self {
+            removals: Vec::new(),
+            receipts,
+            transactions: exec.executed.clone(),
             reconcile_marker: None,
         }
     }
@@ -2004,6 +2030,27 @@ impl Executor {
         Ok(())
     }
 
+    /// r1007 S3-3b: the structural part of the PBA body rule for a chain
+    /// block being applied: its tx root binds its own list. Its transactions'
+    /// signatures and chain id are checked where they run, when the block is
+    /// accepted (`execute_mergeset`), so each tx is authenticated once.
+    fn verify_block_body_structure(&self, block: &Block) -> Result<(), ExecutionError> {
+        let pba = self.pba_hardening();
+        let height = block.header.height;
+        if !pba.active_at(height) {
+            return Ok(());
+        }
+        let expected =
+            citrate_consensus::tx_auth::tx_root_for_height(pba, height, &block.transactions);
+        if block.tx_root != expected {
+            return Err(ExecutionError::InvalidBlockBody(format!(
+                "tx_root {} does not commit to the block's transactions (expected {expected})",
+                block.tx_root
+            )));
+        }
+        Ok(())
+    }
+
     /// PBA-R2: the block-validity hardening this executor enforces.
     pub fn pba_hardening(&self) -> citrate_consensus::hardening::PbaHardening {
         match self
@@ -2654,6 +2701,7 @@ impl Executor {
             eth_tx_type: tx.eth_tx_type,
             effective_gas_price: tx.gas_price,
             revert_reason,
+            acceptance: None,
         };
 
         info!(
