@@ -739,3 +739,89 @@ async fn contract_verify_status_subcommand_polls_guid() {
     let q: BTreeMap<_, _> = explorer.seen()[0].query().into_iter().collect();
     assert_eq!(q["guid"], "abc");
 }
+
+// ---------------------------------------------------------------------------
+// --chain-id: sent as Etherscan v2 `chainid` only when given
+// ---------------------------------------------------------------------------
+
+async fn run_verify_watch(extra: &[&str]) -> Vec<Seen> {
+    let explorer = recorder(vec![(200, OK_GUID), (200, PASS)]).await;
+    let bi = forge_build_info();
+    let mut args = vec![
+        "citrate",
+        "verify",
+        FORGE_ADDR,
+        "--build-info",
+        bi.to_str().expect("utf-8 path"),
+        "--contract",
+        "src/Greeter.sol:Greeter",
+        "--explorer-url",
+        &explorer.url,
+        "--watch",
+        "--poll-interval-ms",
+        "10",
+    ];
+    args.extend_from_slice(extra);
+    let cli = Cli::try_parse_from(args).expect("parse CLI args");
+    contract::execute(cli.cmd, &Config::default())
+        .await
+        .expect("contract verify");
+    explorer.seen()
+}
+
+#[tokio::test]
+async fn chain_id_flag_sends_chainid_on_submit_and_poll() {
+    let seen = run_verify_watch(&["--chain-id", "40204"]).await;
+    assert_eq!(seen.len(), 2);
+    let body: BTreeMap<_, _> = decode_form(&seen[0].body).into_iter().collect();
+    assert_eq!(body.get("chainid").map(String::as_str), Some("40204"));
+    let q: BTreeMap<_, _> = seen[1].query().into_iter().collect();
+    assert_eq!(q.get("chainid").map(String::as_str), Some("40204"));
+}
+
+#[tokio::test]
+async fn no_chain_id_flag_sends_no_chainid() {
+    let seen = run_verify_watch(&[]).await;
+    assert_eq!(seen.len(), 2);
+    assert!(!decode_form(&seen[0].body)
+        .iter()
+        .any(|(k, _)| k == "chainid"));
+    assert!(!seen[1].query().iter().any(|(k, _)| k == "chainid"));
+}
+
+#[tokio::test]
+async fn verify_status_chain_id_flag() {
+    let explorer = recorder(vec![(200, PASS)]).await;
+    let cli = Cli::try_parse_from([
+        "citrate",
+        "verify-status",
+        "abc",
+        "--explorer-url",
+        &explorer.url,
+        "--chain-id",
+        "40204",
+    ])
+    .expect("parse CLI args");
+    contract::execute(cli.cmd, &Config::default())
+        .await
+        .expect("verify-status");
+    let q: BTreeMap<_, _> = explorer.seen()[0].query().into_iter().collect();
+    assert_eq!(q.get("chainid").map(String::as_str), Some("40204"));
+
+    let explorer = recorder(vec![(200, PASS)]).await;
+    let cli = Cli::try_parse_from([
+        "citrate",
+        "verify-status",
+        "abc",
+        "--explorer-url",
+        &explorer.url,
+    ])
+    .expect("parse CLI args");
+    contract::execute(cli.cmd, &Config::default())
+        .await
+        .expect("verify-status");
+    assert!(!explorer.seen()[0]
+        .query()
+        .iter()
+        .any(|(k, _)| k == "chainid"));
+}
