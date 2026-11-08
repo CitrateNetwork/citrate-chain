@@ -3205,6 +3205,33 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_contract_stays_operator_only() {
+        // `citrate contract verify` now uses the explorer's public API; the node's
+        // verifyContract method stays an operator tool and refuses calls without the token.
+        let _lock = OPERATOR_ENV_GUARD.lock().expect("operator env guard");
+        let _env = EnvGuard::set("CITRATE_OPERATOR_TOKEN", "verify-op-token");
+        let (rpc, _temp_dir) = rpc_with_mempool(relaxed_mempool());
+
+        let req = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"citrate_verifyContract",
+            "params":{"address":"0x5fbdb2315678afecb367f032d99f2f9fc9a2f74b","runtime_bytecode":"0x00"}
+        })
+        .to_string();
+        let resp = futures::executor::block_on(rpc.io_handler.handle_request(&req))
+            .expect("verifyContract answers");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("JSON-RPC response");
+
+        assert_eq!(v["error"]["code"], -32001, "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("operator_token required"),
+            "verifyContract without the operator token must be refused: {v}"
+        );
+    }
+
+    #[test]
     fn test_t0_07_mempool_get_pending_is_bounded_and_redacted() {
         let _lock = OPERATOR_ENV_GUARD.lock().expect("operator env guard");
         let _env = EnvGuard::set("CITRATE_OPERATOR_TOKEN", "j1-7-token");
