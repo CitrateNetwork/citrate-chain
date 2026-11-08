@@ -17,7 +17,14 @@ trap 'rm -rf "${T:?}"' EXIT
 REAL_HOME="$HOME"
 export HOME="$T/home"
 mkdir -p "$HOME"
-[[ -d "$REAL_HOME/.svm" ]] && ln -s "$REAL_HOME/.svm" "$HOME/.svm"
+# Foundry's svm uses ~/.svm when it exists, else the platform data dir (macOS
+# ~/Library/Application Support/svm, Linux ${XDG_DATA_HOME:-~/.local/share}/svm). The sandbox
+# always has a ~/.svm, the real cache when there is one, so forge and find_solc agree on one
+# path on every platform (a fresh Linux runner has none: forge then installs into this one).
+for svm in "$REAL_HOME/.svm" "$REAL_HOME/Library/Application Support/svm" "${XDG_DATA_HOME:-$REAL_HOME/.local/share}/svm"; do
+  [[ -d "$svm" ]] && { ln -s "$svm" "$HOME/.svm"; break; }
+done
+[[ -e "$HOME/.svm" ]] || mkdir "$HOME/.svm"
 export RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}"
 
 PASS=0
@@ -3128,8 +3135,7 @@ else
   # resolve every import of its entries on its own, from files byte-identical to this tree's.
   find_solc() {
     local s
-    for s in "${SOLC:-}" "$REAL_HOME/.svm/0.8.36/solc-0.8.36" "$REAL_HOME/Library/Application Support/svm/0.8.36/solc-0.8.36" \
-      "$(command -v solc || true)"; do
+    for s in "${SOLC:-}" "$HOME/.svm/0.8.36/solc-0.8.36" "$(command -v solc || true)"; do
       if [[ -n "$s" && -x "$s" ]] && "$s" --version 2>/dev/null | grep -q 'Version: 0\.8\.36+'; then
         printf '%s\n' "$s"
         return 0

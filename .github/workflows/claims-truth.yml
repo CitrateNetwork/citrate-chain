@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   claims:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Claims vs code (offline)
@@ -33,9 +33,19 @@ jobs:
         run: python3 -m unittest discover -s verification/tests -v
       - name: Deployed-contract count vs getCode snapshot (offline)
         run: python3 verification/check_address_code.py --offline
+      - name: Allow unprivileged user namespaces
+        # The r1006 devnet tests (scripts/ops/tests/test_r1006_bringup.py) run each fake host
+        # inside an unprivileged user + net + pid namespace so nothing reaches the runner's
+        # network. Ubuntu's AppArmor restricts unprivileged user namespaces by default
+        # ("unshare: write failed /proc/self/uid_map: Operation not permitted"); lift the
+        # restriction on this throwaway runner so those tests run instead of failing or skipping.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Address-book tools (unit tests, loopback only)
         # HUP-S7.1: scripts/ops/hup-book-update.py guards what the operator writes into
         # contracts/addresses/40204.json; its tests use a loopback fake RPC, no network.
+        # CITRATE_REQUIRE_USERNS=1: the namespace-sandboxed classes must run here, never skip.
+        env:
+          CITRATE_REQUIRE_USERNS: "1"
         run: python3 -m unittest discover -s scripts/ops/tests -p 'test_*.py' -v
       - name: Producer operator tools (unit tests, loopback only)
         # C3-P: scripts/producers/ (preflight, config generator, registration tx builder,

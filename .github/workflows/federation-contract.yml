@@ -50,7 +50,7 @@ concurrency:
 
 jobs:
   drift:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Internal-only gate: it checks the vendored contract artifact against the canonical
     # intermediate in the PRIVATE citrate-federation. Skips on public/fork CI when the read
     # token is absent (so public CI never tries to check out a private repo — which stays
