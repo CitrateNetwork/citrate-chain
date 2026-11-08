@@ -53,7 +53,7 @@ jobs:
     #     runs-on: ubuntu-latest-8-cores   # (or a GitHub Larger Runner)
     # or a self-hosted runner with >=16 GB free, then raise FOUNDRY_THREADS
     # and remove the swap step below.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Serialize solc via-IR compilations so peak memory is a single unit.
       # Raise on a bigger runner (see escalation note above).
@@ -141,7 +141,7 @@ jobs:
 
   slither:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     continue-on-error: true  # Slither findings surface as warnings but don't block
