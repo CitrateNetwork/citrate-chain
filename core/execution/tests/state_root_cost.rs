@@ -45,7 +45,7 @@ fn addr(i: u32) -> Address {
 }
 
 fn slot(c: u32, i: u32) -> Vec<u8> {
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         let mut k = vec![0u8; 32];
         k[28..].copy_from_slice(&(i / 2).to_be_bytes());
         k

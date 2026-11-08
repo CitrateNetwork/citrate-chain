@@ -961,7 +961,13 @@ fn decode_node(
 
 /// Every leaf value in `rlp` and in the nodes embedded in it, and every
 /// hash-referenced child.
-pub fn node_refs_and_leaf_values(rlp: &[u8]) -> Result<(Vec<[u8; 32]>, Vec<Vec<u8>>), String> {
+/// A node's hash-referenced children and leaf values (see [`node_refs_and_leaf_values`]).
+pub type NodeScan = (Vec<[u8; 32]>, Vec<Vec<u8>>);
+
+/// A trie node as stored: (keccak256 of its RLP, its RLP).
+pub type TrieNodeRecord = ([u8; 32], Vec<u8>);
+
+pub fn node_refs_and_leaf_values(rlp: &[u8]) -> Result<NodeScan, String> {
     let mut hashes = Vec::new();
     let mut leaf_values = Vec::new();
     scan_node(rlp, &mut hashes, &mut leaf_values)?;

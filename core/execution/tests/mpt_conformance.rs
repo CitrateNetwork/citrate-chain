@@ -219,7 +219,7 @@ proptest! {
                 }
                 None => {
                     // Remove a key that exists half the time.
-                    let k = if i % 2 == 0 && !inserted.is_empty() {
+                    let k = if i.is_multiple_of(2) && !inserted.is_empty() {
                         inserted[i % inserted.len()].clone()
                     } else {
                         k.clone()

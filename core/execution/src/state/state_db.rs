@@ -80,6 +80,11 @@ pub struct StateDB {
     folded_accounts: Arc<AtomicU64>,
 }
 
+/// The sink [`StateDB::persist_trie_nodes`] hands a state's new trie nodes to,
+/// with its root.
+pub type TrieNodeWriter<'a> =
+    dyn FnMut(&StateRoot, &[crate::state::mpt::TrieNodeRecord]) -> anyhow::Result<()> + 'a;
+
 /// Which state-root function applies to a post-state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootRule {
@@ -729,7 +734,7 @@ impl StateDB {
     /// ([`Self::reuse_persisted_trie`] fails over), never changes a root.
     pub fn persist_trie_nodes(
         &self,
-        write: &mut dyn FnMut(&StateRoot, &[([u8; 32], Vec<u8>)]) -> anyhow::Result<()>,
+        write: &mut TrieNodeWriter<'_>,
     ) -> anyhow::Result<(StateRoot, usize)> {
         let root = self.mpt_state_root();
         let account = self.account_mpt.lock().clone();
@@ -750,7 +755,7 @@ impl StateDB {
         for m in &storage {
             m.collect_unpersisted(&mut nodes);
         }
-        nodes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        nodes.sort_unstable_by_key(|a| a.0);
         nodes.dedup_by(|a, b| a.0 == b.0);
         if let Err(e) = write(&root, &nodes) {
             // Keep them candidates for the next attempt.

@@ -189,7 +189,7 @@ proptest! {
         let mut snaps = Vec::new();
         for (i, o) in ops.iter().enumerate() {
             apply(&db, o, &mut snaps);
-            if matches!(o, Op::Root | Op::Restore(_) | Op::Undo(_)) || i % 7 == 0 {
+            if matches!(o, Op::Root | Op::Restore(_) | Op::Undo(_)) || i.is_multiple_of(7) {
                 let incremental = db.calculate_state_root();
                 prop_assert_eq!(
                     incremental,

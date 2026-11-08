@@ -428,7 +428,7 @@ impl StateStoreTrait for StateStore {
             &height.to_be_bytes(),
         )?;
         self.db.write_batch(batch)?;
-        if height > 0 && height % TRIE_PRUNE_INTERVAL == 0 {
+        if height > 0 && height.is_multiple_of(TRIE_PRUNE_INTERVAL) {
             let stats = self.prune_trie_nodes(height, REORG_UNDO_DEPTH)?;
             info!(
                 "trie nodes pruned at height {height}: {} root(s) in the window, {} node(s) kept, {} removed",
