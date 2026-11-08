@@ -36,7 +36,7 @@ jobs:
   # SECREM-01 semgrep class rules.
   cargo-deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -68,7 +68,7 @@ jobs:
     # "must pass clean") but no workflow enforced it after the
     # federation split archived this file. Restored fail-closed.
     name: Clippy (deny warnings)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -94,7 +94,7 @@ jobs:
     # baseline, CONS-6 unguarded Hash::from_bytes). It will be made
     # blocking + broadened to the full corpus once the corpus is green.
     name: Semgrep regression rules (advisory)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true
     permissions:
       contents: read

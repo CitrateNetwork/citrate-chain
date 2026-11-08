@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   genesis-pipeline-anvil:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Same via-IR memory bound as solidity-ci.yml (one solc job at a time).
       FOUNDRY_THREADS: 1

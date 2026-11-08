@@ -478,7 +478,7 @@ jobs:
   publish:
     name: Publish Tier-2 release
     needs: package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write
