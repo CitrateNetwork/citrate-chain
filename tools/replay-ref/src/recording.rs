@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 /// deflate-compressed bincode of [`Recording`].
 pub const MAGIC: &[u8; 8] = b"CITRPLAY";
 
-/// Format version of [`Recording`].
-pub const FORMAT_VERSION: u32 = 1;
+/// Format version of [`Recording`]. 2: blocks carry `accepted_root`, the
+/// config the GHOSTDAG K, and chain entries the node's accepted list (r1007
+/// S3-3b).
+pub const FORMAT_VERSION: u32 = 2;
 
 /// One block of the node's applied selected chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +26,11 @@ pub struct ChainEntry {
     /// (`StateStore::get_state_root`, written when the node applied it), if
     /// it has one.
     pub committed_root: Option<Hash>,
+    /// The node's accepted list for this chain block, from its receipt index
+    /// (r1007 S3-3b): (tx hash, including block, status) in execution order.
+    /// `None` when the node indexed no receipts under it (a pre-r1007 block,
+    /// or genesis).
+    pub accepted: Option<Vec<(Hash, Hash, bool)>>,
 }
 
 /// The VALIDATOR-S1 §R' reward policy the node settled with
@@ -97,6 +104,8 @@ pub struct ReplayConfig {
     pub storage_root_hardening_height: Option<u64>,
     /// Genesis allocation: (address, big-endian U256 balance).
     pub genesis_alloc: Vec<([u8; 20], [u8; 32])>,
+    /// GHOSTDAG K the node colored with (`GhostDagParams::k`).
+    pub ghostdag_k: u32,
 }
 
 impl ReplayConfig {
@@ -111,6 +120,7 @@ impl ReplayConfig {
             storage_root_hardening_height:
                 citrate_execution::storage_root_hardening::storage_root_hardening_height(),
             genesis_alloc: Vec::new(),
+            ghostdag_k: citrate_consensus::ghostdag::GHOSTDAG_K,
         }
     }
 }

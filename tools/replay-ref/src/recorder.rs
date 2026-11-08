@@ -7,14 +7,17 @@
 //! - the selected chain: selected-parent links of the stored headers, from the
 //!   applied tip down;
 //! - the committed root per chain block: `StateStore::get_state_root`
-//!   (`CF_STATE`, written by the node when it applied the block).
+//!   (`CF_STATE`, written by the node when it applied the block);
+//! - the accepted list per chain block (r1007 S3-3b): the receipts indexed
+//!   under it (`TransactionStore::get_block_transactions` /
+//!   `get_receipt`), ordered by their acceptance position.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use citrate_consensus::types::Hash;
-use citrate_storage::chain::BlockStore;
+use citrate_storage::chain::{BlockStore, TransactionStore};
 use citrate_storage::db::column_families::CF_HEADERS;
 use citrate_storage::db::RocksDB;
 use citrate_storage::state::StateStore;
@@ -35,6 +38,7 @@ pub fn record_data_dir(data_dir: &Path, config: ReplayConfig) -> Result<Recordin
 pub fn record_db(db: &Arc<RocksDB>, config: ReplayConfig, source: String) -> Result<Recording> {
     let blocks = BlockStore::new(db.clone());
     let state = StateStore::new(db.clone());
+    let txs = TransactionStore::new(db.clone());
     let Some(applied_tip) = blocks.get_applied_tip().context("applied tip")? else {
         bail!("the database has no applied tip");
     };
@@ -68,6 +72,7 @@ pub fn record_db(db: &Arc<RocksDB>, config: ReplayConfig, source: String) -> Res
                     height: 0,
                     hash: cursor,
                     committed_root: None,
+                    accepted: None,
                 });
             }
             break;
@@ -82,6 +87,7 @@ pub fn record_db(db: &Arc<RocksDB>, config: ReplayConfig, source: String) -> Res
             height: header.height,
             hash: cursor,
             committed_root: state.get_state_root(&cursor)?,
+            accepted: accepted_list(&txs, &cursor)?,
         });
         if header.height == 0 {
             break;
@@ -97,4 +103,29 @@ pub fn record_db(db: &Arc<RocksDB>, config: ReplayConfig, source: String) -> Res
         chain,
         blocks: all,
     })
+}
+
+/// The node's accepted list for chain block `hash`: every receipt indexed
+/// under it that still names it, ordered by its acceptance position. `None`
+/// when no receipt is indexed under it, or when a receipt lacks acceptance
+/// fields (a pre-r1007 block).
+fn accepted_list(txs: &TransactionStore, hash: &Hash) -> Result<Option<Vec<(Hash, Hash, bool)>>> {
+    let mut rows = Vec::new();
+    for tx in txs.get_block_transactions(hash)? {
+        let Some(r) = txs.get_receipt(&tx)? else {
+            continue;
+        };
+        if r.block_hash != *hash {
+            continue;
+        }
+        let Some(a) = r.acceptance else {
+            return Ok(None);
+        };
+        rows.push((a.transaction_index, (tx, a.including_block_hash, r.status)));
+    }
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    rows.sort_by_key(|(i, _)| *i);
+    Ok(Some(rows.into_iter().map(|(_, e)| e).collect()))
 }

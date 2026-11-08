@@ -109,6 +109,8 @@ proptest = { workspace = true }
 # r1007 S3-3c: record a test node's data dir and replay it through the
 # independent reference path (tools/replay-ref never depends on the node).
 citrate-replay-ref = { path = "../tools/replay-ref" }
+# r1007 S3-3b: the independent mergeset reference (mergeset_tests).
+citrate-mergeset-ref = { path = "../tools/mergeset-ref" }
 
 [features]
 # PBA-L1a-003: the consensus feature set is part of the DEFAULT build so every

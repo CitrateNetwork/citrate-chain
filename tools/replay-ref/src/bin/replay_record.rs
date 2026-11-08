@@ -18,7 +18,7 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: replay-record <data-dir> <out> [--chain-id N] [--validator-activation H] \
          [--pba-hardening H] [--supply-hardening H] [--storage-root-hardening H] \
-         [--genesis-alloc FILE]"
+         [--genesis-alloc FILE] [--ghostdag-k K]"
     );
     ExitCode::from(2)
 }
@@ -52,6 +52,7 @@ fn main() -> ExitCode {
         supply_hardening_height: None,
         storage_root_hardening_height: None,
         genesis_alloc: Vec::new(),
+        ghostdag_k: citrate_consensus::ghostdag::GHOSTDAG_K,
     };
     let mut i = 0;
     while i < args.len() {
@@ -61,6 +62,10 @@ fn main() -> ExitCode {
         match flag {
             "--chain-id" => match height() {
                 Some(v) => cfg.chain_id = v,
+                None => return usage(),
+            },
+            "--ghostdag-k" => match height().and_then(|v| u32::try_from(v).ok()) {
+                Some(v) => cfg.ghostdag_k = v,
                 None => return usage(),
             },
             "--validator-activation"
