@@ -185,7 +185,13 @@ fn latest_to_latest_serves_the_applied_tip_when_admitted_is_ahead() {
     let (storage, _tmp) = storage();
     let a = chain(&storage, 8, 5);
     let io = io(storage.clone());
-    assert_eq!(block_number(&io), 8, "stored headers are ahead of the tip");
+    // r1007 S3-3b (spec 06 §5.1): eth_blockNumber is the applied tip, not
+    // the highest stored header (8).
+    assert_eq!(
+        block_number(&io),
+        5,
+        "the applied tip, below the stored headers"
+    );
 
     let at_tip = vec![(5, hx(&a[5].hash()))];
     assert_eq!(

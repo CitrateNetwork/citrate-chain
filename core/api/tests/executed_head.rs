@@ -204,7 +204,13 @@ fn executed_head_is_below_block_number_when_headers_are_ahead() {
     tip(&storage, &a[4]);
     let io = io(storage.clone());
 
-    assert_eq!(block_number(&io), 7, "stored-header height");
+    // r1007 S3-3b (spec 06 §5.1): eth_blockNumber is the APPLIED tip, the
+    // block whose post-state is served; stored headers above it are not.
+    assert_eq!(
+        block_number(&io),
+        4,
+        "applied tip, not the stored-header height"
+    );
     assert_eq!(head(&io)["number"], "0x4");
     let above = call(
         &io,
@@ -262,7 +268,12 @@ fn executed_head_moves_with_apply_and_with_reorg() {
         json!({"number": "0x4", "hash": hx(&a[4].hash())})
     );
     assert_eq!(top_log(&io), ("0x4".to_string(), hx(&a[4].hash())));
-    assert_eq!(block_number(&io), 5, "stored headers stay at b5");
+    // r1007 S3-3b: eth_blockNumber follows the applied tip down with it.
+    assert_eq!(
+        block_number(&io),
+        4,
+        "the applied tip, though headers stay at b5"
+    );
 }
 
 /// No persisted applied tip: -32603, never the height index's guess.
@@ -493,8 +504,9 @@ fn is_executed_true_on_the_tip_chain() {
             blk.header.height
         );
     }
-    // a6, a7: stored (eth_blockNumber = 7) but not applied.
-    assert_eq!(block_number(&io), 7);
+    // a6, a7: stored but not applied; r1007 S3-3b: eth_blockNumber is the
+    // applied tip (spec 06 §5.1).
+    assert_eq!(block_number(&io), 5);
     assert_eq!(is_exec(&io, &a[6].hash()), not_executed());
     assert_eq!(is_exec(&io, &a[7].hash()), not_executed());
 }

@@ -80,6 +80,7 @@ mod host_identity;
 mod inference;
 pub mod logging;
 mod memory_bounds;
+mod mergeset;
 #[cfg(test)]
 mod mergeset_tests;
 pub mod metrics;
