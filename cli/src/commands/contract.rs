@@ -7,8 +7,11 @@ use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::commands::verify;
 use crate::config::Config;
 
+// The Verify variant carries every verification flag; the enum is built once per run.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum ContractCommands {
     /// Deploy a smart contract
@@ -73,42 +76,127 @@ pub enum ContractCommands {
         output: Option<PathBuf>,
     },
 
-    /// Verify contract source code
+    /// Verify contract source code on CitrateScan (the explorer's Etherscan-compatible API).
+    ///
+    /// Give one of: --build-info (forge `out/build-info/<id>.json` written with
+    /// `forge build --build-info`, a hardhat `artifacts/build-info/<id>.json`, or a hardhat
+    /// contract artifact), --standard-json, or a single SOURCE file with --compiler.
     Verify {
         /// Contract address
         address: String,
 
-        /// Source code file
-        source: PathBuf,
+        /// Single Solidity source file (single-file mode)
+        #[arg(conflicts_with_all = ["build_info", "standard_json"])]
+        source: Option<PathBuf>,
 
-        /// Compiler version
+        /// forge or hardhat build-info file, or a hardhat contract artifact
+        #[arg(long, conflicts_with = "standard_json")]
+        build_info: Option<PathBuf>,
+
+        /// solc standard JSON input file (needs --contract path:Name and --compiler)
+        #[arg(long)]
+        standard_json: Option<PathBuf>,
+
+        /// Contract to verify: `path/To.sol:Name`, or `Name` when unique in the build-info
+        #[arg(long)]
+        contract: Option<String>,
+
+        /// solc long version, e.g. v0.8.26+commit.8a97fa7a (read from the build-info if omitted)
         #[arg(short, long)]
-        compiler: String,
+        compiler: Option<String>,
 
-        /// Optimization enabled
+        /// Single-file mode: optimizer enabled
         #[arg(short, long)]
         optimized: bool,
 
-        /// Optional runtime bytecode (hex). If not provided, RPC can compile source if configured.
-        #[arg(long)]
-        runtime_bytecode: Option<String>,
+        /// Single-file mode: optimizer runs
+        #[arg(long, default_value_t = 200)]
+        runs: u32,
 
-        /// Optional path to runtime bytecode file (hex). Used if --runtime-bytecode not set.
+        /// Single-file mode: EVM version (e.g. cancun)
         #[arg(long)]
-        runtime_bytecode_file: Option<PathBuf>,
+        evm_version: Option<String>,
 
-        /// Read verification record for an address instead of submitting (alias: --get <address>)
+        /// Single-file mode: linked library, `Name:0xAddress` (repeatable, at most 10)
+        #[arg(long = "library", value_name = "NAME:ADDRESS")]
+        libraries: Vec<String>,
+
+        /// ABI-encoded constructor arguments (hex). Optional: the explorer reads them from the
+        /// creation transaction.
+        #[arg(long)]
+        constructor_args: Option<String>,
+
+        /// Creation transaction hash, if the explorer has not indexed it
+        #[arg(long)]
+        creation_tx: Option<String>,
+
+        /// Explorer API base URL
+        #[arg(long, env = "CITRATE_EXPLORER_URL", default_value = verify::DEFAULT_EXPLORER_URL)]
+        explorer_url: String,
+
+        /// Explorer API key (sent as `apikey`; verification works without one)
+        #[arg(long, env = "CITRATE_EXPLORER_API_KEY", hide_env_values = true)]
+        api_key: Option<String>,
+
+        /// Wait for the verdict instead of printing the guid
+        #[arg(long)]
+        watch: bool,
+
+        /// Status poll interval with --watch, in milliseconds
+        #[arg(long, default_value_t = 3000)]
+        poll_interval_ms: u64,
+
+        /// Give up waiting after this many seconds
+        #[arg(long, default_value_t = 300)]
+        watch_timeout_secs: u64,
+
+        /// Show the explorer's record for an address instead of submitting
         #[arg(long)]
         get: Option<String>,
     },
 
-    /// Get a verification record (alias for --get)
+    /// Check (or with --watch, wait for) a verification job by guid
+    VerifyStatus {
+        /// The guid `verify` printed
+        guid: String,
+
+        /// Explorer API base URL
+        #[arg(long, env = "CITRATE_EXPLORER_URL", default_value = verify::DEFAULT_EXPLORER_URL)]
+        explorer_url: String,
+
+        /// Explorer API key
+        #[arg(long, env = "CITRATE_EXPLORER_API_KEY", hide_env_values = true)]
+        api_key: Option<String>,
+
+        /// Wait for the verdict
+        #[arg(long)]
+        watch: bool,
+
+        /// Status poll interval with --watch, in milliseconds
+        #[arg(long, default_value_t = 3000)]
+        poll_interval_ms: u64,
+
+        /// Give up waiting after this many seconds
+        #[arg(long, default_value_t = 300)]
+        watch_timeout_secs: u64,
+    },
+
+    /// Show the explorer's verified source record for an address (`getsourcecode`)
     VerifyGet {
         /// Contract address
         address: String,
+
+        /// Explorer API base URL
+        #[arg(long, env = "CITRATE_EXPLORER_URL", default_value = verify::DEFAULT_EXPLORER_URL)]
+        explorer_url: String,
+
+        /// Explorer API key
+        #[arg(long, env = "CITRATE_EXPLORER_API_KEY", hide_env_values = true)]
+        api_key: Option<String>,
     },
 
-    /// List all verification records known to the node
+    /// List the verification records stored on the node (written by the node's
+    /// operator-only tooling; public verification lives on the explorer)
     VerifyList,
 }
 
@@ -144,29 +232,73 @@ pub async fn execute(cmd: ContractCommands, config: &Config) -> Result<()> {
         ContractCommands::Verify {
             address,
             source,
+            build_info,
+            standard_json,
+            contract,
             compiler,
             optimized,
-            runtime_bytecode,
-            runtime_bytecode_file,
+            runs,
+            evm_version,
+            libraries,
+            constructor_args,
+            creation_tx,
+            explorer_url,
+            api_key,
+            watch,
+            poll_interval_ms,
+            watch_timeout_secs,
             get,
         } => {
+            let client = verify::ExplorerClient::new(&explorer_url, api_key)?;
             if let Some(addr) = get {
-                get_verification(config, &addr).await?;
+                show_verified_source(&client, &addr).await?;
             } else {
-                verify_contract(
-                    config,
-                    &address,
+                let source = build_source_submission(
                     source,
-                    &compiler,
+                    build_info,
+                    standard_json,
+                    contract.as_deref(),
+                    compiler.as_deref(),
                     optimized,
-                    runtime_bytecode,
-                    runtime_bytecode_file,
-                )
-                .await?;
+                    runs,
+                    evm_version,
+                    &libraries,
+                )?;
+                let req = verify::VerifyRequest {
+                    address,
+                    source,
+                    constructor_args,
+                    creation_tx_hash: creation_tx,
+                    chain_id: None,
+                };
+                let poll = poll_config(poll_interval_ms, watch_timeout_secs);
+                verify_on_explorer(&client, &req, watch, &poll).await?;
             }
         }
-        ContractCommands::VerifyGet { address } => {
-            get_verification(config, &address).await?;
+        ContractCommands::VerifyStatus {
+            guid,
+            explorer_url,
+            api_key,
+            watch,
+            poll_interval_ms,
+            watch_timeout_secs,
+        } => {
+            let client = verify::ExplorerClient::new(&explorer_url, api_key)?;
+            let poll = poll_config(poll_interval_ms, watch_timeout_secs);
+            let status = if watch {
+                client.wait(&guid, &poll).await?
+            } else {
+                client.check_status(&guid).await?
+            };
+            report_status(&guid, &status)?;
+        }
+        ContractCommands::VerifyGet {
+            address,
+            explorer_url,
+            api_key,
+        } => {
+            let client = verify::ExplorerClient::new(&explorer_url, api_key)?;
+            show_verified_source(&client, &address).await?;
         }
         ContractCommands::VerifyList => {
             list_verifications(config).await?;
@@ -537,142 +669,148 @@ async fn get_contract_code(config: &Config, address: &str, output: Option<PathBu
     Ok(())
 }
 
-async fn verify_contract(
-    config: &Config,
-    address: &str,
-    source_path: PathBuf,
-    compiler: &str,
-    optimized: bool,
-    runtime_bytecode: Option<String>,
-    runtime_bytecode_file: Option<PathBuf>,
-) -> Result<()> {
-    println!("{}", "Verifying contract...".cyan());
-
-    // Read source code
-    let source_code = fs::read_to_string(&source_path)
-        .with_context(|| format!("Failed to read source file {:?}", source_path))?;
-
-    // Determine runtime bytecode input if provided
-    let mut runtime_bc_hex: Option<String> = None;
-    if let Some(hex_in) = runtime_bytecode {
-        let s = hex_in.trim();
-        let s = if s.starts_with("0x") {
-            s.to_string()
-        } else {
-            format!("0x{}", s)
-        };
-        runtime_bc_hex = Some(s);
-    } else if let Some(path) = runtime_bytecode_file {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read runtime bytecode file {:?}", path))?;
-        let s = content.trim();
-        let s = if s.starts_with("0x") {
-            s.to_string()
-        } else {
-            format!("0x{}", s)
-        };
-        runtime_bc_hex = Some(s);
+fn poll_config(interval_ms: u64, timeout_secs: u64) -> verify::PollConfig {
+    verify::PollConfig {
+        interval: std::time::Duration::from_millis(interval_ms.max(1)),
+        timeout: std::time::Duration::from_secs(timeout_secs),
+        ..verify::PollConfig::default()
     }
-
-    // Make RPC call to verify
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&config.rpc_endpoint)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "citrate_verifyContract",
-            "params": {
-                "address": address,
-                "source_code": source_code,
-                "compiler_version": compiler,
-                "optimization_enabled": optimized,
-                "runtime_bytecode": runtime_bc_hex,
-            },
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("Failed to connect to RPC endpoint")?;
-
-    let result: serde_json::Value = response.json().await?;
-
-    if result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .get("verified")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_bool()
-        == Some(true)
-    {
-        println!("{}", "✓ Contract verified successfully".green().bold());
-        println!(
-            "Verification ID: {}",
-            result
-                .get("result")
-                .unwrap_or(&serde_json::Value::Null)
-                .get("verification_id")
-                .unwrap_or(&serde_json::Value::Null)
-                .as_str()
-                .unwrap_or("N/A")
-        );
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
-        anyhow::bail!(
-            "Verification failed: {}",
-            error["message"].as_str().unwrap_or("Unknown error")
-        );
-    } else {
-        anyhow::bail!("Contract verification failed");
-    }
-
-    Ok(())
 }
 
-async fn get_verification(config: &Config, address: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&config.rpc_endpoint)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "citrate_getVerification",
-            "params": [address],
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("Failed to connect to RPC endpoint")?;
-
-    let v: serde_json::Value = response.json().await?;
-    if let Some(rec) = v
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
-        println!("{}", "Verification Record:".bold());
-        println!(
-            "Address: {}",
-            rec.get("address").and_then(|s| s.as_str()).unwrap_or("")
-        );
-        println!(
-            "Verified: {}",
-            rec.get("verified")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false)
-        );
-        if let Some(id) = rec.get("verification_id").and_then(|s| s.as_str()) {
-            println!("ID: {}", id);
+#[allow(clippy::too_many_arguments)]
+fn build_source_submission(
+    source: Option<PathBuf>,
+    build_info: Option<PathBuf>,
+    standard_json: Option<PathBuf>,
+    contract: Option<&str>,
+    compiler: Option<&str>,
+    optimized: bool,
+    runs: u32,
+    evm_version: Option<String>,
+    libraries: &[String],
+) -> Result<verify::SourceSubmission> {
+    if let Some(path) = build_info.or(standard_json) {
+        if !libraries.is_empty() {
+            anyhow::bail!("--library applies to single-file mode; a build-info carries its own settings.libraries");
         }
-        if let Some(ts) = rec.get("timestamp").and_then(|s| s.as_str()) {
-            println!("Timestamp: {}", ts);
-        }
-        Ok(())
-    } else {
-        println!("No verification record for {}", address);
-        Ok(())
+        let ci = verify::load_compilation_input(&path)?;
+        let s = verify::prepare_standard_json(&ci, contract, compiler)?;
+        return Ok(verify::SourceSubmission::StandardJson(s));
     }
+    let Some(path) = source else {
+        anyhow::bail!("give --build-info <file>, --standard-json <file>, or a source file");
+    };
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read source file {:?}", path))?;
+    let compiler = compiler.context("single-file mode needs --compiler v0.8.x+commit.<hash>")?;
+    let contract_name = match contract {
+        Some(c) => c.rsplit_once(':').map_or(c, |(_, n)| n).to_owned(),
+        None => path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .context("cannot derive the contract name; pass --contract")?
+            .to_owned(),
+    };
+    let libraries = libraries
+        .iter()
+        .map(|l| verify::parse_library(l))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(verify::SourceSubmission::SingleFile {
+        source: text,
+        contract_name,
+        compiler_version: compiler.to_owned(),
+        optimization_used: optimized,
+        runs,
+        evm_version,
+        libraries,
+    })
+}
+
+async fn verify_on_explorer(
+    client: &verify::ExplorerClient,
+    req: &verify::VerifyRequest,
+    watch: bool,
+    poll: &verify::PollConfig,
+) -> Result<()> {
+    let (name, version) = match &req.source {
+        verify::SourceSubmission::StandardJson(s) => {
+            (s.contract_name.as_str(), s.compiler_version.as_str())
+        }
+        verify::SourceSubmission::SingleFile {
+            contract_name,
+            compiler_version,
+            ..
+        } => (contract_name.as_str(), compiler_version.as_str()),
+    };
+    println!(
+        "{} {} ({}, {}) via {}",
+        "Submitting".cyan(),
+        req.address,
+        name,
+        version,
+        client.base_url()
+    );
+    let guid = match client.submit(req, poll).await {
+        Ok(g) => g,
+        Err(verify::VerifyError::AlreadyVerified(m)) => {
+            println!("{} {}", "✓ Already verified:".green().bold(), m);
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    println!("GUID: {}", guid);
+    if !watch {
+        println!(
+            "Check it with: citrate contract verify-status {} --explorer-url {} --watch",
+            guid,
+            client.base_url()
+        );
+        return Ok(());
+    }
+    let status = client.wait(&guid, poll).await?;
+    report_status(&guid, &status)
+}
+
+fn report_status(guid: &str, status: &verify::VerifyStatus) -> Result<()> {
+    match status {
+        verify::VerifyStatus::Verified(m) => {
+            println!("{} {}", "✓ Contract verified:".green().bold(), m);
+            Ok(())
+        }
+        verify::VerifyStatus::Pending(m) => {
+            println!("{} {} ({})", "… Pending:".yellow(), m, guid);
+            Ok(())
+        }
+        verify::VerifyStatus::Failed(m) => anyhow::bail!("Verification failed: {m} (guid {guid})"),
+    }
+}
+
+async fn show_verified_source(client: &verify::ExplorerClient, address: &str) -> Result<()> {
+    let entry = client.get_source_code(address).await?;
+    let field = |k: &str| {
+        entry
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    if field("SourceCode").is_empty() {
+        println!("No verified source on the explorer for {}", address);
+        return Ok(());
+    }
+    println!("{}", "Verified source record:".bold());
+    println!("Address: {}", address);
+    println!("Contract: {}", field("ContractName"));
+    println!("Compiler: {}", field("CompilerVersion"));
+    println!("EVM version: {}", field("EVMVersion"));
+    let similar = field("SimilarMatch");
+    if !similar.is_empty() {
+        println!("Similar match: {}", similar);
+    }
+    if field("Proxy") == "1" {
+        println!("Proxy implementation: {}", field("Implementation"));
+    }
+    Ok(())
 }
 
 async fn list_verifications(config: &Config) -> Result<()> {
