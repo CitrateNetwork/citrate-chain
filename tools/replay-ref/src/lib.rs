@@ -12,11 +12,15 @@
 //    compact file (`Recording::write_to`: bincode, deflate-compressed).
 //
 // 2. `reference`: an independent replay of the recording. It recomputes the
-//    world state from the genesis allocation along the recorded selected chain,
-//    with the from-scratch state root (the current semantics: `calculate_state_root`
-//    rebuilds the account trie from the full resident state on every call), and
-//    compares, block by block, the reference root with the block's header root
-//    and with the root the node committed. It shares only the trusted base with
+//    world state from the genesis allocation along the recorded selected chain
+//    and compares, block by block, the reference root with the block's header
+//    root and with the root the node committed. Under the MPT state root
+//    (CV-14) the executor's root is incremental, as the node's is; the replay
+//    also computes the FROM-SCRATCH root of every replayed state
+//    (`StateDB::reference_state_root_with`: every account and slot re-encoded,
+//    no cache) and reports a divergence if it differs from the incremental
+//    one. The node's committed roots are judged against the from-scratch root.
+//    (Below the MPT activation the legacy root is from scratch already.) It shares only the trusted base with
 //    the node: block/tx types, the executor (revm, settlement), the reward
 //    schedule and the on-disk layout. It never imports the node crate, so the
 //    node's apply machinery under test (`canonical_apply`: drain, reorgs, the

@@ -51,6 +51,7 @@ fn main() -> ExitCode {
         pba_hardening_height: None,
         supply_hardening_height: None,
         storage_root_hardening_height: None,
+        mpt_state_root_height: None,
         genesis_alloc: Vec::new(),
     };
     let mut i = 0;
@@ -66,7 +67,8 @@ fn main() -> ExitCode {
             "--validator-activation"
             | "--pba-hardening"
             | "--supply-hardening"
-            | "--storage-root-hardening" => {
+            | "--storage-root-hardening"
+            | "--mpt-state-root" => {
                 let Some(h) = height() else {
                     return usage();
                 };
@@ -74,6 +76,7 @@ fn main() -> ExitCode {
                     "--validator-activation" => &mut cfg.validator_activation_height,
                     "--pba-hardening" => &mut cfg.pba_hardening_height,
                     "--supply-hardening" => &mut cfg.supply_hardening_height,
+                    "--mpt-state-root" => &mut cfg.mpt_state_root_height,
                     _ => &mut cfg.storage_root_hardening_height,
                 };
                 *slot = Some(h);

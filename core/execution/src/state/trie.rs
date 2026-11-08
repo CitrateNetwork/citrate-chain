@@ -54,12 +54,37 @@ pub enum TrieNode {
 /// trie that has seen a remove it hashes the insert-only shape of the current
 /// set. [`Trie::legacy_root_hash`] is the structural hash, kept for state roots
 /// below the storage-root hardening height (`crate::storage_root_hardening`).
-#[derive(Clone)]
 pub struct Trie {
     root: TrieNode,
     cache: HashMap<Vec<u8>, Vec<u8>>,
     /// Set by any `remove`: the shape may no longer be the insert-only shape.
     removed: bool,
+    /// The standard secure MPT of the same slots (CV-14), brought up to date
+    /// lazily by [`Trie::mpt_root`]. Behind a lock because a trie is shared by
+    /// `Arc` with snapshots: catching it up never changes the slot set, only
+    /// materializes a pure function of it, so it needs no copy-on-write.
+    mpt: parking_lot::Mutex<StorageMpt>,
+}
+
+/// The MPT of a storage trie and the slot keys changed since it was last
+/// caught up. Invariant: for every key NOT in `pending`, the MPT holds exactly
+/// `encode_storage_value(cache[key])` under keccak256(key) (absent if the slot
+/// is absent or an EVM zero).
+#[derive(Clone, Default)]
+struct StorageMpt {
+    trie: crate::state::mpt::Mpt,
+    pending: std::collections::HashSet<Vec<u8>>,
+}
+
+impl Clone for Trie {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            cache: self.cache.clone(),
+            removed: self.removed,
+            mpt: parking_lot::Mutex::new(self.mpt.lock().clone()),
+        }
+    }
 }
 
 impl Trie {
@@ -68,6 +93,7 @@ impl Trie {
             root: TrieNode::Empty,
             cache: HashMap::new(),
             removed: false,
+            mpt: parking_lot::Mutex::new(StorageMpt::default()),
         }
     }
 
@@ -77,7 +103,85 @@ impl Trie {
         // Take the root by value instead of cloning the whole tree on every
         // insert (the result replaces it either way).
         self.root = Self::insert_node(std::mem::take(&mut self.root), &nibbles, value.clone());
+        self.mpt.get_mut().pending.insert(key.clone());
         self.cache.insert(key, value);
+    }
+
+    /// The root of the standard secure MPT of this trie's slots (CV-14; see
+    /// `crate::state::mpt_state` for the leaf encoding). Incremental: only the
+    /// slots changed since the last call are re-hashed.
+    pub fn mpt_root(&self) -> [u8; 32] {
+        let mut m = self.mpt.lock();
+        self.catch_up(&mut m);
+        m.trie.root_hash()
+    }
+
+    fn catch_up(&self, m: &mut StorageMpt) {
+        if m.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut m.pending);
+        for key in pending {
+            let path = crate::state::mpt_state::storage_trie_key(&key);
+            match self
+                .cache
+                .get(&key)
+                .and_then(|v| crate::state::mpt_state::encode_storage_value(v))
+            {
+                Some(leaf) => m.trie.insert(&path, &leaf),
+                None => m.trie.remove(&path),
+            }
+        }
+    }
+
+    /// The storage MPT, caught up (cheap: nodes are shared).
+    pub fn mpt(&self) -> crate::state::mpt::Mpt {
+        let mut m = self.mpt.lock();
+        self.catch_up(&mut m);
+        m.trie.clone()
+    }
+
+    /// The from-scratch storage root of this trie's slots (no cache): the
+    /// reference for [`Self::mpt_root`].
+    pub fn reference_mpt_root(&self) -> [u8; 32] {
+        crate::state::mpt::root_from_sorted(
+            self.cache
+                .iter()
+                .filter_map(|(k, v)| {
+                    crate::state::mpt_state::encode_storage_value(v)
+                        .map(|leaf| (crate::state::mpt_state::storage_trie_key(k).to_vec(), leaf))
+                })
+                .collect(),
+        )
+    }
+
+    /// Install `mpt` as this trie's storage MPT if it holds exactly this
+    /// trie's slots (each leaf the encoding of the resident value). Used to
+    /// reuse persisted trie nodes on restart; `false` (and nothing installed)
+    /// on any difference.
+    pub fn install_mpt_if_matches(&self, mpt: crate::state::mpt::Mpt) -> bool {
+        let mut want: HashMap<[u8; 32], Vec<u8>> = HashMap::with_capacity(self.cache.len());
+        for (k, v) in &self.cache {
+            if let Some(leaf) = crate::state::mpt_state::encode_storage_value(v) {
+                want.insert(crate::state::mpt_state::storage_trie_key(k), leaf);
+            }
+        }
+        let have = mpt.entries();
+        if have.len() != want.len() {
+            return false;
+        }
+        for (k, v) in &have {
+            let Ok(k) = <[u8; 32]>::try_from(k.as_slice()) else {
+                return false;
+            };
+            if want.get(&k) != Some(v) {
+                return false;
+            }
+        }
+        let mut m = self.mpt.lock();
+        m.trie = mpt;
+        m.pending.clear();
+        true
     }
 
     fn insert_node(node: TrieNode, key: &[u8], value: Vec<u8>) -> TrieNode {
@@ -193,6 +297,7 @@ impl Trie {
     pub fn remove(&mut self, key: &[u8]) {
         let nibbles = to_nibbles(key);
         self.root = Self::remove_node(std::mem::take(&mut self.root), &nibbles);
+        self.mpt.get_mut().pending.insert(key.to_vec());
         self.cache.remove(key);
         // Even a remove of an absent key can reshape a branch on its path.
         self.removed = true;

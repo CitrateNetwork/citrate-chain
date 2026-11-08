@@ -24,8 +24,9 @@
 // store judges stake-gated eligibility with a production VRF selector over the
 // seven producers, the producers sign the equivocation-vote sidecar, and the
 // executor settles with a reward policy. The rules that are process-wide (the
-// block-validity hardening, active from block 1 on r1006) are switched on in a
-// child process so no other test in this binary sees them. Checkpoint finality
+// block-validity hardening, active from block 1 on r1006, and the r1007 MPT
+// state root, CV-14) are switched on in a child process so no other test in
+// this binary sees them. Checkpoint finality
 // is not wired: its voting pin is off for every chain in this release.
 //
 // Every message a node receives first goes through its own
@@ -1569,6 +1570,9 @@ fn in_child() -> bool {
         return false;
     }
     citrate_consensus::hardening::set_pba_hardening_height(Some(0));
+    // CV-14 (an r1007 genesis rule): the post-activation runs root state with
+    // the standard incremental MPT, as an r1007 node does.
+    citrate_execution::mpt_state_root::set_mpt_state_root_height(Some(0));
     true
 }
 

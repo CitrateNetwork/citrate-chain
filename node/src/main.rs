@@ -622,6 +622,14 @@ async fn main() -> Result<()> {
                 storage_root_configured,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::mpt_state_root::init_for_genesis(
+                chain_id,
+                g,
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.chain.mpt_state_root_height),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             let manifest = consensus_manifest::ConsensusManifest::for_node(profile.as_deref(), g);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
@@ -1706,6 +1714,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None => info!(
             "Storage root hardening fork not scheduled (source: {}); legacy rules",
             storage_root_source
+        ),
+    }
+    // CV-14: the standard, incremental MPT state root (an r1007 genesis rule),
+    // published before state is hydrated and before any root is computed.
+    let (mpt_root_height, mpt_root_source) = citrate_execution::mpt_state_root::init_for_genesis(
+        config.chain.chain_id,
+        running_genesis.as_ref(),
+        config.chain.mpt_state_root_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match mpt_root_height {
+        Some(h) => info!(
+            "MPT state root ACTIVE from height {} (source: {})",
+            h, mpt_root_source
+        ),
+        None => info!(
+            "MPT state root not scheduled (source: {}); legacy state root",
+            mpt_root_source
         ),
     }
 

@@ -334,6 +334,18 @@ pub struct ChainConfig {
     #[serde(default)]
     pub storage_root_hardening_height: Option<u64>,
 
+    /// Standard, incremental MPT state root activation height
+    /// (`citrate_execution::mpt_state_root`, ADR-2026-11-03 CV-14): for the
+    /// post-state of a block at or after this height the state root is the
+    /// standard Ethereum secure-trie root. It changes every root value, so it
+    /// is a genesis rule (r1007).
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated. On a release genesis only its compiled entry sets it
+    /// (r1005, r1006: never). A new genesis sets `0` (active from block 1).
+    #[serde(default)]
+    pub mpt_state_root_height: Option<u64>,
+
     /// A local development chain. The activation height compiled into the
     /// release for this chain id (`citrate_consensus::hardening::
     /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
@@ -479,6 +491,7 @@ impl Default for NodeConfig {
                 vrf_canonical_encoding_height: None,
                 supply_hardening_height: None,
                 storage_root_hardening_height: None,
+                mpt_state_root_height: None,
                 dev_profile: false,
             },
             network: NetworkConfig {
@@ -1177,6 +1190,76 @@ mod tests {
         let with = base.replacen("[chain]", "[chain]\nstorage_root_hardening_height = 0", 1);
         let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
         assert_eq!(cfg.chain.storage_root_hardening_height, Some(0));
+    }
+
+    /// CV-14: the MPT state root height is published in start_node before any
+    /// state is hydrated or rooted, from one publication path, and no shipped
+    /// profile schedules it (it is an r1007 genesis rule: the r1007 genesis
+    /// entry, or `mpt_state_root_height = 0` on a new devnet, sets it).
+    #[test]
+    fn mpt_state_root_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::mpt_state_root::init_for_genesis(")
+            .expect("start_node must publish the MPT state root height");
+        for marker in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
+            "boot_state::hydrate_state_db(",
+        ] {
+            let at = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} in start_node"));
+            assert!(init < at, "MPT state root height published before {marker}");
+        }
+        assert!(
+            !main.contains("set_mpt_state_root_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.mpt_state_root_height, None);
+        assert_eq!(NodeConfig::devnet().chain.mpt_state_root_height, None);
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("mpt_state_root_height"),
+                "{name} must not schedule the MPT state root"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nmpt_state_root_height = 0", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.mpt_state_root_height, Some(0));
     }
 
     /// The canonical VRF encoding height is published in start_node before

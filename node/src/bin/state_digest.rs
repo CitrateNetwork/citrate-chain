@@ -44,6 +44,9 @@ fn main() -> anyhow::Result<()> {
         .map(|h| *h.as_bytes());
     citrate_execution::storage_root_hardening::init_for_genesis(chain_id, genesis.as_ref(), None)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // CV-14: the MPT state root rule, keyed the same way (env for a devnet).
+    citrate_execution::mpt_state_root::init_for_genesis(chain_id, genesis.as_ref(), None)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let state_db = StateDB::new();
     let tip_height = match storage.blocks.get_applied_tip()? {
         Some((_, h)) => h,
