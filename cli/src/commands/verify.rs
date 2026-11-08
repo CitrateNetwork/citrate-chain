@@ -567,6 +567,19 @@ impl fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
+impl VerifyError {
+    /// Worth retrying later: a transport failure (connection refused or reset, timeout) or an
+    /// HTTP 5xx or 429 answer. `--watch` rides these out until its deadline; the SDKs do the
+    /// same.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            VerifyError::Transport(_) => true,
+            VerifyError::Http { status, .. } => *status >= 500 || *status == 429,
+            _ => false,
+        }
+    }
+}
+
 /// Etherscan's `{status, message, result}`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
@@ -626,6 +639,9 @@ pub struct PollConfig {
     /// Extra submission attempts after `Max rate limit reached`.
     pub rate_limit_retries: u32,
     pub rate_limit_backoff: Duration,
+    /// While polling, a transient error is retried after a backoff that starts at `interval`,
+    /// doubles per consecutive error and is capped here, all within `timeout`.
+    pub transient_backoff_max: Duration,
 }
 
 impl Default for PollConfig {
@@ -637,12 +653,13 @@ impl Default for PollConfig {
             rate_limit_retries: 3,
             // One submission per 5 s per IP.
             rate_limit_backoff: Duration::from_secs(5),
+            transient_backoff_max: Duration::from_secs(30),
         }
     }
 }
 
 /// HTTP client for the explorer's Etherscan-compatible API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExplorerClient {
     base_url: String,
     api_key: Option<String>,
@@ -651,7 +668,55 @@ pub struct ExplorerClient {
     http: reqwest::Client,
 }
 
+impl fmt::Debug for ExplorerClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExplorerClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("chain_id", &self.chain_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The key as it can appear in a URL query, raw and percent-encoded.
+fn key_spellings(key: &str) -> Vec<String> {
+    let mut out = vec![key.to_owned()];
+    let encoded: String = reqwest::Url::parse_with_params("http://x/", [("k", key)])
+        .ok()
+        .and_then(|u| {
+            u.query()
+                .and_then(|q| q.strip_prefix("k="))
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    if !encoded.is_empty() && encoded != key {
+        out.push(encoded);
+    }
+    out
+}
+
 impl ExplorerClient {
+    /// A transport failure as `VerifyError::Transport`. reqwest's `Display` includes the
+    /// request URL, and status and read calls carry `apikey` in the query string, so the URL
+    /// is dropped and the key is scrubbed from the whole source chain before anything is
+    /// formatted for the user.
+    fn transport_error(&self, e: reqwest::Error) -> VerifyError {
+        let e = e.without_url();
+        let mut msg = e.to_string();
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            msg.push_str(": ");
+            msg.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        if let Some(key) = &self.api_key {
+            for spelling in key_spellings(key) {
+                msg = msg.replace(&spelling, "<redacted>");
+            }
+        }
+        VerifyError::Transport(msg)
+    }
+
     pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self> {
         let parsed = reqwest::Url::parse(base_url)
             .with_context(|| format!("explorer URL {base_url:?} is not a URL"))?;
@@ -683,15 +748,9 @@ impl ExplorerClient {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<Envelope, VerifyError> {
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| VerifyError::Transport(e.to_string()))?;
+        let resp = req.send().await.map_err(|e| self.transport_error(e))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| VerifyError::Transport(e.to_string()))?;
+        let text = resp.text().await.map_err(|e| self.transport_error(e))?;
         let parsed: Option<Value> = serde_json::from_str(&text).ok();
         match parsed.as_ref().and_then(Envelope::parse) {
             Some(env) => Ok(env),
@@ -778,29 +837,43 @@ impl ExplorerClient {
         Ok(classify_status(&env))
     }
 
-    /// Poll `checkverifystatus` until a verdict or the deadline.
+    /// Poll `checkverifystatus` until a verdict or the deadline. Transient errors (see
+    /// [`VerifyError::is_transient`]) are retried with bounded backoff inside the deadline;
+    /// any other error ends the wait.
     pub async fn wait(&self, guid: &str, cfg: &PollConfig) -> Result<VerifyStatus, VerifyError> {
         let deadline = Instant::now().checked_add(cfg.timeout);
+        let mut transient_errors: u32 = 0;
         loop {
-            let status = self.check_status(guid).await?;
-            if status.is_terminal() {
-                return Ok(status);
-            }
-            let last = match &status {
-                VerifyStatus::Pending(m) => m.clone(),
-                _ => String::new(),
+            let mut delay = cfg.interval;
+            let last = match self.check_status(guid).await {
+                Ok(status) if status.is_terminal() => return Ok(status),
+                Ok(status) => {
+                    transient_errors = 0;
+                    match status {
+                        VerifyStatus::Pending(m) => m,
+                        _ => String::new(),
+                    }
+                }
+                Err(e) if e.is_transient() => {
+                    transient_errors = transient_errors.saturating_add(1);
+                    let factor = 1u32
+                        .checked_shl(transient_errors.saturating_sub(1))
+                        .unwrap_or(u32::MAX);
+                    delay = cfg
+                        .interval
+                        .saturating_mul(factor)
+                        .min(cfg.transient_backoff_max.max(cfg.interval));
+                    e.to_string()
+                }
+                Err(e) => return Err(e),
             };
-            if deadline.is_some_and(|d| {
-                Instant::now()
-                    .checked_add(cfg.interval)
-                    .is_none_or(|n| n > d)
-            }) {
+            if deadline.is_some_and(|d| Instant::now().checked_add(delay).is_none_or(|n| n > d)) {
                 return Err(VerifyError::Timeout {
                     guid: guid.to_owned(),
                     last,
                 });
             }
-            tokio::time::sleep(cfg.interval).await;
+            tokio::time::sleep(delay).await;
         }
     }
 

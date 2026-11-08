@@ -209,6 +209,7 @@ fn fast() -> PollConfig {
         timeout: Duration::from_secs(5),
         rate_limit_retries: 2,
         rate_limit_backoff: Duration::from_millis(10),
+        transient_backoff_max: Duration::from_millis(40),
     }
 }
 
@@ -824,4 +825,210 @@ async fn verify_status_chain_id_flag() {
         .query()
         .iter()
         .any(|(k, _)| k == "chainid"));
+}
+
+// ---------------------------------------------------------------------------
+// the API key stays out of transport errors
+// ---------------------------------------------------------------------------
+
+const SECRET_KEY: &str = "SEKRIT123";
+
+/// A localhost URL nothing listens on: bind an ephemeral port, then close it.
+async fn closed_port_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("ephemeral addr");
+    drop(listener);
+    format!("http://{addr}/api")
+}
+
+fn assert_no_key(what: &str, text: &str) {
+    assert!(
+        !text.contains(SECRET_KEY),
+        "{what} leaked the API key: {text}"
+    );
+}
+
+fn assert_error_hides_key(what: &str, e: &VerifyError) {
+    assert_no_key(what, &e.to_string());
+    assert_no_key(what, &format!("{e:?}"));
+    let wrapped = anyhow::Error::new(e.clone());
+    assert_no_key(what, &format!("{wrapped:#}"));
+    assert_no_key(what, &format!("{wrapped:?}"));
+}
+
+#[tokio::test]
+async fn transport_errors_never_carry_the_api_key() {
+    let url = closed_port_url().await;
+    let c = ExplorerClient::new(&url, Some(SECRET_KEY.to_owned()))
+        .expect("client")
+        .with_chain_id(Some(40204));
+    assert_no_key("client Debug", &format!("{c:?}"));
+
+    let e = c.check_status("g").await.expect_err("closed port");
+    assert!(matches!(e, VerifyError::Transport(_)), "{e:?}");
+    assert_error_hides_key("checkverifystatus", &e);
+    // The message still says what went wrong.
+    assert!(
+        e.to_string().contains("could not reach the explorer"),
+        "{e}"
+    );
+
+    let e = c
+        .get_source_code(FORGE_ADDR)
+        .await
+        .expect_err("closed port");
+    assert!(matches!(e, VerifyError::Transport(_)), "{e:?}");
+    assert_error_hides_key("getsourcecode", &e);
+
+    let cfg = PollConfig {
+        timeout: Duration::from_millis(100),
+        ..fast()
+    };
+    let e = c.wait("g", &cfg).await.expect_err("closed port");
+    assert_error_hides_key("wait", &e);
+
+    let e = c
+        .submit(&forge_request(None), &fast())
+        .await
+        .expect_err("closed port");
+    assert_error_hides_key("verifysourcecode", &e);
+}
+
+/// Run the real binary against a closed port and return (success, stdout + stderr).
+fn run_cli_against_closed_port(url: &str, args: &[&str]) -> (bool, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_citrate-cli"))
+        .arg("--config")
+        .arg(dir.path().join("config.json"))
+        .args(args)
+        .args(["--explorer-url", url, "--api-key", SECRET_KEY])
+        .env_remove("CITRATE_EXPLORER_URL")
+        .env_remove("CITRATE_EXPLORER_API_KEY")
+        .env("HOME", dir.path())
+        .output()
+        .expect("run citrate-cli");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), text)
+}
+
+#[tokio::test]
+async fn cli_output_never_carries_the_api_key() {
+    let url = closed_port_url().await;
+    // The real binary: what reaches stdout and stderr.
+    let cases: Vec<Vec<&str>> = vec![
+        vec!["contract", "verify-status", "abc"],
+        vec![
+            "contract",
+            "verify-status",
+            "abc",
+            "--watch",
+            "--poll-interval-ms",
+            "10",
+            "--watch-timeout-secs",
+            "1",
+        ],
+        vec!["contract", "verify-get", FORGE_ADDR],
+    ];
+    for args in cases {
+        let (ok, text) = run_cli_against_closed_port(&url, &args);
+        assert!(!ok, "{args:?} should fail against a closed port: {text}");
+        assert!(
+            text.contains("could not reach the explorer") || text.contains("no verdict"),
+            "{args:?}: {text}"
+        );
+        assert_no_key(&format!("{args:?}"), &text);
+    }
+
+    // `verify --get` and `verify --watch`, in process: main prints the returned error with
+    // `{:?}`. (The binary's `contract verify` trips clap's debug assertion on the `-c` short
+    // flag shared by `--compiler` and the global `--config`, which predates this command.)
+    let bi = forge_build_info();
+    let runs: Vec<Vec<&str>> = vec![
+        vec!["citrate", "verify", FORGE_ADDR, "--get", FORGE_ADDR],
+        vec![
+            "citrate",
+            "verify",
+            FORGE_ADDR,
+            "--build-info",
+            bi.to_str().expect("utf-8 path"),
+            "--contract",
+            "src/Greeter.sol:Greeter",
+            "--watch",
+            "--poll-interval-ms",
+            "10",
+            "--watch-timeout-secs",
+            "1",
+        ],
+    ];
+    for mut args in runs {
+        args.extend_from_slice(&["--explorer-url", &url, "--api-key", SECRET_KEY]);
+        let cli = Cli::try_parse_from(&args).expect("parse CLI args");
+        let err = contract::execute(cli.cmd, &Config::default())
+            .await
+            .expect_err("closed port");
+        assert_no_key(&format!("{args:?}"), &format!("{err:?}"));
+        assert_no_key(&format!("{args:?}"), &format!("{err:#}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --watch rides out transient explorer errors
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn wait_retries_transient_http_errors() {
+    let srv = recorder(vec![
+        (503, "service unavailable"),
+        (200, PENDING),
+        (429, "too many requests"),
+        (500, "oops"),
+        (200, PASS),
+    ])
+    .await;
+    let c = ExplorerClient::new(&srv.url, None).expect("client");
+    let status = c.wait("g", &fast()).await.expect("wait rides out 5xx/429");
+    assert_eq!(status, VerifyStatus::Verified("Pass - Verified".to_owned()));
+    assert_eq!(srv.seen().len(), 5);
+}
+
+#[tokio::test]
+async fn wait_retries_transport_failures_until_the_deadline() {
+    let url = closed_port_url().await;
+    let c = ExplorerClient::new(&url, None).expect("client");
+    let cfg = PollConfig {
+        timeout: Duration::from_millis(150),
+        ..fast()
+    };
+    match c.wait("g", &cfg).await {
+        Err(VerifyError::Timeout { guid, last }) => {
+            assert_eq!(guid, "g");
+            assert!(last.contains("could not reach the explorer"), "{last}");
+        }
+        other => panic!("expected a timeout after transport retries, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wait_stops_on_non_transient_errors() {
+    let srv = recorder(vec![(400, "bad request")]).await;
+    let c = ExplorerClient::new(&srv.url, None).expect("client");
+    assert!(matches!(
+        c.wait("g", &fast()).await,
+        Err(VerifyError::Http { status: 400, .. })
+    ));
+    assert_eq!(srv.seen().len(), 1);
+
+    let srv = recorder(vec![(200, r#"{"verified":true}"#)]).await;
+    let c = ExplorerClient::new(&srv.url, None).expect("client");
+    assert!(matches!(
+        c.wait("g", &fast()).await,
+        Err(VerifyError::Protocol(_))
+    ));
+    assert_eq!(srv.seen().len(), 1);
 }
