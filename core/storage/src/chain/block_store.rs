@@ -1530,4 +1530,106 @@ mod tests {
         let store = BlockStore::new(db);
         assert_eq!(store.get_tips().unwrap(), vec![c.header.block_hash]);
     }
+
+    // ── S3-7 (CNV-RPC): sibling-complete height index and stored-block count ──
+
+    fn sibling(height: u64, parent: Hash, tag: u8) -> Block {
+        let mut b = create_test_block(height, parent);
+        b.header.block_hash = Hash::new([tag; 32]);
+        b
+    }
+
+    /// `citrate_getBlocksAtHeight` needs every stored block at a height. The
+    /// `h‖height` index keeps only the last one stored.
+    #[test]
+    fn s3_7_height_index_keeps_every_sibling_and_follows_delete_and_purge() {
+        let temp_dir = TempDir::new().expect("test store op");
+        let db = Arc::new(RocksDB::open(temp_dir.path()).expect("test store op"));
+        let store = BlockStore::new(db);
+        let g = create_test_block(0, Hash::default());
+        let a1 = create_test_block(1, g.hash());
+        let b1 = sibling(1, g.hash(), 0xB1);
+        let c1 = sibling(1, g.hash(), 0xC1);
+        for b in [&g, &a1, &b1, &c1] {
+            store.put_block(b).expect("test store op");
+        }
+        let mut want = vec![a1.hash(), b1.hash(), c1.hash()];
+        want.sort();
+        assert_eq!(store.get_blocks_at_height(1).expect("test store op"), want);
+        assert_eq!(
+            store.get_blocks_at_height(0).expect("test store op"),
+            vec![g.hash()]
+        );
+        assert!(store
+            .get_blocks_at_height(2)
+            .expect("test store op")
+            .is_empty());
+
+        store.delete_block(&b1.hash()).expect("test store op");
+        let mut want = vec![a1.hash(), c1.hash()];
+        want.sort();
+        assert_eq!(store.get_blocks_at_height(1).expect("test store op"), want);
+
+        let doomed: HashSet<Hash> = [c1.hash()].into_iter().collect();
+        store.purge_blocks(&doomed).expect("test store op");
+        assert_eq!(
+            store.get_blocks_at_height(1).expect("test store op"),
+            vec![a1.hash()]
+        );
+    }
+
+    /// `citrate_getDagStats.totalBlocks` is a maintained counter, not an
+    /// estimate (chain#317): a re-put does not count twice; delete and purge
+    /// count down.
+    #[test]
+    fn s3_7_stored_block_count_is_maintained() {
+        let temp_dir = TempDir::new().expect("test store op");
+        let db = Arc::new(RocksDB::open(temp_dir.path()).expect("test store op"));
+        let store = BlockStore::new(db);
+        assert_eq!(store.stored_block_count().expect("test store op"), Some(0));
+        let g = create_test_block(0, Hash::default());
+        let a1 = create_test_block(1, g.hash());
+        let b1 = sibling(1, g.hash(), 0xB1);
+        for b in [&g, &a1, &b1, &a1] {
+            store.put_block(b).expect("test store op");
+        }
+        assert_eq!(store.stored_block_count().expect("test store op"), Some(3));
+        store.delete_block(&b1.hash()).expect("test store op");
+        assert_eq!(store.stored_block_count().expect("test store op"), Some(2));
+        let doomed: HashSet<Hash> = [a1.hash()].into_iter().collect();
+        store.purge_blocks(&doomed).expect("test store op");
+        assert_eq!(store.stored_block_count().expect("test store op"), Some(1));
+    }
+
+    /// A data dir written by a binary without the index: the open rebuilds the
+    /// sibling index and the count from the stored headers once.
+    #[test]
+    fn s3_7_height_index_and_count_rebuild_for_an_old_data_dir() {
+        let temp_dir = TempDir::new().expect("test store op");
+        let db = Arc::new(RocksDB::open(temp_dir.path()).expect("test store op"));
+        let g = create_test_block(0, Hash::default());
+        let a1 = create_test_block(1, g.hash());
+        let b1 = sibling(1, g.hash(), 0xB1);
+        for b in [&g, &a1, &b1] {
+            db.put_cf(
+                CF_BLOCKS,
+                b.hash().as_bytes(),
+                &bincode::serialize(b).expect("test store op"),
+            )
+            .expect("test store op");
+            db.put_cf(
+                CF_HEADERS,
+                b.hash().as_bytes(),
+                &bincode::serialize(&b.header).expect("test store op"),
+            )
+            .expect("test store op");
+        }
+        db.put_cf(CF_METADATA, LATEST_HEIGHT_KEY, &1u64.to_be_bytes())
+            .expect("test store op");
+        let store = BlockStore::new(db);
+        let mut want = vec![a1.hash(), b1.hash()];
+        want.sort();
+        assert_eq!(store.get_blocks_at_height(1).expect("test store op"), want);
+        assert_eq!(store.stored_block_count().expect("test store op"), Some(3));
+    }
 }
