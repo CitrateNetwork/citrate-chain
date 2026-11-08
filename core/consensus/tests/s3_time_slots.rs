@@ -375,3 +375,96 @@ async fn honest_concurrent_producers_unaffected() {
     assert_eq!(next.header.blue_score, 2 + 7);
     admit_ok(&store, &gd, &next).await;
 }
+
+// ---------------------------------------------------------------------------
+// G9 and the parent-relative timestamp bound
+// ---------------------------------------------------------------------------
+
+/// #184: under G9 every child needs a slot after its parent's, so a parent
+/// stamped at the end of time has no valid child, and one such block would
+/// halt every chain that selects it. The parent-relative bound
+/// (`MAX_TS_ADVANCE`, spec §1.2: a block-0 constant with no override)
+/// therefore holds at every activation setting, including none: a node whose
+/// genesis has no compiled activation entry and no env value runs with the
+/// PBA-R2 height unset.
+#[tokio::test]
+async fn far_future_parent_is_invalid_whatever_the_activation_height() {
+    use citrate_consensus::hardening::{PbaHardening, MAX_BLOCK_TIMESTAMP_ADVANCE_SECS as MAX};
+    for hardening in [
+        PbaHardening::off(),
+        PbaHardening::at(u64::MAX),
+        PbaHardening::at(0),
+    ] {
+        let store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let gd =
+            GhostDag::new(GhostDagParams::default(), store.clone()).with_pba_hardening(hardening);
+        let g = genesis();
+        admit_ok(&store, &gd, &g).await;
+
+        let poison = child(b"P", &g, u64::MAX, 0x66);
+        assert!(
+            verdict(&gd, &poison).await.is_err(),
+            "{hardening:?}: a u64::MAX timestamp leaves no later slot and must be invalid"
+        );
+        let past = child(b"Q", &g, G_TS + MAX + SLOT_DURATION_SECS, 0x66);
+        assert!(
+            verdict(&gd, &past).await.is_err(),
+            "{hardening:?}: one slot past the bound is invalid"
+        );
+
+        // At the bound is valid, and still leaves its children a later slot.
+        let edge = child(b"E", &g, G_TS + MAX, 0x66);
+        admit_ok(&store, &gd, &edge).await;
+        let next = child(b"N", &edge, G_TS + MAX + SLOT_DURATION_SECS, 0x67);
+        assert_eq!(verdict(&gd, &next).await, Ok(()), "{hardening:?}");
+    }
+}
+
+/// #184: the slot origin is the chain's genesis timestamp, a chain constant.
+/// A node that restarts with a DAG store holding only the retained range (no
+/// genesis block, no origin in its metadata) learns it from the configured
+/// genesis it loads at start-up, and can then validate new blocks. An origin
+/// that disagrees with one already known is refused: it would mis-slot every
+/// block.
+#[tokio::test]
+async fn slot_origin_is_bound_from_the_configured_genesis_without_storing_it() {
+    let (store, gd) = engine();
+    let g = genesis();
+    store.set_configured_genesis(g.hash());
+    assert_eq!(store.slot_origin(), None);
+    let a = child(b"A", &g, ts(4), 0xA);
+    assert!(
+        verdict(&gd, &a).await.is_err(),
+        "with no slot origin no block can be slot-checked: fail closed"
+    );
+
+    store
+        .set_slot_origin(&g.header)
+        .expect("the configured genesis binds the origin");
+    assert_eq!(store.slot_origin(), Some(G_TS));
+    // Idempotent for the same genesis.
+    store.set_slot_origin(&g.header).expect("same origin again");
+
+    // Another genesis timestamp is refused, and the origin is unchanged.
+    let mut other = g.header.clone();
+    other.timestamp = G_TS + 1;
+    assert!(store.set_slot_origin(&other).is_err());
+    // So is a header that is not a genesis header.
+    assert!(store.set_slot_origin(&a.header).is_err());
+    assert_eq!(store.slot_origin(), Some(G_TS));
+
+    // Parents must be admitted locally for the slot rule to apply: the
+    // retained range starts above genesis.
+    // As the restart rehydration does: every height is registered with
+    // GhostDAG, only the retained range is in the DAG store.
+    gd.register_existing_block(&g)
+        .await
+        .expect("register genesis");
+    let p = child(b"P", &g, ts(3), 0xB);
+    store.store_block(p.clone()).await.expect("retained block");
+    gd.register_existing_block(&p).await.expect("register");
+    let next = child(b"N", &p, ts(4), 0xC);
+    assert_eq!(verdict(&gd, &next).await, Ok(()));
+    let same = child(b"S", &p, ts(3), 0xC);
+    assert!(verdict(&gd, &same).await.is_err());
+}
