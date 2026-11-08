@@ -974,6 +974,21 @@ async fn red_block_txs_execute_per_spec() {
         j["acceptance"]["including_block_hash"],
         serde_json::to_value(b1.header.block_hash).expect("json")
     );
+    // The independent reference colors b1 red at K = 0 too and reproduces
+    // m's commitments (red block executed, no emission share for it).
+    let mut cfg = citrate_replay_ref::ReplayConfig::from_process(CHAIN_ID);
+    cfg.ghostdag_k = 0;
+    cfg.genesis_alloc = (0..fleet.spec.senders)
+        .map(|s| {
+            let mut be = [0u8; 32];
+            U256::from(FUND).to_big_endian(&mut be);
+            (sender(s).0, be)
+        })
+        .collect();
+    let rec = citrate_replay_ref::record_db(&a.storage.db, cfg, "A".into()).expect("record");
+    let report = citrate_replay_ref::replay_mergeset(&rec).expect("replay");
+    assert_eq!(report.divergence, None, "{report:?}");
+    assert_eq!(report.matched, 3);
 }
 
 /// Spec 06 §3.8 (O3, O4 defaults): R(h) of the accepting block goes to its
@@ -1378,4 +1393,93 @@ async fn blockhash_opcode_returns_selected_chain_ancestors() {
         *sp_parent.as_bytes(),
         "BLOCKHASH(height(C) - 2) = SP(SP(C))"
     );
+}
+
+/// S3-3c (spec 06 §8.3, I6): the node's chain, recorded from its data dir,
+/// replays through the INDEPENDENT reference (`citrate-mergeset-ref`, which
+/// shares no execution code with the node) with no divergence in GHOSTDAG,
+/// state root, receipt root, accepted root, gas used or accepted list, over
+/// randomized multi-producer DAGs, and over the split-heal recordings when
+/// `CITRATE_SPLIT_HEAL_RECORDING_DIR` names them; and a corrupted header root
+/// is caught at its height.
+#[tokio::test]
+async fn replay_parity_mergeset() {
+    for seed in 21..=24u64 {
+        let spec = FleetSpec::new(3);
+        let fleet = Fleet::new(spec.clone()).await;
+        let mut rng = Rng(seed);
+        random_run(&fleet, &mut rng, 6, 3).await;
+        for (ni, node) in fleet.nodes.iter().enumerate() {
+            let mut cfg = citrate_replay_ref::ReplayConfig::from_process(CHAIN_ID);
+            cfg.ghostdag_k = spec.k;
+            cfg.genesis_alloc = (0..spec.senders)
+                .map(|s| {
+                    let mut be = [0u8; 32];
+                    U256::from(FUND).to_big_endian(&mut be);
+                    (sender(s).0, be)
+                })
+                .collect();
+            let rec = citrate_replay_ref::record_db(&node.storage.db, cfg, format!("node {ni}"))
+                .expect("record");
+            let report = citrate_replay_ref::replay_mergeset(&rec).expect("replay");
+            assert_eq!(
+                report.divergence, None,
+                "seed {seed} node {ni}: node and reference diverge"
+            );
+            assert_eq!(
+                report.matched,
+                rec.chain.len() as u64 - 1,
+                "seed {seed} node {ni}"
+            );
+            assert!(
+                report.executed > 0,
+                "seed {seed} node {ni}: nothing executed"
+            );
+            assert!(
+                report.lists_compared > 0,
+                "seed {seed} node {ni}: no list compared"
+            );
+            // Sensitivity: a wrong root at height 3 is the first divergence.
+            let mut bad = rec.clone();
+            if let Some(b) = bad.chain_block_mut(3) {
+                b.state_root = Hash::new([0xAB; 32]);
+                let bad_report = citrate_replay_ref::replay_mergeset(&bad).expect("replay");
+                let d = bad_report.divergence.expect("caught");
+                assert_eq!(d.height, 3, "seed {seed} node {ni}");
+                assert_eq!(d.field, citrate_mergeset_ref::Field::StateRoot);
+            }
+        }
+    }
+    // The split-heal fleet's stopped-side recordings, when a split_heal run
+    // kept them (`CITRATE_SPLIT_HEAL_RECORDING_DIR`, written by
+    // `split_heal_tests`): each replays through the reference with no
+    // divergence.
+    if let Ok(dir) = std::env::var("CITRATE_SPLIT_HEAL_RECORDING_DIR") {
+        let mut replayed = 0usize;
+        let entries = std::fs::read_dir(&dir).expect("the recording dir is readable");
+        for e in entries {
+            let path = e.expect("dir entry").path();
+            if path.extension().and_then(|x| x.to_str()) != Some("rec") {
+                continue;
+            }
+            let rec = citrate_replay_ref::Recording::read_from(&path).expect("read recording");
+            let report = citrate_replay_ref::replay_mergeset(&rec).expect("replay");
+            assert_eq!(
+                report.divergence,
+                None,
+                "{}: node and reference diverge",
+                path.display()
+            );
+            assert_eq!(report.matched, report.tip_height, "{}", path.display());
+            println!(
+                "replay_parity_mergeset: {} matched {} chain blocks ({} executed, {} skipped)",
+                path.display(),
+                report.matched,
+                report.executed,
+                report.skipped
+            );
+            replayed += 1;
+        }
+        assert!(replayed > 0, "no split-heal recording in {dir}");
+    }
 }

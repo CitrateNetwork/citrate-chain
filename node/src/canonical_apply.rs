@@ -14235,13 +14235,14 @@ pub(crate) mod tests {
         /// S3-3c (spec 06 §8.3, I6): a node that switched a fork deeper than
         /// the snapshot ring from its undo records, then restarted and kept
         /// applying, is recorded from its data dir (read-only, while open)
-        /// and replayed by the independent reference path
-        /// (`tools/replay-ref`): every applied block's committed root matches
-        /// a plain linear replay from genesis. A recording with one block of
-        /// the winning branch changed is reported at exactly that height.
+        /// and replayed by the independent mergeset reference
+        /// (`tools/mergeset-ref` via `replay_mergeset`): every applied block's
+        /// commitments and accepted list match. A recording with one tx of
+        /// the winning branch changed is reported at the block that accepts
+        /// it (r1007 S3-3b; before mergeset execution it was that block).
         #[tokio::test]
         async fn a_deep_reorg_replays_with_zero_divergence() {
-            use citrate_replay_ref::{record_data_dir, replay, ReplayConfig, SelectedChain};
+            use citrate_replay_ref::{record_data_dir, ReplayConfig};
             let tip_height = 400u64;
             let fork = tip_height - 300;
             let (main, snaps) = rsr_main(tip_height).await;
@@ -14293,20 +14294,23 @@ pub(crate) mod tests {
             let top = head.header.height + 5;
             assert_eq!(rec.applied_tip.1, top);
             assert_eq!(rec.chain.len() as u64, top + 1, "genesis sentinel..=tip");
-            let report = replay(&rec, &SelectedChain).await.expect("replay");
+            // r1007 S3-3b: the independent mergeset reference.
+            let report = citrate_replay_ref::replay_mergeset(&rec).expect("replay");
             assert_eq!(report.divergence, None, "{report:?}");
             assert_eq!(report.matched, top);
             assert!(
-                report.committed_compared >= top - fork,
-                "every block of the winning branch has a committed root: {report:?}"
+                report.lists_compared >= top - fork,
+                "every block of the winning branch has its accepted list: {report:?}"
             );
+            // A changed tx in block k is executed (and caught) at k + 1, the
+            // block that accepts it.
             let k = fork + 150;
             let mut bad = rec.clone();
             bad.chain_block_mut(k).expect("block k").transactions[0].value += 1;
-            let report = replay(&bad, &SelectedChain).await.expect("replay");
+            let report = citrate_replay_ref::replay_mergeset(&bad).expect("replay");
             assert_eq!(
                 report.divergence.as_ref().map(|d| d.height),
-                Some(k),
+                Some(k + 1),
                 "{report:?}"
             );
         }
