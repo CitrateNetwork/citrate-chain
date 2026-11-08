@@ -55,6 +55,9 @@ const REG_CODE: [u8; 11] = [
 /// executed and fails, and is charged its whole gas limit.
 const REVERTER: [u8; 20] = [0xEF; 20];
 const REVERTER_CODE: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
+/// A contract that stores GASLIMIT at slot 0 on every call.
+const GASLIMIT_PROBE: [u8; 20] = [0xBC; 20];
+const GASLIMIT_PROBE_CODE: [u8; 5] = [0x45, 0x60, 0x00, 0x55, 0x00];
 /// A contract that stores BLOCKHASH(NUMBER - 1) at slot 0 and
 /// BLOCKHASH(NUMBER - 2) at slot 1 on every call.
 const PROBE: [u8; 20] = [0xBB; 20];
@@ -142,6 +145,8 @@ struct FleetSpec {
     reverter: bool,
     /// [`PROBE`] deployed at genesis.
     blockhash_probe: bool,
+    /// [`GASLIMIT_PROBE`] deployed at genesis.
+    gaslimit_probe: bool,
 }
 
 impl FleetSpec {
@@ -153,6 +158,7 @@ impl FleetSpec {
             policy: false,
             reverter: false,
             blockhash_probe: false,
+            gaslimit_probe: false,
         }
     }
 }
@@ -179,6 +185,9 @@ fn seed_genesis(exec: &Executor, spec: &FleetSpec) {
     }
     if spec.blockhash_probe {
         exec.set_code(&Address(PROBE), PROBE_CODE.to_vec());
+    }
+    if spec.gaslimit_probe {
+        exec.set_code(&Address(GASLIMIT_PROBE), GASLIMIT_PROBE_CODE.to_vec());
     }
 }
 
@@ -1482,4 +1491,34 @@ async fn replay_parity_mergeset() {
         }
         assert!(replayed > 0, "no split-heal recording in {dir}");
     }
+}
+
+/// Spec 06 §3.7: inside the transactions chain block C accepts, GASLIMIT is
+/// ACCEPT_GAS_LIMIT, the budget C executes them under.
+#[tokio::test]
+async fn gaslimit_opcode_is_the_accept_gas_limit() {
+    let mut spec = FleetSpec::new(1);
+    spec.gaslimit_probe = true;
+    let fleet = Fleet::new(spec).await;
+    let a = &fleet.nodes[0];
+    let mut call = transfer(0, 0, Address(GASLIMIT_PROBE), 0, GAS_PRICE);
+    call.data = vec![0x01];
+    call.gas_limit = 100_000;
+    assert!(a.submit(&call).await);
+    let x = a.produce().await;
+    assert!(x.transactions.iter().any(|t| t.hash == call.hash));
+    let _c = a.produce().await;
+    let j = a.receipt_json(&call.hash).expect("executed");
+    assert_eq!(j["status"], true, "{j}");
+    let stored = a
+        .executor
+        .state_db()
+        .get_storage(&Address(GASLIMIT_PROBE), &[0u8; 32])
+        .map(|v| U256::from_big_endian(&v))
+        .unwrap_or_default();
+    assert_eq!(
+        stored,
+        U256::from(citrate_consensus::acceptance::ACCEPT_GAS_LIMIT),
+        "GASLIMIT inside an accepted mergeset"
+    );
 }
