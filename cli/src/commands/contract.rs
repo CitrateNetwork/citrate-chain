@@ -138,6 +138,10 @@ pub enum ContractCommands {
         #[arg(long, env = "CITRATE_EXPLORER_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
 
+        /// Etherscan v2 `chainid` to send (e.g. 40204). Omit it for a local devnet.
+        #[arg(long)]
+        chain_id: Option<u64>,
+
         /// Wait for the verdict instead of printing the guid
         #[arg(long)]
         watch: bool,
@@ -168,6 +172,10 @@ pub enum ContractCommands {
         #[arg(long, env = "CITRATE_EXPLORER_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
 
+        /// Etherscan v2 `chainid` to send (e.g. 40204). Omit it for a local devnet.
+        #[arg(long)]
+        chain_id: Option<u64>,
+
         /// Wait for the verdict
         #[arg(long)]
         watch: bool,
@@ -193,6 +201,10 @@ pub enum ContractCommands {
         /// Explorer API key
         #[arg(long, env = "CITRATE_EXPLORER_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
+
+        /// Etherscan v2 `chainid` to send (e.g. 40204). Omit it for a local devnet.
+        #[arg(long)]
+        chain_id: Option<u64>,
     },
 
     /// List the verification records stored on the node (written by the node's
@@ -244,12 +256,14 @@ pub async fn execute(cmd: ContractCommands, config: &Config) -> Result<()> {
             creation_tx,
             explorer_url,
             api_key,
+            chain_id,
             watch,
             poll_interval_ms,
             watch_timeout_secs,
             get,
         } => {
-            let client = verify::ExplorerClient::new(&explorer_url, api_key)?;
+            let client =
+                verify::ExplorerClient::new(&explorer_url, api_key)?.with_chain_id(chain_id);
             if let Some(addr) = get {
                 show_verified_source(&client, &addr).await?;
             } else {
@@ -269,7 +283,7 @@ pub async fn execute(cmd: ContractCommands, config: &Config) -> Result<()> {
                     source,
                     constructor_args,
                     creation_tx_hash: creation_tx,
-                    chain_id: None,
+                    chain_id,
                 };
                 let poll = poll_config(poll_interval_ms, watch_timeout_secs);
                 verify_on_explorer(&client, &req, watch, &poll).await?;
@@ -279,11 +293,13 @@ pub async fn execute(cmd: ContractCommands, config: &Config) -> Result<()> {
             guid,
             explorer_url,
             api_key,
+            chain_id,
             watch,
             poll_interval_ms,
             watch_timeout_secs,
         } => {
-            let client = verify::ExplorerClient::new(&explorer_url, api_key)?;
+            let client =
+                verify::ExplorerClient::new(&explorer_url, api_key)?.with_chain_id(chain_id);
             let poll = poll_config(poll_interval_ms, watch_timeout_secs);
             let status = if watch {
                 client.wait(&guid, &poll).await?
@@ -296,8 +312,10 @@ pub async fn execute(cmd: ContractCommands, config: &Config) -> Result<()> {
             address,
             explorer_url,
             api_key,
+            chain_id,
         } => {
-            let client = verify::ExplorerClient::new(&explorer_url, api_key)?;
+            let client =
+                verify::ExplorerClient::new(&explorer_url, api_key)?.with_chain_id(chain_id);
             show_verified_source(&client, &address).await?;
         }
         ContractCommands::VerifyList => {

@@ -646,6 +646,8 @@ impl Default for PollConfig {
 pub struct ExplorerClient {
     base_url: String,
     api_key: Option<String>,
+    /// Etherscan v2 `chainid`, sent on status and read calls when set.
+    chain_id: Option<u64>,
     http: reqwest::Client,
 }
 
@@ -664,8 +666,16 @@ impl ExplorerClient {
         Ok(Self {
             base_url: base_url.to_owned(),
             api_key: api_key.filter(|k| !k.is_empty()),
+            chain_id: None,
             http,
         })
+    }
+
+    /// Send Etherscan v2 `chainid` on `checkverifystatus` and `getsourcecode`. `None` (the
+    /// default) sends nothing, so a local devnet with another chain id still works.
+    pub fn with_chain_id(mut self, chain_id: Option<u64>) -> Self {
+        self.chain_id = chain_id;
+        self
     }
 
     pub fn base_url(&self) -> &str {
@@ -745,6 +755,9 @@ impl ExplorerClient {
         let mut q: Vec<(String, String)> = Vec::new();
         if let Some(k) = &self.api_key {
             q.push(("apikey".to_owned(), k.clone()));
+        }
+        if let Some(id) = self.chain_id {
+            q.push(("chainid".to_owned(), id.to_string()));
         }
         q.extend(
             pairs
