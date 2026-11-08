@@ -310,3 +310,78 @@ fn the_clis_record_and_report_the_first_divergence() {
     assert_eq!(out.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("FIRST DIVERGENCE: height 17 "), "{stdout}");
 }
+
+/// CV-14 (b): the same fixture under the MPT state root (an r1007 genesis
+/// rule). The node's roots are incremental; the replay recomputes every chain
+/// block's root FROM SCRATCH and diffs it against the incremental root of the
+/// same state and against the node's committed root. Untouched: zero
+/// divergence, every block compared from scratch. A wrong committed root is
+/// still reported at its height. The rule is process-wide, so this runs in a
+/// child process (no other test in this binary sees it).
+#[test]
+fn mpt_state_root_replays_and_diffs_from_scratch_roots() {
+    const CHILD: &str = "CITRATE_REPLAY_MPT_CHILD";
+    const NAME: &str = "mpt_state_root_replays_and_diffs_from_scratch_roots";
+    if std::env::var(CHILD).is_err() {
+        let out = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    citrate_execution::mpt_state_root::set_mpt_state_root_height(Some(0));
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let dir = rt.block_on(node_dir());
+    let rec = record_data_dir(dir.path(), config()).expect("record");
+    assert_eq!(rec.config.mpt_state_root_height, Some(0));
+    let report = rt.block_on(replay(&rec, &SelectedChain)).expect("replay");
+    assert_eq!(report.divergence, None, "{report:?}");
+    assert_eq!(report.matched, N);
+    assert_eq!(
+        report.from_scratch_compared, N,
+        "every block compared from scratch"
+    );
+    assert_eq!(report.committed_compared, N);
+
+    // The node's committed roots are MPT roots (they differ from the legacy root
+    // of the same state) and its store holds the trie nodes of the applied tip.
+    {
+        use citrate_execution::executor::StateStoreTrait;
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let root = storage
+            .state
+            .trie_root_at(N)
+            .expect("record")
+            .expect("tip root");
+        assert_eq!(Some(root), rec.chain.last().and_then(|e| e.committed_root));
+        let source = |h: &[u8; 32]| storage.state.get_trie_node(h).ok().flatten();
+        let trie = citrate_execution::state::mpt::Mpt::load(root.as_bytes(), &source)
+            .expect("the applied tip's trie loads from the node store");
+        assert!(
+            trie.len() >= 3,
+            "alice, the coinbase, the treasury and the recipients"
+        );
+    }
+
+    let mut bad = rec.clone();
+    let k = 9;
+    bad.chain
+        .iter_mut()
+        .find(|e| e.height == k)
+        .expect("entry k")
+        .committed_root = Some(Hash::new([0xEE; 32]));
+    let report = rt.block_on(replay(&bad, &SelectedChain)).expect("replay");
+    let d = report.divergence.expect("a divergence");
+    assert_eq!(
+        (d.height, d.field.clone()),
+        (k, Field::CommittedStateRoot),
+        "{d}"
+    );
+}
