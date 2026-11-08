@@ -827,7 +827,15 @@ def _unshare_ok() -> bool:
         return False
 
 
-@unittest.skipUnless(_unshare_ok(), "needs unprivileged user + network namespaces")
+# The namespace-sandboxed classes skip on a host that cannot create an unprivileged user
+# namespace (macOS, or Ubuntu's AppArmor userns restriction left on). CI enables user
+# namespaces and sets CITRATE_REQUIRE_USERNS=1: there they always run, and a runner that
+# cannot create the namespace fails them instead of skipping them silently.
+USERNS = _unshare_ok() or os.environ.get("CITRATE_REQUIRE_USERNS") == "1"
+USERNS_WHY = "needs unprivileged user + network namespaces (CI sets CITRATE_REQUIRE_USERNS=1)"
+
+
+@unittest.skipUnless(USERNS, USERNS_WHY)
 class StartGateMiningOnlyOnTheR1006Genesis(unittest.TestCase):
     """keys -> genesis-fill -> distribute -> start --mining on, each host a fake node in
     its own network namespace (inside one user + net + pid namespace: nothing reaches the
@@ -1681,6 +1689,7 @@ class BuildRevRunsAsNodeUser(unittest.TestCase):
             self.assertIn("node uid-switched=citrate consensus --json", calls)
             self.assertNotIn("uid-switched=no", calls)
 
+@unittest.skipUnless(USERNS, USERNS_WHY)
 class LocalDevnetOrchestration(unittest.TestCase):
     """scripts/ops/r1006/local_devnet.sh next to a fake r1006_bringup.sh that records its
     arguments (and fails a step on request), so the devnet's own option handling, step
