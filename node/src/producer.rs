@@ -142,6 +142,18 @@ impl TestSimClock {
     }
 }
 
+/// Test builds only: the wall clock (seconds) a test thread's
+/// [`AttestedInner`] reads: the real clock plus the thread's
+/// [`TestSimClock`] offset. Fixtures that stamp deferred-evidence headers "now"
+/// read it, so the evidence is as old to the gate as the fixture means it to
+/// be however many producer rounds (each one moving simulated time a slot
+/// forward) the test runs, and however fast the host runs them.
+#[cfg(test)]
+pub(crate) fn test_wall_now_secs() -> u64 {
+    let real_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    TestSimClock::for_this_thread().now_ms(real_ms) / 1_000
+}
+
 /// Test builds only: [`AttestedInner`]'s link to the test thread's
 /// [`TestSimClock`] (its `Default` picks up the creating thread's clock).
 #[cfg(test)]
@@ -8514,13 +8526,12 @@ mod tests {
         }
 
         /// A copy of `blk` signed by node `i` at `height`, with a parent nobody holds and
-        /// a header time `skew_secs` after real time (matching the test clock).
+        /// a header time `skew_secs` after the test wall clock (`test_wall_now_secs`).
         fn unadmittable(blk: &Block, i: u8, height: u64, skew_secs: u64) -> Block {
             let mut x = blk.clone();
             x.header.height = height;
             x.header.selected_parent_hash = Hash::new([0xEE; 32]);
-            x.header.timestamp =
-                (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(skew_secs);
+            x.header.timestamp = crate::producer::test_wall_now_secs().saturating_add(skew_secs);
             resign(x, i)
         }
 
@@ -8643,7 +8654,11 @@ mod tests {
         async fn old_header_timestamp_is_not_evidence() {
             let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
             // 30 s window + 15 s clock allowance, plus one: literal on purpose.
-            b.attested.advance_clock_for_test(Duration::from_secs(46));
+            // Plus one more (r1007 G9): a producer stamps the first second of
+            // the slot it reads with `SLOT_TICK_EARLY_ALLOWANCE_MS` (250 ms)
+            // added, so its header can be up to one second ahead of the clock
+            // reading it sealed at.
+            b.attested.advance_clock_for_test(Duration::from_secs(47));
             assert!(!b.attested.observe_deferred(&t1));
             assert!(!b.attested.observe_deferred(&t2));
             gossip(&mut b, None, &t1).await;
@@ -9043,7 +9058,7 @@ mod tests {
         }
 
         /// A signed block by node `i` at `height` on top of `parent`, with a header
-        /// time `skew_secs` after real time (matching the test clock). Each one is a
+        /// time `skew_secs` after the test wall clock (`test_wall_now_secs`). Each one is a
         /// real, hash-bound, signed block; B cannot admit any of them because the
         /// first parent of each branch is a block B never received.
         fn signed(templates: &[Block], i: u8, height: u64, parent: Hash, skew_secs: u64) -> Block {
@@ -9056,8 +9071,7 @@ mod tests {
             x.header.blue_work = citrate_consensus::types::blue_work_for_score(height);
             x.header.selected_parent_hash = parent;
             x.header.merge_parent_hashes = Vec::new();
-            x.header.timestamp =
-                (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(skew_secs);
+            x.header.timestamp = crate::producer::test_wall_now_secs().saturating_add(skew_secs);
             x.header.block_hash = x.compute_hash();
             x.signature = crypto::sign_block(
                 &x.header.block_hash,
@@ -9189,7 +9203,10 @@ mod tests {
                 hear(&mut b, &slot_blocks).await;
                 // The next slot selects one sibling and merges the rest.
                 tip = slot_blocks[0].header.block_hash;
-                losers = slot_blocks[1..].iter().map(|x| x.header.block_hash).collect();
+                losers = slot_blocks[1..]
+                    .iter()
+                    .map(|x| x.header.block_hash)
+                    .collect();
                 if b.producer.produce_block().await.is_ok() {
                     sealed.push(t);
                 }
@@ -9248,7 +9265,10 @@ mod tests {
                 }
                 hear(&mut b, &slot_blocks).await;
                 tip = slot_blocks[0].header.block_hash;
-                losers = slot_blocks[1..].iter().map(|x| x.header.block_hash).collect();
+                losers = slot_blocks[1..]
+                    .iter()
+                    .map(|x| x.header.block_hash)
+                    .collect();
                 if b.producer.produce_block().await.is_ok() {
                     sealed.push(t);
                 }
