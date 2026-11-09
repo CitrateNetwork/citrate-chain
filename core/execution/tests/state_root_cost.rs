@@ -201,3 +201,109 @@ fn state_root_cost_per_block_does_not_grow_with_state() {
         costs[2].mpt_inc
     );
 }
+
+/// Heights the boot reorg-window rebuild walks in the S1-2 measurement (fed
+/// `ops/r1007-apply-cost` @ 13830e51: 100 real heights, 305183..305283).
+const REBUILD_HEIGHTS: u32 = 100;
+
+/// `node/src/canonical_apply.rs` `rooted`, step for step: the state root of
+/// `snap` as the post-state of `height`, on a fresh `StateDB`, and the snapshot
+/// a running node holds after it. Copied (it is private to the node) so the
+/// bench times exactly the per-height work of `restore_reorg_window`.
+fn rooted(
+    snap: citrate_execution::state::StateSnapshot,
+    height: u64,
+) -> (
+    citrate_consensus::types::Hash,
+    citrate_execution::state::StateSnapshot,
+) {
+    let scratch = StateDB::new();
+    scratch.restore(snap);
+    scratch.set_root_height(height);
+    let root = scratch.calculate_state_root();
+    scratch.accounts.clear_dirty();
+    let _ = scratch.take_dirty_storage();
+    (root, scratch.snapshot())
+}
+
+/// Per-height cost of the boot reorg-window rebuild (the path S1-2 profiled on
+/// r1006 data), under one root rule. Builds the state, applies
+/// [`REBUILD_HEIGHTS`] blocks the way a node does (root per block, then the
+/// undo pre-images of that block against the state before it), then walks
+/// back down from the tip as `restore_reorg_window` does: pre-images applied
+/// to the state above (`with_pre_images`), then `rooted`. Every rebuilt root
+/// must equal the root the forward pass committed at that height.
+///
+/// Returns the median ms per rebuilt height of (pre-images + `rooted`).
+fn rebuild_cost(mpt: bool, accounts: u32, contracts: u32, slots: u32) -> f64 {
+    citrate_execution::mpt_state_root::set_mpt_state_root_height(mpt.then_some(0));
+    let db = StateDB::new();
+    build(&db, accounts, contracts, slots);
+    let _ = db.calculate_state_root();
+    db.accounts.clear_dirty();
+    let _ = db.take_dirty_storage();
+    // Forward: height h's committed root and undo record (pre-images in the
+    // state of h-1). Heights start at 2 (`block` sets n + 2).
+    let mut roots = Vec::new();
+    let mut undo = Vec::new();
+    let mut prev = db.snapshot();
+    roots.push(db.calculate_state_root());
+    for n in 0..REBUILD_HEIGHTS {
+        block(&db, n, accounts, contracts, slots);
+        let root = db.calculate_state_root();
+        db.accounts.clear_dirty();
+        let _ = db.take_dirty_storage();
+        let cur = db.snapshot();
+        undo.push(cur.pre_images_since(&prev));
+        roots.push(root);
+        prev = cur;
+    }
+    // The tip as a restarted node holds it, root-checked first (as the node does).
+    let (tip_root, mut above) = rooted(prev, u64::from(REBUILD_HEIGHTS) + 1);
+    assert_eq!(tip_root, roots[REBUILD_HEIGHTS as usize], "tip root");
+    let mut per_height = Vec::new();
+    for i in (0..REBUILD_HEIGHTS as usize).rev() {
+        // Undo record i reverts height i + 2 to height i + 1.
+        let below = i as u64 + 1;
+        let (acc, sto) = &undo[i];
+        let t = Instant::now();
+        let reverted = above.with_pre_images(acc, sto, below);
+        let (root, snap) = rooted(reverted, below);
+        per_height.push(t.elapsed().as_secs_f64() * 1e3);
+        assert_eq!(root, roots[i], "rebuilt root at {below} (mpt={mpt})");
+        above = snap;
+    }
+    median(per_height)
+}
+
+/// The S1-2 workload's hot path, before and after CV-14: the per-height cost
+/// of the boot reorg-window rebuild over [`REBUILD_HEIGHTS`] heights at r1006's
+/// live state size (and 10x), legacy root vs the incremental MPT root. Prints
+/// one `REBUILDCOST` line per size. Gate (release): at r1006 size the MPT
+/// rebuild is >= 5x cheaper per height than the legacy rebuild.
+#[test]
+#[ignore = "bench: run in release with --ignored --nocapture"]
+fn reorg_window_rebuild_cost_per_height_legacy_vs_mpt() {
+    let sizes = [(132u32, 12u32, 737u32), (1_320, 12, 7_370)];
+    let mut ratios = Vec::new();
+    for (a, c, s) in sizes {
+        let legacy = rebuild_cost(false, a, c, s);
+        let mpt = rebuild_cost(true, a, c, s);
+        eprintln!(
+            "REBUILDCOST accounts={a} contracts={c} slots={s} heights={REBUILD_HEIGHTS} \
+             touch={TOUCH_ACCOUNTS}a+{TOUCH_SLOTS}s legacy_ms_per_height={legacy:.3} \
+             mpt_ms_per_height={mpt:.3} speedup={:.1}x",
+            legacy / mpt
+        );
+        ratios.push(legacy / mpt);
+    }
+    if cfg!(debug_assertions) {
+        eprintln!("debug build: gates not applied");
+        return;
+    }
+    assert!(
+        ratios[0] >= 5.0,
+        "at r1006 size the MPT rebuild must be >= 5x cheaper per height: {:.1}x",
+        ratios[0]
+    );
+}
