@@ -1,12 +1,12 @@
 {
-  "$schema": "./schema.json",
+  "$schema": "../schema.json",
   "chainId": 40204,
   "chainName": "Citrate Network",
   "rpcUrl": "https://rpc.citrate.ai",
   "explorerUrl": "https://explorer.citrate.ai",
   "deployer": "0x7DAbC319867fCcA7dE8A20809EfBd39BbF17Acdf",
   "deployedAt": "2026-10-06T05:43:04Z",
-  "regenerator": "contracts/addresses/40204.provenance.json (on-chain deployer-tx ledger; see README § Fresh-keys reroll)",
+  "regenerator": "contracts/addresses/r1005/40204.provenance.json (on-chain deployer-tx ledger; see contracts/addresses/README.md § r1005 archive)",
   "comment": "Canonical contract-address table for chain 40204 — the single source of truth the federation reads from. Regenerated for the 2026-10-05 r1005 fresh-keys reroll (genesis block 0x1dcfc4909dd9fdcb…, G = citrate-chain bf551422) from the ON-CHAIN ledger of every deployer transaction, not from broadcast files. Every entry has code; no address appears under two names. GOVERNANCE/GUARDIAN are 2-of-3 MultisigTimelock2of3. See contracts/addresses/README.md.",
   "contracts": {
     "ValidatorRegistry": "0xde4F679632be7810D915F637Cc6a72bf076A3BD9",

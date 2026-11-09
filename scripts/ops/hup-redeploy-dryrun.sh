@@ -13,6 +13,12 @@
 # deployer; ceremony-owned registries must already have code) against today's chain
 # state. After the reroll, point HUP_FORK_RPC at the new chain to rehearse on it.
 #
+# r1005-era rehearsal: it reads the r1005 archive (contracts/addresses/r1005/40204.json and its
+# provenance ledger; the admin default is r1005's CitAgentTimelock, which r1006 does not have).
+# On r1006 the HUP registries are genesis contracts and the live book is generated
+# (scripts/addresses/emit_root_book.py), so fork mode against today's rpc.citrate.ai needs
+# HUP_REGISTRY_ADMIN, DEPLOYER_ADDRESS and HUP_MEMBER_SBT set explicitly.
+#
 # Env (all optional):
 #   HUP_FORK_RPC         read-only RPC to fork (default https://rpc.citrate.ai)
 #   HUP_REGISTRY_ADMIN   admin multisig (fork default: the book's CitAgentTimelock)
@@ -26,7 +32,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
-BOOK="$CONTRACTS/addresses/40204.json"
+BOOK="$CONTRACTS/addresses/r1005/40204.json"
 MODE=fork
 [[ "${1:-}" == "--fresh" ]] && MODE=fresh
 [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { sed -n '2,24p' "$0"; exit 0; }
@@ -72,7 +78,7 @@ unlock() {
 }
 
 export FOUNDRY_BROADCAST="$TMP/broadcast"   # never write the operator's broadcast dir
-export HUP_BOOK_PATH="addresses/40204.json"
+export HUP_BOOK_PATH="addresses/r1005/40204.json"
 if [[ "$MODE" == fork ]]; then
   export DEPLOYER_ADDRESS="${DEPLOYER_ADDRESS:-$(book_get deployer)}"
   export HUP_REGISTRY_ADMIN="${HUP_REGISTRY_ADMIN:-$(book_get CitAgentTimelock)}"
@@ -162,7 +168,7 @@ if [[ "$CHAIN" == 40204 ]]; then
     --broadcast "$TMP/broadcast/DeployHupRegistries.s.sol/40204/run-latest.json" \
     --book "$TMP/40204.json" --admin "$ADMIN" --rpc "$RPC" --genesis "$GEN"
   echo "dryrun: provenance ledger (temp copy) from the same broadcast"
-  cp "$CONTRACTS/addresses/40204.provenance.json" "$TMP/40204.provenance.json"
+  cp "$CONTRACTS/addresses/r1005/40204.provenance.json" "$TMP/40204.provenance.json"
   python3 "$ROOT/scripts/ops/hup-provenance-update.py" \
     --broadcast "$TMP/broadcast/DeployHupRegistries.s.sol/40204/run-latest.json" \
     --book "$TMP/40204.json" --provenance "$TMP/40204.provenance.json" --rpc "$RPC" --genesis "$GEN" \

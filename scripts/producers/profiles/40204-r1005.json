@@ -1,11 +1,11 @@
 {
   "name": "40204-r1005",
   "status": "ready",
-  "description": "Live public testnet (chain 40204, r1005 genesis of 2026-10-06). Values match node/config/testnet-beta.toml, contracts/addresses/40204.json and the fleet's systemd environment.",
+  "description": "Live public testnet (chain 40204, r1005 genesis of 2026-10-06). Values match node/config/testnet-beta.toml, contracts/addresses/r1005/40204.json (the r1005 archive) and the fleet's systemd environment.",
   "sources": {
     "genesis_hash": "eth_getBlockByNumber(0x0).hash on https://rpc.citrate.ai (checked 2026-10-19)",
     "bootstrap_nodes": "node/config/testnet-beta.toml [network].bootstrap_nodes",
-    "validator_registry": "contracts/addresses/40204.json contracts.ValidatorRegistry",
+    "validator_registry": "contracts/addresses/r1005/40204.json contracts.ValidatorRegistry",
     "validator_activation_height": "fleet citrate-node.service drop-in (CITRATE_VALIDATOR_ACTIVATION_HEIGHT), unchanged since the 2026-09-29 reroll",
     "env": "fleet citrate-node.service drop-ins (reroll.conf, dag-prune.conf)",
     "checkpoint": "node/config/testnet-beta.toml [checkpoint]"
