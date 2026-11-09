@@ -59,6 +59,18 @@ abstract contract GuardianV2Base is Test {
     uint128 internal constant B_MAX_PRIO = 1 gwei;
     uint128 internal constant B_MAX_FEE = 2 gwei;
 
+    /// The execution bounds the quorum signs in these tests.
+    function _bounds() internal pure returns (GuardianRecoveryModuleV2.ExecutionBounds memory) {
+        return GuardianRecoveryModuleV2.ExecutionBounds({
+            maxVerificationGasLimit: B_MAX_VGL,
+            minCallGasLimit: B_MIN_CGL,
+            maxCallGasLimit: B_MAX_CGL,
+            maxPreVerificationGas: B_MAX_PVG,
+            maxPriorityFeePerGas: B_MAX_PRIO,
+            maxFeePerGas: B_MAX_FEE
+        });
+    }
+
     /// accountGasLimits / gasFees packing (high 128 | low 128).
     function _pack(uint256 hi, uint256 lo) internal pure returns (bytes32) {
         return bytes32((hi << 128) | lo);
@@ -103,7 +115,7 @@ abstract contract GuardianV2Base is Test {
         view
         returns (bytes memory)
     {
-        bytes32 d = module.recoveryDigest(account, keccak256(callData), nonce);
+        bytes32 d = module.recoveryDigest(account, keccak256(callData), _bounds(), nonce);
         return _sign(pk, d.toEthSignedMessageHash());
     }
 
@@ -141,7 +153,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
     }
 
     function _initiate(address k, bytes memory cd) internal returns (uint48) {
-        return module.initiateRecovery(k, cd, _quorum(k, cd));
+        return module.initiateRecovery(k, cd, _bounds(), _quorum(k, cd));
     }
 
     function _op(bytes memory cd, bytes memory sig) internal pure returns (PackedUserOperation memory op) {
@@ -235,7 +247,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory sigs = _quorum(kernel, cd);
         vm.prank(address(0xB0B)); // anyone may relay the guardians' signatures
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
         (, uint48 ea,) = module.pendingRecovery(kernel);
         assertGt(ea, 0);
     }
@@ -244,7 +256,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory sigs = _quorum(kernel, cd);
         vm.expectRevert(abi.encodeWithSignature("NotInitialized(address)", kernel));
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_rejectsBelowThreshold() public {
@@ -252,7 +264,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory one = _initSig(PK_A, kernel, cd, 0);
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, one);
+        module.initiateRecovery(kernel, cd, _bounds(), one);
     }
 
     function test_initiate_rejectsDuplicateGuardianSig() public {
@@ -260,7 +272,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory a = _initSig(PK_A, kernel, cd, 0);
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, bytes.concat(a, a));
+        module.initiateRecovery(kernel, cd, _bounds(), bytes.concat(a, a));
     }
 
     function test_initiate_rejectsNonGuardian() public {
@@ -268,16 +280,16 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory sigs = bytes.concat(_initSig(PK_A, kernel, cd, 0), _initSig(PK_OTHER, kernel, cd, 0));
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_rejectsRawDigestEoaSignature() public {
         // FWA-C3-06 parity: an EOA signature over the un-prefixed digest is not accepted.
         _install(kernel);
         bytes memory cd = _rotateCallData(kernel, "k1");
-        bytes32 d = module.recoveryDigest(kernel, keccak256(cd), 0);
+        bytes32 d = module.recoveryDigest(kernel, keccak256(cd), _bounds(), 0);
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, bytes.concat(_sign(PK_A, d), _sign(PK_B, d)));
+        module.initiateRecovery(kernel, cd, _bounds(), bytes.concat(_sign(PK_A, d), _sign(PK_B, d)));
     }
 
     function test_initiate_rejectsSignaturesForAnotherAccount() public {
@@ -288,7 +300,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         // Guardians signed for `other` (same callData bytes); replay onto `kernel` must fail.
         bytes memory sigs = bytes.concat(_initSig(PK_A, other, cd, 0), _initSig(PK_B, other, cd, 0));
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_rejectsWrongChain() public {
@@ -297,7 +309,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory sigs = _quorum(kernel, cd);
         vm.chainId(1);
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_rejectsSignaturesForDifferentCallData() public {
@@ -306,7 +318,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory submitted = _rotateCallData(kernel, "attacker-key");
         bytes memory sigs = _quorum(kernel, signedFor);
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, submitted, sigs);
+        module.initiateRecovery(kernel, submitted, _bounds(), sigs);
     }
 
     function test_initiate_rejectsNonAllowlistedCallData_transfer() public {
@@ -316,7 +328,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         );
         bytes memory sigs = _quorum(kernel, cd);
         vm.expectRevert(GuardianRecoveryModuleV2.RecoveryActionNotAllowed.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_rejectsNonAllowlistedCallData_delegatecall() public {
@@ -329,7 +341,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         );
         bytes memory sigs = _quorum(kernel, cd);
         vm.expectRevert(GuardianRecoveryModuleV2.RecoveryActionNotAllowed.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_rejectsNonAllowlistedCallData_otherTarget() public {
@@ -337,7 +349,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory cd = _rotateCallData(address(0xD15EA5E), "k1"); // rotation of someone else
         bytes memory sigs = _quorum(kernel, cd);
         vm.expectRevert(GuardianRecoveryModuleV2.RecoveryActionNotAllowed.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_rejectsMalformedOffset() public {
@@ -348,41 +360,41 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         }
         bytes memory sigs = _quorum(kernel, cd);
         vm.expectRevert(GuardianRecoveryModuleV2.RecoveryActionNotAllowed.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_replayAfterCancel_fails() public {
         _install(kernel);
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory sigs = _quorum(kernel, cd);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
         vm.prank(kernel);
         module.cancelRecovery();
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_replayAfterExecute_fails() public {
         _install(kernel);
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory sigs = _quorum(kernel, cd);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
         assertEq(_validate(kernel, cd) & 1, 0);
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_replayAfterReinstall_fails() public {
         _install(kernel);
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory sigs = _quorum(kernel, cd);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
         vm.prank(kernel);
         module.onUninstall("");
         _install(kernel);
         assertEq(module.recoveryNonce(kernel), 1, "nonce survives uninstall");
         vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_initiate_supersedesPendingAndRestartsClock() public {
@@ -412,10 +424,10 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         vm.prank(kernel);
         module.onInstall(_installBytes(2, g));
         bytes memory cd = _rotateCallData(kernel, "k1");
-        bytes32 d = module.recoveryDigest(kernel, keccak256(cd), 0);
+        bytes32 d = module.recoveryDigest(kernel, keccak256(cd), _bounds(), 0);
         // contract guardian signs the RAW digest (its owner key), EOA signs the EIP-191 form
         bytes memory sigs = bytes.concat(_initSig(PK_A, kernel, cd, 0), _sign(PK_OTHER, d));
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
         (, uint48 ea,) = module.pendingRecovery(kernel);
         assertEq(ea, uint48(block.timestamp) + DELAY);
     }
@@ -457,7 +469,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         bytes memory cd = _rotateCallData(kernel, "k1");
         bytes memory sigs = _quorum(kernel, cd);
         vm.expectRevert(abi.encodeWithSelector(GuardianRecoveryModuleV2.V1StillInstalled.selector, kernel));
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 
     function test_validate_failsWhileV1InstalledAfterV2() public {
@@ -643,6 +655,60 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         assertEq(_validateWith(cd, B_MAX_VGL, B_MAX_CGL, B_MAX_PVG, B_MAX_PRIO, B_MAX_FEE), uint256(ea) << 208);
     }
 
+    function test_initiate_rejectsInvalidExecutionBounds() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "bad-bounds");
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.minCallGasLimit = 0;
+        bytes memory sigs = bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b));
+        vm.expectRevert(GuardianRecoveryModuleV2.InvalidExecutionBounds.selector);
+        module.initiateRecovery(kernel, cd, b, sigs);
+        b = _bounds();
+        b.minCallGasLimit = b.maxCallGasLimit + 1;
+        sigs = bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b));
+        vm.expectRevert(GuardianRecoveryModuleV2.InvalidExecutionBounds.selector);
+        module.initiateRecovery(kernel, cd, b, sigs);
+    }
+
+    /// The bounds are part of what the quorum signs: submitting looser bounds than were signed fails.
+    function test_initiate_rejectsBoundsTheQuorumDidNotSign() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "signed-bounds");
+        bytes memory sigs = _quorum(kernel, cd);
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.maxFeePerGas = b.maxFeePerGas * 1000;
+        vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
+        module.initiateRecovery(kernel, cd, b, sigs);
+        b = _bounds();
+        b.minCallGasLimit = 1;
+        vm.expectRevert(GuardianRecoveryModuleV2.InvalidGuardianSignatures.selector);
+        module.initiateRecovery(kernel, cd, b, sigs);
+    }
+
+    function test_initiate_storesBoundsAndSupersedeReplacesThem() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "store-bounds");
+        _initiate(kernel, cd);
+        assertEq(keccak256(abi.encode(module.pendingBounds(kernel))), keccak256(abi.encode(_bounds())));
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.maxFeePerGas = 5 gwei;
+        b.minCallGasLimit = 300_000;
+        module.initiateRecovery(kernel, cd, b, bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b)));
+        assertEq(keccak256(abi.encode(module.pendingBounds(kernel))), keccak256(abi.encode(b)));
+        vm.prank(kernel);
+        module.cancelRecovery();
+        assertEq(module.pendingBounds(kernel).minCallGasLimit, 0);
+    }
+
+    function _sigOver(uint256 pk, bytes memory cd, GuardianRecoveryModuleV2.ExecutionBounds memory b)
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes32 d = module.recoveryDigest(kernel, keccak256(cd), b, module.recoveryNonce(kernel));
+        return _sign(pk, MessageHashUtils.toEthSignedMessageHash(d));
+    }
+
     /// A single guardian signs the execution op, so its gas fields must stay inside the bounds the
     /// quorum approved: validation passes iff every field is within them.
     function testFuzz_validate_enforcesTheApprovedExecutionBounds(
@@ -737,7 +803,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         // Anything that is not a self-rotation either fails the allowlist or the signature check.
         bytes memory sigs = _quorum(kernel, _rotateCallData(kernel, "k1"));
         vm.expectRevert();
-        module.initiateRecovery(kernel, cd, sigs);
+        module.initiateRecovery(kernel, cd, _bounds(), sigs);
     }
 }
 
@@ -877,7 +943,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
 
     function test_recovery_executes_only_after_72h() public {
         bytes memory cd = _rotationCallData();
-        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        uint48 ea = module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
         assertEq(ea, uint48(block.timestamp) + DELAY);
 
         // Immediately, and one second before the delay ends: the EntryPoint refuses the op.
@@ -896,7 +962,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
 
     function test_owner_cancels() public {
         bytes memory cd = _rotationCallData();
-        module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
 
         // The owner (current root signer) cancels through an ordinary UserOp.
         bytes memory cancel = abi.encodeWithSignature(
@@ -919,7 +985,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
 
     function test_recovery_rejectsInflatedGasNotSignedByAGuardian() public {
         bytes memory cd = _rotationCallData();
-        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        uint48 ea = module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
         vm.warp(ea);
         AaPackedUserOperation memory op = _recoveryOp();
         // A third party bumps the fee after the guardian signed: the signature no longer matches.
@@ -941,7 +1007,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
     /// approved: the op fails validation, the deposit is untouched and the recovery still executes.
     function test_recovery_refusesFeesAboveTheApprovedBounds() public {
         bytes memory cd = _rotationCallData();
-        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        uint48 ea = module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
         vm.warp(ea);
         uint256 depBefore = entryPoint.balanceOf(wallet);
         AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
@@ -962,7 +1028,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
     /// One guardian cannot burn the pending recovery with a callGasLimit too small for the rotation.
     function test_recovery_refusesCallGasBelowTheApprovedMinimum() public {
         bytes memory cd = _rotationCallData();
-        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        uint48 ea = module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
         vm.warp(ea);
         AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
         op.accountGasLimits = bytes32(abi.encodePacked(uint128(1_000_000), uint128(30_000)));
@@ -978,7 +1044,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
     /// The approved minimum callGasLimit is enough for the rotation itself.
     function test_recovery_executesAtTheApprovedMinimumCallGas() public {
         bytes memory cd = _rotationCallData();
-        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        uint48 ea = module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
         vm.warp(ea);
         AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
         op.accountGasLimits = bytes32(abi.encodePacked(uint128(1_000_000), uint128(B_MIN_CGL)));
@@ -990,7 +1056,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
     function testFuzz_delayBoundary(uint32 dt) public {
         bytes memory cd = _rotationCallData();
         uint48 start = uint48(block.timestamp);
-        module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
         vm.warp(uint256(start) + dt);
         if (dt < DELAY) {
             _expectNotDue(_recoveryOp());
@@ -1033,7 +1099,7 @@ contract GuardianV2Handler is GuardianV2Base {
         bytes memory cd = _rotateCallData(ACCOUNT, bytes32(++salt));
         bytes memory sigs = _quorum(ACCOUNT, cd);
         _kill();
-        module.initiateRecovery(ACCOUNT, cd, sigs);
+        module.initiateRecovery(ACCOUNT, cd, _bounds(), sigs);
         pendingStart = uint48(block.timestamp);
         lastSigs = sigs;
         lastCd = cd;
@@ -1041,7 +1107,7 @@ contract GuardianV2Handler is GuardianV2Base {
 
     function replay() external {
         if (lastSigs.length == 0 || !module.isInitialized(ACCOUNT)) return;
-        try module.initiateRecovery(ACCOUNT, lastCd, lastSigs) {
+        try module.initiateRecovery(ACCOUNT, lastCd, _bounds(), lastSigs) {
             replayedInitiations++;
         } catch {}
     }

@@ -22,18 +22,29 @@ import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///         recovery into two phases:
 ///
 ///         1. **Initiate.** M-of-N guardians sign a domain-separated digest over
-///            (chain id, this module, the account, keccak256 of the exact rotation callData, the
-///            account's recovery nonce). Anyone submits the signatures with `initiateRecovery`.
+///            (chain id, this module, the account, keccak256 of the exact rotation callData,
+///            keccak256 of the execution bounds, the account's recovery nonce). Anyone submits the
+///            signatures with `initiateRecovery`. The execution bounds (`ExecutionBounds`) cap the
+///            execution op's verification gas, call gas, preVerificationGas, priority fee and max
+///            fee, and set a minimum call gas, so the one guardian who later signs the execution op
+///            can neither spend more of the account's deposit than the quorum approved nor starve
+///            the rotation of gas to burn the pending recovery.
 ///            The module checks the callData against the same allowlist as V1 (CHAIN-B-C032:
 ///            a single, zero-value self-`execute` whose inner call is `changeRootValidator`),
 ///            records the pending recovery with `executeAfter = now + 72 h` and bumps the nonce,
 ///            so each signature set is single-use.
 ///         2. **Execute.** After the delay, a UserOp routed to this validator whose callData
-///            hashes to the pending hash, carrying one guardian signature over
+///            hashes to the pending hash, whose gas fields are inside the approved bounds (checked
+///            from calldata only), carrying one guardian signature over
 ///            `keccak256(userOpHash ‖ account)` (the V1 digest, binding the gas fields), validates.
+///            An op outside the bounds fails validation and leaves the pending recovery in place.
 ///            The module returns ERC-4337 validation data with `validAfter = executeAfter`; the
 ///            EntryPoint refuses the op before then ("AA22 expired or not due"), so validation
-///            never reads the block timestamp (ERC-7562). The pending entry is consumed.
+///            never reads the block timestamp (ERC-7562). The pending entry is consumed in
+///            validation (the allowlisted callData cannot call back into this module); the approved
+///            minimum call gas, which the EntryPoint guarantees to the call (AA95), is what keeps a
+///            starved execution from consuming it. Core/SDKs set `minCallGasLimit` from a gas
+///            estimate of the exact rotation callData, with margin.
 ///
 ///         The account itself cancels (`cancelRecovery`, a normal UserOp signed by the current
 ///         root validator) at any time before execution; uninstalling the module also clears it.
@@ -42,7 +53,20 @@ import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///         V2 never runs beside V1 (owner Q19, 2026-11-09): `onInstall` refuses an account that
 ///         still has V1 initialized, and if V1 is installed after V2, `initiateRecovery` reverts
 ///         and validation fails until V1 is uninstalled. The execution-op signer is an EOA
-///         guardian (Q20); contract guardians may still sign the initiation.
+///         guardian (Q20); contract guardians may still sign the initiation, and `onInstall`
+///         refuses a guardian set with no EOA (an address with no code, or an EIP-7702 delegated
+///         EOA). An address with no code may still be an undeployed contract; the module cannot tell.
+///
+///         Threshold: 1-of-N is allowed, matching the identity service's nomination rule
+///         (threshold in [1, N]). With 1-of-N any one guardian can initiate and restart the clock;
+///         the 72 h delay and owner cancel are the protection. Wallets should default to M >= 2.
+///
+///         Uninstall leftovers: Kernel calls a module's `onUninstall` through ExcessivelySafeCall
+///         and removes the module even if that call fails (for example out of gas). If V1's
+///         `onUninstall` failed, V1 still reports the account initialized and V2 refuses to install
+///         (Q19). The account clears it itself by calling `V1.onUninstall("")` from an ordinary
+///         `execute`; the same self-clear works for V2's `onUninstall`, which also drops any
+///         pending recovery.
 ///
 ///         The module has **no owner, admin or governance role**. Its one constructor parameter
 ///         is the genesis V1 address (immutable). It is a per-account plug-in, and the delay is a
@@ -64,7 +88,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
 
     /// @notice Domain tag of the guardian initiation digest.
     bytes32 public constant RECOVERY_TYPEHASH = keccak256(
-        "CitrateGuardianRecoveryV2(uint256 chainId,address module,address account,bytes32 callDataHash,uint64 nonce)"
+        "CitrateGuardianRecoveryV2(uint256 chainId,address module,address account,bytes32 callDataHash,bytes32 boundsHash,uint64 nonce)"
     );
 
     bytes4 internal constant EIP1271_MAGIC = 0x1626ba7e;
@@ -91,6 +115,9 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
     error NoPendingRecovery();
     error V1HasNoCode();
     error V1StillInstalled(address smartAccount);
+    error InvalidExecutionBounds();
+    error NoEoaGuardian();
+    error ValueNotAccepted();
 
     // ── events ──────────────────────────────────────────────────────
 
@@ -113,10 +140,22 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         address[7] guardians;
     }
 
+    /// @notice Gas and fee bounds of the execution op, approved by the initiating quorum. All
+    ///         bounds are inclusive. `minCallGasLimit` is non-zero and at most `maxCallGasLimit`.
+    struct ExecutionBounds {
+        uint64 maxVerificationGasLimit;
+        uint64 minCallGasLimit;
+        uint64 maxCallGasLimit;
+        uint64 maxPreVerificationGas;
+        uint128 maxPriorityFeePerGas;
+        uint128 maxFeePerGas;
+    }
+
     struct PendingRecovery {
         bytes32 callDataHash;
         uint48 executeAfter; // 0 = none pending
         uint64 nonce; // the nonce the guardians signed
+        ExecutionBounds bounds;
     }
 
     /// @notice The genesis V1 module. V2 refuses to work for an account while V1 is initialized
@@ -139,6 +178,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
 
     /// `_data` layout (same as V1): uint8 threshold | uint8 count | address[count] guardians.
     function onInstall(bytes calldata _data) external payable override {
+        if (msg.value != 0) revert ValueNotAccepted();
         if (_isInitialized(msg.sender)) revert AlreadyInstalled(msg.sender);
         if (v1.isInitialized(msg.sender)) revert V1StillInstalled(msg.sender);
         if (_data.length < 2) revert InvalidInstallData();
@@ -155,6 +195,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         cfg.count = count;
 
         address[] memory emitted = new address[](count);
+        bool anyEoa = false;
         for (uint256 i = 0; i < count; i++) {
             uint256 offset = 2 + i * 20;
             address g = address(bytes20(_data[offset:offset + 20]));
@@ -164,13 +205,17 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
             }
             cfg.guardians[i] = g;
             emitted[i] = g;
+            if (!anyEoa && _isEoaLike(g)) anyEoa = true;
         }
+        // Q20: only an EOA guardian can sign the execution op.
+        if (!anyEoa) revert NoEoaGuardian();
 
         emit GuardiansRegistered(msg.sender, threshold, emitted);
     }
 
     /// @notice Clears the guardian set and any pending recovery. The recovery nonce is kept.
     function onUninstall(bytes calldata) external payable override {
+        if (msg.value != 0) revert ValueNotAccepted();
         if (!_isInitialized(msg.sender)) revert NotInitialized(msg.sender);
         PendingRecovery memory p = _pending[msg.sender];
         if (p.executeAfter != 0) {
@@ -215,31 +260,56 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         return (p.callDataHash, p.executeAfter, p.nonce);
     }
 
+    /// @notice The execution bounds of `account`'s pending recovery (all zero when none).
+    function pendingBounds(address account) external view returns (ExecutionBounds memory) {
+        return _pending[account].bounds;
+    }
+
     /// @notice The digest guardians sign to initiate recovery. EOA guardians sign its EIP-191
     ///         form (`toEthSignedMessageHash`); contract guardians are asked via EIP-1271 for the
-    ///         digest itself (the V1 convention).
-    function recoveryDigest(address account, bytes32 callDataHash, uint64 nonce) public view returns (bytes32) {
-        return keccak256(abi.encode(RECOVERY_TYPEHASH, block.chainid, address(this), account, callDataHash, nonce));
+    ///         digest itself (the V1 convention). `boundsHash` is `keccak256(abi.encode(bounds))`.
+    function recoveryDigest(address account, bytes32 callDataHash, ExecutionBounds memory bounds, uint64 nonce)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encode(
+                RECOVERY_TYPEHASH,
+                block.chainid,
+                address(this),
+                account,
+                callDataHash,
+                keccak256(abi.encode(bounds)),
+                nonce
+            )
+        );
     }
 
     // ── phase 1: initiate ───────────────────────────────────────────
 
     /// @notice Record a guardian-approved rotation for `account`, executable after 72 h.
     /// @param callData   The exact UserOp callData that will execute the rotation.
+    /// @param bounds     Gas and fee bounds the execution op must stay within.
     /// @param signatures `threshold` concatenated 65-byte signatures over `recoveryDigest`, each
     ///                   from a distinct guardian.
-    function initiateRecovery(address account, bytes calldata callData, bytes calldata signatures)
-        external
-        returns (uint48 executeAfter)
-    {
+    function initiateRecovery(
+        address account,
+        bytes calldata callData,
+        ExecutionBounds calldata bounds,
+        bytes calldata signatures
+    ) external returns (uint48 executeAfter) {
         RecoveryConfig storage cfg = _config[account];
         if (cfg.count == 0) revert NotInitialized(account);
         if (v1.isInitialized(account)) revert V1StillInstalled(account);
         if (!_isAllowedRecoveryAction(callData, account)) revert RecoveryActionNotAllowed();
+        if (bounds.minCallGasLimit == 0 || bounds.minCallGasLimit > bounds.maxCallGasLimit) {
+            revert InvalidExecutionBounds();
+        }
 
         uint64 nonce = recoveryNonce[account];
         bytes32 callDataHash = keccak256(callData);
-        bytes32 digest = recoveryDigest(account, callDataHash, nonce);
+        bytes32 digest = recoveryDigest(account, callDataHash, bounds, nonce);
         if (!_quorumSigned(cfg, digest, signatures)) revert InvalidGuardianSignatures();
 
         recoveryNonce[account] = nonce + 1;
@@ -248,7 +318,8 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         if (old.executeAfter != 0) emit RecoverySuperseded(account, old.nonce, old.callDataHash);
 
         executeAfter = uint48(block.timestamp) + RECOVERY_DELAY;
-        _pending[account] = PendingRecovery({callDataHash: callDataHash, executeAfter: executeAfter, nonce: nonce});
+        _pending[account] =
+            PendingRecovery({callDataHash: callDataHash, executeAfter: executeAfter, nonce: nonce, bounds: bounds});
         emit RecoveryInitiated(account, nonce, callDataHash, executeAfter, callData);
     }
 
@@ -286,6 +357,8 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         if (keccak256(userOp.callData) != p.callDataHash) return SIG_VALIDATION_FAILED_UINT;
         // Defence in depth: the hash was allowlisted at initiation; re-check the bytes.
         if (!_isAllowedRecoveryAction(userOp.callData, msg.sender)) return SIG_VALIDATION_FAILED_UINT;
+        // The quorum-approved gas and fee bounds (calldata reads only).
+        if (!_withinBounds(userOp, p.bounds)) return SIG_VALIDATION_FAILED_UINT;
 
         if (userOp.signature.length != 65) return SIG_VALIDATION_FAILED_UINT;
         bytes32 opDigest = keccak256(abi.encodePacked(userOpHash, msg.sender));
@@ -304,13 +377,39 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
 
     // ── IHook (parity with V1's module types) ───────────────────────
 
+    /// The IHook interface makes these payable; the module holds no value, so it refuses any.
     function preCheck(address, uint256, bytes calldata) external payable override returns (bytes memory) {
+        if (msg.value != 0) revert ValueNotAccepted();
         return hex"";
     }
 
-    function postCheck(bytes calldata) external payable override {}
+    function postCheck(bytes calldata) external payable override {
+        if (msg.value != 0) revert ValueNotAccepted();
+    }
 
     // ── internals ───────────────────────────────────────────────────
+
+    /// True iff every gas and fee field of `op` is inside `b` (inclusive). `accountGasLimits` packs
+    /// verificationGasLimit (high 128) | callGasLimit (low 128); `gasFees` packs
+    /// maxPriorityFeePerGas (high 128) | maxFeePerGas (low 128). Paymaster gas limits are not
+    /// bounded here: a paymaster's own policy decides what it sponsors.
+    function _withinBounds(PackedUserOperation calldata op, ExecutionBounds memory b) internal pure returns (bool) {
+        uint256 limits = uint256(op.accountGasLimits);
+        uint256 fees = uint256(op.gasFees);
+        uint256 callGas = uint128(limits);
+        return (limits >> 128) <= b.maxVerificationGasLimit && callGas >= b.minCallGasLimit
+            && callGas <= b.maxCallGasLimit && op.preVerificationGas <= b.maxPreVerificationGas
+            && (fees >> 128) <= b.maxPriorityFeePerGas && uint128(fees) <= b.maxFeePerGas;
+    }
+
+    /// True for an address with no code or with an EIP-7702 delegation designator
+    /// (0xef0100 ‖ address): both sign with an ECDSA key.
+    function _isEoaLike(address a) internal view returns (bool) {
+        uint256 len = a.code.length;
+        if (len == 0) return true;
+        if (len != 23) return false;
+        return bytes3(a.code) == 0xef0100;
+    }
 
     /// True iff `blob` is exactly `threshold` signatures over `digest`, each from a distinct guardian.
     function _quorumSigned(RecoveryConfig storage cfg, bytes32 digest, bytes calldata blob)
