@@ -11,7 +11,7 @@
 #      offline fixture refuses without --allow-dirty and is recorded with it
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-tmp=$(mktemp -d); trap 'jobs -p | xargs -r kill 2>/dev/null; rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d); trap 'jobs -p | xargs -r kill 2>/dev/null; rm -rf "${tmp:?}"' EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 X=scripts/rehearsal/export-r1.sh

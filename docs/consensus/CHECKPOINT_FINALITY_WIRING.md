@@ -160,6 +160,18 @@ This replaces the earlier "skip boundaries already buried at startup" driver heu
 The record lives in the node's database: wiping the data dir while keeping `proposer.key`
 discards it, exactly like a slashing-protection DB — do not do that on a voting validator.
 
+**Data-directory wipes on a voting validator.** Any resync procedure that says "move the
+chain data aside (keep the keys) and resync" also discards the signed-vote record, and a
+validator that keeps `proposer.key` after such a wipe can later sign a different hash at a
+height it already signed (double-signing). A voting validator must therefore do one of:
+(a) keep the signed-vote record — carry the `dag_metadata` `checkpoint_signed:*` entries
+(`checkpoint_signed:<chain_id>:<H>` and `checkpoint_signed_meta:<chain_id>`) over into the
+new data directory; or (b) rotate its consensus key and re-register it in
+`ValidatorRegistry` after the wipe, so the old record no longer applies to the key it signs
+with. Non-voting nodes are unaffected. The same warning
+(`citrate_storage::VOTING_VALIDATOR_WIPE_NOTE`) is part of the log line printed when a node
+mints a new `proposer.key`.
+
 **Own-vote retry (Stage 1a, PR #321 review).** A failed durable write leaves the checkpoint
 pending without this node's vote. A repeat report of the same `(H, hash)` therefore retries
 the own vote when it is not yet in the pending checkpoint, always through the durable
@@ -168,6 +180,22 @@ boundaries whose own vote failed for a transient reason (store unavailable) and 
 them on later passes — bounded to 60 attempts, 16 boundaries and a 256-block horizon, on a
 separate canonical walk after the pass's new boundaries — until the vote is cast, refused
 permanently, or the checkpoint is finalized.
+
+**Revisit after a safety stop (Stage 1c, PR #323 review L1).** While the §4.5 safety stop is
+engaged the gadget proposes and signs nothing, and the driver's cursor still moves past
+newly buried boundaries. Those boundaries are therefore kept in the same bounded set
+(`OwnVoteRetries`, as `Followup::Halted`: no attempt consumed; at most 32 boundaries within
+the same 256-block horizon). Nothing is due while the stop is engaged; on the first pass
+after it clears, they are reported again on a fresh canonical walk from the current tip, so
+the node proposes and votes them on the chain it is now on. Every revisit goes through the
+normal signing path (signing gate, durable record): a height this key already signed for a
+different hash is refused and not revisited again. An own vote signed just before the stop
+engaged (under the signing gate) and withheld from broadcast is already in the local pending
+checkpoint, so the gadget would not emit it again; the driver therefore keeps that recorded
+vote with the halted boundary (`OwnVoteRetries::hold`, same bounds) and, on the revisit after
+the stop clears, re-broadcasts the SAME vote if its block is still canonical at that height
+(PR #323 review L1a). No new signature is created for it, and the broadcast is still withheld
+while the stop is engaged.
 
 **Early-vote admission before the governing snapshot (Stage 1a, PR #321 review).** When the
 snapshot that governs `H` is not on this node yet, an early vote is checked provisionally
@@ -178,8 +206,10 @@ arrival order, never by key bytes.
 
 ### 4.4 Aggregation & finalization
 Inbound votes are already handled (`main.rs:3328` → `submit_vote`). On reaching quorum,
-`finalize_checkpoint` marks the checkpoint finalized, persists it, and advances
-`latest_finalized_height()`. Votes are validated against the committee membership, the
+`finalize_checkpoint` writes the certificate durably (a synced write,
+`KvStore::kv_put_durable`), then marks the checkpoint finalized and advances
+`latest_finalized_height()`; if the write fails nothing is finalized (§4.5,
+"Certificate durability"). Votes are validated against the committee membership, the
 domain-separated message (binds `chain_id` + `height` + `block_hash`, rejecting cross-chain
 and cross-height replay per TLA+ H-02), and de-duplicated per voter (equivocation → first
 vote wins, second rejected/loggable-as-slashable — D-5).
@@ -199,6 +229,159 @@ needs **new code**:
   **halts finality progress and alarms** (a safety stop, never a silent wrong-branch pin).
 - Only after the hash check passes does the reorg guard reject fork points below the floor.
 
+**Stage 1c implementation (not running: both compiled pins are OFF for 40204).**
+`node/src/finality_floor.rs` (`FloorVerifier`) runs one check at boot, before any block
+admission, drain or recovery, then every 5 s. Each pass:
+1. takes `CheckpointManager::latest_finalized_certificate()` (memory, else the persisted
+   `dag_metadata` `checkpoint:{H}`) and re-verifies it with `Checkpoint::verify_certificate`:
+   status finalized, committee >= 4, votes >= `floor(2n/3)+1`, every voter a committee member,
+   every signature valid for this chain id (`CheckpointError::InvalidCertificate` otherwise);
+2. calls `CanonicalApplicator::verify_certified_floor(H, hash, raise)`, which walks this
+   node's applied chain through the stored headers OUTSIDE the advance lock, then re-confirms
+   UNDER the lock that the applied tip is unchanged (or only extended forward) and, when
+   `raise`, raises the floor before releasing the lock, so a reorg cannot slip in between the
+   check and the raise. Result `Match` / `Mismatch` / `NotYetApplied` / `Unverifiable`; a chain
+   that steps over `H` is a `Mismatch`.
+
+Modes, from two compiled pins in `checkpoint_gadget.rs`: voting OFF → **Legacy** (no poll; a
+certificate persisted by an earlier voting-ON run is logged and ignored, never used to raise
+the floor by its raw height; with voting OFF nothing can finalize, so for a node that never
+ran voting this is byte-identical to the old height poll, which never moved the floor);
+voting ON + `CHECKPOINT_ENFORCEMENT_PINS` OFF → **Observed** (certificates are verified and the
+verified height is exported only as `citrate_finality_verified_height`; the floor is not
+raised and the `finalized`/`safe` RPC tags do not advance — they stay at genesis, see §4.6);
+both ON → **Enforced** (the verified certificate raises the floor and the RPC tags follow the
+verified `(height, hash)` pair, §4.6). On a mismatch or an invalid certificate the floor is not
+raised, the RPC tags do not advance, the gadget is halted (`SkipReason::Halted`: it proposes
+and signs nothing), an `error!` "CHECKPOINT FINALITY SAFETY STOP" with operator guidance is
+logged, and the metrics `citrate_finality_halted`, `citrate_finality_certificate_mismatch_total`,
+`citrate_finality_verified_height` and `citrate_finality_floor_height` are exported. A
+mismatch stop clears only when the certified block becomes canonical on this node through
+normal fork choice; an invalid certificate never clears automatically. "Reorg to the certified
+branch if it can" is deliberately NOT implemented as a forced reorg (no safe path exists for
+it yet): the node halts finality and alarms instead.
+
+**Floor at finalization (Enforced, spec §5 S2).** The 5 s poll alone left a window between
+`finalize_checkpoint` and the next poll in which a reorg could revert a just-finalized block.
+In Enforced mode the floor verifier is installed as the manager's `FinalizationGuard`
+(`FloorVerifier::install_finalization_guard`, `main.rs`), which `finalize_checkpoint` runs
+once quorum is confirmed and the certificate is durably written, and BEFORE the finalization
+is visible (DAG mark, `latest_finalized_height()`), with no manager lock held (finalizations are
+serialized by their own mutex). It runs the poll's check under the same locks
+(`FloorVerifier::on_finalize`): a match raises the floor in the advance-lock critical section
+that confirmed it; a different block at `H` is a mismatch stop; a block that cannot be
+confirmed now (applied tip below `H`, or the check could not complete) is an `Unconfirmed`
+stop, which clears like a mismatch once the block is confirmed canonical and becomes a
+mismatch if another block is found at `H`. So when finalization becomes visible, either the
+floor covers the certified block or the gadget is halted (proposes and signs nothing). The
+certificate is also registered with the applicator (`register_certified`): every reorg first
+raises the floor to the highest registered certificate whose block is canonical, under the
+advance lock (`effective_floor`), so a certified block that becomes canonical after its check
+is protected at once. The registered set has no count bound: an entry leaves it only when the
+floor reaches its height (the floor protects by height, so a lower certificate then adds
+nothing), and nothing above the floor is dropped. (An earlier revision kept only the highest
+64; review of #335 @ 5236d2b showed that could drop the one certificate whose block is
+canonical here.) It holds only verified quorum certificates above the floor and grows only
+while the node is off the certified chain. The poll stays as a backstop. Legacy and Observed
+install no guard (unchanged).
+
+**The guarded certificate is the one finalized.** Once the guard has run, `finalize_checkpoint`
+finalizes the certificate the guard ran on. The entry still pending at that height replaces it
+only when it extends that certificate (same block, same committee, every guarded vote with
+the same signature: `extends_certificate`). A matching block hash alone is not enough: while
+the guard awaits, the pending checkpoint can be pruned or evicted and re-proposed for the same
+hash with no votes, and finalizing that replacement would fail its quorum check after the
+guard had already raised the floor or engaged a stop (review of #335 @ fa6595a1). So every
+finalization after a guard returns `Ok` and records the guarded certificate (debug builds
+assert this on the two remaining error paths). Tests:
+`finalization_guard_certificate_survives_a_same_hash_re_proposal` and
+`finalization_guard_keeps_the_certificate_unless_the_replacement_extends_it` (barrier guard,
+consensus) and `s2_guarded_certificate_survives_a_same_hash_re_proposal_and_a_restart` (real
+verifier guard parked on the advance lock, a concurrent finalization queued, then a restart
+from disk: floor, certificate and RPC pair agree and the rebuild below is refused).
+
+**Publication after persistence (Enforced).** The guard raises the floor but does NOT publish:
+the finalization is not visible yet when it runs (review of #335 @ db243a1). The `finalized`/`safe` RPC pair and the verified-height metric
+advance only in the manager's post-finalization hook (`FinalizationGuard::after_finalize` →
+`FloorVerifier::after_finalize`: no safety stop in force, certificate re-verified, the exact
+`(height, hash)` re-confirmed canonical under the advance lock) or from the poll, and every
+publication path first requires that exact certificate in the persistent store
+(`CheckpointManager::is_certificate_persisted`), so an unpersisted certificate is never
+published, whoever calls the hooks. Tests:
+`s2_rpc_finalized_is_published_only_after_the_certificate_is_persisted` (guard runs, crash
+before persistence, restart: nothing was published and the rebuild below 4 proceeds; once
+persisted the pair is published and after a restart the same rebuild is refused) and
+`s2_cleared_stop_does_not_publish_an_unpersisted_certificate`. The TLA+ model does not model
+RPC publication (finalize and persist are one step there).
+
+**Certificate durability (#362).** The certificate is written with a synced write
+(`KvStore::kv_put_durable`; on RocksDB `write_batch_sync`, i.e. `WriteOptions::sync = true`)
+BEFORE the guard runs, so the floor raised at finalization and the RPC pair published after it
+always have a certificate that survives a process crash AND a host power loss. If the write
+fails, nothing advances: the guard does not run (no floor), nothing is published, the latest
+finalized height, DAG mark and in-memory record are unchanged, the checkpoint stays pending
+with its votes, and `finalize_checkpoint` returns `CheckpointError::StorageError` (surfaced by
+the gadget as `InboundOutcome::FinalizeFailed`; retried by the next vote for that height or by
+the driver tick, see "Certificate write retry" below). This is
+the implementation of the TLA+ `Finalize` action being a single step: a write failure is the
+action not firing. A certificate on disk makes its height final for this node: a same-hash
+re-proposal at that height is refused (`ProposeOutcome::AlreadyFinalized`). If the pending entry
+that finalizes extends the guarded certificate (more votes), it replaces the guarded record
+only if that second synced write succeeds; otherwise the durable guarded certificate is the
+one finalized. Tests: `certificate_write_failure_finalizes_nothing_and_never_runs_the_guard`,
+`certificate_write_failure_without_a_guard_finalizes_nothing`,
+`certificate_is_written_only_through_the_durable_path`,
+`extension_write_failure_keeps_the_durable_guarded_certificate` (consensus, fault-injecting
+store), `s2_certificate_write_failure_raises_no_floor_and_publishes_nothing`,
+`s2_certificate_is_synced_to_disk_before_the_guard_raises_the_floor` (real verifier guard
+over RocksDB), `s2_certificate_survives_a_kill_after_publication` (child process SIGKILLed
+after publication; the reopened store restores the floor) and
+`kv_put_durable_is_a_synced_rocksdb_write`. A SIGKILL does not drop the OS page cache, so the
+kill test proves the ordering across a crash; the power-loss half rests on the synced write,
+pinned by the sync-counter tests. Tripwire: `scripts/ci/finality_certificate_durable_write_tripwire.sh`.
+
+**Certificate write retry (follow-up to #368).** A checkpoint that reached quorum but whose
+certificate write failed must not wait for another vote that may never come (the whole
+committee may already have voted). The finality driver's 1 s tick calls
+`finality_driver::retry_finalizations` → `FinalityGadget::retry_finalizations(now)`, which
+re-attempts `finalize_checkpoint` for every checkpoint pending WITH quorum
+(`CheckpointManager::quorum_pending_heights`) once its backoff has passed: first retry
+`FINALIZE_RETRY_BASE` (1 s) after the failure, doubling per failure, capped at
+`FINALIZE_RETRY_CAP` (30 s), for as long as the checkpoint stays pending with quorum (bounded
+by `MAX_PENDING_CHECKPOINTS`). Every attempt is an ordinary `finalize_checkpoint` (serialized,
+fail-closed), so a failed retry advances nothing, and a checkpoint finalized meanwhile — by a
+late vote or a concurrent tick — is no longer pending and is dropped: one finalization, one
+publication. Pruned / evicted checkpoints are dropped too. Each failed retry logs a warning
+with its failure count and next delay; recovery logs at info. Metrics:
+`citrate_finality_finalize_retries_total`, `citrate_finality_finalize_retry_recovered_total`,
+`citrate_finality_finalize_retry_pending`. The retry state is in memory: after a restart the
+pending checkpoint and its votes are gone too (nothing was finalized, nothing is on disk), and
+the height finalizes through the normal path when its votes are seen again. Tests (consensus):
+`finalize_retry_delay_doubles_to_the_cap`,
+`failed_certificate_write_is_retried_on_the_tick_without_further_votes`,
+`permanent_certificate_failure_backs_off_and_never_finalizes`,
+`retry_and_a_late_vote_never_finalize_twice`, `concurrent_retry_ticks_finalize_once`,
+`pruned_checkpoint_is_no_longer_retried`; (node, real verifier guard over RocksDB)
+`s2_certificate_write_failure_is_retried_on_the_tick_without_further_votes`,
+`s2_permanent_certificate_write_failure_never_raises_the_floor`,
+`s2_retried_certificate_survives_a_kill_after_publication`,
+`s2_kill_during_permanent_certificate_failure_finalizes_nothing` (child processes SIGKILLed).
+
+**Restart (Enforced).** The floor and the registered set are in memory. When the boot check's
+latest certificate does not raise the floor (mismatch, not yet applied, unverifiable),
+`FloorVerifier::restore_certified_floor` walks EVERY stored certificate highest first — the
+persisted `checkpoint:{height}` records (`CheckpointManager::finalized_certificate_heights`),
+not only the 256 held in memory — verifies and registers each, and stops at the highest one
+whose block is on the applied chain (one descending header walk, `AppliedWalk`), raising the
+floor to it under the advance lock before any block admission, drain or recovery. After a
+restart the snapshot ring holds only the tip, so a reorg below it goes through the spine
+rebuild (`recover_to_head`), whose I4 guard then sees the restored floor. Test:
+`s2_restart_restores_the_floor_below_many_uncovered_certificates` (70 uncovered certificates
+above the finalized A10; a rebuild forking below 10 is refused) and
+`boot_restores_the_floor_from_any_number_of_stored_certificates` (300 stored above the
+match). TLA+: `CheckpointFinalitySafety_restart.cfg` (holds) and `_bootlimit.cfg` (a boot
+check consulting only the latest stored certificate reverts an older finalized block).
+
 ### 4.6 RPC surface
 Add `finalized` and `safe` block tags to `eth_rpc.rs`. **There are ~8 block-tag parse sites,
 not 2** (`:329, :832, :1662, :1683, :1886, :1897, :2555, :2616`) — all must learn the new
@@ -209,6 +392,42 @@ resolves to the block at the finalized height; `safe` == `finalized` for a BFT g
 the first finalized checkpoint, resolve to genesis (block 0), never error. Closes
 `verification/claims.json:127`, helps dim 8.
 
+**Which height the tags read (Stage 1c, PR #323 review L2, chain-team ruling).** The tags
+advance only where the floor is enforced. `FloorVerifier::rpc_finalized_handle` returns the
+canonical applicator's floor handle in Legacy and Observed mode — neither raises it, so
+`finalized`/`safe` keep resolving to genesis exactly as today — and the verified height only
+in Enforced mode. In Observed mode a reorg below a verified certificate still proceeds, so
+labelling that block "finalized" over RPC would claim a guarantee the node does not give; the
+verified height is visible there only through the `citrate_finality_verified_height` metric
+(with `citrate_finality_floor_height` and `citrate_finality_halted`). A read-only status RPC
+(mode, verified height, floor, halted) is not added in this stage: the RPC crate has no
+handle to the floor verifier, and the metrics carry the same data.
+
+**Resolve by hash, not height (Stage 1c, PR #323 review R1).** The block store's height index
+is not a canonical index: every stored block writes its height key, so the last block written
+at a height wins — possibly an uncertified sibling of the certified block. In Enforced mode
+the tags therefore read the verifier's verified `(height, hash)` pairs
+(`citrate_api::finalized_tag::FinalizedTagSource::Verified`, recorded only on a verified,
+matching certificate) and every block-lookup site (`eth_getBlockByNumber`,
+`eth_getBlockTransactionCountByNumber`, `eth_getTransactionByBlockNumberAndIndex`, and the
+newest block of `eth_feeHistory`) fetches the certified block BY HASH. If that block is not
+stored locally, the previous verified pair is served, else genesis — never a sibling. Range
+reads (`eth_getLogs`; `eth_newFilter` read through `eth_getFilterLogs` /
+`eth_getFilterChanges`; the `eth_feeHistory` window) take the resolved pair's height as their
+bound, and when a bound is `finalized`/`safe` every height at or below the certified height is
+read from the certified chain: the selected-parent
+chain followed back from the certified hash (the same chain `verify_certified_floor` checks
+against), via `citrate_api::finalized_tag::range_block_hashes`. A height that chain steps over
+has no block (no logs; empty-slot fee defaults); heights above the certified height, and
+`latest`/numeric ranges, still use the height index. The walk is bounded: a range starting
+more than `FINALIZED_RANGE_MAX_WALK` (10,000) blocks below the certified height is refused with
+`-32602`. A log filter keeps the anchor it resolved at creation. The
+state-read guard (`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`,
+`eth_getStorageAt`, `eth_call`, `eth_estimateGas`) additionally requires, for a verified pair,
+that the applied tip (`BlockStore::get_applied_tip`) IS the certified hash before serving
+latest state under `finalized`/`safe`. Legacy and Observed keep the height-only source, which
+stays at genesis.
+
 ### 4.7 Config & remnants
 - Plumb `CheckpointNodeConfig` (`config.rs:65`) → `CheckpointConfig` (today `main.rs:1767`
   ignores it and uses `default()`). Add `interval`/`committee_size` from node config; derive
@@ -216,6 +435,10 @@ the first finalized checkpoint, resolve to genesis (block 0), never error. Close
 - Point checkpoint persistence at the dedicated `CF_CHECKPOINTS` column
   (`column_families.rs:27`, currently dead) or delete it and keep the `dag_metadata`
   `checkpoint:*` scheme — pick one, remove the dead one (D-6).
+  **Stage 1c:** certificates stay in `dag_metadata` `checkpoint:*`. `CF_CHECKPOINTS` stays
+  listed but unused: RocksDB refuses to open a database holding a column family the open call
+  does not list, and every existing node database has it, so removing it needs a `drop_cf`
+  migration first (not done here).
 
 ---
 
@@ -255,7 +478,9 @@ the first finalized checkpoint, resolve to genesis (block 0), never error. Close
   the binary (auditable, not a runtime toggle). Ship the producer/vote/RPC/enforcement code;
   the compiled pin decides when enforcement goes live.
 - **Sequenced rollout (safety):** (1) merge with enforcement pinned OFF — producers still
-  propose/sign/broadcast and RPC serves `finalized`, but the floor is observed, not enforced;
+  propose/sign/broadcast and certificates are verified and exported as metrics, but the
+  floor is observed, not enforced, and the `finalized`/`safe` RPC tags stay at genesis
+  (§4.6: they advance only once enforcement is ON);
   (2) stand up the validator committee (§7); (3) observe healthy finalization on the fleet;
   (4) flip the compiled pin ON in a release once finalization is proven and late-joiners can
   fetch certificates (§ verifier-revisions #10). Existing state, addresses, balances
@@ -263,6 +488,10 @@ the first finalized checkpoint, resolve to genesis (block 0), never error. Close
 - The **reorg guard itself is already live and ungated** (`canonical_apply.rs:657`); what the
   pin gates is *raising the floor above 0*, i.e. whether finalized certificates actually
   constrain fork-choice.
+- Two separate compiled pins (`core/consensus/src/checkpoint_gadget.rs`), both OFF for 40204:
+  `CHECKPOINT_VOTING_PINS` (step 1: the producer path) and `CHECKPOINT_ENFORCEMENT_PINS`
+  (step 4: a verified certificate raises the floor, §4.5). Enforcement without voting has no
+  effect.
 
 A straggler on old code is weaker (won't honor finality) but not forked off — it still
 accepts the same blocks. Coordinate the enable-release per `feedback_deploy_from_main_only`.
@@ -322,6 +551,63 @@ message).
 
 ---
 
+### 8.5 Stage 2 implementation (tests only; finality still not running — both pins OFF)
+- **Adversarial + integration suite:** `node/src/finality_adversarial_tests.rs` (test-only module of
+  the node binary, because the driver and floor verifier live there). Each scenario runs 3–5
+  in-process nodes, each with its own RocksDB store, `CanonicalApplicator`,
+  `CheckpointManager` + `FinalityGadget` (switch forced ON in the test), the driver pass
+  (`finality_driver::run_pass` + `gate_outbound`) and the floor verifier in Enforced mode,
+  connected by an in-process gossip queue. Covers §8.2 (happy path, floor raise, RPC tag,
+  reorg-below-floor rejected), A1–A8 as listed in §8.3, the §4.5 safety stop and its recovery
+  through fork choice, and a restart mid-epoch (identical re-signed votes, floor re-raised at
+  boot). A1's literal "flagged slashable" part is not tested: D-5 is still "reject only".
+- **Ignored, with reasons:** three scenarios need late-joiner certificate sync (§11.10, C3-S1b):
+  a node that sat on a losing sibling, a node that restarted after the votes were gossiped, and
+  binding a certificate's committee to the governing epoch snapshot before certificates arrive
+  from peers (`verify_certificate` checks internal consistency only). One is an open finding,
+  below.
+- **S2 window (found by this suite, fixed):** the reorg floor used to follow finality only on
+  the verifier's 5 s poll, so between `finalize_checkpoint` and the next poll a reorg below the
+  new certificate still proceeded. The floor is now raised at finalization (§4.5, "Floor at
+  finalization"). Tests: `s2_strict_reorg_below_fresh_certificate_is_rejected`,
+  `s2_certificate_not_yet_applied_pauses_then_protects_on_return`,
+  `s2_unconfirmed_becomes_mismatch_when_another_block_is_applied`; TLA+:
+  `CheckpointFinalitySafety_strict.cfg` must pass (`FinalizedNeverReverted`,
+  `FinalizedStaysCanonical`), `CheckpointFinalitySafety_pollonly.cfg` (the poll-only design)
+  must still produce the counterexample.
+- **Open finding (S1 across sibling committees; review of #333 @ 0286eff):** the committee for
+  `(H, block)` is drawn by `FinalityGadget::committee_for` from the governing snapshot with the
+  CANDIDATE block's own VRF output as seed. Once the validator set is larger than
+  `committee_size`, two siblings at `H` get different committees, and the quorum bound
+  (`floor(2n/3)+1` of ONE committee) no longer forces two quorums to share an honest signer.
+  Under a partition along the fork, each committee can finalize its own sibling with no
+  equivocation and no Byzantine key. Tests: `open_finding_sibling_committees_finalize_conflicting_blocks`
+  (passes: pins the counterexample — 8 validators, committees of 4 overlapping in at most one
+  member, both siblings finalize) and `s1_sibling_committees_never_finalize_conflicting_blocks`
+  (ignored, "bug: …"). TLA+: committees are now modelled per candidate (`comm`, `CommitteeSize`);
+  `CheckpointFinalitySafety_committees.cfg` (5 voters, f = 1, committees of 4) must produce the
+  violation. The gating configs keep `CommitteeSize` = all voters, i.e. they verify S1 only
+  for a committee shared by every candidate. Decision for the owner (protocol change, before
+  voting is enabled): make the committee independent of the candidate (e.g. seed it from a
+  block every candidate at `H` shares, or use the whole snapshot set while it is small), or
+  require the quorum over a fixed set.
+- **TLA+:** `specs/tla/consensus/CheckpointFinalitySafety.tla` models S1/S2 across nodes
+  (actions Propose, SignVote, Finalize, VerifyFloor, Reorg, Restart). TLC runs in CI
+  (`.github/workflows/tla-finality.yml` → `scripts/ci/tla_finality.sh`, TLC 1.7.1 sha256-pinned):
+  the bounded gating, strict-S2 and restart-S2 configs must pass, and five configs must produce
+  counterexamples (f ≥ n/3; no durable signed-vote record; poll-only floor; truncated boot
+  restore; per-candidate committees). The two-height config
+  (`_deep.cfg`) runs on demand (`TLA_FINALITY_DEEP=1`; exhaustive local run 2026-10-19:
+  92.1M distinct states, no violation, 46 min — on the model before the boot floor restore;
+  not re-run since). `CheckpointVoteSafety` now runs too,
+  with a submission bound and two invariants restated (errata in the spec: as first written they
+  were refuted by a valid vote followed by a rejected resubmission, and the unbounded sequence
+  never terminated).
+- **Conformance:** `core/consensus/tests/finality_tla_conformance.rs` checks the action and
+  invariant names, `MinCommittee`/`Quorum` against `MIN_FINALITY_COMMITTEE`/`derived_quorum`,
+  the 69-byte message layout, and runs seeded random walks of real gadgets through the TLA+
+  actions, checking the model invariants and the SignVote guard after every step.
+
 ## 9. Implementation stages (each its own PR, reviewed)
 
 - **Stage 0 — safe, non-consensus:** `finalized`/`safe` RPC tag (§4.6) + `CheckpointNodeConfig`
@@ -363,7 +649,8 @@ the design + test bar and tracked here so #12 addresses every one:
 - **(2) quorum & min committee** — `floor(2n/3)+1`, min 4 (§3, D-2/D-2a). Resolved.
 - **(3) vote at depth D** — no tip voting (§3). Resolved.
 - **(4) floor is a hash, enforcement is real code** — `(height,hash)` cert, verify on-chain at
-  runtime + boot, halt-not-pin on mismatch (§4.5). Resolved.
+  runtime + boot, halt-not-pin on mismatch (§4.5). Resolved. Implemented in Stage 1c
+  (`node/src/finality_floor.rs`, §4.5), behind the enforcement pin (OFF).
 - **(5) liveness — early votes & relay:** **buffer** inbound votes that arrive *before* this
   node proposes the checkpoint (keyed by `(height,hash)`, replayed into `submit_vote` on
   propose), and **re-gossip** every accepted, valid vote to peers (today the inbound handler
@@ -383,7 +670,10 @@ the design + test bar and tracked here so #12 addresses every one:
 - **(11) claims tripwire:** `check_claims.py` currently passes on any non-test `.propose(`
   call — a default-off flag would false-positive "running". Tighten it (require the flag/pin
   ON **and** an outbound vote path) **in the same PR**; MAC flips the tripwire only when
-  finality actually runs. Add.
+  finality actually runs. Add. **Stage 1c:** "running" now requires both compiled pins ON for
+  40204, a non-test `sign_checkpoint_vote(` call, and a `node/src` file that builds
+  `NetworkMessage::CheckpointVote { .. }` (not a match pattern) and calls `.broadcast(`; a
+  missing pin table counts as OFF with a warning (`verification/tests/test_check_claims.py`).
 - **(1, config) chain_id:** stop hard-coding 40204 in `CheckpointConfig::default` — take
   `chain_id` from node chain config so devnet 1337 signs correct vote messages (§4.7).
 

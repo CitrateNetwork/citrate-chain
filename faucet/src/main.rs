@@ -38,6 +38,7 @@ mod desktop;
 mod limits;
 mod liveness;
 mod membership;
+mod policy;
 use limits::GlobalCap;
 use liveness::ReadinessCache;
 
@@ -80,6 +81,8 @@ struct FaucetState {
     desktop_origins: Arc<Vec<String>>,
     /// HUP-S6.5: cached `/ready` probe.
     readiness: Arc<ReadinessCache>,
+    /// G4: `FAUCET_REQUIRE_GATES` was on at startup, so every policy gate is configured.
+    gates_required: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +149,7 @@ fn denial_parts(d: &cooldowns::CooldownDenial) -> (&'static str, u64) {
             ("address", *remaining_secs)
         }
         cooldowns::CooldownDenial::IpCooldown { remaining_secs } => ("ip", *remaining_secs),
+        cooldowns::CooldownDenial::PersistenceUnavailable => ("persistence", 0),
     }
 }
 
@@ -265,14 +269,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // RM-B1 / WP-E6.3 (audit FAU-04): persistent cooldowns. When
     // FAUCET_COOLDOWN_FILE is set we load + persist; otherwise the
     // tracker stays in-memory (dev mode).
-    let cooldown_policy = CooldownPolicy::default();
-    let cooldowns = match std::env::var("FAUCET_COOLDOWN_FILE").ok() {
-        Some(path) if !path.is_empty() => {
+    // G4: both windows are configurable; unset keeps 24 h per address and 1 h per IP.
+    let cooldown_policy = CooldownPolicy::from_env(
+        std::env::var("FAUCET_ADDRESS_COOLDOWN_SECS")
+            .ok()
+            .as_deref(),
+        std::env::var("FAUCET_IP_COOLDOWN_SECS").ok().as_deref(),
+    )?;
+    info!(
+        "Cooldowns: one drip per address per {} s, per IP per {} s",
+        cooldown_policy.address_cooldown_secs, cooldown_policy.ip_cooldown_secs
+    );
+    let cooldown_file = std::env::var("FAUCET_COOLDOWN_FILE")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    let cooldown_file_set = cooldown_file.is_some();
+    // G4: parsed here because required-gates mode also changes how the cooldown file is opened.
+    let gates_required =
+        policy::parse_require_gates(std::env::var("FAUCET_REQUIRE_GATES").ok().as_deref())?;
+    let cooldowns = match cooldown_file {
+        Some(path) if gates_required => {
+            let p = PathBuf::from(&path);
+            // Required mode: the file must load cleanly and be writable before anything is served,
+            // and a later write failure refuses new drips until a write succeeds.
+            let c = Cooldowns::with_file_required(p.clone(), cooldown_policy)?;
+            info!(
+                "Cooldowns persisted to {} (verified readable and writable)",
+                p.display()
+            );
+            Arc::new(c)
+        }
+        Some(path) => {
             let p = PathBuf::from(&path);
             info!("Cooldowns persisted to {}", p.display());
             Arc::new(Cooldowns::with_file(p, cooldown_policy))
         }
-        _ => {
+        None => {
             info!("Cooldowns in memory only (set FAUCET_COOLDOWN_FILE=<path> for persistence)");
             Arc::new(Cooldowns::in_memory(cooldown_policy))
         }
@@ -326,6 +358,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    // G4: with FAUCET_REQUIRE_GATES on, a missing policy gate stops the faucet at startup.
+    policy::check_required_gates(
+        gates_required,
+        policy::GateConfig {
+            global_cap: global_cap.is_some(),
+            member_sbt: member_sbt.is_some(),
+            cooldown_file: cooldown_file_set,
+        },
+    )?;
+    if gates_required {
+        info!("FAUCET_REQUIRE_GATES on: global cap, membership check and cooldown file all set");
+    }
     let (desktop_origins, dropped_desktop) =
         desktop::desktop_origins(std::env::var("FAUCET_DESKTOP_ORIGINS").ok().as_deref());
     for d in &dropped_desktop {
@@ -357,6 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         turnstile_site_key,
         desktop_origins: Arc::new(desktop_origins),
         readiness: Arc::new(ReadinessCache::default()),
+        gates_required,
     };
 
     // Build router
@@ -563,19 +608,69 @@ async fn faucet_js() -> ([(axum::http::HeaderName, &'static str); 1], &'static s
 
 /// HUP-S6.5: the page, with the CAPTCHA widget when the operator turned the CAPTCHA page on.
 /// Without a site key it is exactly [`PAGE_HTML`].
-fn render_page(turnstile_site_key: Option<&str>) -> String {
+/// G4: how the page states the per-address window ("24h", "2d", "90m").
+fn window_label(secs: u64) -> String {
+    if secs.is_multiple_of(86_400) && secs >= 2 * 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// G4: the same window in words, for the page's description ("24&nbsp;hours", "2&nbsp;days",
+/// "1&nbsp;hour"). Uses the same unit as [`window_label`], so the two statements always agree.
+fn window_phrase(secs: u64) -> String {
+    let (n, unit) = if secs.is_multiple_of(86_400) && secs >= 2 * 86_400 {
+        (secs / 86_400, "day")
+    } else if secs.is_multiple_of(3600) {
+        (secs / 3600, "hour")
+    } else if secs.is_multiple_of(60) {
+        (secs / 60, "minute")
+    } else {
+        (secs, "second")
+    };
+    format!("{n}&nbsp;{unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The two places [`PAGE_HTML`] states the per-address window, as written for the 24h default.
+const PAGE_WINDOW_SENTENCE: &str = "once every 24&nbsp;hours.";
+const PAGE_WINDOW_FOOTER: &str = "&middot; 24h cooldown &middot;";
+
+fn render_page(turnstile_site_key: Option<&str>, address_cooldown_secs: u64) -> String {
+    // Both statements of the window come from the configured policy, never just one of them.
+    let page = PAGE_HTML
+        .replacen(
+            PAGE_WINDOW_SENTENCE,
+            &format!("once every {}.", window_phrase(address_cooldown_secs)),
+            1,
+        )
+        .replacen(
+            PAGE_WINDOW_FOOTER,
+            &format!(
+                "&middot; {} cooldown &middot;",
+                window_label(address_cooldown_secs)
+            ),
+            1,
+        );
     match turnstile_site_key {
-        Some(key) => PAGE_HTML.replacen(
+        Some(key) => page.replacen(
             "<button id=\"btn\">",
             &format!("{}\n<button id=\"btn\">", desktop::turnstile_markup(key)),
             1,
         ),
-        None => PAGE_HTML.to_string(),
+        None => page,
     }
 }
 
 async fn root(State(state): State<FaucetState>) -> axum::response::Html<String> {
-    axum::response::Html(render_page(state.turnstile_site_key.as_deref()))
+    axum::response::Html(render_page(
+        state.turnstile_site_key.as_deref(),
+        state.cooldowns.policy().address_cooldown_secs,
+    ))
 }
 
 // Charter register of the citrate-core / app-layer design system
@@ -659,6 +754,7 @@ async fn status(State(state): State<FaucetState>) -> Json<serde_json::Value> {
         "captcha": state.turnstile.is_some(),
         "turnstile_site_key": state.turnstile_site_key,
         "membership_check": state.member_sbt.is_some(),
+        "gates_required": state.gates_required,
     }))
 }
 
@@ -912,6 +1008,12 @@ async fn request_tokens(
     // `release()` the reservation so legitimate users can retry.
     let now = unix_now();
     if let Err(denial) = state.cooldowns.try_reserve(&recipient_hex, &client_ip) {
+        if matches!(denial, cooldowns::CooldownDenial::PersistenceUnavailable) {
+            return Ok(Json(FaucetResponse::deny(
+                "cooldown_store_unavailable",
+                "The faucet cannot record drips right now, try again later",
+            )));
+        }
         let (limit, remaining) = denial_parts(&denial);
         return Ok(Json(FaucetResponse::rate_limited(
             limit,
@@ -1276,6 +1378,7 @@ mod tests {
             turnstile_site_key: None,
             desktop_origins: Arc::new(Vec::new()),
             readiness: Arc::new(ReadinessCache::default()),
+            gates_required: false,
         }
     }
 
@@ -1682,6 +1785,89 @@ mod tests {
         assert!(s["global_cap_used"].is_null());
         assert_eq!(s["captcha"], false);
         assert_eq!(s["membership_check"], false);
+        assert_eq!(s["gates_required"], false);
+    }
+
+    #[test]
+    fn g4_window_label_is_readable() {
+        assert_eq!(window_label(86_400), "24h");
+        assert_eq!(window_label(2 * 86_400), "2d");
+        assert_eq!(window_label(3600), "1h");
+        assert_eq!(window_label(5400), "90m");
+        assert_eq!(window_label(61), "61s");
+    }
+
+    #[test]
+    fn g4_page_states_the_configured_address_window() {
+        let page = render_page(None, 2 * 86_400);
+        assert!(page.contains("&middot; 2d cooldown &middot;"));
+        assert!(!page.contains("24h cooldown"));
+    }
+
+    #[test]
+    fn g4_window_phrase_matches_the_label_unit() {
+        assert_eq!(window_phrase(86_400), "24&nbsp;hours");
+        assert_eq!(window_phrase(2 * 86_400), "2&nbsp;days");
+        assert_eq!(window_phrase(3600), "1&nbsp;hour");
+        assert_eq!(window_phrase(5400), "90&nbsp;minutes");
+        assert_eq!(window_phrase(60), "1&nbsp;minute");
+        assert_eq!(window_phrase(61), "61&nbsp;seconds");
+    }
+
+    #[test]
+    fn g4_page_description_and_footer_both_follow_the_policy() {
+        // The template states the 24h default in both places; a rendering must replace both.
+        assert_eq!(PAGE_HTML.matches(PAGE_WINDOW_SENTENCE).count(), 1);
+        assert_eq!(PAGE_HTML.matches(PAGE_WINDOW_FOOTER).count(), 1);
+        for (secs, phrase, label) in [
+            (2 * 86_400, "2&nbsp;days", "2d"),
+            (3600, "1&nbsp;hour", "1h"),
+            (5400, "90&nbsp;minutes", "90m"),
+        ] {
+            let page = render_page(None, secs);
+            assert!(
+                page.contains(&format!("once every {phrase}.")),
+                "description for {secs}s"
+            );
+            assert!(
+                page.contains(&format!("&middot; {label} cooldown &middot;")),
+                "footer for {secs}s"
+            );
+            assert!(
+                !page.contains("24&nbsp;hours"),
+                "stale description for {secs}s"
+            );
+            assert!(!page.contains("24h"), "stale footer for {secs}s");
+            assert!(!page.contains("24 hours"), "stale description for {secs}s");
+        }
+        // The default renders the page exactly as written.
+        assert_eq!(render_page(None, 86_400), PAGE_HTML);
+    }
+
+    #[tokio::test]
+    async fn g4_status_and_page_follow_a_configured_policy() {
+        let mut state = test_state("http://127.0.0.1:9");
+        state.cooldowns = Arc::new(Cooldowns::in_memory(
+            CooldownPolicy::from_env(Some("172800"), Some("600")).expect("policy"),
+        ));
+        state.gates_required = true;
+        let base = serve(state, None).await;
+        let s: serde_json::Value = reqwest::get(format!("{base}/status"))
+            .await
+            .expect("req")
+            .json()
+            .await
+            .expect("json");
+        assert_eq!(s["address_cooldown_secs"], 172_800);
+        assert_eq!(s["ip_cooldown_secs"], 600);
+        assert_eq!(s["gates_required"], true);
+        let html = reqwest::get(format!("{base}/"))
+            .await
+            .expect("req")
+            .text()
+            .await
+            .expect("body");
+        assert!(html.contains("2d cooldown"));
     }
 
     #[tokio::test]
@@ -1699,6 +1885,27 @@ mod tests {
             again["code"], "node_unreachable",
             "the slot was returned, not held"
         );
+    }
+
+    #[tokio::test]
+    async fn g4_required_cooldown_store_down_refuses_drips() {
+        // Required-gates mode: once a cooldown write fails, the faucet refuses new drips with a
+        // stable code instead of dripping without a persisted window.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("cooldowns.json");
+        let mut st = test_state("http://127.0.0.1:9");
+        st.gates_required = true;
+        st.cooldowns = Arc::new(
+            Cooldowns::with_file_required(path.clone(), CooldownPolicy::default()).expect("start"),
+        );
+        let cooldowns = st.cooldowns.clone();
+        let base = serve(st, None).await;
+        std::fs::remove_file(&path).expect("rm");
+        std::fs::create_dir(&path).expect("dir in place of file");
+        cooldowns.record_success("00000000000000000000000000000000000000aa", "10.0.0.1");
+        assert!(!cooldowns.persistence_ok());
+        let r = post_drip(&base, &addr_of(0x52), None).await;
+        assert_eq!(r["code"], "cooldown_store_unavailable", "{r}");
     }
 
     #[tokio::test]
@@ -1817,7 +2024,7 @@ mod tests {
         assert!(html.contains(r#"data-sitekey="site-key_123""#));
         assert!(html.contains(desktop::TURNSTILE_ORIGIN));
         assert_eq!(
-            render_page(None),
+            render_page(None, 24 * 3600),
             PAGE_HTML,
             "no site key: the page is unchanged"
         );

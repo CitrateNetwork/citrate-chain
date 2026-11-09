@@ -85,6 +85,10 @@ pub struct VrfProposerSelector {
     /// PSET-EPOCH: recent per-snapshot sets, keyed by snapshot height S(E).
     /// Bounded to [`PROPOSER_SET_HISTORY_SNAPSHOTS`] entries.
     history: Arc<RwLock<BTreeMap<u64, EpochSet>>>,
+    /// Height from which an ECVRF proof's curve points must be in canonical
+    /// compressed form ([`crate::vrf_encoding`]). Captured from the process
+    /// store at construction; `None` = not activated.
+    canonical_encoding_height: Option<u64>,
 }
 
 /// PSET-EPOCH: one epoch's materialised proposer set.
@@ -123,6 +127,7 @@ impl VrfProposerSelector {
             legacy_vrf_cutoff_height: DEFAULT_LEGACY_VRF_CUTOFF_HEIGHT,
             snapshot_schedule: None,
             history: Arc::new(RwLock::new(BTreeMap::new())),
+            canonical_encoding_height: crate::vrf_encoding::vrf_canonical_encoding_height(),
         }
     }
 
@@ -264,6 +269,18 @@ impl VrfProposerSelector {
         self
     }
 
+    /// Override the canonical-encoding activation height captured from the
+    /// process store ([`crate::vrf_encoding`]). `None` = not activated.
+    pub fn with_canonical_encoding_height(mut self, height: Option<u64>) -> Self {
+        self.canonical_encoding_height = height;
+        self
+    }
+
+    /// The canonical-encoding activation height this selector applies.
+    pub fn canonical_encoding_height(&self) -> Option<u64> {
+        self.canonical_encoding_height
+    }
+
     /// FWA-C1-01: a selector with the legacy (forgeable SHA3) VRF path
     /// **fully disabled** (`legacy_vrf_cutoff_height = 0`), so EVERY block
     /// — at any height — must carry a real ECVRF proof. `verify_legacy_proof`
@@ -323,6 +340,7 @@ impl VrfProposerSelector {
         let (ecvrf_proof, beta) = crate::ecvrf::prove(secret_key, &alpha)
             .map_err(|e| VrfError::CryptoError(format!("ECVRF prove: {}", e)))?;
 
+        // VRF-PROOF-SOURCE: ecvrf::prove output (RFC 9381).
         Ok(VrfProof {
             proof: ecvrf_proof.to_bytes(), // 81 bytes
             output: Hash::from_bytes(&beta),
@@ -465,8 +483,16 @@ impl VrfProposerSelector {
         previous_vrf: &Hash,
         slot: u64,
     ) -> Result<bool, VrfError> {
-        let ecvrf_proof = crate::ecvrf::EcvrfProof::from_bytes(&proof.proof)
-            .map_err(|e| VrfError::CryptoError(format!("ECVRF decode: {}", e)))?;
+        // From the activation height the proof's curve points must be in
+        // canonical compressed form; below it the previous decoder applies,
+        // so historical blocks are judged exactly as they were.
+        let decoded = if crate::vrf_encoding::active_at(self.canonical_encoding_height, slot) {
+            crate::ecvrf::EcvrfProof::from_bytes_canonical(&proof.proof)
+        } else {
+            crate::ecvrf::EcvrfProof::from_bytes(&proof.proof)
+        };
+        let ecvrf_proof =
+            decoded.map_err(|e| VrfError::CryptoError(format!("ECVRF decode: {}", e)))?;
 
         let alpha = Self::build_alpha(pubkey, previous_vrf, slot);
 
@@ -738,6 +764,30 @@ impl LeaderElection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tripwire: the ECVRF verify path picks the canonical decoder by the
+    /// activation height, and nowhere else in this module decodes a proof.
+    #[test]
+    fn ecvrf_verify_path_is_gated_on_the_canonical_decoder() {
+        let src = include_str!("vrf.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let start = prod
+            .find("fn verify_ecvrf_proof(")
+            .expect("verify_ecvrf_proof");
+        let body = prod.get(start..).unwrap_or("");
+        let end = body
+            .get(1..)
+            .and_then(|b| b.find("\n    fn "))
+            .unwrap_or(body.len());
+        let body = body.get(..end).unwrap_or(body);
+        assert!(body.contains("vrf_encoding::active_at(self.canonical_encoding_height, slot)"));
+        assert!(body.contains("EcvrfProof::from_bytes_canonical(&proof.proof)"));
+        assert_eq!(
+            prod.matches("EcvrfProof::from_bytes").count(),
+            2,
+            "one gated pair of decode sites"
+        );
+    }
 
     #[tokio::test]
     async fn panic_s1_update_stake_moves_the_total_exactly() {

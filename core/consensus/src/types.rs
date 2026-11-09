@@ -823,6 +823,8 @@ impl BlockBuilder {
                     blue_work: 0,
                     pruning_point: Hash::default(),
                     proposer_pubkey: PublicKey::default(),
+                    // VRF-PROOF-SOURCE: empty default; a sealed non-genesis header must
+                    // set a real ECVRF proof via `.vrf_reveal(..)` (an empty one never verifies).
                     vrf_reveal: VrfProof {
                         proof: vec![],
                         output: Hash::default(),

@@ -1,0 +1,9 @@
+# Positive-control fixture for scripts/ci/audit_all_lockfiles.sh --self-test.
+# Pins rustls-webpki to a patched version. Never a real build
+# input; the name deliberately does not match '*Cargo.lock'.
+version = 4
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"

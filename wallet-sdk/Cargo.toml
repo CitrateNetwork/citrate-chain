@@ -9,14 +9,23 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Core wallet library
-citrate-wallet-core = { path = "../wallet-core" }
+# Core wallet library. Only the native `Wallet` (src/wallet.rs) uses it, so
+# it is optional and turned on by the `native` feature, with wallet-core's
+# own `native` feature (keystore, RPC client). Default features are off so
+# that a wasm32 build (`--no-default-features --features wasm`) pulls none
+# of wallet-core's tree: its `native` feature brings tokio with mio,
+# reqwest and the chain crates, and even its lean `crypto` build needs a
+# wasm32 randomness source for uuid and getrandom. src/wasm.rs uses only
+# argon2, k256, sha3 and wasm-bindgen. `native` is in `default`, so native
+# consumers get the same build as before.
+citrate-wallet-core = { path = "../wallet-core", default-features = false, optional = true }
 
 # Always needed
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-tokio = { version = "1", features = ["sync"] }
+# Only the native `Wallet` (src/wallet.rs) uses tokio.
+tokio = { version = "1", features = ["sync"], optional = true }
 
 # Cryptography exposed to WASM consumers (browser extension, edu webapp).
 # Pulled in unconditionally — wallet-core re-exports its dispatcher and
@@ -41,11 +50,21 @@ wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["console"] }
-getrandom = { version = "0.2", optional = true, features = ["js"] }
+
+# Every wasm32-unknown-unknown build needs a randomness source for
+# getrandom 0.2 (pulled by k256 through rand_core), with or without the
+# `wasm` feature, so this is a target dependency rather than part of `wasm`.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [features]
-default = []
-wasm = ["wasm-bindgen", "js-sys", "serde-wasm-bindgen", "web-sys", "getrandom"]
+# `native` is the Rust API in src/wallet.rs: the on-disk keystore and the
+# RPC client. It needs wallet-core's `native` feature and tokio, so it is
+# not built for wasm32. Build the WASM bundle with
+# `--no-default-features --features wasm`.
+default = ["native"]
+native = ["dep:citrate-wallet-core", "citrate-wallet-core/native", "dep:tokio"]
+wasm = ["wasm-bindgen", "js-sys", "serde-wasm-bindgen", "web-sys"]
 # WP-A1.5: pre-build target for browser-extension Argon2id migration.
 # `argon2-wasm` implies `wasm` and adds the `argon2_v2_derive_key` export.
 # The full PBKDF2 → Argon2 migration in the extension lands in RM-G1.

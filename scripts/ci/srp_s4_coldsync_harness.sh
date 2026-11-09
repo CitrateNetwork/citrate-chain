@@ -20,7 +20,7 @@ CHAIN=/home/saul/Projects/Citrate-Labs/citrate-chain
 BIN=$CHAIN/target/release/citrate
 DIG=$CHAIN/target/release/state-digest
 SCR=/tmp/claude-1000/-home-saul-Projects-Citrate-Labs/24130b06-755f-4d61-b09c-8ce5c1ea552c/scratchpad
-DIR=$SCR/s4; rm -rf "$DIR"; mkdir -p "$DIR"
+DIR=$SCR/s4; rm -rf "${DIR:?}"; mkdir -p "$DIR"
 ENVF=/home/saul/Projects/Citrate-Labs/.env.testnet
 DK=$(grep -m1 '^DEPLOYER_PRIVATE_KEY=' "$ENVF" | cut -d= -f2)
 DEP=0x4fAB35c8c5033c80b3a0452A873B81e6ED4ED732

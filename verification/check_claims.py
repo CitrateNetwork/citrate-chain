@@ -5,10 +5,18 @@ Offline, stdlib only. Fails (exit 1) when:
 
 1. claims.json asserts checkpoint finality is running
    (deterministic_checkpoint_finality.value.running == true, or a status other
-   than specified-not-running) while no non-test code path calls `.propose(`
-   in node/src or core/consensus/src. The reverse (a production caller exists
-   but the claim still says not running) is reported as a warning so the claim
-   gets updated when checkpoint finality is wired.
+   than specified-not-running) while the code does not run it. The code counts
+   as running only when ALL of these hold (spec §11.11 — a default-off flag
+   must not read as "running"):
+     a. the compiled voting pin (CHECKPOINT_VOTING_PINS) is ON for 40204;
+     b. the compiled enforcement pin (CHECKPOINT_ENFORCEMENT_PINS) is ON for 40204;
+     c. a non-test code path calls `sign_checkpoint_vote(` (node/src or
+        core/consensus/src);
+     d. a non-test node/src file BUILDS a `NetworkMessage::CheckpointVote { .. }`
+        (not a match pattern) and calls `.broadcast(`.
+   A missing pin table counts as OFF and is reported as a warning. The reverse
+   (the code runs it but the claim still says not running) is a warning so the
+   claim gets updated once finality runs.
 2. consensus_ghostdag / confirmation_latency describe finality as current while
    checkpoint finality is not running.
 3. A public README (see PUBLIC_DOCS) describes finality as current, cites the
@@ -131,18 +139,119 @@ def strip_tests(src: str) -> str:
     return "".join(out)
 
 
-def production_propose_callers(root: Path) -> list[str]:
-    hits = []
-    for base in ("node/src", "core/consensus/src"):
-        for f in sorted((root / base).rglob("*.rs")):
+GADGET = "core/consensus/src/checkpoint_gadget.rs"
+PIN_CHAIN = 40204
+VOTING_PINS = "CHECKPOINT_VOTING_PINS"
+ENFORCEMENT_PINS = "CHECKPOINT_ENFORCEMENT_PINS"
+
+
+def strip_comments(src: str) -> str:
+    """Drop `//` line comments (doc comments included) so prose never counts as code."""
+    return "\n".join(line.split("//", 1)[0] for line in src.splitlines())
+
+
+def production_source(path: Path) -> str:
+    return strip_comments(strip_tests(path.read_text(errors="replace")))
+
+
+def production_files(root: Path, bases: tuple[str, ...]) -> list[Path]:
+    out = []
+    for base in bases:
+        d = root / base
+        if not d.is_dir():
+            continue
+        for f in sorted(d.rglob("*.rs")):
             if "/tests/" in str(f) or f.name.endswith("_tests.rs"):
                 continue
-            body = strip_tests(f.read_text(errors="replace"))
-            for i, line in enumerate(body.splitlines(), 1):
-                code = line.split("//", 1)[0]
-                if re.search(r"\.propose\s*\(", code):
-                    hits.append(f"{f.relative_to(root)}:{i}")
+            out.append(f)
+    return out
+
+
+def pin_on(root: Path, table: str, chain_id: int, warns: list[str]) -> bool:
+    """Whether the compiled pin table `table` in the gadget turns `chain_id` ON.
+    A missing file or table is OFF, with a warning (the tripwire must not pass
+    "running" on something it could not read)."""
+    path = root / GADGET
+    if not path.exists():
+        warns.append(f"{GADGET} not found; treating {table} as OFF")
+        return False
+    src = production_source(path)
+    m = re.search(table + r"\s*:\s*&\[\s*\(\s*u64\s*,\s*bool\s*\)\s*\]\s*=\s*&\[(.*?)\]\s*;", src, re.S)
+    if not m:
+        warns.append(f"compiled pin table {table} not found in {GADGET}; treating it as OFF")
+        return False
+    for cid, on in re.findall(r"\(\s*(\d+)\s*,\s*(true|false)\s*\)", m.group(1)):
+        if int(cid) == chain_id:
+            return on == "true"
+    return False
+
+
+def production_sign_callers(root: Path) -> list[str]:
+    hits = []
+    for f in production_files(root, ("node/src", "core/consensus/src")):
+        for i, line in enumerate(production_source(f).splitlines(), 1):
+            if re.search(r"\bsign_checkpoint_vote\s*\(", line) and not re.search(r"\bfn\s+sign_checkpoint_vote\b", line):
+                hits.append(f"{f.relative_to(root)}:{i}")
     return hits
+
+
+def builds_checkpoint_vote(src: str) -> bool:
+    """True when `src` CONSTRUCTS a NetworkMessage::CheckpointVote { .. } value.
+    A destructuring pattern (match arm `{ .. } =>`, `let/if let .. =`) does not count."""
+    for m in re.finditer(r"NetworkMessage::CheckpointVote\s*\{", src):
+        depth, j = 0, m.end() - 1
+        while j < len(src):
+            if src[j] == "{":
+                depth += 1
+            elif src[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        after = src[j + 1:].lstrip()
+        before = src[:m.start()].rstrip()
+        if after.startswith("=>") or (after.startswith("=") and not after.startswith("==")):
+            continue
+        if after.startswith("|") and not after.startswith("||"):
+            continue
+        if re.search(r"\b(let|if let|while let)\s*$", before) or before.endswith("|"):
+            continue
+        return True
+    return False
+
+
+def outbound_vote_files(root: Path) -> list[str]:
+    hits = []
+    for f in production_files(root, ("node/src",)):
+        body = production_source(f)
+        if builds_checkpoint_vote(body) and re.search(r"\.broadcast\s*\(", body):
+            hits.append(str(f.relative_to(root)))
+    return hits
+
+
+def finality_evidence(root: Path, warns: list[str]) -> dict:
+    """What the code says about checkpoint finality running on 40204."""
+    ev = {
+        "voting_pin": pin_on(root, VOTING_PINS, PIN_CHAIN, warns),
+        "enforcement_pin": pin_on(root, ENFORCEMENT_PINS, PIN_CHAIN, warns),
+        "sign_callers": production_sign_callers(root),
+        "outbound_files": outbound_vote_files(root),
+    }
+    ev["running"] = bool(ev["voting_pin"] and ev["enforcement_pin"] and ev["sign_callers"] and ev["outbound_files"])
+    return ev
+
+
+def missing_evidence(ev: dict) -> list[str]:
+    missing = []
+    if not ev["voting_pin"]:
+        missing.append(f"{VOTING_PINS} is not ON for {PIN_CHAIN}")
+    if not ev["enforcement_pin"]:
+        missing.append(f"{ENFORCEMENT_PINS} is not ON for {PIN_CHAIN}")
+    if not ev["sign_callers"]:
+        missing.append("no non-test code calls sign_checkpoint_vote(")
+    if not ev["outbound_files"]:
+        missing.append("no node/src file builds NetworkMessage::CheckpointVote { .. } and calls .broadcast(")
+    return missing
 
 
 def check(root: Path) -> tuple[list[str], list[str]]:
@@ -153,19 +262,21 @@ def check(root: Path) -> tuple[list[str], list[str]]:
     dcf = claims.get("deterministic_checkpoint_finality", {})
     running = bool((dcf.get("value") or {}).get("running", True))
     status = dcf.get("verification_status")
-    callers = production_propose_callers(root)
-    if (running or status != "specified-not-running") and not callers:
+    ev = finality_evidence(root, warns)
+    if (running or status != "specified-not-running") and not ev["running"]:
         errs.append(
             "claims.json deterministic_checkpoint_finality asserts a running mechanism "
-            f"(running={running}, status={status}) but no non-test code calls .propose( "
-            "in node/src or core/consensus/src"
+            f"(running={running}, status={status}) but the code does not run it: "
+            + "; ".join(missing_evidence(ev))
         )
-    if callers and not running:
+    if ev["running"] and not running:
         warns.append(
-            f"production .propose( callers exist ({', '.join(callers)}); re-verify and update "
+            "checkpoint finality is pinned ON (voting + enforcement) for 40204 with a production "
+            f"signer ({', '.join(ev['sign_callers'])}) and outbound vote broadcast "
+            f"({', '.join(ev['outbound_files'])}); re-verify and update "
             "deterministic_checkpoint_finality if checkpoints now finalize on the live network"
         )
-    finality_running = running and bool(callers)
+    finality_running = running and ev["running"]
 
     if not finality_running:
         cg = json.dumps(claims.get("consensus_ghostdag", {}).get("value", {}))

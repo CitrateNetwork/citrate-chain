@@ -21,7 +21,15 @@
 #     scripts/ceremony/REROLL_FANOUT.md).
 #
 # The ValidatorRegistry address is captured from its broadcast and exported as
-# VALIDATOR_REGISTRY so DeployCoreMembership derives (never hardcodes) it.
+# VALIDATOR_REGISTRY so the membership step derives (never hardcodes) it.
+#
+# MEMBERSHIP: by default the last step is DeployCoreMembership (the r1005 path the reroll
+# runbooks use). `--genesis-membership` (the G5 genesis ceremony, scripts/genesis/
+# genesis_ceremony.sh P2) runs DeployGenesisMembership instead (chain#331, Track M: the vault's
+# upgrade authority is the GOVERNANCE timelock, the grant signer holds only the grant role). It
+# needs GOVERNANCE_TIMELOCK, GOVERNANCE_MULTISIG, MEMBERSHIP_GRANTOR and GENESIS_MEMBERSHIP_OUT
+# (GENESIS_GOVERNANCE_BOOK is passed through when set), refuses to start without them, and tells
+# the address-book generator which broadcast holds the membership (EMIT_MEMBERSHIP_SCRIPT).
 #
 # Usage:
 #   RPC_URL=http://localhost:8545 DEPLOYER_ADDRESS=0x.. \
@@ -29,9 +37,16 @@
 #
 # Flags:
 #   --reroll        fresh-keys reroll mode (CITRATE_REROLL=1)
+#   --genesis-membership  deploy membership with DeployGenesisMembership (chain#331), not
+#                   DeployCoreMembership (see MEMBERSHIP above)
 #   --with-aa       also run the ERC-4337 AA stack (DeployAA) + P256 verifier
 #   --broadcast     actually send txs (omit = simulate only; safe dry-run)
 #   --account NAME  forge keystore account to sign with (passed through)
+#   --password-file PATH  the keystore password file for --account (passed through to
+#                   every forge step as a path; this script never reads or prints it).
+#                   It must be a regular file of this user, mode 0600/0400, not a symlink,
+#                   in a directory only its owner can change, and unchanged between steps.
+#                   A password on the command line (--password) is refused.
 #   --private-key K forge private key to sign with (passed through; devnet only)
 #
 # DEVNET SAFETY: without --broadcast nothing is sent. A broadcast to a non-local
@@ -51,24 +66,76 @@ die()  { err "$*"; exit 1; }
 
 REROLL=0
 WITH_AA=0
+GENESIS_MEMBERSHIP=0
 BROADCAST=0
 SIGNER_ARGS=()
+ACCOUNT_SET=0
+PASSWORD_FILE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reroll)      REROLL=1; shift ;;
     --with-aa)     WITH_AA=1; shift ;;
+    --genesis-membership) GENESIS_MEMBERSHIP=1; shift ;;
     --broadcast)   BROADCAST=1; shift ;;
-    --account)     SIGNER_ARGS+=(--account "$2"); shift 2 ;;
+    --account)     SIGNER_ARGS+=(--account "$2"); ACCOUNT_SET=1; shift 2 ;;
+    --password-file) PASSWORD_FILE="${2:-}"; shift 2 ;;
+    # Never echo the value: it is the password.
+    --password | --password=*) die "a keystore password on the command line is refused; pass --password-file PATH" ;;
     --private-key) SIGNER_ARGS+=(--private-key "$2"); shift 2 ;;
     *) die "unknown arg: $1" ;;
   esac
 done
+# The password file goes to forge as a path. Its value is not echoed on refusal: a caller
+# that passed the password itself in its place must not see it in the log. It must be private
+# to this user, by the genesis ceremony's shared check (scripts/genesis/secret_file_check.py:
+# a regular file, not a symlink, owned by this user, no group or world bits, in a directory
+# only its owner can change), and is re-checked, as the same file, before every forge step.
+PASSWORD_FILE_ID=""
+PW_CHECK="${REPO_ROOT}/scripts/genesis/secret_file_check.py"
+pw_check() { "${PYTHON:-python3}" -I "$PW_CHECK" --password-file "$@"; }
+if [[ -n "$PASSWORD_FILE" ]]; then
+  [[ "$ACCOUNT_SET" == 1 ]] || die "--password-file needs --account (it unlocks that keystore)"
+  [[ -f "$PW_CHECK" ]] || die "the password-file check $PW_CHECK is missing; run regenesis.sh from a full checkout"
+  PASSWORD_FILE_ID=$(pw_check "$PASSWORD_FILE") || die "$PASSWORD_FILE_ID"
+  SIGNER_ARGS+=(--password-file "$PASSWORD_FILE")
+fi
+# Forge output, by the genesis ceremony's shared check (scripts/genesis/forge_output_check.py,
+# which lists the settings and why): forge must record this run's broadcasts in
+# contracts/broadcast/, where the address-book generator and the ceremony's sends-once guard
+# read them. A variable that moves forge's broadcast or script-cache output is refused by name
+# (never its value), in every mode; on --broadcast the config forge resolves is checked too.
+FORGE_OUT_CHECK="${REPO_ROOT}/scripts/genesis/forge_output_check.py"
+[[ -f "$FORGE_OUT_CHECK" ]] || die "the forge output check $FORGE_OUT_CHECK is missing; run regenesis.sh from a full checkout"
+why=$("${PYTHON:-python3}" -I "$FORGE_OUT_CHECK" env --dotenv "$CONTRACTS/.env" "$REPO_ROOT/.env" 2>&1) || die "$why"
 
 command -v forge >/dev/null || die "forge not on PATH"
 command -v jq >/dev/null || die "jq is required"
-: "${RPC_URL:?set RPC_URL to the re-rolled chain's RPC}"
+: "${RPC_URL:?set RPC_URL to the RPC of the re-rolled chain}"
 : "${DEPLOYER_ADDRESS:?set DEPLOYER_ADDRESS (the fresh ceremony deployer; scripts read it)}"
-export CEREMONY_DEPLOYER_ADDRESS="${CEREMONY_DEPLOYER_ADDRESS:-$DEPLOYER_ADDRESS}"
+# The deploy scripts read CEREMONY_DEPLOYER_ADDRESS before DEPLOYER_ADDRESS (ScriptEnv), and
+# derive constructor arguments (fee recipients) from it. A preset value that is not exactly
+# DEPLOYER_ADDRESS (another address, empty, another case) is refused, never silently used.
+if [[ -n "${CEREMONY_DEPLOYER_ADDRESS+x}" && "${CEREMONY_DEPLOYER_ADDRESS}" != "${DEPLOYER_ADDRESS}" ]]; then
+  die "CEREMONY_DEPLOYER_ADDRESS (${CEREMONY_DEPLOYER_ADDRESS:-<empty>}) is not exactly DEPLOYER_ADDRESS (${DEPLOYER_ADDRESS}); unset it or set it to the same value"
+fi
+export CEREMONY_DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS"
+
+# Which membership deploy runs last, and which broadcast the generator reads it from. Checked
+# before the build, so a refused input sends nothing.
+MEMBERSHIP_SCRIPT="DeployCoreMembership.s.sol"
+if [[ "$GENESIS_MEMBERSHIP" == "1" ]]; then
+  MEMBERSHIP_SCRIPT="DeployGenesisMembership.s.sol"
+  [[ -f "${CONTRACTS}/script/${MEMBERSHIP_SCRIPT}" ]] ||
+    die "contracts/script/${MEMBERSHIP_SCRIPT} is missing (chain#331, the genesis membership path, must be merged)"
+  for v in GOVERNANCE_TIMELOCK GOVERNANCE_MULTISIG MEMBERSHIP_GRANTOR; do
+    [[ "${!v:-}" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "--genesis-membership needs $v (an address; got '${!v:-}')"
+  done
+  [[ -n "${GENESIS_MEMBERSHIP_OUT:-}" ]] || die "--genesis-membership needs GENESIS_MEMBERSHIP_OUT (the membership book path, relative to contracts/)"
+fi
+if [[ -n "${EMIT_MEMBERSHIP_SCRIPT:-}" && "$EMIT_MEMBERSHIP_SCRIPT" != "$MEMBERSHIP_SCRIPT" ]]; then
+  die "EMIT_MEMBERSHIP_SCRIPT is set to ${EMIT_MEMBERSHIP_SCRIPT}, but this run deploys membership with ${MEMBERSHIP_SCRIPT}; unset it"
+fi
+export EMIT_MEMBERSHIP_SCRIPT="$MEMBERSHIP_SCRIPT"
 
 if [[ "$REROLL" == "1" ]]; then
   export CITRATE_REROLL=1
@@ -84,7 +151,14 @@ if [[ "$BROADCAST" == "1" ]]; then
   if [[ "$RPC_URL" != *localhost* && "$RPC_URL" != *127.0.0.1* && "${CITRATE_ALLOW_REMOTE:-0}" != "1" ]]; then
     die "refusing to --broadcast to a non-local RPC without CITRATE_ALLOW_REMOTE=1 (live-reroll two-key guard)"
   fi
-  BROADCAST_ARGS+=(--broadcast)
+  # What forge resolves (foundry.toml, its profiles, a global ~/.foundry/foundry.toml) must
+  # record into contracts/broadcast/ as well; read before the first forge step.
+  cfg=$(cd "$CONTRACTS" && forge config --json 2>/dev/null) || die "cannot read forge's config (forge config --json in $CONTRACTS)"
+  why=$(printf '%s' "$cfg" | "${PYTHON:-python3}" -I "$FORGE_OUT_CHECK" config --contracts "$CONTRACTS" 2>&1) || die "$why"
+  # --slow: one transaction at a time, each waited for, as the ceremony's own forge phases
+  # and the r1005 driver ran. A Citrate node answers null for a pending transaction, so a
+  # batched broadcast can give up on receipts of transactions that are later mined.
+  BROADCAST_ARGS+=(--broadcast --slow)
   log "BROADCAST enabled → $RPC_URL"
 else
   log "SIMULATE only (no --broadcast) → $RPC_URL"
@@ -102,7 +176,10 @@ log "Step 0: clean full forge build (compile-scope determinism)"
 ( cd "$CONTRACTS" && forge clean && forge build ) || die "clean build failed"
 
 run_step() {
-  local script="$1"; shift
+  local script="$1" why; shift
+  if [[ -n "$PASSWORD_FILE" ]]; then
+    why=$(pw_check "$PASSWORD_FILE" "$PASSWORD_FILE_ID") || { err "${why}; stopping before ${script}"; exit 2; }
+  fi
   log "→ ${script}"
   ( cd "$CONTRACTS" && forge script "script/${script}" \
       --rpc-url "$RPC_URL" --sender "$DEPLOYER_ADDRESS" \
@@ -116,16 +193,16 @@ run_step() {
 run_step "DeployAll.s.sol"
 run_step "DeployValidatorRegistry.s.sol"
 
-# Capture the just-deployed ValidatorRegistry so DeployCoreMembership derives it.
+# Capture the just-deployed ValidatorRegistry so the membership step derives it.
 VR_BROADCAST="${CONTRACTS}/broadcast/DeployValidatorRegistry.s.sol/${CHAIN_ID}/run-latest.json"
 if [[ -f "$VR_BROADCAST" ]]; then
   VR_ADDR="$(jq -r '[.transactions[] | select(.contractName=="ValidatorRegistry") | .contractAddress] | last // empty' "$VR_BROADCAST")"
   if [[ -n "$VR_ADDR" && "$VR_ADDR" != "null" ]]; then
     export VALIDATOR_REGISTRY="$VR_ADDR"
-    log "captured VALIDATOR_REGISTRY=$VALIDATOR_REGISTRY (fed to DeployCoreMembership)"
+    log "captured VALIDATOR_REGISTRY=$VALIDATOR_REGISTRY (fed to ${MEMBERSHIP_SCRIPT%.s.sol})"
   fi
 fi
-[[ -n "${VALIDATOR_REGISTRY:-}" ]] || log "WARN: VALIDATOR_REGISTRY not captured (simulate mode writes no broadcast); set it before DeployCoreMembership."
+[[ -n "${VALIDATOR_REGISTRY:-}" ]] || log "WARN: VALIDATOR_REGISTRY not captured (simulate mode writes no broadcast); set it before ${MEMBERSHIP_SCRIPT%.s.sol}."
 
 run_step "DeployModelAccessControl.s.sol"
 run_step "DeployTEEAttestationRegistry.s.sol"
@@ -141,19 +218,31 @@ if [[ "$WITH_AA" == "1" ]]; then
   run_step "aa/DeployAA.s.sol"
 fi
 
-# CoreMembership last — it derives VALIDATOR_REGISTRY (env) + MEMBERSHIP_OWNER (env).
+# Membership last: it derives VALIDATOR_REGISTRY (env). DeployCoreMembership reads
+# MEMBERSHIP_OWNER; DeployGenesisMembership reads GOVERNANCE_TIMELOCK, GOVERNANCE_MULTISIG,
+# MEMBERSHIP_GRANTOR, GENESIS_MEMBERSHIP_OUT and GENESIS_GOVERNANCE_BOOK (see MEMBERSHIP above).
 if [[ -n "${VALIDATOR_REGISTRY:-}" ]]; then
-  run_step "DeployCoreMembership.s.sol"
+  run_step "$MEMBERSHIP_SCRIPT"
 else
-  log "SKIP DeployCoreMembership (no VALIDATOR_REGISTRY captured — simulate mode)."
+  log "SKIP ${MEMBERSHIP_SCRIPT%.s.sol} (no VALIDATOR_REGISTRY captured — simulate mode)."
 fi
 
 # ---------------------------------------------------------------------------
 # Post: regenerate the canonical address table + verify CREATE2 determinism.
 # ---------------------------------------------------------------------------
+# The book names the deployer this run deployed with (EMIT_DEPLOYER), never a pin left in
+# .env.testnet. Under EMIT_FRESH_GENESIS=1 (the G5 genesis ceremony) a failed regeneration
+# stops the run: the ceremony's later gates read this book.
 if [[ "$BROADCAST" == "1" ]]; then
   log "regenerating canonical address table"
-  bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh" || err "emit-address-table failed (continue: check manually)"
+  # One canonical spelling (lowercase), the one the G5 ceremony's P2 gate compares against.
+  if ! EMIT_DEPLOYER="$(printf '%s' "$DEPLOYER_ADDRESS" | tr 'A-F' 'a-f')" bash "${REPO_ROOT}/scripts/ops/emit-address-table.sh"; then
+    if [[ "${EMIT_FRESH_GENESIS:-0}" == "1" ]]; then
+      err "emit-address-table failed in a fresh genesis"
+      exit 2
+    fi
+    err "emit-address-table failed (continue: check manually)"
+  fi
 fi
 log "checking CREATE2 determinism"
 bash "${REPO_ROOT}/scripts/ci/check-create2-determinism.sh" || die "CREATE2 determinism check failed"

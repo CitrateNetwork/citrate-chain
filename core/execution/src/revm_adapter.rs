@@ -118,6 +118,14 @@ pub struct StateDBAdapter {
     /// executor selects the legacy behaviour below
     /// [`CREATE_NONCE_FIX_ACTIVATION_HEIGHT`](crate::executor::CREATE_NONCE_FIX_ACTIVATION_HEIGHT).
     persist_contract_nonces: bool,
+    /// Exact-created-code rule (see [`crate::exact_code`]). When `true`
+    /// (post-activation, the correct rule), `commit` stores a created
+    /// contract's ORIGINAL code bytes. When `false` (pre-activation legacy),
+    /// it stores REVM's analysed form, which carries 33 trailing zero bytes of
+    /// padding, so historical blocks replay identically. Defaults to `true` so
+    /// new code and tests get the correct rule; the execution entry points
+    /// select it by block height.
+    exact_create_code: bool,
 }
 
 /// Which party owns native value movement during a REVM execution.
@@ -155,6 +163,7 @@ impl StateDBAdapter {
             journal: None,
             value_semantics: ValueSemantics::RevmAuthoritative,
             persist_contract_nonces: true,
+            exact_create_code: true,
         }
     }
 
@@ -172,6 +181,14 @@ impl StateDBAdapter {
     /// `false` reproduces the legacy nonce-drop (pre-activation replay).
     pub fn with_contract_nonce_persistence(mut self, persist: bool) -> Self {
         self.persist_contract_nonces = persist;
+        self
+    }
+
+    /// Select the created-code storage rule for this execution
+    /// (consensus-gated by block height, see [`crate::exact_code`]). `true`
+    /// stores original bytes; `false` reproduces the legacy padded form.
+    pub fn with_exact_create_code(mut self, exact: bool) -> Self {
+        self.exact_create_code = exact;
         self
     }
 
@@ -386,6 +403,26 @@ impl Database for StateDBAdapter {
     }
 }
 
+/// The bytes `commit` stores for an account's code.
+///
+/// REVM analyses the code of a contract created from inside a call before it
+/// reaches `commit`: `Bytecode::bytes()` of that analysed form is the original
+/// code followed by 33 zero bytes of interpreter padding, while
+/// `original_bytes()` is exactly the init code's return data (and is what
+/// REVM's own `code_hash` is computed over). Code loaded from state is raw, so
+/// both accessors agree for it.
+///
+/// `exact` (the exact-created-code rule, [`crate::exact_code`]) selects the
+/// original bytes. Below the activation the legacy padded form is kept so
+/// historical blocks replay to the roots they were produced with.
+fn stored_code_bytes(code: &Bytecode, exact: bool) -> Vec<u8> {
+    if exact {
+        code.original_bytes().to_vec()
+    } else {
+        code.bytes().to_vec()
+    }
+}
+
 impl DatabaseCommit for StateDBAdapter {
     fn commit(
         &mut self,
@@ -484,7 +521,7 @@ impl DatabaseCommit for StateDBAdapter {
             let is_contract = acct_code_hash != KECCAK_EMPTY && acct_code_hash != B256::ZERO;
             if is_contract {
                 if let Some(code) = account.info.code {
-                    let code_bytes = code.bytes().to_vec();
+                    let code_bytes = stored_code_bytes(&code, self.exact_create_code);
                     if !code_bytes.is_empty() {
                         // Sprint P950-A-5 WP-A.5.3: route code writes through
                         // the journal so mid-tx contract deployment (CREATE
@@ -817,7 +854,8 @@ pub fn execute_contract_create_with_context(
     let mut db = StateDBAdapter::new(state_db.clone())
         .with_block_hashes(block_ctx.block_hashes)
         .with_value_semantics(value_semantics)
-        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number));
+        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number))
+        .with_exact_create_code(crate::exact_code::exact_create_code_active(block_number));
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
@@ -1032,7 +1070,8 @@ pub fn execute_contract_call_with_context(
     let mut db = StateDBAdapter::new(state_db)
         .with_block_hashes(block_ctx.block_hashes)
         .with_value_semantics(value_semantics)
-        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number));
+        .with_contract_nonce_persistence(crate::executor::persist_contract_nonces_at(block_number))
+        .with_exact_create_code(crate::exact_code::exact_create_code_active(block_number));
     if let Some(h) = writes_handle {
         db = db.with_writes(h);
     }
@@ -2121,5 +2160,124 @@ mod tests {
         assert_eq!(right_align_32(&long), want);
         let exact: [u8; 32] = [9; 32];
         assert_eq!(right_align_32(&exact), exact);
+    }
+
+    // ---- Exact-created-code rule (crate::exact_code) ----
+
+    fn analysed(code: &[u8]) -> Bytecode {
+        revm::interpreter::analysis::to_analysed(Bytecode::new_raw(Bytes::from(code.to_vec())))
+    }
+
+    #[test]
+    fn stored_code_bytes_exact_is_the_original_and_legacy_is_padded() {
+        let original = vec![0x60u8, 0x2a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3, 0x7f, 0xaa];
+        let code = analysed(&original);
+        assert_eq!(stored_code_bytes(&code, true), original);
+        let legacy = stored_code_bytes(&code, false);
+        assert_eq!(legacy.len(), original.len() + 33, "revm pads analysed code");
+        assert_eq!(&legacy[..original.len()], &original[..]);
+        assert!(legacy[original.len()..].iter().all(|b| *b == 0));
+        // revm's own code hash is over the original bytes.
+        assert_eq!(code.hash_slow(), revm::primitives::keccak256(&original));
+        // Raw code (as loaded from state) is the same under both rules.
+        let raw = Bytecode::new_raw(Bytes::from(original.clone()));
+        assert_eq!(stored_code_bytes(&raw, true), original);
+        assert_eq!(stored_code_bytes(&raw, false), original);
+    }
+
+    fn created_commit(
+        addr: RevmAddress,
+        code: Bytecode,
+    ) -> revm::primitives::HashMap<RevmAddress, revm::primitives::Account> {
+        let mut changes = revm::primitives::HashMap::default();
+        changes.insert(
+            addr,
+            revm::primitives::Account {
+                info: AccountInfo {
+                    balance: RevmU256::ZERO,
+                    nonce: 1,
+                    code_hash: code.hash_slow(),
+                    code: Some(code),
+                },
+                storage: Default::default(),
+                status: revm::primitives::AccountStatus::Touched
+                    | revm::primitives::AccountStatus::Created,
+            },
+        );
+        changes
+    }
+
+    #[test]
+    fn commit_stores_created_code_by_rule_directly_and_through_the_journal() {
+        let original = vec![0x5bu8, 0x60, 0x01, 0x00];
+        let addr = Address([0xC1; 20]);
+        let raddr = RevmAddress::from_slice(&addr.0);
+        for exact in [true, false] {
+            let expect_len = if exact { 4 } else { 4 + 33 };
+
+            // Direct to state_db.
+            let sdb = Arc::new(StateDB::new());
+            let mut db = StateDBAdapter::new(sdb.clone()).with_exact_create_code(exact);
+            db.commit(created_commit(raddr, analysed(&original)));
+            let h = sdb.accounts.get_code_hash(&addr);
+            let stored = sdb.get_code(&h).expect("code stored");
+            assert_eq!(stored.len(), expect_len, "direct, exact={exact}");
+            assert_eq!(h.as_bytes(), &revm::primitives::keccak256(&stored).0);
+
+            // Through the per-tx journal (the block execution path).
+            let journal: JournalHandle = Arc::new(Mutex::new(crate::mvcc::ScratchJournal::new()));
+            let sdb = Arc::new(StateDB::new());
+            let mut db = StateDBAdapter::new(sdb)
+                .with_journal(journal.clone())
+                .with_exact_create_code(exact);
+            db.commit(created_commit(raddr, analysed(&original)));
+            let j = journal.lock();
+            let pending = j
+                .iter_writes()
+                .find(|(a, _)| **a == addr)
+                .and_then(|(_, p)| p.new_code.clone())
+                .expect("journal holds the code");
+            assert_eq!(pending.len(), expect_len, "journal, exact={exact}");
+        }
+    }
+
+    /// Tripwire: the commit path reads a `Bytecode`'s bytes in exactly one
+    /// place, `stored_code_bytes`, so no second accessor can store the
+    /// analysed (padded) form ungated.
+    fn ungated_bytecode_reads(src: &str) -> Vec<String> {
+        let body = match src.find("fn stored_code_bytes(") {
+            Some(start) => {
+                let end = src[start..]
+                    .find("\n}\n")
+                    .map(|e| start + e)
+                    .unwrap_or(src.len());
+                format!("{}{}", &src[..start], &src[end..])
+            }
+            None => src.to_string(),
+        };
+        let prod = body.split("#[cfg(test)]").next().unwrap_or_default();
+        prod.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| {
+                [
+                    "code.bytes()",
+                    ".bytes_slice()",
+                    ".bytecode()",
+                    "code.original_bytes()",
+                ]
+                .iter()
+                .any(|p| l.contains(p))
+            })
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tripwire_commit_reads_code_bytes_only_through_the_gate() {
+        let hits = ungated_bytecode_reads(include_str!("revm_adapter.rs"));
+        assert!(hits.is_empty(), "ungated Bytecode byte reads: {hits:?}");
+        // Negative control: a commit path that reads the bytes directly.
+        let planted = "fn commit() {\n    let code_bytes = code.bytes().to_vec();\n}\n";
+        assert_eq!(ungated_bytecode_reads(planted).len(), 1);
     }
 }

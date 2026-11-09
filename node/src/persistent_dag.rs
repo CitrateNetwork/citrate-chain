@@ -122,6 +122,43 @@ mod tests {
         )
     }
 
+    /// `kv_put_durable` on the production store is a synced (fsync'd) RocksDB
+    /// write; a plain `kv_put` is not. The finalized checkpoint certificate is
+    /// written with the former (follow-up to #335).
+    #[test]
+    fn kv_put_durable_is_a_synced_rocksdb_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(RocksDB::open(dir.path()).expect("open rocksdb"));
+        let kv = RocksDbKvStore::new(db.clone());
+        let before = db.write_batch_sync_count();
+        kv.kv_put(
+            citrate_consensus::dag_store::cf::DAG_METADATA,
+            b"plain",
+            b"1",
+        )
+        .expect("plain put");
+        assert_eq!(db.write_batch_sync_count(), before, "kv_put is not synced");
+        kv.kv_put_durable(
+            citrate_consensus::dag_store::cf::DAG_METADATA,
+            b"checkpoint:4",
+            b"cert",
+        )
+        .expect("durable put");
+        assert_eq!(
+            db.write_batch_sync_count(),
+            before + 1,
+            "kv_put_durable commits with sync = true"
+        );
+        assert_eq!(
+            kv.kv_get(
+                citrate_consensus::dag_store::cf::DAG_METADATA,
+                b"checkpoint:4"
+            )
+            .expect("read"),
+            Some(b"cert".to_vec())
+        );
+    }
+
     /// PR #321 P2 on the production store: the signing decision is committed with
     /// a synced (fsync'd) RocksDB write before the vote is emitted, survives a
     /// close/reopen of the database, and blocks a different hash at that height.

@@ -3,9 +3,10 @@
 use crate::db::{column_families::*, RocksDB};
 use anyhow::Result;
 use citrate_consensus::types::{Hash, Transaction};
+use citrate_execution::executor::{ReceiptIndexBatch, ReceiptReconcileMarker};
 use citrate_execution::types::TransactionReceipt;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Transaction and receipt storage
 pub struct TransactionStore {
@@ -194,6 +195,167 @@ impl TransactionStore {
     }
 }
 
+/// C1-R: stage a [`ReceiptIndexBatch`] into `batch` with the producer's exact
+/// layout (`put_transactions` + `put_receipts`), so the caller can commit it in the
+/// same `write_batch_sync` as the block's state and applied-tip pointer.
+///
+/// Removals are staged FIRST: for each abandoned `(block, tx)` the `t‖block‖tx`
+/// marker is deleted, and the receipt is deleted only when the stored receipt still
+/// names that block (a receipt already moved to another block is left alone). Puts
+/// follow, so a tx re-executed on the winning branch ends with its new receipt —
+/// RocksDB applies a batch's operations in order.
+pub(crate) fn stage_receipt_index(
+    db: &RocksDB,
+    batch: &mut rocksdb::WriteBatch,
+    index: &ReceiptIndexBatch,
+) -> Result<()> {
+    for (block_hash, tx_hash) in &index.removals {
+        db.batch_delete_cf(batch, CF_METADATA, &block_tx_key(block_hash, tx_hash))?;
+        let remove = match read_stored_receipt(db, tx_hash)? {
+            StoredReceipt::Absent => false,
+            StoredReceipt::Decoded(stored) => stored.block_hash == *block_hash,
+            // It cannot be served, and which block it names is unknown: it
+            // leaves with the block it was indexed under. Never an error: the
+            // receipt index must not decide whether a removal commits.
+            StoredReceipt::Undecodable(e) => {
+                warn!(
+                    "C1-R: removing the undecodable stored receipt of {tx_hash} (indexed under {block_hash}): {e}"
+                );
+                true
+            }
+        };
+        if remove {
+            db.batch_delete_cf(batch, CF_RECEIPTS, tx_hash.as_bytes())?;
+        }
+    }
+    for tx in &index.transactions {
+        let tx_bytes = bincode::serialize(tx)?;
+        db.batch_put_cf(batch, CF_TRANSACTIONS, tx.hash.as_bytes(), &tx_bytes)?;
+        db.batch_put_cf(
+            batch,
+            CF_METADATA,
+            &sender_tx_key(&tx.from, tx.nonce),
+            tx.hash.as_bytes(),
+        )?;
+    }
+    for receipt in &index.receipts {
+        let receipt_bytes = bincode::serialize(receipt)?;
+        db.batch_put_cf(
+            batch,
+            CF_RECEIPTS,
+            receipt.tx_hash.as_bytes(),
+            &receipt_bytes,
+        )?;
+        db.batch_put_cf(
+            batch,
+            CF_METADATA,
+            &block_tx_key(&receipt.block_hash, &receipt.tx_hash),
+            &[],
+        )?;
+    }
+    match index.reconcile_marker {
+        Some(ReceiptReconcileMarker::Set(hash, height)) => {
+            db.batch_put_cf(
+                batch,
+                CF_METADATA,
+                RECEIPT_RECONCILE_KEY,
+                &encode_reconcile_marker(&hash, height),
+            )?;
+        }
+        Some(ReceiptReconcileMarker::Clear) => {
+            db.batch_delete_cf(batch, CF_METADATA, RECEIPT_RECONCILE_KEY)?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// C1-R: a stored receipt as the receipt-index reconcile reads it. The index
+/// is RPC data, not consensus data: a value that does not decode (damaged, or
+/// written with a different receipt layout) is reported, not raised, so it can
+/// never stop a reorg or a rebuild. Storage read errors stay errors.
+#[derive(Debug)]
+pub enum StoredReceipt {
+    /// Nothing stored under the transaction hash.
+    Absent,
+    /// The stored receipt.
+    Decoded(TransactionReceipt),
+    /// A value is stored but does not decode as a receipt.
+    Undecodable(bincode::Error),
+}
+
+fn read_stored_receipt(db: &RocksDB, tx_hash: &Hash) -> Result<StoredReceipt> {
+    Ok(match db.get_cf(CF_RECEIPTS, tx_hash.as_bytes())? {
+        None => StoredReceipt::Absent,
+        Some(bytes) => match bincode::deserialize(&bytes) {
+            Ok(r) => StoredReceipt::Decoded(r),
+            Err(e) => StoredReceipt::Undecodable(e),
+        },
+    })
+}
+
+/// C1-R: `CF_METADATA` key of the [`ReceiptReconcileMarker`] (value: block hash
+/// `[32]` ‖ height big-endian `[8]`, the applied-tip layout).
+const RECEIPT_RECONCILE_KEY: &[u8] = b"receipt_reconcile_from";
+
+fn encode_reconcile_marker(hash: &Hash, height: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(hash.as_bytes());
+    buf.extend_from_slice(&height.to_be_bytes());
+    buf
+}
+
+impl TransactionStore {
+    /// C1-R: the stored receipt of `tx_hash` for the receipt-index reconcile:
+    /// like [`Self::get_receipt`], but a value that does not decode is
+    /// [`StoredReceipt::Undecodable`] instead of an error. A read error is
+    /// still an error.
+    pub fn get_stored_receipt(&self, tx_hash: &Hash) -> Result<StoredReceipt> {
+        read_stored_receipt(&self.db, tx_hash)
+    }
+
+    /// C1-R: visit every `(block_hash, tx_hash)` entry of the block→transaction
+    /// index (the `t‖block‖tx` markers written with each receipt), in key order,
+    /// so the entries of one block arrive together. Streams the index instead of
+    /// collecting it, so a scan of the whole chain's index holds one key at a
+    /// time. Used to reconcile the receipt index against an applied chain when
+    /// the old chain can no longer be walked block by block. A read error (or an
+    /// `Err` from `visit`) ends the scan and is returned, never skipped.
+    pub fn for_each_receipt_index_entry(
+        &self,
+        mut visit: impl FnMut(Hash, Hash) -> Result<()>,
+    ) -> Result<()> {
+        self.db.for_each_prefix_key_cf(CF_METADATA, b"t", |key| {
+            let Some(rest) = key.strip_prefix(b"t".as_slice()) else {
+                return Ok(());
+            };
+            if rest.len() != 64 {
+                return Ok(()); // another metadata key that happens to start with `t`
+            }
+            let (block, tx) = rest.split_at(32);
+            match (<[u8; 32]>::try_from(block), <[u8; 32]>::try_from(tx)) {
+                (Ok(block), Ok(tx)) => visit(Hash::new(block), Hash::new(tx)),
+                _ => Ok(()),
+            }
+        })
+    }
+
+    /// C1-R: the old applied tip recorded by an unfinished from-genesis rebuild
+    /// (see [`ReceiptReconcileMarker`]), if any. A malformed value reads as absent.
+    pub fn get_receipt_reconcile_marker(&self) -> Result<Option<(Hash, u64)>> {
+        let Some(bytes) = self.db.get_cf(CF_METADATA, RECEIPT_RECONCILE_KEY)? else {
+            return Ok(None);
+        };
+        let Some((hash, height)) = bytes.split_at_checked(32) else {
+            return Ok(None);
+        };
+        match (<[u8; 32]>::try_from(hash), <[u8; 8]>::try_from(height)) {
+            (Ok(hash), Ok(height)) => Ok(Some((Hash::new(hash), u64::from_be_bytes(height)))),
+            _ => Ok(None),
+        }
+    }
+}
+
 // Key generation helpers
 fn sender_tx_key(sender: &citrate_consensus::types::PublicKey, nonce: u64) -> Vec<u8> {
     let mut key = vec![b's'];
@@ -291,6 +453,124 @@ mod tests {
         let block_txs = store.get_block_transactions(&block_hash).unwrap();
         assert_eq!(block_txs.len(), 1);
         assert_eq!(block_txs[0], tx_hash);
+    }
+
+    /// Make the stored receipt of `tx` undecodable (its encoding minus the last
+    /// byte).
+    fn corrupt_receipt(db: &RocksDB, tx: &Hash) {
+        let mut bytes = db.get_cf(CF_RECEIPTS, tx.as_bytes()).unwrap().unwrap();
+        bytes.pop();
+        db.put_cf(CF_RECEIPTS, tx.as_bytes(), &bytes).unwrap();
+    }
+
+    /// A removal whose stored receipt does not decode still commits: the marker
+    /// and the receipt both go, and staging never fails on it. Negative
+    /// controls: a decodable receipt that names another block is kept, and one
+    /// that names the removed block goes.
+    #[test]
+    fn stage_removal_drops_an_undecodable_receipt_without_failing() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = TransactionStore::new(db.clone());
+        let block_a = Hash::new([0xA; 32]);
+        let block_b = Hash::new([0xB; 32]);
+        let (bad, moved, own) = (Hash::new([1; 32]), Hash::new([2; 32]), Hash::new([3; 32]));
+        store
+            .put_receipts(&[
+                (bad, create_test_receipt(bad, block_a)),
+                (moved, create_test_receipt(moved, block_b)),
+                (own, create_test_receipt(own, block_a)),
+            ])
+            .unwrap();
+        corrupt_receipt(&db, &bad);
+        assert!(store.get_receipt(&bad).is_err(), "precondition");
+        assert!(matches!(
+            store.get_stored_receipt(&bad).unwrap(),
+            StoredReceipt::Undecodable(_)
+        ));
+        assert!(matches!(
+            store.get_stored_receipt(&Hash::new([9; 32])).unwrap(),
+            StoredReceipt::Absent
+        ));
+
+        let index = ReceiptIndexBatch {
+            removals: vec![(block_a, bad), (block_a, moved), (block_a, own)],
+            ..ReceiptIndexBatch::default()
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+        stage_receipt_index(&db, &mut batch, &index).expect("staging does not fail");
+        db.write_batch_sync(batch).unwrap();
+
+        assert!(matches!(
+            store.get_stored_receipt(&bad).unwrap(),
+            StoredReceipt::Absent
+        ));
+        assert!(store.get_receipt(&own).unwrap().is_none());
+        assert_eq!(
+            store.get_receipt(&moved).unwrap().map(|r| r.block_hash),
+            Some(block_b),
+            "a receipt that names another block is kept"
+        );
+        assert!(store.get_block_transactions(&block_a).unwrap().is_empty());
+    }
+
+    /// The index scan streams: an `Err` from the visitor ends it at once and is
+    /// returned.
+    #[test]
+    fn receipt_index_scan_stops_on_a_visitor_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = TransactionStore::new(db.clone());
+        let block = Hash::new([0xA; 32]);
+        let txs: Vec<Hash> = (1..=3u8).map(|i| Hash::new([i; 32])).collect();
+        let receipts: Vec<_> = txs
+            .iter()
+            .map(|t| (*t, create_test_receipt(*t, block)))
+            .collect();
+        store.put_receipts(&receipts).unwrap();
+        let mut seen = 0u32;
+        let res = store.for_each_receipt_index_entry(|_, _| {
+            seen += 1;
+            anyhow::bail!("stop")
+        });
+        assert!(res.is_err());
+        assert_eq!(seen, 1);
+    }
+
+    /// The full block→transaction index scan returns exactly the `t‖block‖tx`
+    /// entries, across blocks, and skips other metadata keys that start with
+    /// `t` (negative control: a key of a different length, and a `u` key).
+    #[test]
+    fn receipt_index_entries_lists_every_block_tx_marker_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = Arc::new(RocksDB::open(temp_dir.path()).unwrap());
+        let store = TransactionStore::new(db.clone());
+        let block_a = Hash::new([0xA; 32]);
+        let block_b = Hash::new([0xB; 32]);
+        let (t1, t2, t3) = (Hash::new([1; 32]), Hash::new([2; 32]), Hash::new([3; 32]));
+        store
+            .put_receipts(&[
+                (t1, create_test_receipt(t1, block_a)),
+                (t2, create_test_receipt(t2, block_a)),
+                (t3, create_test_receipt(t3, block_b)),
+            ])
+            .unwrap();
+        db.put_cf(CF_METADATA, b"tip_like_key", b"x").unwrap();
+        let mut long = block_tx_key(&block_a, &t1);
+        long.push(0);
+        db.put_cf(CF_METADATA, &long, &[]).unwrap();
+        db.put_cf(CF_METADATA, &[b'u'; 65], &[]).unwrap();
+        let mut got = Vec::new();
+        store
+            .for_each_receipt_index_entry(|b, t| {
+                got.push((b, t));
+                Ok(())
+            })
+            .unwrap();
+        got.sort();
+        let mut want = vec![(block_a, t1), (block_a, t2), (block_b, t3)];
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

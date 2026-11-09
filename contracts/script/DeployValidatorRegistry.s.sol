@@ -87,7 +87,10 @@ contract DeployValidatorRegistry is ScriptEnv {
                 block.chainid != 40204,
                 "VALIDATOR_GOVERNANCE or GOVERNANCE must be set on 40204"
             );
-            gov = envAddressOr("CEREMONY_DEPLOYER_ADDRESS", envAddressOr("DEPLOYER_ADDRESS", _placeholderGovernance()));
+            // Off-chain only: the deployer (one source, ScriptEnv) or the placeholder.
+            gov = (vm.envExists("CEREMONY_DEPLOYER_ADDRESS") || vm.envExists("DEPLOYER_ADDRESS"))
+                ? deployerAddress()
+                : _placeholderGovernance();
         }
     }
 

@@ -5,6 +5,7 @@ use crate::state::{AccountManager, Trie};
 use crate::types::{Address, ExecutionError, JobId, ModelId, ModelState, TrainingJob};
 use citrate_consensus::types::Hash;
 use dashmap::{DashMap, DashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -16,8 +17,12 @@ pub struct StateDB {
     /// Account manager
     pub accounts: Arc<AccountManager>,
 
-    /// Storage tries for each account
-    storage_tries: Arc<DashMap<Address, Trie>>,
+    /// Storage tries for each account, copy-on-write: a `StateSnapshot` holds
+    /// another reference to each trie instead of a deep copy, and a write after
+    /// a snapshot copies only the one trie it touches (`Arc::make_mut`). The
+    /// reorg ring keeps 100 snapshots, so this is what keeps its cost
+    /// proportional to what changed rather than 100x the contract state.
+    storage_tries: Arc<DashMap<Address, Arc<Trie>>>,
 
     /// Contract code storage
     code_storage: Arc<DashMap<Hash, Vec<u8>>>,
@@ -28,8 +33,9 @@ pub struct StateDB {
     /// Training jobs
     training_jobs: Arc<DashMap<JobId, TrainingJob>>,
 
-    /// Global state trie
-    state_trie: Arc<parking_lot::RwLock<Trie>>,
+    /// Global state trie (rebuilt whole by `calculate_state_root`; shared, not
+    /// copied, by snapshots).
+    state_trie: Arc<parking_lot::RwLock<Arc<Trie>>>,
 
     /// C6 fix: Track dirty storage slots for persistence.
     /// Stores (address, key) pairs that have been modified since last commit.
@@ -41,6 +47,21 @@ pub struct StateDB {
     /// re-apply a branch in-memory (`apply_block_no_persist`) with NO durable
     /// writes — an aborted reorg that deployed a contract leaves nothing on disk.
     dirty_code: Arc<DashSet<Hash>>,
+
+    /// Height of the block whose post-state this db holds. It selects the
+    /// storage-root rule (`crate::storage_root_hardening`) for
+    /// [`Self::calculate_state_root`]. Set by block reward settlement (the one
+    /// step the producer, block import and trusted replay all run, after
+    /// execution and before the root), by restart hydration to the applied tip,
+    /// and carried by snapshots so a revert restores it. `0` (genesis) until
+    /// then.
+    root_height: AtomicU64,
+
+    /// Bumped on every change to `models` or `training_jobs` (and on every
+    /// restore). Never decreases, so an equal value read twice from the same
+    /// db means neither registry changed in between: the undo record of a
+    /// block that touches neither needs no model/job comparison.
+    model_job_generation: AtomicU64,
 }
 
 impl StateDB {
@@ -51,9 +72,11 @@ impl StateDB {
             code_storage: Arc::new(DashMap::new()),
             models: Arc::new(DashMap::new()),
             training_jobs: Arc::new(DashMap::new()),
-            state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
+            state_trie: Arc::new(parking_lot::RwLock::new(Arc::new(Trie::new()))),
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
+            root_height: AtomicU64::new(0),
+            model_job_generation: AtomicU64::new(0),
         }
     }
 
@@ -71,9 +94,11 @@ impl StateDB {
             code_storage: self.code_storage.clone(),
             models: Arc::new(DashMap::new()),
             training_jobs: Arc::new(DashMap::new()),
-            state_trie: Arc::new(parking_lot::RwLock::new(Trie::new())),
+            state_trie: Arc::new(parking_lot::RwLock::new(Arc::new(Trie::new()))),
             dirty_storage: Arc::new(DashSet::new()),
             dirty_code: Arc::new(DashSet::new()),
+            root_height: AtomicU64::new(0),
+            model_job_generation: AtomicU64::new(0),
         };
         iso.restore(self.snapshot());
         iso
@@ -103,16 +128,61 @@ impl StateDB {
     /// SRP-S3b diagnostic: recompute an account's storage_root FRESH from its resident
     /// storage trie (what `calculate_state_root` folds), or `None` if no trie is resident.
     pub fn get_storage_root_recomputed(&self, address: &Address) -> Option<Hash> {
-        self.storage_tries.get(address).map(|t| t.root_hash())
+        let canonical = self.canonical_storage_roots_at(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            self.root_height(),
+        );
+        self.storage_root_with_rule(address, canonical)
+    }
+
+    /// An account's storage_root under an explicit activation and height (the
+    /// fold [`Self::calculate_state_root_with`] uses), or `None` if no trie is
+    /// resident.
+    pub fn storage_root_with(
+        &self,
+        activation: Option<u64>,
+        height: u64,
+        address: &Address,
+    ) -> Option<Hash> {
+        self.storage_root_with_rule(address, self.canonical_storage_roots_at(activation, height))
+    }
+
+    fn storage_root_with_rule(&self, address: &Address, canonical: bool) -> Option<Hash> {
+        self.storage_tries
+            .get(address)
+            .map(|t| Self::storage_root_of(&t, canonical))
+    }
+
+    /// The storage root of one trie: a function of its slot set from the
+    /// hardening height, the legacy structural hash below it.
+    fn storage_root_of(trie: &Trie, canonical: bool) -> Hash {
+        if canonical {
+            trie.root_hash()
+        } else {
+            trie.legacy_root_hash()
+        }
+    }
+
+    fn canonical_storage_roots_at(&self, activation: Option<u64>, height: u64) -> bool {
+        crate::storage_root_hardening::active_at(activation, height)
+    }
+
+    /// Record the height of the block whose post-state this db now holds.
+    pub fn set_root_height(&self, height: u64) {
+        self.root_height.store(height, Ordering::SeqCst);
+    }
+
+    /// The height of the block whose post-state this db holds (see
+    /// `root_height`).
+    pub fn root_height(&self) -> u64 {
+        self.root_height.load(Ordering::SeqCst)
     }
 
     /// Set storage value
     pub fn set_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
         self.dirty_storage.insert((address, key.clone()));
-        self.storage_tries
-            .entry(address)
-            .or_default()
-            .insert(key, value);
+        let mut trie = self.storage_tries.entry(address).or_default();
+        Arc::make_mut(trie.value_mut()).insert(key, value);
     }
 
     /// PIL-13b: warm the in-memory storage cache from the persistent
@@ -121,17 +191,15 @@ impl StateDB {
     /// it would create a no-op flush at next commit. Used by the REVM
     /// Database adapter to hydrate cold-cache misses for view calls.
     pub fn cache_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
-        self.storage_tries
-            .entry(address)
-            .or_default()
-            .insert(key, value);
+        let mut trie = self.storage_tries.entry(address).or_default();
+        Arc::make_mut(trie.value_mut()).insert(key, value);
     }
 
     /// Delete storage value
     pub fn delete_storage(&self, address: Address, key: &[u8]) {
         self.dirty_storage.insert((address, key.to_vec()));
         if let Some(mut trie) = self.storage_tries.get_mut(&address) {
-            trie.remove(key);
+            Arc::make_mut(trie.value_mut()).remove(key);
         }
     }
 
@@ -178,6 +246,7 @@ impl StateDB {
         }
 
         self.models.insert(model_id, model);
+        self.bump_model_job_generation();
         info!("Registered model: {:?}", model_id);
         Ok(())
     }
@@ -194,6 +263,7 @@ impl StateDB {
         }
 
         self.models.insert(model_id, model);
+        self.bump_model_job_generation();
         Ok(())
     }
 
@@ -213,6 +283,7 @@ impl StateDB {
         }
 
         self.training_jobs.insert(job_id, job);
+        self.bump_model_job_generation();
         info!("Created training job: {:?}", job_id);
         Ok(())
     }
@@ -233,7 +304,61 @@ impl StateDB {
         }
 
         self.training_jobs.insert(job_id, job);
+        self.bump_model_job_generation();
         Ok(())
+    }
+
+    /// Apply a model-registry entry recorded in a committed tx journal.
+    ///
+    /// Insert-or-replace: the executor already checked existence against the
+    /// journal-first view when the tx ran, and the MVCC check guarantees no
+    /// other committed tx changed the entry since. Only the journal drain calls
+    /// this; inside a tx, write through the journal.
+    pub(crate) fn apply_journaled_model(&self, model_id: ModelId, model: ModelState) {
+        self.models.insert(model_id, model);
+        self.bump_model_job_generation();
+    }
+
+    /// Apply a training-job entry recorded in a committed tx journal
+    /// (see [`Self::apply_journaled_model`]).
+    pub(crate) fn apply_journaled_job(&self, job_id: JobId, job: TrainingJob) {
+        self.training_jobs.insert(job_id, job);
+        self.bump_model_job_generation();
+    }
+
+    fn bump_model_job_generation(&self) {
+        self.model_job_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The model/job change counter (see the field). Pair it with a
+    /// [`Self::snapshot`] taken at the same moment and pass both to
+    /// [`Self::model_job_pre_images`].
+    pub fn model_job_generation(&self) -> u64 {
+        self.model_job_generation.load(Ordering::SeqCst)
+    }
+
+    /// The model and training-job pre-images, in `prev`, of every entry that
+    /// differs now (`None`: absent in `prev`). `prev` must be a snapshot of
+    /// this db taken when [`Self::model_job_generation`] read `generation`;
+    /// when it still reads the same, neither registry changed and the answer
+    /// is empty without comparing anything.
+    pub fn model_job_pre_images(
+        &self,
+        prev: &StateSnapshot,
+        generation: u64,
+    ) -> crate::executor::ModelJobUndo {
+        if self.model_job_generation() == generation {
+            return crate::executor::ModelJobUndo::default();
+        }
+        let jobs: Vec<(JobId, TrainingJob)> = self
+            .training_jobs
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        crate::executor::ModelJobUndo {
+            models: pre_images_by_encoding(&prev.models, &self.all_models()),
+            jobs: pre_images_by_encoding(&prev.training_jobs, &jobs),
+        }
     }
 
     /// Calculate state root.
@@ -268,8 +393,32 @@ impl StateDB {
     ///    marks the same accounts dirty per block), so the accumulated trie —
     ///    and its root — is identical across the fleet (see
     ///    `state_root_is_operation_order_independent`).
+    ///
+    /// The storage-root rule follows the process-wide storage-root hardening
+    /// height and this db's [`Self::root_height`]; see
+    /// [`Self::calculate_state_root_with`].
     pub fn calculate_state_root(&self) -> StateRoot {
-        let mut state_trie = self.state_trie.write();
+        self.calculate_state_root_at(self.root_height())
+    }
+
+    /// The state root of the post-state of the block at `height`, under the
+    /// process-wide storage-root hardening height.
+    pub fn calculate_state_root_at(&self, height: u64) -> StateRoot {
+        self.calculate_state_root_with(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            height,
+        )
+    }
+
+    /// The state root under an explicit storage-root hardening `activation`,
+    /// for the post-state of the block at `height`. At and after the activation
+    /// each account's `storage_root` is a function of its slot set only; below
+    /// it (and with no activation) it is the legacy structural hash, so every
+    /// historical root is reproduced byte for byte.
+    pub fn calculate_state_root_with(&self, activation: Option<u64>, height: u64) -> StateRoot {
+        let canonical = self.canonical_storage_roots_at(activation, height);
+        let mut state_trie_slot = self.state_trie.write();
+        let mut state_trie = Trie::new();
 
         // SRP (ADR-2026-07-21-state-root-purity, Decision §1+§2): the consensus root MUST
         // be a PURE FUNCTION of committed state — identical whether a node produced,
@@ -288,7 +437,6 @@ impl StateDB {
         // class). The resident map is never evicted; a restarted node fully hydrates it
         // first (WP-2.2). Deterministic address-sorted insertion preserves the PR-#88
         // order-independence invariant.
-        *state_trie = Trie::new();
 
         let mut all = self.accounts.all_accounts();
         all.sort_unstable_by_key(|a| a.0 .0);
@@ -298,7 +446,7 @@ impl StateDB {
             // trie — for EVERY account, not just dirty ones — so a slot change via any
             // path is reflected. (Recomputes identically each call → idempotent.)
             if let Some(storage_trie) = self.storage_tries.get(&address) {
-                account.storage_root = storage_trie.root_hash();
+                account.storage_root = Self::storage_root_of(&storage_trie, canonical);
                 // Keep the resident account consistent with what we hash.
                 self.accounts.set_account(address, account.clone());
             }
@@ -325,7 +473,11 @@ impl StateDB {
             state_trie.insert(address.0.to_vec(), encoded);
         }
 
-        state_trie.root_hash()
+        // Rebuilt by inserts only, so the structural hash is already a function
+        // of the account set.
+        let root = state_trie.legacy_root_hash();
+        *state_trie_slot = Arc::new(state_trie);
+        root
     }
 
     /// SRP-S4 diagnostic — an INJECTIVE full-state fingerprint that DISTINGUISHES two
@@ -338,13 +490,17 @@ impl StateDB {
     /// diff two nodes at a wedge height. DIAGNOSTIC ONLY — never a consensus value.
     pub fn full_state_fingerprint(&self) -> Hash {
         use sha3::{Digest, Keccak256};
+        let canonical = self.canonical_storage_roots_at(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            self.root_height(),
+        );
         let mut all = self.accounts.all_accounts();
         all.sort_unstable_by_key(|a| a.0 .0);
         let mut h = Keccak256::new();
         for (address, mut account) in all {
             let slots: Vec<(Vec<u8>, Vec<u8>)> = match self.storage_tries.get(&address) {
                 Some(t) => {
-                    account.storage_root = t.root_hash();
+                    account.storage_root = Self::storage_root_of(&t, canonical);
                     let mut s: Vec<(Vec<u8>, Vec<u8>)> = t.entries_map().into_iter().collect();
                     s.sort();
                     s
@@ -372,13 +528,17 @@ impl StateDB {
     /// SRP-S4 diagnostic — per-account lines for the injective fingerprint above, so a
     /// diff of two nodes' dumps at a wedge height NAMES the diverging account/slot-count.
     pub fn full_state_digest_lines(&self) -> Vec<String> {
+        let canonical = self.canonical_storage_roots_at(
+            crate::storage_root_hardening::storage_root_hardening_height(),
+            self.root_height(),
+        );
         let mut all = self.accounts.all_accounts();
         all.sort_unstable_by_key(|a| a.0 .0);
         all.into_iter()
             .map(|(address, mut account)| {
                 let nslots = match self.storage_tries.get(&address) {
                     Some(t) => {
-                        account.storage_root = t.root_hash();
+                        account.storage_root = Self::storage_root_of(&t, canonical);
                         t.entries_map().len()
                     }
                     None => 0,
@@ -439,6 +599,7 @@ impl StateDB {
                 .collect(),
             dirty_code: self.dirty_code.iter().map(|h| *h).collect(),
             state_trie: self.state_trie.read().clone(),
+            root_height: self.root_height(),
         }
     }
 
@@ -467,6 +628,7 @@ impl StateDB {
 
         // Restore the accumulating account trie (see StateSnapshot::state_trie).
         *self.state_trie.write() = snapshot.state_trie;
+        self.set_root_height(snapshot.root_height);
 
         // Restore models
         self.models.clear();
@@ -479,6 +641,7 @@ impl StateDB {
         for (id, job) in snapshot.training_jobs {
             self.training_jobs.insert(id, job);
         }
+        self.bump_model_job_generation();
 
         debug!("State restored from snapshot");
     }
@@ -498,6 +661,13 @@ impl Default for StateDB {
     }
 }
 
+/// An account's value before a change (`None`: absent).
+pub type AccountPreImage = (Address, Option<crate::types::AccountState>);
+
+/// A storage slot's value before a change: `(address, slot key, value)`
+/// (`None`: absent).
+pub type StoragePreImage = (Address, Vec<u8>, Option<Vec<u8>>);
+
 /// State snapshot for rollback.
 ///
 /// `Clone` supports the execute-on-receive reorg snapshot ring
@@ -507,7 +677,8 @@ impl Default for StateDB {
 #[derive(Clone)]
 pub struct StateSnapshot {
     accounts: crate::state::account::AccountSnapshot,
-    storage_tries: Vec<(Address, Trie)>,
+    /// Shared with the live `StateDB` (copy-on-write; see `StateDB::storage_tries`).
+    storage_tries: Vec<(Address, Arc<Trie>)>,
     models: Vec<(ModelId, ModelState)>,
     training_jobs: Vec<(JobId, TrainingJob)>,
     dirty_storage: Vec<(Address, Vec<u8>)>,
@@ -519,13 +690,153 @@ pub struct StateSnapshot {
     /// rebuilt from scratch), so a snapshot that omitted it left the trie polluted after
     /// a restore — a rejected apply_block would then still report the (uncommitted)
     /// candidate root. Capturing + restoring it makes revert byte-exact.
-    state_trie: Trie,
+    state_trie: Arc<Trie>,
+    /// `StateDB::root_height` at snapshot time, so a revert also restores the
+    /// storage-root rule of the restored state.
+    root_height: u64,
 }
 
 impl StateSnapshot {
     /// All captured accounts (address → state). For reorg store reconciliation.
     pub fn account_entries(&self) -> &[(Address, crate::types::AccountState)] {
         self.accounts.entries()
+    }
+
+    /// The pre-images, in `prev`, of every account and storage slot whose
+    /// value differs in `self`: applying them to `self` with
+    /// [`Self::with_pre_images`] gives `prev`'s accounts and storage. `None`
+    /// means the key is absent in `prev`. Storage tries `self` still shares
+    /// with `prev` (the same `Arc`: copy-on-write leaves an unchanged trie
+    /// shared while `prev` holds it) are skipped without being read.
+    pub fn pre_images_since(
+        &self,
+        prev: &StateSnapshot,
+    ) -> (Vec<AccountPreImage>, Vec<StoragePreImage>) {
+        use std::collections::HashMap;
+        let before: HashMap<&Address, &crate::types::AccountState> =
+            prev.account_entries().iter().map(|(a, s)| (a, s)).collect();
+        let after: HashMap<&Address, &crate::types::AccountState> =
+            self.account_entries().iter().map(|(a, s)| (a, s)).collect();
+        let mut accounts = Vec::new();
+        for (addr, state) in &after {
+            let old = before.get(addr).copied();
+            if old != Some(*state) {
+                accounts.push((**addr, old.cloned()));
+            }
+        }
+        for (addr, state) in &before {
+            if !after.contains_key(addr) {
+                accounts.push((**addr, Some((*state).clone())));
+            }
+        }
+
+        let before_tries: HashMap<&Address, &Arc<Trie>> =
+            prev.storage_tries.iter().map(|(a, t)| (a, t)).collect();
+        let after_tries: HashMap<&Address, &Arc<Trie>> =
+            self.storage_tries.iter().map(|(a, t)| (a, t)).collect();
+        let mut storage = Vec::new();
+        for (addr, trie) in &after_tries {
+            let old = before_tries.get(addr).copied();
+            if old.is_some_and(|o| Arc::ptr_eq(o, trie)) {
+                continue;
+            }
+            let now = trie.entries_map();
+            let was = old.map(|o| o.entries_map()).unwrap_or_default();
+            for (key, value) in &now {
+                if was.get(key) != Some(value) {
+                    storage.push((**addr, key.clone(), was.get(key).cloned()));
+                }
+            }
+            for (key, value) in &was {
+                if !now.contains_key(key) {
+                    storage.push((**addr, key.clone(), Some(value.clone())));
+                }
+            }
+        }
+        for (addr, trie) in &before_tries {
+            if !after_tries.contains_key(addr) {
+                for (key, value) in trie.entries_map() {
+                    storage.push((**addr, key, Some(value)));
+                }
+            }
+        }
+        (accounts, storage)
+    }
+
+    /// The pre-images, in `prev`, of every model and training job that differs
+    /// in `self` (compared by their encoding; `None`: absent in `prev`).
+    pub fn model_job_pre_images_since(
+        &self,
+        prev: &StateSnapshot,
+    ) -> crate::executor::ModelJobUndo {
+        crate::executor::ModelJobUndo {
+            models: pre_images_by_encoding(&prev.models, &self.models),
+            jobs: pre_images_by_encoding(&prev.training_jobs, &self.training_jobs),
+        }
+    }
+
+    /// This snapshot with model and training-job pre-images applied (`Some`
+    /// is written, `None` removes the entry).
+    pub fn with_model_job_pre_images(mut self, undo: &crate::executor::ModelJobUndo) -> Self {
+        self.models = apply_pre_images(std::mem::take(&mut self.models), &undo.models);
+        self.training_jobs = apply_pre_images(std::mem::take(&mut self.training_jobs), &undo.jobs);
+        self
+    }
+
+    /// This snapshot with `accounts` and `storage` pre-images applied (a
+    /// `Some` value is written, `None` removes the key; a contract left with
+    /// no slots keeps no trie, as a node hydrated from the store has none),
+    /// nothing dirty, and `root_height` as given. Models, training jobs and
+    /// shared tries are carried over unchanged. The inverse of
+    /// [`Self::pre_images_since`] for accounts and storage.
+    pub fn with_pre_images(
+        &self,
+        accounts: &[AccountPreImage],
+        storage: &[StoragePreImage],
+        root_height: u64,
+    ) -> StateSnapshot {
+        use std::collections::{HashMap, HashSet};
+        let mut account_map: HashMap<Address, crate::types::AccountState> =
+            self.account_entries().iter().cloned().collect();
+        for (addr, state) in accounts {
+            match state {
+                Some(s) => {
+                    account_map.insert(*addr, s.clone());
+                }
+                None => {
+                    account_map.remove(addr);
+                }
+            }
+        }
+        let mut tries: HashMap<Address, Arc<Trie>> = self.storage_tries.iter().cloned().collect();
+        let mut shrunk: HashSet<Address> = HashSet::new();
+        for (addr, key, value) in storage {
+            let trie = tries.entry(*addr).or_insert_with(|| Arc::new(Trie::new()));
+            match value {
+                Some(v) => Arc::make_mut(trie).insert(key.clone(), v.clone()),
+                None => {
+                    Arc::make_mut(trie).remove(key);
+                    shrunk.insert(*addr);
+                }
+            }
+        }
+        for addr in shrunk {
+            if tries.get(&addr).is_some_and(|t| t.entries_map().is_empty()) {
+                tries.remove(&addr);
+            }
+        }
+        StateSnapshot {
+            accounts: crate::state::account::AccountSnapshot::from_entries(
+                account_map.into_iter().collect(),
+            ),
+            storage_tries: tries.into_iter().collect(),
+            models: self.models.clone(),
+            training_jobs: self.training_jobs.clone(),
+            dirty_storage: Vec::new(),
+            dirty_code: Vec::new(),
+            state_trie: self.state_trie.clone(),
+            root_height,
+        }
     }
 
     /// All captured contract storage as address → (slot key → value). Enumerated
@@ -538,6 +849,52 @@ impl StateSnapshot {
             .map(|(addr, trie)| (*addr, trie.entries_map()))
             .collect()
     }
+}
+
+/// The entries of `before` that differ in `after` (by encoding), with their
+/// `before` value; `None` for entries `after` added.
+fn pre_images_by_encoding<K, V>(before: &[(K, V)], after: &[(K, V)]) -> Vec<(K, Option<V>)>
+where
+    K: Copy + Eq + std::hash::Hash,
+    V: Clone + serde::Serialize,
+{
+    use std::collections::HashMap;
+    let enc = |v: &V| bincode::serialize(v).ok();
+    let was: HashMap<K, &V> = before.iter().map(|(k, v)| (*k, v)).collect();
+    let now: HashMap<K, &V> = after.iter().map(|(k, v)| (*k, v)).collect();
+    let mut out = Vec::new();
+    for (k, v) in &now {
+        match was.get(k) {
+            Some(old) if enc(old).is_some() && enc(old) == enc(v) => {}
+            old => out.push((*k, old.map(|o| (*o).clone()))),
+        }
+    }
+    for (k, v) in &was {
+        if !now.contains_key(k) {
+            out.push((*k, Some((*v).clone())));
+        }
+    }
+    out
+}
+
+/// `entries` with `pre_images` applied: `Some` is written, `None` removed.
+fn apply_pre_images<K, V>(entries: Vec<(K, V)>, pre_images: &[(K, Option<V>)]) -> Vec<(K, V)>
+where
+    K: Copy + Eq + std::hash::Hash,
+    V: Clone,
+{
+    let mut map: std::collections::HashMap<K, V> = entries.into_iter().collect();
+    for (k, v) in pre_images {
+        match v {
+            Some(v) => {
+                map.insert(*k, v.clone());
+            }
+            None => {
+                map.remove(k);
+            }
+        }
+    }
+    map.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -597,6 +954,112 @@ mod tests {
 
         assert_eq!(db.get_code(&code_hash), Some(code));
         assert_eq!(db.accounts.get_code_hash(&addr), code_hash);
+    }
+
+    /// A block's model/job pre-images, from the db and a snapshot taken with
+    /// its generation: empty when neither registry changed (no comparison),
+    /// otherwise exactly the entries that changed, with their earlier value.
+    /// A restore counts as a change.
+    #[test]
+    fn model_job_pre_images_track_every_registry_change() {
+        use crate::types::{ModelMetadata, UsageStats};
+        let model = |version: u32| ModelState {
+            owner: Address([1; 20]),
+            model_hash: Hash::new([0x77; 32]),
+            version,
+            metadata: ModelMetadata::default(),
+            access_policy: crate::types::AccessPolicy::Public,
+            usage_stats: UsageStats::default(),
+        };
+        let (m1, m2) = (ModelId(Hash::new([1; 32])), ModelId(Hash::new([2; 32])));
+        let db = StateDB::new();
+        db.register_model(m1, model(1)).expect("register");
+        let gen = db.model_job_generation();
+        let before = db.snapshot();
+        db.accounts.set_balance(Address([9; 20]), U256::from(5));
+        assert_eq!(
+            db.model_job_pre_images(&before, gen),
+            crate::executor::ModelJobUndo::default(),
+            "no registry change: empty"
+        );
+        db.update_model(m1, model(2)).expect("update");
+        db.register_model(m2, model(1)).expect("register");
+        let undo = db.model_job_pre_images(&before, gen);
+        let mut got: Vec<(ModelId, Option<u32>)> = undo
+            .models
+            .iter()
+            .map(|(id, m)| (*id, m.as_ref().map(|m| m.version)))
+            .collect();
+        got.sort_by_key(|(id, _)| id.0);
+        assert_eq!(got, vec![(m1, Some(1)), (m2, None)]);
+        assert!(undo.jobs.is_empty());
+        // Applied back, the pre-images give the earlier registry.
+        let back = db.snapshot().with_model_job_pre_images(&undo);
+        let restored = StateDB::new();
+        restored.restore(back);
+        assert_eq!(restored.get_model(&m1).map(|m| m.version), Some(1));
+        assert!(restored.get_model(&m2).is_none());
+        // A restore moves the generation: a stale pairing never reads "unchanged".
+        let gen2 = db.model_job_generation();
+        db.restore(before.clone());
+        assert_ne!(db.model_job_generation(), gen2);
+    }
+
+    /// The pre-images of a change, applied back, give the earlier state: the
+    /// same accounts, the same slots, the same root. A trie the change never
+    /// touched is not read.
+    #[test]
+    fn pre_images_since_and_with_pre_images_are_inverse() {
+        let db = StateDB::new();
+        let (a, b, c, d) = (
+            Address([1; 20]),
+            Address([2; 20]),
+            Address([3; 20]),
+            Address([4; 20]),
+        );
+        db.accounts.set_balance(a, U256::from(1000));
+        db.accounts.set_balance(b, U256::from(7));
+        db.set_storage(a, b"k1".to_vec(), b"v1".to_vec());
+        db.set_storage(a, b"k2".to_vec(), b"v2".to_vec());
+        db.set_storage(d, b"same".to_vec(), b"untouched".to_vec());
+        let prev_root = db.calculate_state_root();
+        let prev = db.snapshot();
+
+        db.accounts.set_balance(a, U256::from(900)); // changed
+        db.accounts.set_balance(c, U256::from(100)); // created
+        db.set_storage(a, b"k1".to_vec(), b"v1b".to_vec()); // slot changed
+        db.delete_storage(a, b"k2"); // slot removed
+        db.set_storage(c, b"n".to_vec(), b"new".to_vec()); // new contract storage
+        db.set_root_height(9);
+        let _ = db.calculate_state_root();
+        let cur = db.snapshot();
+
+        let (accounts, storage) = cur.pre_images_since(&prev);
+        assert!(
+            storage.iter().all(|(addr, _, _)| *addr != d),
+            "a shared, untouched trie is skipped: {storage:?}"
+        );
+        assert!(
+            accounts.contains(&(c, None)),
+            "a created account reverts to absent"
+        );
+        assert!(storage.contains(&(a, b"k2".to_vec(), Some(b"v2".to_vec()))));
+        assert!(storage.contains(&(c, b"n".to_vec(), None)));
+
+        let back = cur.with_pre_images(&accounts, &storage, prev.root_height);
+        let restored = StateDB::new();
+        restored.restore(back);
+        assert_eq!(restored.calculate_state_root(), prev_root);
+        assert_eq!(restored.accounts.get_balance(&a), U256::from(1000));
+        assert!(!restored.accounts.exists(&c));
+        assert_eq!(restored.get_storage(&a, b"k1"), Some(b"v1".to_vec()));
+        assert_eq!(restored.get_storage(&a, b"k2"), Some(b"v2".to_vec()));
+        assert_eq!(restored.get_storage(&c, b"n"), None);
+        assert!(
+            !restored.storage_tries.contains_key(&c),
+            "a contract left with no slots keeps no trie, as after hydration"
+        );
+        assert_eq!(restored.root_height(), prev.root_height);
     }
 
     #[test]

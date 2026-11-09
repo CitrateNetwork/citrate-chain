@@ -79,6 +79,12 @@ Next == \E h \in Heights, v \in Voters, sig_c \in Chains : SubmitVote(h, v, sig_
 
 Spec == Init /\ [][Next]_vars
 
+\* State constraint for TLC: `submitted_msgs` grows without bound, so a run
+\* must cap it (Stage 2: without the cap TLC never terminates). Every
+\* interleaving of up to 5 submissions over the configured voters, heights
+\* and chains is explored.
+SubmissionBound == Len(submitted_msgs) <= 5
+
 \* ---- Invariants ----
 
 \* INV-1 (H-01): every (h, v) in voted has a corresponding
@@ -89,27 +95,38 @@ VotedSetTracksAcceptedOnly ==
             v == pair[2]
         IN v \in accepted[h]
 
-\* INV-2 (H-01 corollary): a voter who submits a garbage-sig vote
-\* (sig_chain_id # chain_id is a stand-in for "fails verification")
-\* MUST NOT appear in `voted`. They retain the right to cast a
+\* INV-2 (H-01 corollary): a garbage-sig vote (sig_chain_id # chain_id is a
+\* stand-in for "fails verification") never puts its (height, voter) into
+\* `voted`: every (h, v) in `voted` is backed by a VALID submission from v at h.
+\* A voter hit by garbage submissions therefore keeps the right to cast a
 \* later valid vote.
+\*
+\* Stage 2 erratum (2026-10-19): the first version required every garbage
+\* submission's (height, voter) to be absent from `voted`, which TLC refutes
+\* with a valid vote followed by a garbage resubmission for the same pair
+\* (the pair is in `voted` because of the VALID vote, which is correct). The
+\* property intended — garbage alone never locks a voter — is stated below.
 GarbageSigDoesNotLockVoter ==
-    \A i \in 1..Len(submitted_msgs) :
-        LET m == submitted_msgs[i]
-        IN m.sig_chain_id # chain_id => <<m.height, m.voter>> \notin voted
-        \* Read: any submission with a non-matching sig_chain_id
-        \* must NOT have caused (height, voter) to land in voted.
+    \A pair \in voted :
+        \E i \in 1..Len(submitted_msgs) :
+            /\ submitted_msgs[i].height = pair[1]
+            /\ submitted_msgs[i].voter = pair[2]
+            /\ submitted_msgs[i].sig_chain_id = chain_id
 
-\* INV-3 (H-02): only votes signed for our chain are ever accepted.
-\* Cross-chain replay is structurally rejected.
+\* INV-3 (H-02): only votes signed for our chain are ever accepted. Every
+\* accepted (height, voter) is backed by a submission whose signature was made
+\* for this chain; cross-chain replay is structurally rejected.
+\*
+\* Stage 2 erratum (2026-10-19): the first version attributed acceptance to
+\* EVERY submission from an accepted voter, which TLC refutes with a valid vote
+\* followed by a cross-chain resubmission (rejected, but the voter is already
+\* accepted from the valid one). Restated as intended.
 OnlyOwnChainVotesAccepted ==
-    \A i \in 1..Len(submitted_msgs) :
-        LET m == submitted_msgs[i]
-        IN (m.voter \in accepted[m.height] /\
-            \E j \in 1..Len(submitted_msgs) :
-                /\ submitted_msgs[j] = m
-                /\ j = i)
-           => m.sig_chain_id = chain_id
+    \A h \in Heights : \A v \in accepted[h] :
+        \E i \in 1..Len(submitted_msgs) :
+            /\ submitted_msgs[i].height = h
+            /\ submitted_msgs[i].voter = v
+            /\ submitted_msgs[i].sig_chain_id = chain_id
 
 \* INV-4: voted set is monotonic (entries are never removed).
 VotedMonotonic ==

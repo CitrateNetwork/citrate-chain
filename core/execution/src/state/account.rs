@@ -249,6 +249,14 @@ pub struct AccountSnapshot {
 }
 
 impl AccountSnapshot {
+    /// A snapshot holding exactly `accounts`, none of them dirty.
+    pub(crate) fn from_entries(accounts: Vec<(Address, AccountState)>) -> Self {
+        Self {
+            accounts,
+            dirty: Vec::new(),
+        }
+    }
+
     /// All captured accounts (every account resident in the cache at snapshot
     /// time). Used by the reorg store-reconciliation to diff two snapshots.
     pub fn entries(&self) -> &[(Address, AccountState)] {

@@ -15,11 +15,13 @@
 )]
 
 pub mod ai_rpc;
+pub mod canonical_logs;
 pub mod economics_rpc;
 pub mod eth_rpc;
 pub mod eth_subscriptions;
 pub mod eth_tx_decoder;
 pub mod filter;
+pub mod finalized_tag;
 pub mod inference_auth;
 pub mod methods;
 pub mod metrics;
@@ -30,11 +32,13 @@ pub mod rate_limit;
 pub mod rpc_limits;
 pub mod rpc_runtime;
 pub mod server;
+pub mod state_tag;
 pub mod types;
 pub mod websocket;
 
 pub use eth_subscriptions::EthSubscriptionServer;
 pub use filter::FilterRegistry;
+pub use finalized_tag::{FinalizedAnchor, FinalizedTagSource, VerifiedFinalized};
 pub use jsonrpc_http_server::CloseHandle as RpcCloseHandle;
 pub use node_rpc::NodeIdentity;
 pub use openai_api::OpenAiRestServer;

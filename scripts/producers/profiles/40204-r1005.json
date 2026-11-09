@@ -1,0 +1,38 @@
+{
+  "name": "40204-r1005",
+  "status": "ready",
+  "description": "Live public testnet (chain 40204, r1005 genesis of 2026-10-06). Values match node/config/testnet-beta.toml, contracts/addresses/40204.json and the fleet's systemd environment.",
+  "sources": {
+    "genesis_hash": "eth_getBlockByNumber(0x0).hash on https://rpc.citrate.ai (checked 2026-10-19)",
+    "bootstrap_nodes": "node/config/testnet-beta.toml [network].bootstrap_nodes",
+    "validator_registry": "contracts/addresses/40204.json contracts.ValidatorRegistry",
+    "validator_activation_height": "fleet citrate-node.service drop-in (CITRATE_VALIDATOR_ACTIVATION_HEIGHT), unchanged since the 2026-09-29 reroll",
+    "env": "fleet citrate-node.service drop-ins (reroll.conf, dag-prune.conf)",
+    "checkpoint": "node/config/testnet-beta.toml [checkpoint]"
+  },
+  "chain_id": 40204,
+  "genesis_hash": "0x1dcfc4909dd9fdcb0f03c823d627e4b2032cc86bef5fc4561030d6c64b9775f1",
+  "genesis_profile": null,
+  "public_rpc": "https://rpc.citrate.ai",
+  "block_time": 2,
+  "ghostdag_k": 18,
+  "bootstrap_nodes": [
+    "noise_f356d3ebb07371eaad371b3960272f9d58fc457cde409c34549ef03776b78141@boot1.citrate.ai:30303",
+    "noise_4ed281386422f6a65b92d8760d24baa82bb1b476e9dd3e21d5a070d026802c07@boot2.citrate.ai:30303",
+    "noise_2b4924671e0babc9f52eb1695c72141a9c639e17ad95a2a2d2a715eae34a420e@boot3.citrate.ai:30303",
+    "noise_6ee549718d522c9ccc122585dfedef72aea8df24f4a2bb0264e7658a91118b4a@rpc.citrate.ai:30303"
+  ],
+  "validator_registry": "0xde4F679632be7810D915F637Cc6a72bf076A3BD9",
+  "validator_activation_height": 2000,
+  "env": {
+    "CITRATE_BLOCK_V2": "1",
+    "CITRATE_DAG_PRUNE_RETAIN": "10000"
+  },
+  "checkpoint": {
+    "interval": 50,
+    "committee_size": 100,
+    "quorum_threshold": 67
+  },
+  "gas_price_wei": 1000000000,
+  "registration_gas_limit": 600000
+}

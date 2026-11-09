@@ -40,7 +40,7 @@ It is a parameterized helper for non-canonical pilot experiments.
 5. `IPFSIncentives`
 6. `X402Facilitator`
 7. `X402Paywall`
-8. `LiquidStakingPool`
+8. ~~`LiquidStakingPool`~~: not part of block 0 (owner decision 2026-10-26); `TreasuryGovernor` is deployed with no pool (address(0)) and a passed proposal can wire one later
 9. `ContributionAccounting`
 10. `NematocystSlashing`
 11. `MarketMakerAllocation`

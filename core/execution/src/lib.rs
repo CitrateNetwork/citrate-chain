@@ -17,6 +17,9 @@
 )]
 pub mod activation;
 pub mod agent_fork;
+pub mod exact_code;
+pub mod storage_root_hardening;
+pub mod supply_hardening;
 
 /// PBA-L1a-003: consensus-affecting cargo features of THIS build of the
 /// execution crate. Dependent binaries assert on these at compile time (a

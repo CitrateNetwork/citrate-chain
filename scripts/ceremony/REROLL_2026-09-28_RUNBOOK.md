@@ -1,5 +1,7 @@
 # Reroll 2026-09-28 — Runbook + Address Ledger
 
+> **SUPERSEDED (2026-10-19)** by [`scripts/genesis/CEREMONY_RUNBOOK.md`](../genesis/CEREMONY_RUNBOOK.md). This file names the pre-r1005 deployer, governance and genesis; do not follow it. Kept for history.
+
 **Status:** STAGING (execute only after the pre-reroll gate is green). **Owner:** DGX (chain + deployer, holds all keys). **Coord channel:** citrate-federation#253 (MAC cut protocol).
 
 Goal: cut a fresh genesis for chain 40204 that (a) clears the rpc-1 fork, (b) rebuilds from a fully-hardened `main`, and (c) launches multisig-governed, stake-gated, with `blockSubsidy` cut — while **preserving every merged PR / code hardening / org lockdown**. This runbook doubles as the dim-9 decentralization cut (multi-producer + stake-gating).

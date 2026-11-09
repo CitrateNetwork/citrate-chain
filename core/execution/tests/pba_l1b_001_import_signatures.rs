@@ -18,6 +18,7 @@ use citrate_consensus::tx_auth::{native_tx_id, tx_root_for_height};
 use citrate_consensus::types::{
     Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
+use citrate_execution::executor::fixed_reward;
 use citrate_execution::{address_utils, Executor, StateDB};
 use primitive_types::U256;
 use std::collections::HashMap;
@@ -178,7 +179,7 @@ async fn pba_l1b_001_forged_sender_block_rejected_after_activation() {
     let block = seal(pba, &fund, vec![forged_transfer(steal.as_u128())]).await;
 
     let f = follower(pba, &fund);
-    let r = f.apply_block(&block, COINBASE, &[]).await;
+    let r = f.apply_block(&block, COINBASE, &fixed_reward(&[])).await;
     assert!(
         r.is_err(),
         "PBA-L1b-001: a block with a forged-sender tx must be rejected on import, got {r:?}"
@@ -201,7 +202,7 @@ async fn pba_l1b_001_before_activation_legacy_import_is_unchanged() {
     let fund = [(embedded(VICTIM), funds())];
     let block = seal(pba, &fund, vec![forged_transfer(1_000)]).await;
     let f = follower(pba, &fund);
-    f.apply_block(&block, COINBASE, &[])
+    f.apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .expect("pre-activation: legacy rule");
 }
@@ -214,7 +215,7 @@ async fn pba_l1b_001_validly_signed_block_applies_after_activation() {
     let fund = [(sender, funds())];
     let block = seal(pba, &fund, vec![native_signed(&sk, THIEF, 5, CHAIN)]).await;
     let f = follower(pba, &fund);
-    f.apply_block(&block, COINBASE, &[])
+    f.apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .expect("an honest signed block applies");
     assert_eq!(
@@ -235,7 +236,7 @@ async fn pba_l1b_001_non_canonical_hash_rejected_after_activation() {
     tx.hash = Hash::new([0x42; 32]); // squats someone else's id
     let block = seal(pba, &fund, vec![tx]).await;
     assert!(follower(pba, &fund)
-        .apply_block(&block, COINBASE, &[])
+        .apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .is_err());
 }
@@ -249,7 +250,7 @@ async fn pba_l1b_001_foreign_chain_id_rejected_after_activation() {
     let fund = [(sender, funds())];
     let block = seal(pba, &fund, vec![native_signed(&sk, THIEF, 5, 1)]).await;
     assert!(follower(pba, &fund)
-        .apply_block(&block, COINBASE, &[])
+        .apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .is_err());
 }
@@ -297,14 +298,14 @@ async fn v1_native_signed_for_another_chain_applies_below_h_rejected_from_h() {
     let below = PbaHardening::at(2);
     let block = seal(below, &fund, vec![tx.clone()]).await;
     follower(below, &fund)
-        .apply_block(&block, COINBASE, &[])
+        .apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .expect("below H: legacy validity");
 
     let at = PbaHardening::at(1);
     let block = seal(at, &fund, vec![tx]).await;
     let f = follower(at, &fund);
-    let r = f.apply_block(&block, COINBASE, &[]).await;
+    let r = f.apply_block(&block, COINBASE, &fixed_reward(&[])).await;
     assert!(
         matches!(r, Err(ref e) if e.to_string().contains("legacy digest")),
         "at H a V1 native signature is invalid, got {r:?}"
@@ -326,12 +327,12 @@ async fn v1_native_rejected_v2_applies_from_h() {
     let v1 = native_v1_for_chain(&sk, PAYEE, 5, CHAIN);
     let block = seal(pba, &fund, vec![v1]).await;
     assert!(follower(pba, &fund)
-        .apply_block(&block, COINBASE, &[])
+        .apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .is_err());
     let block = seal(pba, &fund, vec![native_signed(&sk, PAYEE, 5, CHAIN)]).await;
     follower(pba, &fund)
-        .apply_block(&block, COINBASE, &[])
+        .apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .expect("V2 applies at H");
 }
@@ -358,7 +359,10 @@ async fn small_order_key_signature_rejected_from_h_applies_below_h() {
     let at = PbaHardening::at(1);
     let block = seal(at, &fund, vec![tx.clone()]).await;
     let f = follower(at, &fund);
-    assert!(f.apply_block(&block, COINBASE, &[]).await.is_err());
+    assert!(f
+        .apply_block(&block, COINBASE, &fixed_reward(&[]))
+        .await
+        .is_err());
     assert_eq!(
         f.get_balance(&address_utils::normalize_address(&embedded(PAYEE))),
         U256::zero()
@@ -367,7 +371,7 @@ async fn small_order_key_signature_rejected_from_h_applies_below_h() {
     let below = PbaHardening::at(2);
     let block = seal(below, &fund, vec![tx]).await;
     follower(below, &fund)
-        .apply_block(&block, COINBASE, &[])
+        .apply_block(&block, COINBASE, &fixed_reward(&[]))
         .await
         .expect("below H: legacy import unchanged");
 }

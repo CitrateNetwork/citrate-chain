@@ -34,7 +34,7 @@ scan() { # <root> ; prints violations, returns 0 iff any found
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   printf 'async fn f(s: &S) {\n    s.stats.write().await.n = s.stats.write().await.n + 1;\n}\n' > "$d/a.rs"
   scan "$d" >/dev/null || { echo "self-test: did not detect a double write lock"; rc=1; }
   printf 'async fn f(s: &S) {\n    let mut st = s.stats.write().await;\n    st.n = st.n + 1;\n    let a = s.x.read().await.len() + s.x.read().await.len();\n}\n' > "$d/a.rs"

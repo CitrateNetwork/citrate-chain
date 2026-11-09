@@ -25,7 +25,8 @@
 //! ```
 
 use metrics::{
-    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram, Unit,
+    absolute_counter, counter, describe_counter, describe_gauge, describe_histogram, gauge,
+    histogram, Unit,
 };
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
@@ -61,6 +62,7 @@ pub const METRIC_PEER_COUNT: &str = "citrate_peer_count";
 pub const METRIC_PEER_CONNECTIONS_TOTAL: &str = "citrate_peer_connections_total";
 pub const METRIC_PEER_DISCONNECTIONS_TOTAL: &str = "citrate_peer_disconnections_total";
 pub const METRIC_PEER_LATENCY: &str = "citrate_peer_latency_seconds";
+pub const METRIC_P2P_INBOUND_DROPPED_TOTAL: &str = "citrate_p2p_inbound_dropped_total";
 
 // Mempool
 pub const METRIC_MEMPOOL_SIZE: &str = "citrate_mempool_size";
@@ -108,6 +110,27 @@ pub const METRIC_IPFS_PINS_TOTAL: &str = "citrate_ipfs_pins_total";
 pub const METRIC_IPFS_LATENCY: &str = "citrate_ipfs_latency_seconds";
 pub const METRIC_IPFS_BYTES_UPLOADED: &str = "citrate_ipfs_bytes_uploaded_total";
 pub const METRIC_IPFS_BYTES_DOWNLOADED: &str = "citrate_ipfs_bytes_downloaded_total";
+
+// Checkpoint finality floor (WP-S.3 Stage 1c, node/src/finality_floor.rs)
+/// 1 while the finality floor verifier holds a safety stop (certificate
+/// mismatch or invalid certificate), else 0.
+pub const METRIC_FINALITY_HALTED: &str = "citrate_finality_halted";
+/// Safety stops entered: a finalized certificate that does not match this
+/// node's applied chain, or does not verify.
+pub const METRIC_FINALITY_CERT_MISMATCH_TOTAL: &str = "citrate_finality_certificate_mismatch_total";
+/// Highest finalized checkpoint height verified against this node's chain.
+/// The only place it is visible in Observed mode (voting ON, enforcement OFF);
+/// the `finalized`/`safe` RPC tags follow it in Enforced mode only.
+pub const METRIC_FINALITY_VERIFIED_HEIGHT: &str = "citrate_finality_verified_height";
+/// The reorg floor actually enforced by the canonical applicator.
+pub const METRIC_FINALITY_FLOOR_HEIGHT: &str = "citrate_finality_floor_height";
+/// Finalize retries of a quorum checkpoint whose certificate write failed.
+pub const METRIC_FINALITY_FINALIZE_RETRIES_TOTAL: &str = "citrate_finality_finalize_retries_total";
+/// Finalize retries that finalized their checkpoint.
+pub const METRIC_FINALITY_FINALIZE_RETRY_RECOVERED_TOTAL: &str =
+    "citrate_finality_finalize_retry_recovered_total";
+/// Quorum checkpoints currently waiting for a finalize retry.
+pub const METRIC_FINALITY_FINALIZE_RETRY_PENDING: &str = "citrate_finality_finalize_retry_pending";
 
 // ============================================================================
 // Initialization
@@ -175,6 +198,10 @@ fn register_metric_descriptions() {
     describe_counter!(
         METRIC_PEER_DISCONNECTIONS_TOTAL,
         "Total peer disconnection events"
+    );
+    describe_counter!(
+        METRIC_P2P_INBOUND_DROPPED_TOTAL,
+        "Inbound P2P messages shed because the inbound queue was full, by message type"
     );
     describe_histogram!(
         METRIC_PEER_LATENCY,
@@ -273,6 +300,36 @@ fn register_metric_descriptions() {
         Unit::Bytes,
         "Total bytes downloaded from IPFS"
     );
+
+    // Checkpoint finality floor (Stage 1c)
+    describe_gauge!(
+        METRIC_FINALITY_HALTED,
+        "1 while checkpoint finality is in a safety stop (certificate mismatch or invalid certificate)"
+    );
+    describe_counter!(
+        METRIC_FINALITY_CERT_MISMATCH_TOTAL,
+        "Checkpoint finality safety stops entered (certificate not on this node's chain, or invalid)"
+    );
+    describe_gauge!(
+        METRIC_FINALITY_VERIFIED_HEIGHT,
+        "Highest finalized checkpoint height verified against this node's applied chain"
+    );
+    describe_gauge!(
+        METRIC_FINALITY_FLOOR_HEIGHT,
+        "Reorg floor enforced by the canonical applicator (finalized height)"
+    );
+    describe_counter!(
+        METRIC_FINALITY_FINALIZE_RETRIES_TOTAL,
+        "Finalize retries of quorum checkpoints whose certificate write failed"
+    );
+    describe_counter!(
+        METRIC_FINALITY_FINALIZE_RETRY_RECOVERED_TOTAL,
+        "Finalize retries that finalized their checkpoint"
+    );
+    describe_gauge!(
+        METRIC_FINALITY_FINALIZE_RETRY_PENDING,
+        "Quorum checkpoints waiting for a finalize retry (certificate not yet durable)"
+    );
 }
 
 // ============================================================================
@@ -333,6 +390,15 @@ pub fn record_peer_disconnected(peer_id: &str) {
     counter!(METRIC_PEER_DISCONNECTIONS_TOTAL, 1, &labels);
 }
 
+/// Publish the inbound drop counters (`PeerManager::inbound_drops_by_kind`).
+/// Absolute: the source counters are monotone and owned by the peer manager.
+pub fn record_inbound_drops(by_kind: &[(&'static str, u64)]) {
+    for (kind, count) in by_kind {
+        let labels = [("type", kind.to_string())];
+        absolute_counter!(METRIC_P2P_INBOUND_DROPPED_TOTAL, *count, &labels);
+    }
+}
+
 /// Record peer latency
 pub fn record_peer_latency(latency: Duration) {
     histogram!(METRIC_PEER_LATENCY, latency.as_secs_f64());
@@ -385,6 +451,34 @@ pub fn record_dag_metrics(tips: usize, blue_score: u64, width: usize, depth: u64
     gauge!(METRIC_DAG_BLUE_SCORE, blue_score as f64);
     gauge!(METRIC_DAG_WIDTH, width as f64);
     gauge!(METRIC_DAG_DEPTH, depth as f64);
+}
+
+/// Record the checkpoint-finality floor state (Stage 1c): safety-stop flag,
+/// verified finalized height, enforced reorg floor.
+pub fn record_finality_floor(halted: bool, verified_height: u64, floor_height: u64) {
+    gauge!(METRIC_FINALITY_HALTED, if halted { 1.0 } else { 0.0 });
+    gauge!(METRIC_FINALITY_VERIFIED_HEIGHT, verified_height as f64);
+    gauge!(METRIC_FINALITY_FLOOR_HEIGHT, floor_height as f64);
+}
+
+/// Record one finalize-retry tick: attempts made, checkpoints recovered, and
+/// checkpoints still waiting for a retry.
+pub fn record_finality_finalize_retry(attempts: usize, recovered: usize, pending: usize) {
+    if attempts > 0 {
+        counter!(METRIC_FINALITY_FINALIZE_RETRIES_TOTAL, attempts as u64);
+    }
+    if recovered > 0 {
+        counter!(
+            METRIC_FINALITY_FINALIZE_RETRY_RECOVERED_TOTAL,
+            recovered as u64
+        );
+    }
+    gauge!(METRIC_FINALITY_FINALIZE_RETRY_PENDING, pending as f64);
+}
+
+/// Count one checkpoint-finality safety stop (certificate mismatch / invalid).
+pub fn record_finality_certificate_mismatch() {
+    counter!(METRIC_FINALITY_CERT_MISMATCH_TOTAL, 1);
 }
 
 /// Record sync status
@@ -517,6 +611,7 @@ mod tests {
         record_peer_count(5);
         record_block_height(100);
         record_mempool_size(10, 1000);
+        record_inbound_drops(&[("NewBlock", 2), ("GetBlocks", 7)]);
     }
 
     /// PIL-13 WP-13.5: the RSS sampler reads a real, plausible value from the

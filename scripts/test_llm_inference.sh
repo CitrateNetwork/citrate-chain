@@ -54,7 +54,7 @@ cleanup() {
         wait $NODE_PID 2>/dev/null || true
     fi
     echo "Removing test directory..."
-    rm -rf "$TEST_DATA_DIR"
+    rm -rf "${TEST_DATA_DIR:?}"
     echo "Cleanup complete"
 }
 trap cleanup EXIT INT TERM

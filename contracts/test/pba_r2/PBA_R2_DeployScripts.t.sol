@@ -23,7 +23,8 @@ contract PBA_R2_DeployScripts is Test {
         DeployAll.Deployed memory d2 = b.deployWith(SENDER, multisig, multisig);
         assertEq(d1.wsalt, d2.wsalt);
         assertEq(d1.registry, d2.registry);
-        assertEq(d1.stakingPool, d2.stakingPool);
+        assertEq(d1.computeMarketplace, d2.computeMarketplace);
+        assertEq(d1.verifier, d2.verifier);
         assertEq(d1.treasury, d2.treasury);
         assertEq(d1.governor, d2.governor);
     }

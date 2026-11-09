@@ -43,6 +43,7 @@ use zeroize::Zeroizing;
 
 use super::QSSP_MAGIC;
 use crate::db::column_families::all_column_families;
+use crate::VOTING_VALIDATOR_WIPE_NOTE;
 
 /// Version byte for the compact at-rest value format. Version 1 is the
 /// full `EncryptionEnvelope` header format (see `envelope.rs`); version 2
@@ -75,35 +76,35 @@ pub enum AtRestError {
     #[error(
         "encryption key does not match this database (key commitment mismatch in \
          encryption.meta). If the key or password is lost the data cannot be recovered — \
-         wipe the data directory and resync"
+         wipe the data directory and resync. {VOTING_VALIDATOR_WIPE_NOTE}"
     )]
     WrongKey,
 
     #[error(
         "data directory '{0}' contains an existing UNENCRYPTED database but encryption is \
          enabled. In-place migration is not supported — wipe the data directory and resync \
-         with encryption enabled"
+         with encryption enabled. {VOTING_VALIDATOR_WIPE_NOTE}"
     )]
     PlaintextDbWithEncryptionEnabled(String),
 
     #[error(
         "data directory '{0}' contains an ENCRYPTED database ({ENCRYPTION_META_FILE} present) \
          but encryption is not enabled. Open it with the original key, or wipe the data \
-         directory and resync unencrypted"
+         directory and resync unencrypted. {VOTING_VALIDATOR_WIPE_NOTE}"
     )]
     EncryptedDbWithoutEncryption(String),
 
     #[error(
         "data directory '{0}' contains values in the encrypted format but \
          {ENCRYPTION_META_FILE} is missing. Restore the metadata file, or wipe the data \
-         directory and resync"
+         directory and resync. {VOTING_VALIDATOR_WIPE_NOTE}"
     )]
     EncryptedValuesWithoutMeta(String),
 
     #[error(
         "stored value in column family '{0}' is not in the encrypted format — the database \
          appears to contain plaintext data. Wipe the data directory and resync with \
-         encryption enabled"
+         encryption enabled. {VOTING_VALIDATOR_WIPE_NOTE}"
     )]
     NotEncrypted(String),
 

@@ -52,7 +52,7 @@ scan() { # <root> ; prints violations, returns 0 iff any found
 
 self_test() {
   local d rc=0
-  d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   mkdir -p "$d/core/x/src" "$d/core/x/tests"
   # R1 positive: unjustified allow must be caught.
   printf 'fn f(v: &[u8]) -> u8 {\n    #[allow(clippy::indexing_slicing)]\n    v[0]\n}\n' > "$d/core/x/src/a.rs"

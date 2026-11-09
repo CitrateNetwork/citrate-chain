@@ -89,10 +89,45 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks, Create2Deploy {
     /// the PBA-R2 hardening, so the ceremony must name the reviewed address.
     /// TEE_REGISTRY is REQUIRED and must have code.
 
+    /// @notice The IPFSIncentivesV3 address `run()` lands at for this build, KYC updater and
+    ///         governance: the value to review and pin as EXPECTED_IPFS_V3 on 40204. CREATE2
+    ///         through the Arachnid factory, so it is the same on every chain with the factory.
+    ///         `forge script script/DeployFederatedLearning.s.sol --sig "projectIpfsV3(address,address)" <updater> <governance>`
+    function projectIpfsV3(address kycUpdater, address governance) public view returns (address) {
+        address kyc = _create2Address("KYCRegistry", abi.encodePacked(type(KYCRegistry).creationCode, abi.encode(kycUpdater, governance)));
+        address v3 = _create2Address("IPFSIncentivesV3", abi.encodePacked(type(IPFSIncentivesV3).creationCode, abi.encode(
+            kyc,
+            IPFS_BOND,
+            IPFS_REWARD,
+            IPFS_ROUNDS,
+            IPFS_MAX_MISSED,
+            IPFS_CHALLENGER_BPS,
+            IPFS_QUORUM,
+            IPFS_WINDOW,
+            IPFS_CHALLENGE_N,
+            IPFS3_CHALLENGER_BOND,
+            IPFS3_REVEAL_DELAY,
+            IPFS3_MIN_MODEL_BOND,
+            IPFS3_MODEL_CHALLENGE_WINDOW,
+            IPFS3_MODEL_CHALLENGER_BPS,
+            envAddressOr("FOLD_VERIFIER", FOLD_VERIFIER_PRECOMPILE),
+            governance
+        )));
+        console.log("IPFSIncentivesV3 projection:", v3);
+        return v3;
+    }
+
     function run() external {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
         address teeRegistry = envAddressOr("TEE_REGISTRY", address(0));
+        // The KYCRegistry's extra KYC_UPDATER_ROLE holder. The admin (governance) is always
+        // an updater. Off 40204 the default is the deployer (dev bootstrap); on 40204 the
+        // deployer must hold no role after the run, so KYC_UPDATER must be set and must not be
+        // the deployer (the genesis ceremony passes GOVERNANCE: no extra holder).
+        address kycUpdater = envAddressOr("KYC_UPDATER", block.chainid == 40204 ? address(0) : deployer);
+        require(block.chainid != 40204 || kycUpdater != address(0), "KYC_UPDATER must be set on 40204");
+        require(block.chainid != 40204 || kycUpdater != deployer, "KYC_UPDATER must not be the deployer on 40204");
 
         console.log("=== I64-S1 WP-B1: federated-learning contract deploy ===");
         console.log("Deployer (genesis):", deployer);
@@ -107,9 +142,9 @@ contract DeployFederatedLearning is ScriptEnv, AdminChecks, Create2Deploy {
         //    add the production IDP updater post-deploy). PBA-L2-002:
         //    DEFAULT_ADMIN_ROLE is the explicit `governance` argument, NOT the
         //    constructor caller (which is the CREATE2 factory here).
-        KYCRegistry kyc = (_isLive("KYCRegistry", abi.encodePacked(type(KYCRegistry).creationCode, abi.encode(deployer, governance)))
-            ? KYCRegistry(payable(_create2Address("KYCRegistry", abi.encodePacked(type(KYCRegistry).creationCode, abi.encode(deployer, governance)))))
-            : new KYCRegistry{salt: Salts.salt("KYCRegistry")}(deployer, governance));
+        KYCRegistry kyc = (_isLive("KYCRegistry", abi.encodePacked(type(KYCRegistry).creationCode, abi.encode(kycUpdater, governance)))
+            ? KYCRegistry(payable(_create2Address("KYCRegistry", abi.encodePacked(type(KYCRegistry).creationCode, abi.encode(kycUpdater, governance)))))
+            : new KYCRegistry{salt: Salts.salt("KYCRegistry")}(kycUpdater, governance));
 
         // 2. IPFSIncentivesV2 — consumes KYCRegistry.
         IPFSIncentivesV2 ipfsV2 = (_isLive("IPFSIncentivesV2", abi.encodePacked(type(IPFSIncentivesV2).creationCode, abi.encode(

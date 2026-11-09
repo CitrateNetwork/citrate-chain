@@ -123,7 +123,7 @@ fi
 if [ "$CLEAN" = true ]; then
     echo -e "${YELLOW}Cleaning data directories...${NC}"
     for i in 1 2 3; do
-        rm -rf "$PROJECT_ROOT/.citrate-testnet-boot-${i}"
+        rm -rf "${PROJECT_ROOT:?}/.citrate-testnet-boot-${i}"
         echo "  Removed .citrate-testnet-boot-${i}"
     done
 fi

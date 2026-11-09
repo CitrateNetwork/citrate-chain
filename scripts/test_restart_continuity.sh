@@ -19,7 +19,7 @@ NC='\033[0m'
 
 cleanup() {
     kill "$NODE_PID" 2>/dev/null || true
-    rm -rf "$DATA_DIR"
+    rm -rf "${DATA_DIR:?}"
 }
 trap cleanup EXIT
 

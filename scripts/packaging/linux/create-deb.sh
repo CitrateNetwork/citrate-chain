@@ -45,7 +45,7 @@ esac
 
 PKG_NAME="citrate_${VERSION}_${DEB_ARCH}"
 STAGING_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGING_DIR"' EXIT
+trap 'rm -rf "${STAGING_DIR:?}"' EXIT
 
 echo "=== Citrate Linux DEB Packager ==="
 echo "  Version:  $VERSION"

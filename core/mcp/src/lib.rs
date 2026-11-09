@@ -16,6 +16,7 @@
     )
 )]
 pub mod cache;
+pub mod chunk_assembly;
 pub mod execution;
 pub mod gguf_engine;
 pub mod provider;

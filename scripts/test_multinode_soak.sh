@@ -27,7 +27,7 @@ cleanup() {
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
-    rm -rf "$TMPDIR"
+    rm -rf "${TMPDIR:?}"
 }
 trap cleanup EXIT
 

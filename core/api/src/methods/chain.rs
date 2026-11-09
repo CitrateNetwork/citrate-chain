@@ -29,10 +29,12 @@ impl ChainApi {
                 .map_err(|e| ApiError::InternalError(e.to_string()))?
                 .ok_or_else(|| ApiError::BlockNotFound(format!("{:?}", hash)))?,
             BlockId::Number(height) => {
+                // The executed chain's block at this height (chain#421), never a
+                // later-stored sibling. Finality tags resolve by hash in eth_rpc.
                 let hash = self
                     .storage
                     .blocks
-                    .get_block_by_height(height)
+                    .get_canonical_block_by_height(height)
                     .map_err(|e| ApiError::InternalError(e.to_string()))?
                     .ok_or_else(|| ApiError::BlockNotFound(format!("height {}", height)))?;
 
@@ -53,10 +55,11 @@ impl ChainApi {
                     }
                 };
 
+                // latest / earliest tag, on the executed chain (finality tags never reach here).
                 let hash = self
                     .storage
                     .blocks
-                    .get_block_by_height(height)
+                    .get_canonical_block_by_height(height)
                     .map_err(|e| ApiError::InternalError(e.to_string()))?
                     .ok_or_else(|| ApiError::BlockNotFound(format!("height {}", height)))?;
 
@@ -81,10 +84,12 @@ impl ChainApi {
                 .map_err(|e| ApiError::InternalError(e.to_string()))?
                 .ok_or_else(|| ApiError::BlockNotFound(format!("{:?}", hash)))?,
             BlockId::Number(height) => {
+                // The executed chain's block at this height (chain#421), never a
+                // later-stored sibling. Finality tags resolve by hash in eth_rpc.
                 let hash = self
                     .storage
                     .blocks
-                    .get_block_by_height(height)
+                    .get_canonical_block_by_height(height)
                     .map_err(|e| ApiError::InternalError(e.to_string()))?
                     .ok_or_else(|| ApiError::BlockNotFound(format!("height {}", height)))?;
 
@@ -105,10 +110,11 @@ impl ChainApi {
                     }
                 };
 
+                // latest / earliest tag, on the executed chain (finality tags never reach here).
                 let hash = self
                     .storage
                     .blocks
-                    .get_block_by_height(height)
+                    .get_canonical_block_by_height(height)
                     .map_err(|e| ApiError::InternalError(e.to_string()))?
                     .ok_or_else(|| ApiError::BlockNotFound(format!("height {}", height)))?;
 
@@ -159,10 +165,11 @@ impl ChainApi {
 
         if tips.is_empty() {
             let height = self.get_latest_height().await?;
+            // Latest height, only when there are no DAG tips.
             if let Some(hash) = self
                 .storage
                 .blocks
-                .get_block_by_height(height)
+                .get_canonical_block_by_height(height)
                 .map_err(|e| ApiError::InternalError(e.to_string()))?
             {
                 tips.push(hash);

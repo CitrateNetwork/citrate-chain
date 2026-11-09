@@ -21,6 +21,10 @@ path = "src/bin/validator_registration_ceremony.rs"
 name = "state-digest"
 path = "src/bin/state_digest.rs"
 
+[[bin]]
+name = "state-dump"
+path = "src/bin/state_dump.rs"
+
 [dependencies]
 # Local dependencies
 citrate-consensus = { path = "../core/consensus" }
@@ -78,6 +82,11 @@ once_cell = "1.19"
 parking_lot = "0.12"
 # SECREM-01 CFG-1: wipe Noise P2P key bytes after handoff to the network layer.
 zeroize = "1.8"
+# Producer bring-up (host_identity.rs): Web3 v3 staker keystore. Same versions the
+# lockfile already carries (aes-gcm, wallet), so no new crates.
+scrypt = { version = "0.11", default-features = false }
+aes = "0.8"
+ctr = "0.9"
 # Wallet interactive UI deps
 dialoguer = "0.11"
 console = "0.15"
@@ -90,6 +99,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.15"
+# C1-R: drive the real eth_* IoHandler against a follower's store in canonical_apply tests.
+jsonrpc-core = "18.0"
 # #310: paused-clock tests of the consensus timers (node/src/timing.rs).
 tokio = { version = "1.32", features = ["full", "test-util"] }
 # WS-5 ceremony fuzz: property-based coverage of proposer-key derivation,

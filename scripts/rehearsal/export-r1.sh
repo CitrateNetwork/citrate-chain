@@ -163,7 +163,7 @@ if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
 fi
 mkdir -p "$(dirname "$OUT")"
 STAGE=$(mktemp -d "$(dirname "$OUT")/.export-r1.XXXXXX")
-trap 'rm -rf "$STAGE"' EXIT
+trap 'rm -rf "${STAGE:?}"' EXIT
 
 BOOK_NAME="addresses-$BOOK_CHAIN.json"
 cp "$BOOK" "$STAGE/$BOOK_NAME"

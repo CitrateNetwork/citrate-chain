@@ -4,6 +4,9 @@
 //! config propagation, error handling, and cross-module interactions.
 //! These tests verify properties that wallet-core alone does not cover.
 
+// Uses the native `Wallet`, which is behind the default `native` feature.
+#![cfg(feature = "native")]
+
 use citrate_wallet_core::error::WalletError;
 use citrate_wallet_sdk::{SdkConfig, Wallet};
 

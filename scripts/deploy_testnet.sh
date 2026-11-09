@@ -192,7 +192,7 @@ if $BUILD_FROM_SOURCE; then
     (cd "$BUILD_DIR" && cargo build --release --locked -p citrate-node)
 
     install -m 0755 "$BUILD_DIR/target/release/citrate" "$BIN_PATH"
-    rm -rf "$BUILD_DIR"
+    rm -rf "${BUILD_DIR:?}"
 else
     # Download the pinned release asset and verify it before installing.
     # No fallback: any failure below aborts the deploy.
@@ -230,7 +230,7 @@ else
 
     tar -xzf "$DL_DIR/$ASSET" -C "$DL_DIR"
     install -m 0755 "$DL_DIR/citrate-chain-${TRIPLE}/citrate-node" "$BIN_PATH"
-    rm -rf "$DL_DIR"
+    rm -rf "${DL_DIR:?}"
     log_ok "Binary installed to $BIN_PATH"
 fi
 

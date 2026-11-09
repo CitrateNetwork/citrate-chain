@@ -43,7 +43,7 @@ for dir in "$SCRIPT_DIR"/consensus "$SCRIPT_DIR"/zk "$SCRIPT_DIR"/learning "$SCR
         tmpdir=$(mktemp -d)
         output=$(cd "$tmpdir" && timeout "$TIMEOUT" java -cp "$JAR" "-Xmx${HEAP}" \
             tlc2.TLC -config "$cfg" "$tla" -workers "$WORKERS" -deadlock 2>&1 || true)
-        rm -rf "$tmpdir"
+        rm -rf "${tmpdir:?}"
 
         dist=$(echo "$output" | grep -oP '[\d,]+ distinct states' | tail -1 | grep -oP '^[\d,]+' | tr -d ',' 2>/dev/null) || dist="0"
         [ -z "$dist" ] && dist="0"

@@ -26,7 +26,7 @@ CB="${COINBASE:-0x0ecbcd8557781161A41b34dEE55Ee5A00561363b}"
 DEPTH="${DEPTH:-180}"; H="${CMP_HEIGHT:-150}"
 
 DIR=$(mktemp -d -t srp-gate-XXXXXX)
-cleanup(){ [ -n "${PPID_PROD:-}" ] && kill "$PPID_PROD" 2>/dev/null; [ -n "${PPID_FOLL:-}" ] && kill "$PPID_FOLL" 2>/dev/null; rm -rf "$DIR"; }
+cleanup(){ [ -n "${PPID_PROD:-}" ] && kill "$PPID_PROD" 2>/dev/null; [ -n "${PPID_FOLL:-}" ] && kill "$PPID_FOLL" 2>/dev/null; rm -rf "${DIR:?}"; }
 trap cleanup EXIT
 # Keep S1 reward settlement OFF so the gate exercises the pre-activation path deterministically.
 export CITRATE_VALIDATOR_ACTIVATION_HEIGHT=100000 CITRATE_BLOCK_V2=1

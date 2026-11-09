@@ -7,4 +7,5 @@ pub mod devx;
 pub mod governance;
 pub mod model;
 pub mod network;
+pub mod verify;
 pub mod wizard;

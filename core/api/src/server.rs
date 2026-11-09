@@ -503,6 +503,13 @@ pub struct RpcConfig {
     /// configured trusted proxy answers loopback `Host`s only (DNS-rebinding
     /// defence); every other deployment keeps accepting any `Host`.
     pub allowed_hosts: Vec<String>,
+    /// chain#425 operator opt-out: serve account-state reads whose block tag
+    /// names a canonical block at most this many blocks from the executed head
+    /// (below it, or stored above it) from the head's state. `0` (default) is
+    /// strict: only the executed head. For a private deploy node that runs
+    /// Foundry fork-mode scripts; never on a public RPC. Clamped to
+    /// `state_tag::MAX_RECENT_STATE_TAGS`.
+    pub serve_recent_state_tags: u64,
 }
 
 /// PBA-L1a-023: the `Host` allowlist the HTTP RPC server enforces, or `None`
@@ -553,6 +560,7 @@ impl Default for RpcConfig {
             rate_limit: RateLimitConfig::default(),
             allow_eth_send_transaction: false, // Secure default: reject unsigned tx
             allowed_hosts: Vec::new(),
+            serve_recent_state_tags: 0, // strict (chain#425)
         }
     }
 }
@@ -639,10 +647,11 @@ impl RpcServer {
         // NEVER registered on a public bind, so the override cannot be reached over the
         // public RPC. Setting it resumes production one round; the gate auto-clears it.
         catchup_override: Option<Arc<std::sync::atomic::AtomicBool>>,
-        // BFT-finalized height source (the canonical applicator's `finalized_height`
-        // handle). Backs the `finalized`/`safe` RPC block tags. When None, the tags
+        // Source of the `finalized`/`safe` RPC block tags: a height handle (the
+        // canonical applicator's `finalized_height`), or verified (height, hash)
+        // pairs resolved by hash (finality enforcement ON). When None, the tags
         // resolve to genesis (block 0) — the documented pre-checkpoint behaviour.
-        finalized_height: Option<Arc<std::sync::atomic::AtomicU64>>,
+        finalized: Option<crate::finalized_tag::FinalizedTagSource>,
         // UI truth contract §9: the node's build + consensus identity (version, git
         // sha, consensus/activation fingerprints, running GhostDAG params). Backs
         // web3_clientVersion, citrate_nodeIdentity and citrate_getDagStats. When
@@ -668,7 +677,7 @@ impl RpcServer {
 
         // Register Ethereum-compatible RPC methods
         // WP-I.3: Pass pause_flag so emergency methods are actually registered
-        eth_rpc::register_eth_methods_with_finality(
+        eth_rpc::register_eth_methods_with_options(
             &mut io_handler,
             storage.clone(),
             mempool.clone(),
@@ -676,7 +685,12 @@ impl RpcServer {
             chain_id,
             filter_registry,
             pause_flag,
-            finalized_height.unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicU64::new(0))),
+            finalized.unwrap_or_default(),
+            eth_rpc::EthRpcOptions {
+                state_tags: crate::state_tag::StateTagPolicy::from_config(
+                    config.serve_recent_state_tags,
+                ),
+            },
         );
 
         // Truthful eth_syncing OVERRIDE (last registration wins): report progress
@@ -3187,6 +3201,33 @@ mod tests {
                 .contains("operator_token required"),
             "T0-07: unauthenticated pending dump must fail closed: {}",
             v
+        );
+    }
+
+    #[test]
+    fn test_verify_contract_stays_operator_only() {
+        // `citrate contract verify` now uses the explorer's public API; the node's
+        // verifyContract method stays an operator tool and refuses calls without the token.
+        let _lock = OPERATOR_ENV_GUARD.lock().expect("operator env guard");
+        let _env = EnvGuard::set("CITRATE_OPERATOR_TOKEN", "verify-op-token");
+        let (rpc, _temp_dir) = rpc_with_mempool(relaxed_mempool());
+
+        let req = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"citrate_verifyContract",
+            "params":{"address":"0x5fbdb2315678afecb367f032d99f2f9fc9a2f74b","runtime_bytecode":"0x00"}
+        })
+        .to_string();
+        let resp = futures::executor::block_on(rpc.io_handler.handle_request(&req))
+            .expect("verifyContract answers");
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("JSON-RPC response");
+
+        assert_eq!(v["error"]["code"], -32001, "{v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("operator_token required"),
+            "verifyContract without the operator token must be refused: {v}"
         );
     }
 

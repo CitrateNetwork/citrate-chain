@@ -31,6 +31,7 @@ pub mod tip_selection;
 pub mod tx_auth;
 pub mod types;
 pub mod vrf;
+pub mod vrf_encoding;
 
 pub use chain_selection::{ChainSelectionError, ChainSelector, ChainState, ReorgEvent};
 pub use checkpoint::{CheckpointConfig, CheckpointError, CheckpointManager, CheckpointVote};

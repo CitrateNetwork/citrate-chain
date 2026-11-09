@@ -50,7 +50,7 @@ scan() { # <root>
 }
 
 self_test() {
-  local d rc=0; d="$(mktemp -d)"; trap 'rm -rf "$d"' RETURN
+  local d rc=0; d="$(mktemp -d)"; trap 'rm -rf "${d:?}"' RETURN
   printf 'fn f(x: u8) {\n    assert!(x > 0);\n}\n' > "$d/a.rs"
   [ "$(scan "$d" | wc -l)" -eq 1 ] || { echo "self-test: missed a production assert"; rc=1; }
   printf '#[cfg(test)]\nmod t {\n    fn f() { assert!(true); }\n}\nconst _: () = assert!(1 == 1);\n' > "$d/a.rs"

@@ -6,8 +6,9 @@
 # or (b) ignored here with a documented REM tracker + reason.
 #
 # cargo-audit reads ~/.cargo/audit.toml NOT project-local, so the
-# actual ignore list is passed via --ignore flags in
-# .github/workflows/cargo-audit.yml. This file is the documentation
+# actual ignore list is passed via --ignore flags by
+# scripts/ci/audit_all_lockfiles.sh (run from .github/workflows/cargo-audit.yml
+# against every tracked Cargo.lock). This file is the documentation
 # source-of-truth for assessors.
 
 [advisories]
@@ -81,14 +82,14 @@ ignore = [
     "RUSTSEC-2025-0055",
 
     # ─────────────────────────────────────────────────────────────────
-    # crypto-bigint < 0.7.6 (time-boxed) — EXPIRES 2026-11-09
+    # crypto-bigint < 0.7.6 (time-boxed) — EXPIRES 2027-01-31 (owner-approved)
     # ─────────────────────────────────────────────────────────────────
     # RUSTSEC-2026-0387 — crypto-bigint < 0.7.6: multiple timing
     # variability issues in operations intended to be constant-time.
     # elliptic-curve 0.13 requires crypto-bigint ^0.5; the fix is in the
     # 0.14 curve line, held back upstream (revm-precompile,
     # openmls_rust_crypto and bip32 still require the 0.13 line).
-    # Guard: scripts/ci/check_crypto_bigint_users.py.
+    # Guard: scripts/ci/check_crypto_bigint_users.py (every tracked Cargo.lock).
     "RUSTSEC-2026-0387",
 ]
 

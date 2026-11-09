@@ -73,6 +73,7 @@ pub mod block_propagation;
 pub mod bootnode;
 pub mod discovery;
 pub mod gossip;
+pub mod inbound;
 pub mod learning_messages;
 pub mod nat;
 pub mod noise;

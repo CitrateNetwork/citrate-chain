@@ -78,7 +78,7 @@ case "$DEB_ARCH" in
 esac
 
 STAGING_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGING_DIR"' EXIT
+trap 'rm -rf "${STAGING_DIR:?}"' EXIT
 
 PKG_NAME="citrate-learning-center_${VERSION}_${DEB_ARCH}"
 DEB_ROOT="$STAGING_DIR/$PKG_NAME"

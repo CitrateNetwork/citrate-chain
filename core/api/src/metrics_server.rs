@@ -182,6 +182,52 @@ pub static PRODUCER_CATCHUP_STATE: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     )
 });
 
+/// Slots the producer skipped because ECVRF proving failed. A non-zero rate means the
+/// node holds a key it cannot prove with: it produces nothing until that is fixed.
+pub static PRODUCER_VRF_PROVE_FAILURES: Lazy<prometheus::CounterVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_counter_vec!(
+            "citrate_producer_vrf_prove_failures_total",
+            "Block production slots skipped because ECVRF proving failed",
+            &[]
+        ),
+        "Failed to register producer VRF prove failure metric",
+    )
+});
+
+/// Count one slot skipped because ECVRF proving failed.
+pub fn record_producer_vrf_prove_failure() {
+    PRODUCER_VRF_PROVE_FAILURES.with_label_values(&[]).inc();
+}
+
+/// Total slots skipped because ECVRF proving failed (read side of the counter).
+pub fn producer_vrf_prove_failures() -> f64 {
+    PRODUCER_VRF_PROVE_FAILURES.with_label_values(&[]).get()
+}
+
+/// Slots the producer skipped because its candidate block failed a rule a peer
+/// applies on admission. Non-zero means producer and peer rules have drifted apart.
+pub static PRODUCER_PRESEAL_REJECTS: Lazy<prometheus::CounterVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_counter_vec!(
+            "citrate_producer_preseal_rejects_total",
+            "Block production slots skipped because the candidate failed a peer admission rule",
+            &[]
+        ),
+        "Failed to register producer pre-seal reject metric",
+    )
+});
+
+/// Count one slot skipped by the pre-seal peer check.
+pub fn record_producer_preseal_reject() {
+    PRODUCER_PRESEAL_REJECTS.with_label_values(&[]).inc();
+}
+
+/// Total slots skipped by the pre-seal peer check (read side of the counter).
+pub fn producer_preseal_rejects() -> f64 {
+    PRODUCER_PRESEAL_REJECTS.with_label_values(&[]).get()
+}
+
 pub static PRODUCER_CATCHUP_HEIGHTS: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
     crate::metrics::must(
         register_gauge_vec!(

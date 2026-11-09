@@ -119,6 +119,11 @@ pub struct SyncManager {
     /// (PBA-L1b-002). Captured from the process-wide activation at
     /// construction; see `citrate_consensus::hardening`.
     pba_hardening: citrate_consensus::hardening::PbaHardening,
+
+    /// Milliseconds added to the monotonic clock this manager stamps and ages
+    /// requests with. `None` in a node; a simulation that runs many seconds of
+    /// sync in a few milliseconds advances it (see [`Self::with_clock_offset`]).
+    clock_offset_ms: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,7 +191,26 @@ impl SyncManager {
             last_requested_header: Arc::new(RwLock::new(None)),
             local_height: None,
             pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
+            clock_offset_ms: None,
         }
+    }
+
+    /// Age requests on the monotonic clock plus `offset` milliseconds, so a
+    /// simulated network's request timeouts follow its own time.
+    pub fn with_clock_offset(mut self, offset: Arc<AtomicU64>) -> Self {
+        self.clock_offset_ms = Some(offset);
+        self
+    }
+
+    fn now(&self) -> Instant {
+        let offset = self
+            .clock_offset_ms
+            .as_ref()
+            .map(|o| o.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let now = Instant::now();
+        now.checked_add(Duration::from_millis(offset))
+            .unwrap_or(now)
     }
 
     /// The PBA-R2 hardening activation this instance enforces.
@@ -350,7 +374,7 @@ impl SyncManager {
             BlockRequest {
                 hash: from,
                 peer_id,
-                requested_at: Instant::now(),
+                requested_at: self.now(),
                 retries: 0,
             },
         );
@@ -370,21 +394,36 @@ impl SyncManager {
     ///
     /// `from_height` is the height of `from`, recorded so a response can be
     /// judged against the anchor that produced it (#156).
+    ///
+    /// `Ok(true)` when a `GetBlocks` was sent; `Ok(false)` when it was not
+    /// because a request for `from` is already pending or the in-flight cap is
+    /// reached. Callers that track "what did I ask, and whom" must act only on
+    /// `Ok(true)`.
     pub async fn request_blocks(
         &self,
         peer: &Peer,
         from: Hash,
         from_height: u64,
-    ) -> Result<(), NetworkError> {
+    ) -> Result<bool, NetworkError> {
+        self.send_block_request(peer, from, from_height, true).await
+    }
+
+    async fn send_block_request(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+        driver: bool,
+    ) -> Result<bool, NetworkError> {
         let peer_id = peer.info.read().await.id.clone();
 
         // Check if already pending
         if self.pending_blocks.read().await.contains_key(&from) {
-            return Ok(());
+            return Ok(false);
         }
 
         if self.pending_blocks.read().await.len() >= self.config.max_concurrent_downloads {
-            return Ok(());
+            return Ok(false);
         }
 
         // Send request
@@ -401,14 +440,36 @@ impl SyncManager {
             BlockRequest {
                 hash: from,
                 peer_id,
-                requested_at: Instant::now(),
+                requested_at: self.now(),
                 retries: 0,
             },
         );
-        self.last_block_anchor_height
-            .store(from_height, Ordering::Relaxed);
+        if driver {
+            self.last_block_anchor_height
+                .store(from_height, Ordering::Relaxed);
+        }
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// How long a sent request stays pending before [`Self::check_timeouts`]
+    /// retires it.
+    pub fn request_timeout(&self) -> Duration {
+        self.config.request_timeout
+    }
+
+    /// A `GetBlocks` sent for missing-parent recovery, not by the sync driver:
+    /// pending and de-duplicated like any request, but it leaves
+    /// [`Self::last_block_anchor_height`] (the driver's own anchor, which its
+    /// stale-answer check and serve scoring read) alone.
+    pub async fn request_blocks_for_recovery(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+    ) -> Result<bool, NetworkError> {
+        self.send_block_request(peer, from, from_height, false)
+            .await
     }
 
     /// Handle received headers
@@ -781,7 +842,7 @@ impl SyncManager {
     /// Check for timed out requests
     pub async fn check_timeouts(&self) -> Vec<(Hash, PeerId)> {
         let mut timed_out: Vec<(Hash, PeerId)> = Vec::new();
-        let now = Instant::now();
+        let now = self.now();
 
         // Check header requests
         {
@@ -875,6 +936,49 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_peer(id: &str) -> (Peer, tokio::sync::mpsc::Receiver<NetworkMessage>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (_in_tx, in_rx) = tokio::sync::mpsc::channel(1);
+        let info = crate::peer::PeerInfo::new(
+            PeerId::new(id.to_string()),
+            "127.0.0.1:1".parse().expect("addr"),
+            crate::peer::Direction::Outbound,
+        );
+        (Peer::new(info, tx, in_rx), rx)
+    }
+
+    /// `request_blocks` says whether it actually sent: a second request for a
+    /// pending anchor, or one past the in-flight cap, is not sent and reports
+    /// `Ok(false)`, so the caller does not record it as asked.
+    #[tokio::test]
+    async fn request_blocks_reports_whether_it_sent() {
+        let sync = SyncManager::new(SyncConfig {
+            max_concurrent_downloads: 2,
+            ..SyncConfig::default()
+        });
+        let (a, mut a_rx) = test_peer("peer-a");
+        let (b, mut b_rx) = test_peer("peer-b");
+        let h = |n: u8| Hash::new([n; 32]);
+        assert!(sync.request_blocks(&a, h(1), 1).await.expect("send"));
+        assert!(matches!(
+            a_rx.try_recv(),
+            Ok(NetworkMessage::GetBlocks { .. })
+        ));
+        // Same anchor, other peer: suppressed, nothing on the wire.
+        assert!(!sync.request_blocks(&b, h(1), 1).await.expect("send"));
+        assert!(b_rx.try_recv().is_err());
+        assert!(sync.request_blocks(&b, h(2), 2).await.expect("send"));
+        assert!(b_rx.try_recv().is_ok());
+        // In-flight cap (2) reached.
+        assert!(!sync.request_blocks(&a, h(3), 3).await.expect("send"));
+        assert!(a_rx.try_recv().is_err());
+        assert_eq!(
+            sync.last_block_anchor_height(),
+            2,
+            "a suppressed request records nothing"
+        );
+    }
 
     #[tokio::test]
     async fn test_sync_state_transitions() {

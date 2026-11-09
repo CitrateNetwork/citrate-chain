@@ -108,12 +108,14 @@ pub fn check_method_budget(method_cost: u32) -> Result<(), jsonrpc_core::Error> 
 /// Get the default cost for a given RPC method name.
 ///
 /// WP-I.4 cost tiers:
-///   - eth_call, eth_estimateGas, eth_getLogs, debug_*: 10
+///   - eth_call, eth_estimateGas, eth_getLogs, citrate_getLogs,
+///     citrate_isExecuted, debug_*: 10
 ///   - eth_sendRawTransaction, eth_sendTransaction: 5
 ///   - everything else: 1
 pub fn default_method_cost(method: &str) -> u32 {
     match method {
-        "eth_call" | "eth_estimateGas" | "eth_getLogs" => 10,
+        "eth_call" | "eth_estimateGas" | "eth_getLogs" | "citrate_getLogs"
+        | "citrate_isExecuted" => 10,
         m if m.starts_with("debug_") => 10,
         "eth_sendRawTransaction" | "eth_sendTransaction" => 5,
         _ => 1,
@@ -771,6 +773,8 @@ mod tests {
         assert_eq!(default_method_cost("eth_call"), 10);
         assert_eq!(default_method_cost("eth_estimateGas"), 10);
         assert_eq!(default_method_cost("eth_getLogs"), 10);
+        assert_eq!(default_method_cost("citrate_getLogs"), 10);
+        assert_eq!(default_method_cost("citrate_isExecuted"), 10);
         assert_eq!(default_method_cost("debug_traceTransaction"), 10);
         assert_eq!(default_method_cost("eth_sendTransaction"), 5);
         assert_eq!(default_method_cost("eth_sendRawTransaction"), 5);

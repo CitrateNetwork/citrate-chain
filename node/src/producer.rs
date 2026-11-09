@@ -31,7 +31,7 @@ use citrate_network::{GossipProtocol, NetworkMessage, PeerManager};
 use citrate_sequencer::mempool::Mempool;
 use citrate_storage::{state_manager::StateManager as AIStateManager, StorageManager};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,19 +43,37 @@ use crate::contribution_recorder::ContributionRecorder;
 // Block hash is now computed via Block::compute_hash() in consensus/types.rs (C-05).
 // This ensures a single canonical hash function used by both producer and validator.
 
+/// The ECVRF prover a [`BlockProducer`] proves its block VRF with. Production always uses
+/// [`citrate_consensus::ecvrf::prove`] (see [`real_vrf_prover`]); tests swap in a failing
+/// prover to exercise the skip-the-slot path.
+pub(crate) type VrfProver = Arc<
+    dyn Fn(
+            &[u8; 32],
+            &[u8],
+        ) -> Result<
+            (citrate_consensus::ecvrf::EcvrfProof, [u8; 32]),
+            citrate_consensus::ecvrf::EcvrfError,
+        > + Send
+        + Sync,
+>;
+
+/// The production prover: RFC 9381 ECVRF-P256-SHA256.
+pub(crate) fn real_vrf_prover() -> VrfProver {
+    Arc::new(citrate_consensus::ecvrf::prove)
+}
+
 /// Generate a real ECVRF-P256-SHA256 proof for block production (WP-Z.1).
 ///
 /// Uses RFC 9381 ECVRF with alpha binding: proposer_pubkey(32) || prev_vrf(32) || slot(8).
 /// The ed25519 signing key seed is deterministically converted to a P-256 scalar via
 /// `ecvrf::secret_to_scalar()`. Proof is 114 bytes (self-contained, verifiable).
-///
-/// Falls back to SHA3 stub if ECVRF fails (should not happen with valid keys).
 fn generate_block_vrf(
+    prover: &VrfProver,
     signing_key: &Ed25519SigningKey,
     proposer_pubkey: &PublicKey,
     prev_vrf: &Hash,
     slot: u64,
-) -> VrfProof {
+) -> anyhow::Result<VrfProof> {
     let seed_bytes = signing_key.to_bytes();
 
     // Build alpha: proposer_pubkey(32) || prev_vrf(32) || slot(8) = 72 bytes
@@ -64,26 +82,28 @@ fn generate_block_vrf(
     alpha.extend_from_slice(prev_vrf.as_bytes());
     alpha.extend_from_slice(&slot.to_le_bytes());
 
-    match citrate_consensus::ecvrf::prove(&seed_bytes, &alpha) {
-        Ok((ecvrf_proof, beta)) => {
-            VrfProof {
-                proof: ecvrf_proof.to_bytes(), // 114 bytes
-                output: Hash::from_bytes(&beta),
-            }
-        }
-        Err(e) => {
-            // Fallback: should never happen with a valid ed25519 key
-            warn!("ECVRF prove failed ({}), using SHA3 fallback", e);
-            use sha3::{Digest, Sha3_256};
-            let mut hasher = Sha3_256::new();
-            hasher.update(&alpha);
-            let output_bytes = hasher.finalize();
-            VrfProof {
-                proof: output_bytes.to_vec(), // 32 bytes (legacy)
-                output: Hash::from_bytes(&output_bytes),
-            }
-        }
+    // A block may only ever carry a real ECVRF proof. If proving fails there is no
+    // valid block to build for this slot: the caller skips it. (A stand-in proof would
+    // be rejected by every peer, wasting the slot and leaving this producer on its own
+    // fork.)
+    let (ecvrf_proof, beta) =
+        prover(&seed_bytes, &alpha).map_err(|e| anyhow::anyhow!("ECVRF prove error: {e}"))?;
+
+    // Self-check before sealing: the proof must verify for THIS header's alpha and
+    // yield the output we commit, so a proof for the wrong input is never sealed.
+    let proof_bytes = ecvrf_proof.to_bytes();
+    let reverified = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&proof_bytes)
+        .and_then(|p| citrate_consensus::ecvrf::verify(&alpha, &p))
+        .map_err(|e| anyhow::anyhow!("ECVRF proof does not verify for this header: {e}"))?;
+    if reverified != beta {
+        anyhow::bail!("ECVRF proof output does not match the committed output");
     }
+
+    // VRF-PROOF-SOURCE: ecvrf::prove output (RFC 9381), self-verified above.
+    Ok(VrfProof {
+        proof: proof_bytes, // 114 bytes
+        output: Hash::from_bytes(&beta),
+    })
 }
 
 /// VALIDATOR-S1 (v5): configuration for producing the height-binding EquivocationVote
@@ -158,6 +178,12 @@ pub struct ProduceCatchupGate {
     /// VERIFY-255-F2-H1: the finalized-reorg floor. A candidate at/below it can never be
     /// "ahead" of the canonical head, so recompute prunes it. `None` ⇒ floor 0.
     finalized_floor: Option<Arc<AtomicU64>>,
+    /// Per-round scratch: the deferred-evidence watermark (heard-but-unadmitted signed
+    /// blocks, see [`AttestedNetworkHead::observe_deferred`]). Wired with the F2 gate.
+    deferred_ahead: Option<Arc<AtomicU64>>,
+    /// Set by the sync driver once this node's initial sync after start has completed
+    /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
+    initial_sync_done: Option<Arc<AtomicBool>>,
 }
 
 /// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
@@ -171,6 +197,11 @@ struct CatchupBehindState {
     /// Set once a >`stall_alert_after` no-progress stall is detected; only the
     /// human-in-command override clears it (NEVER auto-resume after a stall).
     stalled_latch: bool,
+    /// Since when deferred (heard-but-unadmitted) evidence alone has been the reason to
+    /// refuse; `None` outside such an episode. Bounded by [`DEFERRED_ONLY_REFUSE_MAX`].
+    deferred_only_since: Option<Instant>,
+    /// Last time the "sealing despite deferred evidence" warning was logged.
+    deferred_only_warned: Option<Instant>,
 }
 
 impl Default for CatchupBehindState {
@@ -180,6 +211,8 @@ impl Default for CatchupBehindState {
             last_applied_tip: 0,
             last_progress: Instant::now(),
             stalled_latch: false,
+            deferred_only_since: None,
+            deferred_only_warned: None,
         }
     }
 }
@@ -228,7 +261,52 @@ pub struct AttestedInner {
     /// "ahead" only while it still descends from the live fork-choice head. Bounded to
     /// [`ATTESTED_OBSERVED_CAP`] by evicting the lowest-height entry.
     observed: Mutex<BTreeMap<Hash, u64>>,
+    /// Proposer keys seen on attested blocks (signed AND chained to a block we hold).
+    /// Only these proposers' deferred blocks count as "behind" evidence. Bounded.
+    known_proposers: Mutex<HashSet<PublicKey>>,
+    /// Signed blocks heard from known proposers that could not be admitted yet (their
+    /// parent is missing): `proposer -> (highest such height, when THAT height was first
+    /// heard)`. A node that is behind receives only such blocks, so without this the gate
+    /// read a gap of 0 exactly when the node was behind. Only a higher height from the
+    /// proposer resets the time; a repeat or a lower height never does, so the same
+    /// evidence counts for at most [`DEFERRED_EVIDENCE_TTL`]. Bounded.
+    deferred: Mutex<HashMap<PublicKey, (u64, Instant)>>,
+    /// Test clock offset (both the monotonic and the wall clock), so tests can age
+    /// evidence without sleeping.
+    #[cfg(test)]
+    clock_skew: Mutex<Duration>,
 }
+
+/// Deferred ("heard but not admitted") evidence counts only while this fresh.
+pub const DEFERRED_EVIDENCE_TTL: Duration = Duration::from_secs(30);
+/// Deferred evidence counts only when at least this many DISTINCT known proposers
+/// vouch for a height, so one proposer (stranded on a side branch, or misbehaving)
+/// cannot make the rest of the fleet stop producing. The quorum also scales with the
+/// producer set (see [`deferred_quorum_size`]).
+pub const DEFERRED_EVIDENCE_MIN_PROPOSERS: usize = 2;
+/// Longest a producer refuses on deferred evidence ALONE (no held, chained evidence
+/// says it is behind). Past it the producer seals anyway and warns, until that
+/// evidence stops being the only reason to refuse.
+pub const DEFERRED_ONLY_REFUSE_MAX: Duration = Duration::from_secs(60);
+/// Spacing of the warning logged while sealing despite deferred evidence.
+pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Distinct proposers that must vouch for deferred evidence, given `known` other
+/// proposers this node has seen: more than a third of the producer set (`known` plus
+/// this node), and never fewer than [`DEFERRED_EVIDENCE_MIN_PROPOSERS`]. With 7
+/// producers that is 3, so 2 cannot hold the others off.
+pub fn deferred_quorum_size(known: usize) -> usize {
+    let producers = known.saturating_add(1);
+    DEFERRED_EVIDENCE_MIN_PROPOSERS.max(producers.checked_div(3).unwrap_or(0).saturating_add(1))
+}
+/// Deferred evidence counts only when its header timestamp is within the TTL plus this
+/// clock allowance of local wall time (and not more than this allowance in the future),
+/// so an old block cannot be presented as evidence.
+pub const DEFERRED_EVIDENCE_CLOCK_DRIFT: Duration = Duration::from_secs(15);
+/// Deferred evidence is clamped to this far above the selected head.
+pub const DEFERRED_EVIDENCE_MAX_LEAD: u64 = crate::sync_peer::ANCESTRY_RECOVERY_WINDOW;
+/// Cap on the known-proposer and deferred-evidence records.
+const PROPOSER_RECORD_CAP: usize = 1024;
 
 /// Cap on retained attested candidates (a few reorg windows of headroom; the gate prunes
 /// entries at/below the finalized floor on every recompute, so this only bounds a burst).
@@ -263,6 +341,12 @@ impl AttestedNetworkHead {
         match Self::attested_height(storage, block) {
             Some(h) => {
                 self.inner.best.fetch_max(h, Ordering::SeqCst);
+                {
+                    let mut known = self.inner.known_proposers.lock();
+                    if known.len() < PROPOSER_RECORD_CAP {
+                        known.insert(block.header.proposer_pubkey);
+                    }
+                }
                 let mut obs = self.inner.observed.lock();
                 obs.insert(block.header.block_hash, h);
                 // Stay bounded: evict the lowest-height candidate on overflow. The gate
@@ -278,6 +362,63 @@ impl AttestedNetworkHead {
             }
             None => false,
         }
+    }
+
+    /// Fold a signed block that could NOT be admitted yet (its parent is missing) into
+    /// the deferred "behind" evidence. Counts only when the header binds its own hash,
+    /// the proposer signature verifies, and the proposer is KNOWN (it signed an attested
+    /// block on this node before). Returns true when it counted. Whether the evidence
+    /// makes the producer refrain is decided per round by the gate
+    /// ([`ProduceCatchupGate::recompute_attested_ahead`]): fresh, from at least
+    /// [`DEFERRED_EVIDENCE_MIN_PROPOSERS`] proposers, clamped above the selected head.
+    pub fn observe_deferred(&self, block: &Block) -> bool {
+        if !block.verify_hash_for(PbaHardening::from_process()) {
+            return false;
+        }
+        if !matches!(crypto::verify_block_signature(block), Ok(true)) {
+            return false;
+        }
+        let proposer = block.header.proposer_pubkey;
+        if !self.inner.known_proposers.lock().contains(&proposer) {
+            return false;
+        }
+        // The header must be recent by local wall time: an old block is not evidence.
+        let wall = self.inner.wall_now_secs();
+        let ts = block.header.timestamp;
+        let max_age = DEFERRED_EVIDENCE_TTL
+            .saturating_add(DEFERRED_EVIDENCE_CLOCK_DRIFT)
+            .as_secs();
+        if ts.saturating_add(max_age) < wall
+            || ts > wall.saturating_add(DEFERRED_EVIDENCE_CLOCK_DRIFT.as_secs())
+        {
+            return false;
+        }
+        let now = self.inner.now_instant();
+        let mut deferred = self.inner.deferred.lock();
+        // Entries are never pruned on expiry: an expired entry is the record that this
+        // height was already heard, so re-delivering it cannot count again. The map is
+        // bounded by the known-proposer set (itself capped).
+        if deferred.len() >= PROPOSER_RECORD_CAP && !deferred.contains_key(&proposer) {
+            return false;
+        }
+        // Only a HIGHER height is new evidence; a repeat or a lower height never renews
+        // the first-heard time.
+        match deferred.get_mut(&proposer) {
+            Some(entry) if block.header.height <= entry.0 => {}
+            Some(entry) => *entry = (block.header.height, now),
+            None => {
+                deferred.insert(proposer, (block.header.height, now));
+            }
+        }
+        true
+    }
+
+    /// Advance this record's clock (tests only): ages deferred evidence and moves the
+    /// wall clock its timestamp check uses.
+    #[cfg(test)]
+    pub fn advance_clock_for_test(&self, by: Duration) {
+        let mut skew = self.inner.clock_skew.lock();
+        *skew = skew.saturating_add(by);
     }
 
     /// The signature + ancestry check. `Some(height)` iff the block is attested-ahead
@@ -303,6 +444,48 @@ impl AttestedNetworkHead {
             return None;
         }
         Some(block.header.height)
+    }
+}
+
+impl AttestedInner {
+    /// Monotonic now (plus the test offset under `cfg(test)`).
+    fn now_instant(&self) -> Instant {
+        #[cfg(test)]
+        {
+            Instant::now() + *self.clock_skew.lock()
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    /// Wall-clock seconds since the epoch (plus the test offset under `cfg(test)`).
+    fn wall_now_secs(&self) -> u64 {
+        let wall = chrono::Utc::now().timestamp().max(0) as u64;
+        #[cfg(test)]
+        {
+            wall.saturating_add(self.clock_skew.lock().as_secs())
+        }
+        #[cfg(not(test))]
+        {
+            wall
+        }
+    }
+
+    /// The deferred-evidence height at least [`DEFERRED_EVIDENCE_MIN_PROPOSERS`] fresh,
+    /// distinct proposers vouch for (0 when fewer do).
+    fn deferred_quorum_height(&self, now: Instant) -> u64 {
+        // Expired entries are kept (see `observe_deferred`) and simply not counted.
+        let deferred = self.deferred.lock();
+        let mut heights: Vec<u64> = deferred
+            .values()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < DEFERRED_EVIDENCE_TTL)
+            .map(|(h, _)| *h)
+            .collect();
+        heights.sort_unstable_by(|a, b| b.cmp(a));
+        let quorum = deferred_quorum_size(self.known_proposers.lock().len());
+        heights.get(quorum.saturating_sub(1)).copied().unwrap_or(0)
     }
 }
 
@@ -362,9 +545,23 @@ impl ProduceCatchupGate {
             None => {
                 // No selected tip ⇒ we have no fork-choice line to be "behind" on.
                 scratch.store(0, Ordering::SeqCst);
+                if let Some(d) = self.deferred_ahead.as_ref() {
+                    d.store(0, Ordering::SeqCst);
+                }
                 return;
             }
         };
+        // Deferred evidence: signed blocks from at least two known proposers that this
+        // node heard but cannot admit (it lacks their ancestry). Clamped above the
+        // selected head; a stale or single-proposer claim never counts.
+        if let Some(d) = self.deferred_ahead.as_ref() {
+            let quorum = observed.deferred_quorum_height(observed.now_instant());
+            let bounded = quorum.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
+            d.store(
+                if bounded > sel_height { bounded } else { 0 },
+                Ordering::SeqCst,
+            );
+        }
         let mut best = sel_height;
         let mut obs = observed.observed.lock();
         // Prune anything the finalized floor has passed — it can never be ahead again.
@@ -502,6 +699,53 @@ impl ProduceCatchupGate {
         }
     }
 
+    /// The deferred-evidence watermark of the last recompute (0 when not wired). It
+    /// never latches the stall alert on its own: a refusal driven by blocks whose
+    /// ancestry this node cannot verify always ends when that evidence expires or
+    /// is admitted.
+    fn deferred_watermark(&self) -> u64 {
+        self.deferred_ahead
+            .as_ref()
+            .map(|d| d.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// The deferred watermark this round may use. While deferred evidence ALONE would
+    /// make the producer refuse, that is allowed for [`DEFERRED_ONLY_REFUSE_MAX`]; after
+    /// it the evidence is ignored (the producer seals) with a rate-limited warning, until
+    /// it stops being the only reason to refuse.
+    fn deferred_for_round(&self, st: &mut CatchupBehindState, local_tip: u64, held: u64) -> u64 {
+        let raw = self.deferred_watermark();
+        let deferred_only = raw.saturating_sub(local_tip) > CATCHUP_RESUME_GAP
+            && held.saturating_sub(local_tip) <= CATCHUP_RESUME_GAP;
+        if !deferred_only {
+            st.deferred_only_since = None;
+            return raw;
+        }
+        let now = self
+            .attested_observed
+            .as_ref()
+            .map(|o| o.now_instant())
+            .unwrap_or_else(Instant::now);
+        let since = *st.deferred_only_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < DEFERRED_ONLY_REFUSE_MAX {
+            return raw;
+        }
+        let due = st
+            .deferred_only_warned
+            .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+        if due {
+            st.deferred_only_warned = Some(now);
+            warn!(
+                "F2/#126: signed blocks this node cannot admit have said it is behind \
+                 (evidence at {raw}, applied tip {local_tip}) for over {}s with nothing it \
+                 holds agreeing; sealing anyway. Check this node's peers and sync.",
+                DEFERRED_ONLY_REFUSE_MAX.as_secs()
+            );
+        }
+        0
+    }
+
     /// F2: decide whether the node is too far BEHIND its peers to seal this slot.
     /// `local_tip` is the node's applied-tip height (read under the same advance lock
     /// the producer holds for its build). Returns `Err` to make the producer REFRAIN.
@@ -513,9 +757,13 @@ impl ProduceCatchupGate {
         let Some(attested) = self.attested_ahead.as_ref() else {
             return Ok(()); // F2 disabled ⇒ plain #126 gate.
         };
-        let attested = attested.load(Ordering::SeqCst);
-        let gap = attested.saturating_sub(local_tip);
+        // Held (chained) evidence, or heard-but-unadmitted evidence; only the held
+        // kind can latch the stall alert (see `deferred_watermark`).
+        let held = attested.load(Ordering::SeqCst);
         let mut st = self.behind.lock();
+        let attested = held.max(self.deferred_for_round(&mut st, local_tip, held));
+        let gap = attested.saturating_sub(local_tip);
+        let held_behind = held.saturating_sub(local_tip) > CATCHUP_RESUME_GAP;
 
         // Human-in-command override always wins: clear the stall latch and resume.
         //
@@ -574,8 +822,8 @@ impl ProduceCatchupGate {
         }
 
         // Refusing: raise the stall alert + latch after `stall_alert_after` with no
-        // applied-tip progress.
-        if st.last_progress.elapsed() >= self.stall_alert_after {
+        // applied-tip progress (held evidence only, see above).
+        if held_behind && st.last_progress.elapsed() >= self.stall_alert_after {
             st.stalled_latch = true;
             self.stall_alert.store(true, Ordering::SeqCst);
             error!(
@@ -602,6 +850,45 @@ impl ProduceCatchupGate {
 }
 
 /// Block producer for mining new blocks
+/// Environment switch for the r1006 genesis build devnet: produce a block only when the
+/// mempool holds a transaction. The ceremony sends one transaction at a time, so every
+/// transaction then lands at a height fixed by its position in the ceremony, and the
+/// contracts' block-number and block-timestamp state is the same on every run (the
+/// genesis builder's reproducibility). Never a network setting: the node refuses it
+/// unless the chain runs the dev-accounts `default` genesis profile with RPC on loopback
+/// ([`check_mine_on_demand`]).
+pub const MINE_ON_DEMAND_ENV: &str = "CITRATE_DEVNET_MINE_ON_DEMAND";
+
+static MINE_ON_DEMAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn mine_on_demand() -> bool {
+    MINE_ON_DEMAND.load(Ordering::SeqCst)
+}
+
+/// Decide the on-demand switch from the env value, the genesis profile and whether RPC
+/// listens on loopback only. `Ok(true)` = on; an env value on anything but a loopback
+/// `default`-profile devnet is refused.
+pub fn check_mine_on_demand(
+    env: Option<&str>,
+    genesis_profile: Option<&str>,
+    rpc_loopback: bool,
+) -> Result<bool, String> {
+    match env {
+        None => Ok(false),
+        Some("1") if genesis_profile == Some("default") && rpc_loopback => Ok(true),
+        Some("1") => Err(format!(
+            "{MINE_ON_DEMAND_ENV}=1 is for the local genesis build devnet only: it needs \
+             genesis_profile = \"default\" and RPC on loopback"
+        )),
+        Some(v) => Err(format!("{MINE_ON_DEMAND_ENV}={v}: only 1 is accepted")),
+    }
+}
+
+/// Publish the switch (the node calls this once, before the producer starts).
+pub fn set_mine_on_demand(on: bool) {
+    MINE_ON_DEMAND.store(on, Ordering::SeqCst);
+}
+
 pub struct BlockProducer {
     storage: Arc<StorageManager>,
     executor: Arc<Executor>,
@@ -698,6 +985,9 @@ pub struct BlockProducer {
     /// Producer-side circuit breaker for rounds that panic on the same
     /// mempool transaction (see [`PanicBreaker`]).
     panic_breaker: Mutex<PanicBreaker>,
+
+    /// ECVRF prover for the block VRF. Always [`real_vrf_prover`] outside tests.
+    vrf_prover: VrfProver,
 }
 
 /// PBA-L1a-001: outcome of one supervised production round.
@@ -790,6 +1080,14 @@ impl<T> RoundOutcome<T> {
 /// whichever transaction the halving isolates; that needs an existing panic
 /// bug and only affects what this producer proposes. Block validity is
 /// unchanged.
+/// Log budget for slots skipped by the pre-seal peer check: a persistent rule
+/// mismatch would otherwise log once per slot.
+fn preseal_reject_log() -> &'static crate::admission::LogBudget {
+    static BUDGET: once_cell::sync::Lazy<crate::admission::LogBudget> =
+        once_cell::sync::Lazy::new(|| crate::admission::LogBudget::new(5, 60));
+    &BUDGET
+}
+
 #[derive(Default)]
 pub(crate) struct PanicBreaker {
     /// Candidate ids handed to the builder in the current round.
@@ -804,6 +1102,10 @@ pub(crate) struct PanicBreaker {
     quarantine_order: std::collections::VecDeque<Hash>,
     #[cfg(test)]
     fault: Option<(Hash, TestFault)>,
+    /// Test-only: alter the candidate block just before it is hashed, to stand in
+    /// for a producer rule that has drifted from a peer rule.
+    #[cfg(test)]
+    seal_tamper: Option<fn(&mut Block)>,
 }
 
 /// Test-only fault injected after a round has executed its transactions.
@@ -994,6 +1296,7 @@ impl BlockProducer {
             applied_tip_lock: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            vrf_prover: real_vrf_prover(),
         }
     }
 
@@ -1060,6 +1363,7 @@ impl BlockProducer {
             applied_tip_lock: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            vrf_prover: real_vrf_prover(),
         }
     }
 
@@ -1125,6 +1429,7 @@ impl BlockProducer {
             applied_tip_lock: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            vrf_prover: real_vrf_prover(),
         }
     }
 
@@ -1269,6 +1574,7 @@ impl BlockProducer {
             applied_tip_lock: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            vrf_prover: real_vrf_prover(),
         }
     }
 
@@ -1423,6 +1729,7 @@ impl BlockProducer {
             applied_tip_lock: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            vrf_prover: real_vrf_prover(),
         }
     }
 
@@ -1530,6 +1837,8 @@ impl BlockProducer {
             // VERIFY-255-F2-H1: the reorg floor is the applicator's finalized height, so a
             // candidate below finality is never treated as "ahead".
             finalized_floor: Some(app.finalized_height_handle()),
+            deferred_ahead: None,
+            initial_sync_done: None,
         });
         self
     }
@@ -1549,6 +1858,17 @@ impl BlockProducer {
         if let Some(gate) = self.produce_gate.as_mut() {
             gate.attested_ahead = Some(Arc::new(AtomicU64::new(0)));
             gate.attested_observed = Some(attested.handle());
+            gate.deferred_ahead = Some(Arc::new(AtomicU64::new(0)));
+        }
+        self
+    }
+
+    /// Refuse to seal until the sync driver reports that initial sync after start has
+    /// completed (`flag` set true, one-way). Extends the #126 gate; must be chained AFTER
+    /// [`Self::with_produce_catchup_gate`]. No-op if the #126 gate is not wired.
+    pub fn with_initial_sync_gate(mut self, flag: Arc<AtomicBool>) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.initial_sync_done = Some(flag);
         }
         self
     }
@@ -1632,6 +1952,7 @@ impl BlockProducer {
 
     /// Start block production loop
     pub async fn start(self: Arc<Self>) {
+        let on_demand = mine_on_demand();
         // #310: Skip, not tokio's default Burst — after a round that waited
         // out a long catch-up, resume at the configured block time instead of
         // sealing one block per missed tick back to back.
@@ -1642,6 +1963,10 @@ impl BlockProducer {
             interval.tick().await;
 
             if self.is_paused() {
+                continue;
+            }
+            // Build devnet only (see `MINE_ON_DEMAND`): no block without a transaction.
+            if on_demand && self.mempool.stats().await.total_transactions == 0 {
                 continue;
             }
 
@@ -1715,7 +2040,7 @@ impl BlockProducer {
     }
 
     /// Produce a single block
-    async fn produce_block(&self) -> anyhow::Result<Hash> {
+    pub(crate) async fn produce_block(&self) -> anyhow::Result<Hash> {
         // VERIFY-255-P1 (perf): RE-DERIVE the F2 attested-ahead watermark BEFORE acquiring
         // the applied-tip lock. The recompute reads only the fork-choice-selected head, the
         // shared candidate record, and storage — none of which require that lock — and its
@@ -1831,6 +2156,17 @@ impl BlockProducer {
                     ));
                 }
             }
+            // The genesis-build devnet (mine-on-demand, loopback only) has no network to
+            // sync from and must seal each ceremony transaction as it arrives.
+            if let Some(done) = &gate.initial_sync_done {
+                if !done.load(Ordering::SeqCst) && !mine_on_demand() {
+                    return Err(anyhow::anyhow!(
+                        "#126: refusing to produce — initial sync since start has not completed \
+                         (the applied tip is not yet within the refuse band of the network). \
+                         Skipping this slot until it does."
+                    ));
+                }
+            }
             // F2 — NETWORK-HEIGHT CATCH-UP. Refuse to seal while this node is BEHIND its
             // peers, judged ONLY from the best VALIDLY-SIGNED, CHAIN-DESCENDING peer head
             // (never a self-reported Hello height / sync target). `local_tip` is read from
@@ -1852,7 +2188,9 @@ impl BlockProducer {
             // the watermark + applied tip), so the fleet monitor can see WHY a producer is
             // skipping slots. Only while F2 is wired.
             if let Some(scratch) = gate.attested_ahead.as_ref() {
-                let attested_now = scratch.load(Ordering::SeqCst);
+                let attested_now = scratch
+                    .load(Ordering::SeqCst)
+                    .max(gate.deferred_watermark());
                 citrate_api::metrics_server::update_producer_catchup_status(
                     gate_result.is_err(),
                     gate.stall_alert.load(Ordering::SeqCst),
@@ -2009,6 +2347,29 @@ impl BlockProducer {
         blue_set.score = blue_score;
         blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
 
+        // Prove the block VRF FIRST, before selecting transactions or opening an executor
+        // round. If proving fails this slot is skipped: no block is built, stored or
+        // broadcast, and the mempool and executor are untouched. Never substitute a
+        // stand-in proof (peers reject it). Producer-side only; validity is unchanged.
+        let proposer_pubkey = PublicKey::new(self.signing_key.verifying_key().to_bytes());
+        let vrf_reveal = match generate_block_vrf(
+            &self.vrf_prover,
+            &self.signing_key,
+            &proposer_pubkey,
+            &parent_vrf_output,
+            next_height,
+        ) {
+            Ok(proof) => proof,
+            Err(e) => {
+                citrate_api::metrics_server::record_producer_vrf_prove_failure();
+                error!(
+                    "VRF prove failed for height {}: {:#}; skipping this slot (no block built or broadcast)",
+                    next_height, e
+                );
+                return Err(e.context(format!("VRF prove failed for height {next_height}")));
+            }
+        };
+
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
         // Producer-side panic breaker: skip quarantined transactions and, after
@@ -2089,13 +2450,8 @@ impl BlockProducer {
             blue_score,
             blue_work,
             pruning_point: Hash::default(),
-            proposer_pubkey: PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-            vrf_reveal: generate_block_vrf(
-                &self.signing_key,
-                &PublicKey::new(self.signing_key.verifying_key().to_bytes()),
-                &parent_vrf_output,
-                next_height,
-            ),
+            proposer_pubkey,
+            vrf_reveal,
             // The §R' import rule requires the canonical base fee; the former inline
             // "EIP-1559" computation used constant inputs (parent gas used = 0) and
             // always evaluated to exactly this value.
@@ -2169,8 +2525,10 @@ impl BlockProducer {
         // and the enhanced branch are gone; block rewards NEVER read `economics_manager`.
         // (economics_manager remains for RPC/telemetry only.)
         //
-        // `calculate_reward` reads only header.height + transactions (never state_root), so
-        // this temp block is a safe reward-input carrier.
+        // The reward reads only header.height, the transactions and (at/after the
+        // supply-hardening height) their executed `receipts` — never state_root — so
+        // this temp block is a safe reward-input carrier. `canonical_block_reward` is
+        // the same rule selection every receive path applies.
         let temp_block = BlockBuilder::new()
             .header(header.clone())
             .tx_root(tx_root)
@@ -2180,10 +2538,12 @@ impl BlockProducer {
             .transactions(executed_transactions.clone())
             .build_unhashed();
         // PANIC-S1 D3: an uncomputable reward rejects the block (never panics/saturates).
-        let reward = self
-            .reward_calculator
-            .calculate_reward(&temp_block)
-            .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
+        let reward = crate::canonical_apply::canonical_block_reward(
+            &self.reward_calculator,
+            &temp_block,
+            &receipts,
+        )
+        .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
         // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
         // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
         // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
@@ -2250,6 +2610,11 @@ impl BlockProducer {
             block.learning_root = learning_root;
         }
 
+        #[cfg(test)]
+        if let Some(tamper) = self.panic_breaker.lock().seal_tamper {
+            tamper(&mut block);
+        }
+
         // C-05: Compute canonical block hash from ALL fields including commitment roots.
         // This must happen AFTER execution AND rewards so state_root is final.
         block.header.block_hash = block.compute_hash();
@@ -2275,6 +2640,35 @@ impl BlockProducer {
                     &self.signing_key,
                 ));
             }
+        }
+
+        // PRE-SEAL PEER CHECK: judge the candidate with the rules a peer applies on
+        // admission BEFORE anything is persisted, applied or broadcast. A block that
+        // fails them would be rejected by every peer while this node built on it
+        // alone (the r1006 split). Failing here ends the round: `round_state` is
+        // dropped uncommitted, so the executor rolls back, and the slot is skipped.
+        // Any future drift between producer and peer rules then costs one slot.
+        if let Err(rule) = self.peer_admission_verdict(&block).await {
+            citrate_api::metrics_server::record_producer_preseal_reject();
+            let d = preseal_reject_log().check();
+            if d.suppressed_in_previous_window > 0 {
+                warn!(
+                    "producer: {} more slot(s) skipped by the pre-seal peer check in the \
+                     previous window (lines suppressed)",
+                    d.suppressed_in_previous_window
+                );
+            }
+            if d.emit {
+                warn!(
+                    "producer: skipping slot — candidate {} @ {} fails a peer admission rule: {}",
+                    block.header.block_hash, block.header.height, rule
+                );
+            }
+            return Err(anyhow::anyhow!(
+                "pre-seal peer check failed for candidate @ {}: {}",
+                block.header.height,
+                rule
+            ));
         }
 
         // SRP-S3b (restart/crash consistency): persist the BLOCK first, then the state +
@@ -2316,10 +2710,17 @@ impl BlockProducer {
 
         // 2) Persist state changes + advance the durable applied tip ATOMICALLY to THIS
         //    block, so durable state and the committed tip can never diverge on a crash.
+        //    The block's model/job pre-images (from the state the round opened on)
+        //    commit in its undo record in the same batch.
         info!("Persisting state changes to storage...");
+        let models_jobs = round_state.model_job_undo();
         let modified_count = self
             .executor
-            .persist_state_changes_with_tip(Some((block.header.block_hash, block.header.height)))
+            .persist_state_changes_with_undo(
+                Some((block.header.block_hash, block.header.height)),
+                &citrate_execution::executor::ReceiptIndexBatch::default(),
+                models_jobs.as_ref(),
+            )
             .await?;
         // The block's state is durable: keep it.
         round_state.commit();
@@ -2569,6 +2970,27 @@ impl BlockProducer {
     /// returns false so the drain's reorg still governs. The walk is bounded — a
     /// gap wider than `SUPERSEDE_WALK_CAP` is treated as "not the restart-lag case"
     /// and left to the drain, so this never masks a deep legitimate reorg.
+    /// The verdict a peer's admission path (`BlockAdmission::admit`) would reach on
+    /// `block`, minus node-local operator state (rollback withdrawals and canonical
+    /// checkpoints, which name historical blocks): the GhostDAG consistency rules,
+    /// then the body rules, then sidecar ingest. `Err` carries the failed rule.
+    ///
+    /// A parentless block is only built on the legacy path where no genesis was
+    /// seeded; there is no parent to judge it against, so it is not checked here.
+    async fn peer_admission_verdict(&self, block: &Block) -> Result<(), String> {
+        if block.header.selected_parent_hash == Hash::default() {
+            return Ok(());
+        }
+        self.ghostdag
+            .validate_block_consistency(block)
+            .await
+            .map_err(|e| format!("consistency: {e}"))?;
+        let hardening = self.ghostdag.pba_hardening();
+        crate::admission::verify_block_body(hardening, block)?;
+        crate::admission::sidecar_ingest(hardening, block)?;
+        Ok(())
+    }
+
     async fn applied_tip_supersedes(
         &self,
         candidate: Hash,
@@ -2691,17 +3113,46 @@ impl BlockProducer {
             .await
             .map(|h| h.saturating_add(1));
 
+        // HEAVIEST-PARENT RULE: never list a merge parent whose HEADER blue_score
+        // exceeds the selected parent's. Receivers enforce exactly that comparison
+        // (`validate_block_consistency`), but fork choice above ranks tips by the
+        // RECOMPUTED score, which also counts blue merge parents, while headers carry
+        // `parent + 1`. Once blocks merge, the two orderings can disagree: fork choice
+        // picks a tip whose header score is below another tip's. Merging that other tip
+        // seals a block every peer rejects, and the producer then builds on it alone.
+        // Like MP-DEPTH this is a filter: the skipped tip stays in the tip set and is
+        // merged once a selected parent at least as heavy exists.
+        let sp_header_score = self
+            .dag_store
+            .get_block(&selected_parent)
+            .await
+            .ok()
+            .map(|b| b.header.blue_score);
+
         let max_parents = self.ghostdag.params().max_parents;
         let mut dropped_deep = 0usize;
+        let mut dropped_heavier = 0usize;
+        let mut dropped_unreadable = 0usize;
         let mut merge_parents: Vec<Hash> = Vec::new();
         for h in tip_hashes.into_iter().filter(|h| *h != selected_parent) {
             if merge_parents.len() >= max_parents.saturating_sub(1) {
                 break; // Leave room for the selected parent.
             }
-            if let (Some(child_h), Some(tip_h)) =
-                (child_height, self.ghostdag.get_block_height(&h).await)
-            {
-                if child_h.saturating_sub(tip_h)
+            // Without the selected parent's header there is nothing to compare
+            // against, and a tip whose header we cannot read is one a receiver may
+            // lack: merge neither. Counted apart from "heavier" so the log says why.
+            let (Some(sp_score), Some(tip)) =
+                (sp_header_score, self.dag_store.get_block(&h).await.ok())
+            else {
+                dropped_unreadable = dropped_unreadable.saturating_add(1);
+                continue;
+            };
+            if tip.header.blue_score > sp_score {
+                dropped_heavier = dropped_heavier.saturating_add(1);
+                continue;
+            }
+            if let Some(child_h) = child_height {
+                if child_h.saturating_sub(tip.header.height)
                     > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
                 {
                     dropped_deep = dropped_deep.saturating_add(1);
@@ -2709,6 +3160,21 @@ impl BlockProducer {
                 }
             }
             merge_parents.push(h);
+        }
+        if dropped_heavier > 0 {
+            debug!(
+                "producer: left {} tip(s) unmerged whose header blue_score exceeds the selected \
+                 parent's ({:?}); merging them would make our block invalid for every peer",
+                dropped_heavier, sp_header_score
+            );
+        }
+        if dropped_unreadable > 0 {
+            debug!(
+                "producer: left {} tip(s) unmerged because a header could not be read \
+                 (selected parent header readable: {})",
+                dropped_unreadable,
+                sp_header_score.is_some()
+            );
         }
         if dropped_deep > 0 {
             debug!(
@@ -3563,8 +4029,10 @@ mod tests {
         let prev_vrf = Hash::new([3u8; 32]);
         let slot = 42u64;
 
-        let vrf_a = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
-        let vrf_b = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
+        let vrf_a = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &prev_vrf, slot)
+            .expect("ECVRF prove");
+        let vrf_b = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &prev_vrf, slot)
+            .expect("ECVRF prove");
 
         assert_eq!(
             vrf_a.proof, vrf_b.proof,
@@ -3583,7 +4051,8 @@ mod tests {
         let proposer = PublicKey::new(sk.verifying_key().to_bytes());
         let prev_vrf = Hash::new([3u8; 32]);
 
-        let vrf = generate_block_vrf(&sk, &proposer, &prev_vrf, 1);
+        let vrf = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &prev_vrf, 1)
+            .expect("ECVRF prove");
 
         // WP-Z.1: Real ECVRF produces 114-byte proofs
         assert_eq!(vrf.proof.len(), 114, "ECVRF proof must be 114 bytes");
@@ -3598,7 +4067,8 @@ mod tests {
         let prev_vrf = Hash::new([3u8; 32]);
         let slot = 7u64;
 
-        let vrf = generate_block_vrf(&sk, &proposer, &prev_vrf, slot);
+        let vrf = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &prev_vrf, slot)
+            .expect("ECVRF prove");
 
         // Verify the proof using the consensus ECVRF verifier
         let ecvrf_proof = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&vrf.proof)
@@ -3622,8 +4092,10 @@ mod tests {
         let proposer = PublicKey::new(sk.verifying_key().to_bytes());
         let prev_vrf = Hash::new([3u8; 32]);
 
-        let vrf_slot_1 = generate_block_vrf(&sk, &proposer, &prev_vrf, 1);
-        let vrf_slot_2 = generate_block_vrf(&sk, &proposer, &prev_vrf, 2);
+        let vrf_slot_1 = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &prev_vrf, 1)
+            .expect("ECVRF prove");
+        let vrf_slot_2 = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &prev_vrf, 2)
+            .expect("ECVRF prove");
 
         assert_ne!(
             vrf_slot_1.output, vrf_slot_2.output,
@@ -3643,11 +4115,13 @@ mod tests {
         let genesis_vrf = Hash::default();
 
         // Produce block A
-        let vrf_a = generate_block_vrf(&sk, &proposer, &genesis_vrf, 1);
+        let vrf_a = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &genesis_vrf, 1)
+            .expect("ECVRF prove");
         assert_eq!(vrf_a.proof.len(), 114);
 
         // Produce block B using A's output as prev_vrf
-        let vrf_b = generate_block_vrf(&sk, &proposer, &vrf_a.output, 2);
+        let vrf_b = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &vrf_a.output, 2)
+            .expect("ECVRF prove");
         assert_eq!(vrf_b.proof.len(), 114);
         assert_ne!(
             vrf_a.output, vrf_b.output,
@@ -4794,7 +5268,11 @@ mod tests {
         ];
 
         let got = receiver
-            .apply_block(&sealed, sealed.header.coinbase, &basic_credits)
+            .apply_block(
+                &sealed,
+                sealed.header.coinbase,
+                &citrate_execution::executor::fixed_reward(&basic_credits),
+            )
             .await
             .expect(
                 "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
@@ -4949,6 +5427,485 @@ mod tests {
         );
     }
 
+    /// PARENT-RULE PARITY (r1006 7-way split, height 16,509). Fork choice ranks tips
+    /// by the RECOMPUTED blue score (selected parent's score + 1 + blue merge
+    /// parents). The header carries the producer's `parent + 1` approximation, and the
+    /// receive-side linkage rule compares HEADER scores: no merge parent may out-score
+    /// the selected parent. The two metrics disagree as soon as a block merges, so
+    /// fork choice can pick a tip whose header score is LOWER than another tip's. The
+    /// producer then listed that other tip as a merge parent and sealed a block every
+    /// peer rejected ("selected parent must be the heaviest parent"). It kept
+    /// extending that block, peers kept rejecting its branch, and when several
+    /// producers did it in the same round every node ended up on its own branch.
+    ///
+    /// INVARIANT: the parents the producer picks must satisfy the receiver's linkage
+    /// rule, i.e. the block it would seal passes `validate_block_consistency`. A tip
+    /// whose header score does not exceed the selected parent's must still be merged.
+    #[tokio::test]
+    async fn producer_never_merges_a_parent_heavier_than_its_selected_parent() {
+        use citrate_execution::StateDB;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            Ed25519SigningKey::from_bytes(&[42; 32]),
+            2,
+        )
+        .with_v2_headers(true);
+        let dag = producer.dag_store();
+        let ghostdag = producer.ghostdag();
+        let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
+
+        // A peer block as the live producers write it: header blue_score is the
+        // selected parent's header score + 1, whatever it merges.
+        async fn admit(
+            dag: &DagStore,
+            ghostdag: &GhostDag,
+            tag: u8,
+            parent: &Block,
+            merges: &[&Block],
+        ) -> Block {
+            let score = parent.header.blue_score + 1;
+            let mut blk = BlockBuilder::new()
+                .version(2)
+                .height(parent.header.height + 1)
+                .parent(parent.header.block_hash)
+                .merge_parents(merges.iter().map(|m| m.header.block_hash).collect())
+                .coinbase([tag; 20])
+                .timestamp(parent.header.timestamp + 1)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([tag; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(score)
+                .blue_work(citrate_consensus::types::blue_work_for_score(score))
+                .build_unhashed();
+            blk.header.block_hash = blk.compute_hash();
+            dag.store_block(blk.clone())
+                .await
+                .expect("store peer block");
+            ghostdag.add_block(&blk).await.expect("admit peer block");
+            blk
+        }
+
+        // Three siblings at height 1.
+        let a1 = admit(&dag, &ghostdag, 0xA1, &genesis, &[]).await;
+        let a2 = admit(&dag, &ghostdag, 0xA2, &genesis, &[]).await;
+        let a3 = admit(&dag, &ghostdag, 0xA3, &genesis, &[]).await;
+        // X @ 2 merges both siblings: header score 2, recomputed score +2 higher.
+        let x = admit(&dag, &ghostdag, 0xB1, &a1, &[&a2, &a3]).await;
+        // Y @ 3 is a plain chain A1 -> B -> Y: header score 3, recomputed lower than X.
+        let b = admit(&dag, &ghostdag, 0xB2, &a1, &[]).await;
+        let y = admit(&dag, &ghostdag, 0xC1, &b, &[]).await;
+        // Z @ 2: a sibling of X with an equal header score (a legitimate merge).
+        let z = admit(&dag, &ghostdag, 0xB3, &a1, &[]).await;
+
+        // Preconditions: fork choice prefers X while Y carries the higher header score.
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            x.header.block_hash,
+            "fork choice must prefer X (more blue merges) for this scenario to apply"
+        );
+        assert!(y.header.blue_score > x.header.blue_score);
+
+        let tips = dag.get_tips().await;
+        let (sp, merges) = producer
+            .select_parents_with_ghostdag(&tips, None)
+            .await
+            .expect("parent selection");
+        assert_eq!(
+            sp, x.header.block_hash,
+            "selected parent follows fork choice"
+        );
+
+        let sp_block = dag.get_block(&sp).await.expect("selected parent stored");
+        for m in &merges {
+            let mb = dag.get_block(m).await.expect("merge parent stored");
+            assert!(
+                mb.header.blue_score <= sp_block.header.blue_score,
+                "merge parent {} has header blue_score {} above the selected parent's {}: \
+                 every peer rejects this block (selected parent must be the heaviest parent)",
+                m,
+                mb.header.blue_score,
+                sp_block.header.blue_score
+            );
+        }
+        assert!(
+            merges.contains(&z.header.block_hash),
+            "a tip whose header score equals the selected parent's must still be merged"
+        );
+
+        // The receiver's verdict on the header the producer would seal.
+        let score = sp_block.header.blue_score + 1;
+        let mut candidate = BlockBuilder::new()
+            .version(2)
+            .height(sp_block.header.height + 1)
+            .parent(sp)
+            .merge_parents(merges.clone())
+            .coinbase([0x44; 20])
+            .timestamp(sp_block.header.timestamp + 1)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0xEE; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(score)
+            .blue_work(citrate_consensus::types::blue_work_for_score(score))
+            .build_unhashed();
+        candidate.header.block_hash = candidate.compute_hash();
+        ghostdag
+            .validate_block_consistency(&candidate)
+            .await
+            .expect("a block built on the producer's parent choice must pass the receiver's rule");
+    }
+
+    /// The heaviest-parent filter's two unreadable arms. A tip whose header this
+    /// node cannot read is not merged (a receiver may lack it), and when the
+    /// selected parent's own header cannot be read there is nothing to compare
+    /// against, so nothing is merged. Readable tips with an equal header score are
+    /// still merged in the first case (negative control).
+    #[tokio::test]
+    async fn heaviest_parent_filter_never_merges_on_an_unreadable_header() {
+        use citrate_execution::StateDB;
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+        let producer = BlockProducer::new(
+            storage.clone(),
+            executor,
+            mempool,
+            embedded_pubkey(Address([0x44; 20])),
+            Ed25519SigningKey::from_bytes(&[42; 32]),
+            2,
+        )
+        .with_v2_headers(true);
+        let dag = producer.dag_store();
+        let ghostdag = producer.ghostdag();
+        let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
+
+        fn peer_block(tag: u8, parent: &Block, merges: &[&Block]) -> Block {
+            let score = parent.header.blue_score + 1;
+            let mut blk = BlockBuilder::new()
+                .version(2)
+                .height(parent.header.height + 1)
+                .parent(parent.header.block_hash)
+                .merge_parents(merges.iter().map(|m| m.header.block_hash).collect())
+                .coinbase([tag; 20])
+                .timestamp(parent.header.timestamp + 1)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([tag; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(score)
+                .blue_work(citrate_consensus::types::blue_work_for_score(score))
+                .build_unhashed();
+            blk.header.block_hash = blk.compute_hash();
+            blk
+        }
+        async fn admit(dag: &DagStore, ghostdag: &GhostDag, b: &Block) {
+            dag.store_block(b.clone()).await.expect("store peer block");
+            ghostdag.add_block(b).await.expect("admit peer block");
+        }
+
+        let a = peer_block(0xA1, &genesis, &[]);
+        let b = peer_block(0xA2, &genesis, &[]);
+        admit(&dag, &ghostdag, &a).await;
+        admit(&dag, &ghostdag, &b).await;
+
+        // 1. An unreadable tip is not merged; the readable equal-score sibling is.
+        let unknown = Hash::new([0xEE; 32]);
+        let mut tips = dag.get_tips().await;
+        tips.push(citrate_consensus::types::Tip {
+            hash: unknown,
+            ..tips[0].clone()
+        });
+        let (sp, merges) = producer
+            .select_parents_with_ghostdag(&tips, None)
+            .await
+            .expect("parent selection");
+        assert!(
+            !merges.contains(&unknown),
+            "a tip with no readable header must not be merged"
+        );
+        let sibling = if sp == a.header.block_hash { &b } else { &a };
+        assert_eq!(
+            merges,
+            vec![sibling.header.block_hash],
+            "the readable equal-score sibling is still merged"
+        );
+
+        // 2. Fork choice selects a block whose header this DAG store does not hold
+        //    (registered with GhostDAG only): no merge parent can be judged.
+        let ghost = peer_block(0xB1, &a, &[&b]);
+        ghostdag
+            .add_block(&ghost)
+            .await
+            .expect("register with GhostDAG only");
+        assert!(dag.get_block(&ghost.header.block_hash).await.is_err());
+        let c = peer_block(0xC1, &b, &[]);
+        admit(&dag, &ghostdag, &c).await;
+        assert_eq!(
+            ghostdag.select_tip().await.expect("select_tip"),
+            ghost.header.block_hash,
+            "precondition: fork choice prefers the block with an unreadable header"
+        );
+        let tips = dag.get_tips().await;
+        let (sp, merges) = producer
+            .select_parents_with_ghostdag(&tips, None)
+            .await
+            .expect("parent selection");
+        assert_eq!(sp, ghost.header.block_hash);
+        assert!(
+            merges.is_empty(),
+            "with the selected parent's header unreadable nothing may be merged, got {merges:?}"
+        );
+    }
+
+    /// SEVEN CONCURRENT PRODUCERS, ~150 SLOTS (compact form of the #430 review soak).
+    /// Each node has its own stores and runs the real `produce_block`; every sealed
+    /// block reaches the other six through the real admission path
+    /// (`BlockAdmission::admit`, i.e. `validate_block_consistency` and the body
+    /// rules) after a random delay of 0, 1 or 2 slots, then execute-on-receive and
+    /// the drain. This is the shape that split r1006 into one branch per producer at
+    /// height 16,509; before #430 it fails here within the run.
+    ///
+    /// INVARIANTS: no block is ever rejected by a peer; after a quiet period every
+    /// node's selected chain agrees at a common height; every producer has blocks on
+    /// that selected chain.
+    #[tokio::test(flavor = "current_thread")]
+    async fn seven_producers_with_delivery_delay_never_split() {
+        use crate::admission::{AdmitOutcome, BlockAdmission};
+        use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
+        use citrate_execution::StateDB;
+        use std::collections::HashMap;
+
+        const PRODUCERS: usize = 7;
+        const SLOTS: u64 = 150;
+        const QUIET_SLOTS: u64 = 10;
+
+        // Fixed-seed xorshift: the delay pattern is reproducible.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        struct Node {
+            storage: Arc<StorageManager>,
+            app: Arc<CanonicalApplicator>,
+            adm: BlockAdmission,
+            producer: BlockProducer,
+            pending: Vec<Block>,
+            _dir: TempDir,
+        }
+        let mut nodes: Vec<Node> = Vec::new();
+        for i in 0..PRODUCERS {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(storage.state.clone()),
+                40204,
+            ));
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            seed_test_genesis(&storage, &dag, &ghostdag).await;
+            let app = Arc::new(
+                CanonicalApplicator::new(executor.clone(), storage.clone())
+                    .with_fork_choice(ghostdag.clone()),
+            );
+            let adm = BlockAdmission::new(storage.clone(), dag.clone(), ghostdag.clone(), None);
+            let mempool = Arc::new(Mempool::new(MempoolConfig {
+                require_valid_signature: false,
+                ..Default::default()
+            }));
+            let producer = BlockProducer::with_shared_dag(
+                storage.clone(),
+                executor,
+                mempool,
+                None,
+                embedded_pubkey(Address([0x10 + i as u8; 20])),
+                Ed25519SigningKey::from_bytes(&[0x60 + i as u8; 32]),
+                2,
+                Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                    citrate_economics::UnifiedEconomicsConfig::default(),
+                )),
+                dag,
+                ghostdag,
+            )
+            .await
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock());
+            nodes.push(Node {
+                storage,
+                app,
+                adm,
+                producer,
+                pending: Vec::new(),
+                _dir: dir,
+            });
+        }
+
+        async fn deliver(n: &mut Node, b: Block, rejections: &mut Vec<String>) {
+            match n.adm.admit(&b).await {
+                AdmitOutcome::Admitted { .. } | AdmitOutcome::AlreadyAdmitted => {
+                    if let ApplyOutcome::Rejected(why) = n.app.apply_received(&b).await {
+                        rejections.push(format!(
+                            "execute {} @ {}: {why}",
+                            b.header.block_hash, b.header.height
+                        ));
+                    }
+                }
+                AdmitOutcome::Deferred { .. } => n.pending.push(b),
+                AdmitOutcome::Rejected(why) => rejections.push(format!(
+                    "admit {} @ {}: {why}",
+                    b.header.block_hash, b.header.height
+                )),
+            }
+        }
+        async fn retry_pending(n: &mut Node, rejections: &mut Vec<String>) {
+            loop {
+                let before = n.pending.len();
+                for b in std::mem::take(&mut n.pending) {
+                    deliver(n, b, rejections).await;
+                }
+                if n.pending.len() >= before {
+                    break;
+                }
+            }
+            n.app.drive_drain().await;
+        }
+
+        let mut rejections: Vec<String> = Vec::new();
+        let mut inflight: Vec<(u64, usize, Block)> = Vec::new();
+        for slot in 0..SLOTS + QUIET_SLOTS {
+            let quiet = slot >= SLOTS;
+            let mut order: Vec<usize> = (0..PRODUCERS).collect();
+            for k in (1..order.len()).rev() {
+                order.swap(k, (next() % (k as u64 + 1)) as usize);
+            }
+            for &i in &order {
+                // An Err is a deliberate skip (MP-S1 or the pre-seal check).
+                let Ok(h) = nodes[i].producer.produce_block().await else {
+                    continue;
+                };
+                let b = nodes[i]
+                    .storage
+                    .blocks
+                    .get_block(&h)
+                    .expect("read produced block")
+                    .expect("produced block stored");
+                for j in (0..PRODUCERS).filter(|j| *j != i) {
+                    let r = next() % 100;
+                    let delay = if quiet || r < 60 {
+                        0
+                    } else if r < 90 {
+                        1
+                    } else {
+                        2
+                    };
+                    inflight.push((slot + delay, j, b.clone()));
+                }
+            }
+            let (due, rest): (Vec<_>, Vec<_>) =
+                inflight.into_iter().partition(|(at, _, _)| *at <= slot);
+            inflight = rest;
+            for (_, j, b) in due {
+                deliver(&mut nodes[j], b, &mut rejections).await;
+            }
+            for n in nodes.iter_mut() {
+                retry_pending(n, &mut rejections).await;
+            }
+        }
+        assert!(
+            rejections.is_empty(),
+            "{} peer rejection(s), first: {:?}",
+            rejections.len(),
+            rejections.iter().take(3).collect::<Vec<_>>()
+        );
+
+        // Each node's selected chain, walked from its applied tip.
+        let mut chains: Vec<HashMap<u64, Hash>> = Vec::new();
+        for n in &nodes {
+            let mut chain = HashMap::new();
+            let mut cur = n.app.applied_tip().await.hash;
+            loop {
+                let b = n
+                    .storage
+                    .blocks
+                    .get_block(&cur)
+                    .expect("read")
+                    .expect("selected chain block stored");
+                chain.insert(b.header.height, cur);
+                if b.header.height == 0 {
+                    break;
+                }
+                cur = b.header.selected_parent_hash;
+            }
+            chains.push(chain);
+        }
+        let min_height = chains.iter().map(|c| c.len() as u64 - 1).min().unwrap_or(0);
+        assert!(min_height >= SLOTS / 2, "chain too short: {min_height}");
+        let common = min_height.saturating_sub(2);
+        let reference = chains[0][&common];
+        for (i, c) in chains.iter().enumerate() {
+            assert_eq!(
+                c.get(&common),
+                Some(&reference),
+                "node {i} is on a different branch at common height {common}"
+            );
+        }
+        let mut share: HashMap<[u8; 20], usize> = HashMap::new();
+        for h in chains[0].values() {
+            let b = nodes[0]
+                .storage
+                .blocks
+                .get_block(h)
+                .expect("read")
+                .expect("stored");
+            *share.entry(b.header.coinbase).or_default() += 1;
+        }
+        for i in 0..PRODUCERS {
+            assert!(
+                share.get(&[0x10 + i as u8; 20]).copied().unwrap_or(0) > 0,
+                "producer {i} has no block on the selected chain: {share:?}"
+            );
+        }
+    }
+
     /// REGRESSION (chain 40204 reroll wedge @ height 101, 2026-08-12). `produce_block`
     /// stores each produced block in the DAG store (so `dag_store.get_tips()`, the
     /// PARENT source, advances and the chain grows) but never registered it into
@@ -5048,7 +6005,8 @@ mod tests {
                 (Address(block.header.coinbase), reward.validator_reward),
                 (Address(TREASURY), reward.treasury_reward),
             ];
-            exec.apply_block(block, block.header.coinbase, &credits)
+            let reward = citrate_execution::executor::fixed_reward(&credits);
+            exec.apply_block(block, block.header.coinbase, &reward)
                 .await
         }
 
@@ -5240,6 +6198,145 @@ mod tests {
     //   LIVENESS — both producers keep producing. The MP-S1 fix makes a producer
     //              SKIP a round when fork-choice and its applied tip disagree, so
     //              this pins that the skip is transient and never a deadlock.
+    /// C1-R: the producer's receipt path is unchanged, and a FOLLOWER that
+    /// applies the producer's block stores byte-identical receipts in the same
+    /// store + format (`CF_RECEIPTS` by tx hash, the `t‖block‖tx` marker, the tx
+    /// body), with the same block hash and number.
+    #[tokio::test]
+    async fn c1r_follower_receipts_match_the_producers() {
+        use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
+        use citrate_execution::StateDB;
+
+        async fn node(
+            producing: bool,
+        ) -> (
+            TempDir,
+            Arc<StorageManager>,
+            Arc<Executor>,
+            Arc<DagStore>,
+            Arc<GhostDag>,
+            CanonicalApplicator,
+            Option<(BlockProducer, Arc<Mempool>)>,
+        ) {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(storage.state.clone()),
+                40204,
+            ));
+            let sender = Address([0x11; 20]);
+            executor.set_balance(&sender, U256::from(21_000u64 * 1_000_000_000u64 * 10));
+            executor
+                .persist_state_changes()
+                .await
+                .expect("persist funded genesis");
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            seed_test_genesis(&storage, &dag, &ghostdag).await;
+            let app = CanonicalApplicator::new(executor.clone(), storage.clone())
+                .with_fork_choice(ghostdag.clone());
+            let producer = if producing {
+                let mempool = Arc::new(Mempool::new(MempoolConfig {
+                    require_valid_signature: false,
+                    ..Default::default()
+                }));
+                let p = BlockProducer::with_shared_dag(
+                    storage.clone(),
+                    executor.clone(),
+                    mempool.clone(),
+                    None,
+                    embedded_pubkey(Address([0x44; 20])),
+                    Ed25519SigningKey::from_bytes(&[42; 32]),
+                    2,
+                    Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                        citrate_economics::UnifiedEconomicsConfig::default(),
+                    )),
+                    dag.clone(),
+                    ghostdag.clone(),
+                )
+                .await
+                .with_v2_headers(true)
+                .with_applied_tip_lock(app.advance_lock());
+                Some((p, mempool))
+            } else {
+                None
+            };
+            (dir, storage, executor, dag, ghostdag, app, producer)
+        }
+
+        let (_pd, p_storage, _pe, _pdag, _pg, _papp, producer) = node(true).await;
+        let (_fd, f_storage, _fe, f_dag, f_ghostdag, f_app, _) = node(false).await;
+        let (producer, mempool) = producer.expect("producer node");
+
+        let tx = transfer_tx(0xC1, Address([0x11; 20]), Address([0x33; 20]), 0);
+        mempool
+            .add_transaction(tx.clone(), TxClass::Standard)
+            .await
+            .expect("admit tx");
+        let hash = producer.produce_block().await.expect("produce");
+        let block = p_storage
+            .blocks
+            .get_block(&hash)
+            .expect("read block")
+            .expect("sealed block");
+        assert_eq!(block.transactions.len(), 1);
+
+        // Producer side: unchanged — its own receipt, stamped with the sealed block.
+        let p_receipt = p_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .expect("producer stored its receipt");
+        assert_eq!(p_receipt.block_hash, hash);
+        assert_eq!(p_receipt.block_number, block.header.height);
+
+        // Follower: the real receive path (persist, DAG admit, apply).
+        assert!(f_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .is_none());
+        f_storage.blocks.put_block(&block).expect("persist");
+        f_dag.store_block(block.clone()).await.expect("dag");
+        f_ghostdag.add_block(&block).await.expect("ghostdag");
+        assert!(matches!(
+            f_app.apply_received(&block).await,
+            ApplyOutcome::Applied { .. }
+        ));
+
+        let f_receipt = f_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .expect("follower stored the receipt");
+        assert_eq!(
+            bincode::serialize(&f_receipt).expect("ser"),
+            bincode::serialize(&p_receipt).expect("ser"),
+            "follower receipt is byte-identical to the producer's"
+        );
+        assert_eq!(
+            f_storage
+                .transactions
+                .get_block_transactions(&hash)
+                .expect("markers"),
+            p_storage
+                .transactions
+                .get_block_transactions(&hash)
+                .expect("markers"),
+        );
+        assert_eq!(
+            f_storage
+                .transactions
+                .get_transaction(&tx.hash)
+                .expect("tx")
+                .map(|t| t.hash),
+            Some(tx.hash)
+        );
+    }
+
     #[tokio::test]
     async fn mp_s1_two_concurrent_producers_a_follower_reproduces_every_root() {
         use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
@@ -5515,6 +6612,8 @@ mod tests {
             stall_alert_after: stall_after,
             attested_observed: None,
             finalized_floor: None,
+            deferred_ahead: None,
+            initial_sync_done: None,
         }
     }
 
@@ -6032,6 +7131,8 @@ mod tests {
             stall_alert_after: Duration::from_secs(3600),
             attested_observed: Some(att.handle()),
             finalized_floor: floor.map(|f| Arc::new(AtomicU64::new(f))),
+            deferred_ahead: None,
+            initial_sync_done: None,
         }
     }
 
@@ -6185,6 +7286,831 @@ mod tests {
             "only the genuine extension counts; the watermark tracks the selected chain to 9"
         );
     }
+
+    // ── Producer seal gate and missing-parent walk. The harness drives the real
+    // admission/serve/apply path and the same calls main.rs makes on gossip and
+    // on a `Blocks` answer, with an in-process "network". ──
+    mod seal_gate_and_parent_walk {
+        use super::*;
+        use crate::admission::{AdmitOutcome, BlockAdmission};
+        use crate::canonical_apply::CanonicalApplicator;
+        use crate::sync_recovery::{ParentWalks, Step, WalkAnswer};
+        use citrate_execution::StateDB;
+
+        pub(super) struct N {
+            pub storage: Arc<StorageManager>,
+            pub app: Arc<CanonicalApplicator>,
+            pub adm: BlockAdmission,
+            pub producer: BlockProducer,
+            pub orphans: Vec<Block>,
+            pub attested: AttestedNetworkHead,
+            pub walk: ParentWalks,
+            /// This node's peer id, as the others see it.
+            pub id: String,
+            /// The walk's clock (advanced by the tests).
+            pub clock: std::time::Instant,
+            /// Every request the walk sent, as `(peer, parent height)`.
+            pub asked: Vec<(String, u64)>,
+            pub initial_sync: Arc<AtomicBool>,
+            _dir: TempDir,
+        }
+
+        pub(super) async fn node(i: u8, gated: bool) -> N {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let executor = Arc::new(Executor::with_storage_and_chain_id(
+                Arc::new(StateDB::new()),
+                Some(storage.state.clone()),
+                40204,
+            ));
+            let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+            let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+            // Genesis stamped with the current time, as on a live chain, so produced
+            // headers carry recent timestamps (the deferred-evidence check reads them).
+            let mut genesis = test_genesis();
+            // One timestamp for every node in the process, or nodes created across
+            // a second boundary would get different genesis hashes.
+            static GENESIS_TS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            genesis.header.timestamp =
+                *GENESIS_TS.get_or_init(|| chrono::Utc::now().timestamp().max(0) as u64);
+            genesis.header.block_hash = genesis.compute_hash();
+            storage.blocks.put_block(&genesis).expect("persist genesis");
+            storage
+                .blocks
+                .put_applied_tip(&genesis.header.block_hash, 0)
+                .expect("genesis applied tip");
+            dag.set_configured_genesis(genesis.header.block_hash);
+            dag.store_block(genesis.clone())
+                .await
+                .expect("genesis in DAG");
+            ghostdag
+                .add_block(&genesis)
+                .await
+                .expect("genesis in GhostDAG");
+            let app = Arc::new(
+                CanonicalApplicator::new(executor.clone(), storage.clone())
+                    .with_fork_choice(ghostdag.clone()),
+            );
+            let adm = BlockAdmission::new(
+                storage.clone(),
+                dag.clone(),
+                ghostdag.clone(),
+                Some(app.clone()),
+            );
+            let mempool = Arc::new(Mempool::new(MempoolConfig {
+                require_valid_signature: false,
+                ..Default::default()
+            }));
+            let attested = AttestedNetworkHead::new();
+            let initial_sync = Arc::new(AtomicBool::new(true));
+            let mut producer = BlockProducer::with_shared_dag(
+                storage.clone(),
+                executor,
+                mempool,
+                None,
+                embedded_pubkey(Address([0x10 + i; 20])),
+                Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                2,
+                Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                    citrate_economics::UnifiedEconomicsConfig::default(),
+                )),
+                dag,
+                ghostdag,
+            )
+            .await
+            .with_v2_headers(true)
+            .with_applied_tip_lock(app.advance_lock());
+            if gated {
+                // Same chain as main.rs.
+                producer = producer
+                    .with_produce_catchup_gate(&app)
+                    .with_network_height_gate(&attested)
+                    .with_initial_sync_gate(initial_sync.clone());
+            }
+            N {
+                storage,
+                app,
+                adm,
+                producer,
+                orphans: Vec::new(),
+                attested,
+                walk: ParentWalks::new(
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(30),
+                ),
+                id: format!("node-{i}"),
+                clock: std::time::Instant::now(),
+                asked: Vec::new(),
+                initial_sync,
+                _dir: dir,
+            }
+        }
+
+        pub(super) async fn produce(n: &N) -> Block {
+            let h = n.producer.produce_block().await.expect("produce");
+            n.storage
+                .blocks
+                .get_block(&h)
+                .expect("read")
+                .expect("stored")
+        }
+
+        pub(super) fn applied(n: &N) -> (Hash, u64) {
+            n.storage
+                .blocks
+                .get_applied_tip()
+                .expect("read tip")
+                .expect("tip")
+        }
+
+        /// The gossip `NewBlock` arm of main.rs: admit; on Deferred record the
+        /// deferred evidence and run SYNC-S3 against `server` (when given).
+        pub(super) async fn gossip(n: &mut N, server: Option<&N>, b: &Block) -> &'static str {
+            match n.adm.admit(b).await {
+                AdmitOutcome::Admitted { .. } => {
+                    n.attested.observe(&n.storage, b);
+                    "admitted"
+                }
+                AdmitOutcome::AlreadyAdmitted => "already",
+                AdmitOutcome::Deferred { missing_parent } => {
+                    n.attested.observe_deferred(b);
+                    if let Some(server) = server {
+                        let applied_now = applied(n).1;
+                        if crate::sync_peer::should_attempt_ancestry_recovery(
+                            b.header.height,
+                            applied_now,
+                        ) {
+                            let step = n.walk.begin(
+                                &server.id,
+                                missing_parent,
+                                b.header.height.saturating_sub(1),
+                                applied_now,
+                                n.clock,
+                            );
+                            if let Step::Ask { parent, height } = step {
+                                n.asked.push((server.id.clone(), height));
+                                let resp =
+                                    crate::block_serve::serve_blocks(&server.storage, &parent, 32);
+                                on_blocks(n, server, resp).await;
+                            }
+                        }
+                    }
+                    "deferred"
+                }
+                AdmitOutcome::Rejected(_) => "rejected",
+            }
+        }
+
+        /// One `Blocks` answer from `from` through main.rs's receive arm (the
+        /// shared fixpoint, the bounded orphan buffer, then the parent walk and
+        /// the stuck-parent fetch). Returns the newly admitted count and the
+        /// follow-up requests to `from`.
+        async fn admit_answer(n: &mut N, from: &str, blocks: Vec<Block>) -> (usize, Vec<Hash>) {
+            let answer: std::collections::HashSet<Hash> =
+                blocks.iter().map(|b| b.header.block_hash).collect();
+            let mut pending = blocks;
+            let reprocess = !pending.is_empty();
+            if reprocess {
+                pending.append(&mut n.orphans);
+                pending = crate::admission::bound_orphan_buffer(pending);
+            }
+            let attested = n.attested.clone();
+            let storage = n.storage.clone();
+            let fixpoint = n
+                .adm
+                .admit_to_fixpoint(pending, |b, _| {
+                    attested.observe(&storage, b);
+                })
+                .await;
+            let from_answer: Vec<&Block> = fixpoint
+                .deferred
+                .iter()
+                .filter(|b| answer.contains(&b.header.block_hash))
+                .collect();
+            let lowest = crate::sync_recovery::lowest_deferred(&from_answer, &fixpoint);
+            let roots = if reprocess {
+                crate::sync_recovery::deferred_roots(&fixpoint)
+            } else {
+                Vec::new()
+            };
+            if reprocess {
+                n.orphans = crate::admission::bound_orphan_buffer(fixpoint.deferred);
+            }
+            n.app.drive_drain().await;
+            let applied_now = applied(n).1;
+            let now = n.clock;
+            let mut asks = Vec::new();
+            let step = n.walk.next(
+                from,
+                WalkAnswer {
+                    lowest_deferred: lowest,
+                    admitted: fixpoint.newly_admitted,
+                    orphans_remaining: !n.orphans.is_empty(),
+                    applied: applied_now,
+                },
+                now,
+            );
+            if let Step::Ask { parent, height } = step {
+                n.asked.push((from.to_string(), height));
+                asks.push(parent);
+            }
+            n.walk.note_stuck(&roots, from, now);
+            let storage = n.storage.clone();
+            let (refetch, _) = n.walk.refetch_stuck(
+                |p| storage.blocks.has_block(p).unwrap_or(false),
+                applied_now,
+                now,
+            );
+            for r in refetch {
+                if r.peer == from {
+                    n.asked.push((r.peer.clone(), r.height));
+                    asks.push(r.parent);
+                } else {
+                    // Only `from` is reachable in this harness.
+                    n.walk.unsent(&r.peer);
+                }
+            }
+            (fixpoint.newly_admitted, asks)
+        }
+
+        /// A `Blocks` answer plus every missing-parent request it triggers, each
+        /// served by the same peer (main.rs sends them to the answering peer).
+        pub(super) async fn on_blocks(n: &mut N, server: &N, blocks: Vec<Block>) -> usize {
+            let mut total = 0usize;
+            let mut queue = std::collections::VecDeque::from([blocks]);
+            while let Some(bs) = queue.pop_front() {
+                let (newly, asks) = admit_answer(n, &server.id, bs).await;
+                total += newly;
+                for parent in asks {
+                    queue.push_back(crate::block_serve::serve_blocks(
+                        &server.storage,
+                        &parent,
+                        32,
+                    ));
+                }
+            }
+            total
+        }
+
+        /// Plain tip-anchored sync (the node is behind on the same chain).
+        pub(super) async fn sync_from_tip(n: &mut N, server: &N) -> usize {
+            let (anchor, _) = applied(n);
+            let resp = crate::block_serve::serve_blocks(&server.storage, &anchor, 32);
+            on_blocks(n, server, resp).await
+        }
+
+        /// A deferred-evidence fixture: A1 and A2 (two known proposers) share the
+        /// common prefix with B, then extend to 46 without B hearing it.
+        async fn behind_fixture() -> (N, N, N, Block, Block) {
+            let mut a1 = node(1, false).await;
+            let mut a2 = node(2, false).await;
+            let mut b = node(7, true).await;
+            for i in 0..39 {
+                let (p, q) = if i % 2 == 0 {
+                    (&mut a1, &mut a2)
+                } else {
+                    (&mut a2, &mut a1)
+                };
+                let blk = produce(p).await;
+                assert_eq!(gossip(q, None, &blk).await, "admitted");
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut last = [None, None];
+            for i in 0..7 {
+                let (p, q, k) = if i % 2 == 0 {
+                    (&mut a1, &mut a2, 0)
+                } else {
+                    (&mut a2, &mut a1, 1)
+                };
+                let blk = produce(p).await;
+                assert_eq!(gossip(q, None, &blk).await, "admitted");
+                last[k] = Some(blk);
+            }
+            let [l1, l2] = last;
+            (a1, a2, b, l1.expect("A1 block"), l2.expect("A2 block"))
+        }
+
+        /// The deferred-evidence watermark the gate computed in its last round.
+        fn deferred_watermark(n: &N) -> u64 {
+            n.producer
+                .produce_gate
+                .as_ref()
+                .and_then(|g| g.deferred_ahead.as_ref())
+                .map(|d| d.load(Ordering::SeqCst))
+                .expect("gate wired")
+        }
+
+        /// Re-sign `b` by node `i`'s proposer key after editing its header.
+        fn resign(mut b: Block, i: u8) -> Block {
+            b.header.block_hash = b.compute_hash();
+            b.signature = crypto::sign_block(
+                &b.header.block_hash,
+                &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+            );
+            b
+        }
+
+        /// Serializes the tests that read or set the process-wide mine-on-demand
+        /// switch, and clears it again even if a test fails.
+        static MINE_ON_DEMAND_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        struct MineOnDemandOff;
+        impl Drop for MineOnDemandOff {
+            fn drop(&mut self) {
+                set_mine_on_demand(false);
+            }
+        }
+
+        /// A copy of `blk` signed by node `i` at `height`, with a parent nobody holds and
+        /// a header time `skew_secs` after real time (matching the test clock).
+        fn unadmittable(blk: &Block, i: u8, height: u64, skew_secs: u64) -> Block {
+            let mut x = blk.clone();
+            x.header.height = height;
+            x.header.selected_parent_hash = Hash::new([0xEE; 32]);
+            x.header.timestamp =
+                (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(skew_secs);
+            resign(x, i)
+        }
+
+        /// Two proposers that keep sending fresh, ever-higher blocks nobody can admit
+        /// hold a producer off for at most the cap (60 s), then it seals every round.
+        #[tokio::test(flavor = "current_thread")]
+        async fn unadmittable_evidence_holds_sealing_off_at_most_the_cap() {
+            let (_a1, _a2, b, t1, t2) = behind_fixture().await;
+            let mut sealed_at = None;
+            for step in 0..=18u64 {
+                let t = step * 10;
+                let tip = applied(&b).1;
+                for (blk, i) in [(&t1, 1u8), (&t2, 2u8)] {
+                    let x = unadmittable(blk, i, tip + 50 + step, t);
+                    assert!(b.attested.observe_deferred(&x), "t={t}s: evidence counted");
+                }
+                let r = b.producer.produce_block().await;
+                if t == 0 {
+                    assert!(r.is_err(), "fresh evidence must hold sealing off at first");
+                }
+                // Literal on purpose: the bound is 60 s (+ one 10 s round of slack).
+                if t >= 70 {
+                    assert!(r.is_ok(), "t={t}s: still held off: {:?}", r.err());
+                }
+                if r.is_ok() && sealed_at.is_none() {
+                    sealed_at = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = sealed_at.expect("sealed within the cap");
+            assert!(
+                at >= 60,
+                "the cap must not cut the refusal short (sealed at {at}s)"
+            );
+        }
+
+        /// With 7 producers, 2 proposers' unadmittable evidence cannot hold the
+        /// others off; 3 (more than a third) can, until the cap.
+        #[tokio::test(flavor = "current_thread")]
+        async fn two_of_seven_cannot_hold_sealing_off() {
+            let mut others = Vec::new();
+            for i in 1..=6u8 {
+                others.push(node(i, false).await);
+            }
+            let mut b = node(7, true).await;
+            let mut last = Vec::new();
+            for r in 0..12usize {
+                let p = r % 6;
+                let blk = produce(&others[p]).await;
+                for (q, o) in others.iter_mut().enumerate() {
+                    if q != p {
+                        assert_eq!(gossip(o, None, &blk).await, "admitted");
+                    }
+                }
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+                last.push(blk);
+            }
+            let tip = applied(&b).1;
+            for (k, blk) in last.iter().take(2).enumerate() {
+                let x = unadmittable(blk, k as u8 + 1, tip + 50, 0);
+                assert!(b.attested.observe_deferred(&x));
+            }
+            let r = b.producer.produce_block().await;
+            assert!(r.is_ok(), "2 of 7 held sealing off: {:?}", r.err());
+            let tip = applied(&b).1;
+            for (k, blk) in last.iter().take(3).enumerate() {
+                let x = unadmittable(blk, k as u8 + 1, tip + 60, 0);
+                assert!(b.attested.observe_deferred(&x));
+            }
+            assert!(
+                b.producer.produce_block().await.is_err(),
+                "3 of 7 (more than a third) count"
+            );
+        }
+
+        /// The same evidence, re-delivered, counts for at most 30 s from when it was
+        /// first heard: the same two blocks (and lower ones from the same proposers)
+        /// re-sent every 10 s for 5 minutes stop the producer only for the first 30 s.
+        #[tokio::test(flavor = "current_thread")]
+        async fn redelivered_deferred_evidence_expires_30s_after_first_heard() {
+            let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            // Lower-height evidence from the same two proposers (validly signed,
+            // parent missing): must not renew either.
+            let lower: Vec<Block> = [(&t1, 1u8), (&t2, 2u8)]
+                .into_iter()
+                .map(|(blk, i)| {
+                    let mut x = blk.clone();
+                    x.header.height -= 2;
+                    resign(x, i)
+                })
+                .collect();
+            for step in 0..=30u64 {
+                let t = step * 10;
+                gossip(&mut b, None, &t1).await;
+                gossip(&mut b, None, &t2).await;
+                for x in &lower {
+                    b.attested.observe_deferred(x);
+                }
+                let r = b.producer.produce_block().await;
+                // Literal on purpose: the spec is 30 s, not whatever the constant says.
+                if t < 30 {
+                    assert!(
+                        r.is_err(),
+                        "t={t}s: sealed while fresh evidence says behind"
+                    );
+                } else {
+                    assert!(
+                        r.is_ok(),
+                        "t={t}s: re-delivered evidence still stops sealing: {:?}",
+                        r.err()
+                    );
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+        }
+
+        /// A block whose header timestamp is old is not evidence, even heard for the
+        /// first time from a known proposer.
+        #[tokio::test(flavor = "current_thread")]
+        async fn old_header_timestamp_is_not_evidence() {
+            let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            // 30 s window + 15 s clock allowance, plus one: literal on purpose.
+            b.attested.advance_clock_for_test(Duration::from_secs(46));
+            assert!(!b.attested.observe_deferred(&t1));
+            assert!(!b.attested.observe_deferred(&t2));
+            gossip(&mut b, None, &t1).await;
+            gossip(&mut b, None, &t2).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// A known proposer's block with a broken signature is not evidence (anyone
+        /// can put a known key in a header).
+        #[tokio::test(flavor = "current_thread")]
+        async fn bad_signature_on_a_known_key_is_not_evidence() {
+            let (_a1, _a2, mut b, t1, mut t2) = behind_fixture().await;
+            let mut sig = *t2.signature.as_bytes();
+            sig[0] ^= 0x01;
+            t2.signature = citrate_consensus::types::Signature::new(sig);
+            assert!(
+                !b.attested.observe_deferred(&t2),
+                "forged signature counted"
+            );
+            gossip(&mut b, None, &t1).await;
+            gossip(&mut b, None, &t2).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// A block whose header no longer binds its hash (height edited, signature
+        /// over the original hash still valid) is not evidence.
+        #[tokio::test(flavor = "current_thread")]
+        async fn tampered_header_is_not_evidence() {
+            let (_a1, _a2, mut b, t1, mut t2) = behind_fixture().await;
+            t2.header.height += 100;
+            assert!(matches!(crypto::verify_block_signature(&t2), Ok(true)));
+            assert!(!b.attested.observe_deferred(&t2), "tampered header counted");
+            gossip(&mut b, None, &t1).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// Deferred evidence is clamped to the selected head + 512.
+        #[tokio::test(flavor = "current_thread")]
+        async fn deferred_watermark_is_capped_above_the_head() {
+            let (_a1, _a2, b, t1, t2) = behind_fixture().await;
+            for (blk, i) in [(t1, 1u8), (t2, 2u8)] {
+                let mut far = blk;
+                far.header.height = 1_000_000;
+                let far = resign(far, i);
+                assert!(b.attested.observe_deferred(&far));
+            }
+            assert!(b.producer.produce_block().await.is_err());
+            assert_eq!(deferred_watermark(&b), 39 + DEFERRED_EVIDENCE_MAX_LEAD);
+        }
+
+        /// The genesis-build devnet (mine-on-demand) seals without waiting for
+        /// initial sync.
+        #[tokio::test(flavor = "current_thread")]
+        async fn devnet_mine_on_demand_skips_the_initial_sync_wait() {
+            let _serial = MINE_ON_DEMAND_TESTS.lock().await;
+            let _reset = MineOnDemandOff;
+            let b = node(7, true).await;
+            b.initial_sync.store(false, Ordering::SeqCst);
+            set_mine_on_demand(true);
+            let r = b.producer.produce_block().await;
+            assert!(r.is_ok(), "devnet waited for initial sync: {:?}", r.err());
+        }
+
+        /// The seal gate refuses while the node is behind: B at 39 has heard signed
+        /// tips from two known proposers above it that it cannot admit (their
+        /// parents are missing). Before, the gate counted only blocks whose parent
+        /// B holds (none), read a gap of 0, and sealed height 40.
+        #[tokio::test(flavor = "current_thread")]
+        async fn producer_refuses_while_behind_on_deferred_evidence() {
+            let (a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            assert_eq!(gossip(&mut b, None, &t1).await, "deferred");
+            assert_eq!(gossip(&mut b, None, &t2).await, "deferred");
+            assert_eq!(applied(&b).1, 39, "B still behind");
+            let r = b.producer.produce_block().await;
+            assert!(
+                r.is_err(),
+                "producer sealed {:?} at height 40 while 7 behind the network (A@46)",
+                r.ok()
+            );
+            // Catching up clears it: B syncs, then seals on top of the majority.
+            for _ in 0..4 {
+                sync_from_tip(&mut b, &a1).await;
+            }
+            assert_eq!(applied(&b), applied(&a1));
+            let sealed = produce(&b).await;
+            assert_eq!(sealed.header.height, 47);
+        }
+
+        /// Halt safety: one proposer's deferred blocks never stop a producer (a
+        /// single stranded or misbehaving proposer cannot idle the fleet), nor do
+        /// blocks signed by a key this node never saw on an admitted block.
+        #[tokio::test(flavor = "current_thread")]
+        async fn single_or_unknown_proposer_deferred_evidence_does_not_block_sealing() {
+            let (_a1, _a2, mut b, t1, _t2) = behind_fixture().await;
+            assert_eq!(gossip(&mut b, None, &t1).await, "deferred");
+            let stranger = node(9, false).await;
+            for _ in 0..45 {
+                produce(&stranger).await;
+            }
+            let far = produce(&stranger).await;
+            assert!(!b.attested.observe_deferred(&far), "unknown proposer");
+            gossip(&mut b, None, &far).await;
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// Deferred evidence alone never latches the stall alert: B keeps refusing
+        /// while behind, but after the stall window it is not latched OFF (an
+        /// override is not needed once the evidence expires or is admitted).
+        #[tokio::test(flavor = "current_thread")]
+        async fn deferred_evidence_never_latches_the_stall_alert() {
+            let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
+            b.producer = b
+                .producer
+                .with_catchup_stall_alert_after(Duration::from_millis(1));
+            gossip(&mut b, None, &t1).await;
+            gossip(&mut b, None, &t2).await;
+            for _ in 0..3 {
+                assert!(b.producer.produce_block().await.is_err());
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let alert = b.producer.catchup_alert_handle().expect("gate wired");
+            assert!(
+                !alert.load(Ordering::SeqCst),
+                "deferred-only refusal latched"
+            );
+        }
+
+        /// Initial sync: a gated producer refuses until the sync driver reports
+        /// initial sync complete, then seals.
+        #[tokio::test(flavor = "current_thread")]
+        async fn producer_waits_for_initial_sync() {
+            let _serial = MINE_ON_DEMAND_TESTS.lock().await;
+            let b = node(7, true).await;
+            b.initial_sync.store(false, Ordering::SeqCst);
+            let refused = b.producer.produce_block().await;
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("initial sync")),
+                "sealed before initial sync completed: {refused:?}"
+            );
+            b.initial_sync.store(true, Ordering::SeqCst);
+            assert!(b.producer.produce_block().await.is_ok());
+        }
+
+        /// A deferred gossip block whose ancestry is several heights deep is
+        /// recovered by walking back by hash (no sync tick involved).
+        #[tokio::test(flavor = "current_thread")]
+        async fn deferred_gossip_walks_back_to_a_held_ancestor() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut tip = None;
+            for _ in 0..8 {
+                tip = Some(produce(&a).await);
+            }
+            let tip = tip.expect("tip");
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert_eq!(applied(&b), applied(&a), "walked back 8 heights to 39");
+        }
+
+        /// The walk is bounded: a gap deeper than the budget is left to sync.
+        #[tokio::test(flavor = "current_thread")]
+        async fn parent_walk_stops_at_its_budget() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            let mut tip = None;
+            for _ in 0..(crate::sync_recovery::MAX_PARENT_WALK_STEPS as u64 + 40) {
+                tip = Some(produce(&a).await);
+            }
+            let tip = tip.expect("tip");
+            gossip(&mut b, Some(&a), &tip).await;
+            assert_eq!(applied(&b).1, 0, "nothing below the budget connects");
+            // The tip-anchored sync owns the rest (32 blocks per answer).
+            for _ in 0..(crate::sync_recovery::MAX_PARENT_WALK_STEPS / 32 + 4) {
+                sync_from_tip(&mut b, &a).await;
+            }
+            assert_eq!(applied(&b), applied(&a));
+        }
+
+        /// `len` blocks signed by node `i` (from `tmpl`), heights `1..=len`, the
+        /// first on a parent nobody holds: a branch no walk can connect.
+        fn unconnected_chain(tmpl: &Block, i: u8, len: u64) -> Vec<Block> {
+            let mut parent = Hash::new([0xEE; 32]);
+            let mut out = Vec::new();
+            for k in 1..=len {
+                let mut x = tmpl.clone();
+                x.header.height = k;
+                x.header.selected_parent_hash = parent;
+                x.header.merge_parent_hashes.clear();
+                x.header.timestamp = chrono::Utc::now().timestamp().max(0) as u64;
+                let x = resign(x, i);
+                parent = x.header.block_hash;
+                out.push(x);
+            }
+            out
+        }
+
+        /// Blocks of `branch` that `n` has not fully admitted.
+        async fn not_admitted(n: &N, branch: &[Block]) -> Vec<u64> {
+            let mut out = Vec::new();
+            for blk in branch {
+                if !n.adm.is_fully_admitted(&blk.header.block_hash).await {
+                    out.push(blk.header.height);
+                }
+            }
+            out
+        }
+
+        fn asks_to(n: &N, peer: &N) -> usize {
+            n.asked.iter().filter(|(p, _)| *p == peer.id).count()
+        }
+
+        /// (a) + (c): equal-height branches, as on r1006. After an earlier burst
+        /// against another peer spent more than the old shared 64-step budget
+        /// (and left orphans that never resolve), a 20-block foreign branch
+        /// whose parents are missing is still walked back to the fork and every
+        /// block of it is admitted through BlockAdmission.
+        #[tokio::test(flavor = "current_thread")]
+        async fn foreign_branch_20_deep_is_fully_stored_after_another_peers_burst() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            // Each side seals 20 on its own: equal-height branches.
+            let mut branch = Vec::new();
+            for _ in 0..20 {
+                branch.push(produce(&a).await);
+            }
+            for _ in 0..20 {
+                produce(&b).await;
+            }
+            assert_eq!(applied(&b).1, 59);
+            // Peer X serves a 70-block branch nobody can connect.
+            let tmpl = produce(&node(9, false).await).await;
+            let x = node(9, false).await;
+            let fake = unconnected_chain(&tmpl, 9, 70);
+            for blk in &fake {
+                x.storage.blocks.put_block(blk).expect("put");
+            }
+            let top = fake.last().expect("top").clone();
+            on_blocks(&mut b, &x, vec![top]).await;
+            assert!(
+                asks_to(&b, &x) >= 64,
+                "precondition: the burst against X took at least 64 steps ({})",
+                asks_to(&b, &x)
+            );
+            assert!(!b.orphans.is_empty(), "X's orphans stay buffered");
+            // The foreign tip arrives by gossip; its parents are missing.
+            let tip = branch.last().expect("tip").clone();
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert_eq!(
+                not_admitted(&b, &branch).await,
+                Vec::<u64>::new(),
+                "every block of the foreign branch is admitted"
+            );
+            assert!(
+                b.orphans.iter().all(|o| !branch
+                    .iter()
+                    .any(|f| f.header.block_hash == o.header.block_hash)),
+                "no block of the foreign branch is left in the orphan buffer"
+            );
+        }
+
+        /// DGX's numbers (r1006 4v3 partition, restarted mid-partition): the fork
+        /// point is 82 below the restart tip, inside MAX_REORG_DEPTH. The old walk
+        /// spent its 64 steps and stopped short; the walk must reach the fork, and
+        /// the heavier branch is then applied.
+        #[tokio::test(flavor = "current_thread")]
+        async fn fork_82_deep_below_the_restart_tip_is_recovered() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut branch = Vec::new();
+            for _ in 0..83 {
+                branch.push(produce(&a).await);
+            }
+            for _ in 0..82 {
+                produce(&b).await;
+            }
+            assert_eq!(applied(&b).1, 39 + 82, "the restart tip");
+            let tip = branch.last().expect("tip").clone();
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert_eq!(
+                not_admitted(&b, &branch).await,
+                Vec::<u64>::new(),
+                "the walk reached the fork 82 below the tip"
+            );
+            assert!(asks_to(&b, &a) <= crate::sync_recovery::MAX_PARENT_WALK_STEPS as usize);
+            assert_eq!(applied(&b), applied(&a), "the heavier branch is applied");
+        }
+
+        /// A walk that stopped short (this peer's budget spent by an earlier
+        /// burst) descends again while the orphan buffer is still non-empty,
+        /// from the bottom of what it holds, as budget comes back: no restart,
+        /// no operator action.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_walk_that_stopped_short_resumes_while_orphans_remain() {
+            let a = node(1, false).await;
+            let mut b = node(7, false).await;
+            for _ in 0..39 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+            }
+            let mut branch = Vec::new();
+            for _ in 0..30 {
+                branch.push(produce(&a).await);
+            }
+            for _ in 0..30 {
+                produce(&b).await;
+            }
+            // Peer `a` (same id) first serves a branch nobody can connect, which
+            // spends nearly all of its walk budget.
+            let a_fake = node(1, false).await;
+            let fake = unconnected_chain(
+                &branch[0],
+                1,
+                u64::from(crate::sync_recovery::MAX_PARENT_WALK_STEPS) - 3,
+            );
+            for blk in &fake {
+                a_fake.storage.blocks.put_block(blk).expect("put");
+            }
+            on_blocks(&mut b, &a_fake, vec![fake.last().expect("top").clone()]).await;
+            let tip = branch.last().expect("tip").clone();
+            assert_eq!(gossip(&mut b, Some(&a), &tip).await, "deferred");
+            assert!(
+                !not_admitted(&b, &branch).await.is_empty(),
+                "precondition: the walk stopped short of the fork"
+            );
+            // Time passes (less than the idle reset each round) and `a` keeps
+            // sealing; each new tip's deferral resumes the walk.
+            let mut rounds = 0;
+            while !not_admitted(&b, &branch).await.is_empty() && rounds < 6 {
+                rounds += 1;
+                b.clock += Duration::from_secs(20);
+                let blk = produce(&a).await;
+                branch.push(blk.clone());
+                gossip(&mut b, Some(&a), &blk).await;
+            }
+            assert_eq!(
+                not_admitted(&b, &branch).await,
+                Vec::<u64>::new(),
+                "the walk resumed and reached the fork ({rounds} rounds)"
+            );
+            assert!(
+                !b.orphans.is_empty(),
+                "the unconnectable orphans are still buffered"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6219,7 +8145,9 @@ mod multi_producer_regression {
         assert_ne!(real_prev_vrf, degraded_prev_vrf);
 
         // A proof built the way the bug built it.
-        let degraded = generate_block_vrf(&sk, &proposer, &degraded_prev_vrf, slot);
+        let degraded =
+            generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &degraded_prev_vrf, slot)
+                .expect("ECVRF prove");
 
         let selector = VrfProposerSelector::production();
         let verified_against_real_chain = selector
@@ -6234,7 +8162,8 @@ mod multi_producer_regression {
 
         // And the correctly-bound proof does verify, so the assertion above is
         // testing the binding and not a broken verifier.
-        let correct = generate_block_vrf(&sk, &proposer, &real_prev_vrf, slot);
+        let correct = generate_block_vrf(&real_vrf_prover(), &sk, &proposer, &real_prev_vrf, slot)
+            .expect("ECVRF prove");
         assert!(
             selector
                 .verify_vrf_math_only(&proposer, &correct, &real_prev_vrf, slot)
@@ -6902,7 +8831,7 @@ mod producer_panic_breaker {
             .find("self.executor.set_block_context(")
             .expect("first executor mutation");
         let persist = body
-            .find(".persist_state_changes_with_tip(")
+            .find(".persist_state_changes_with_undo(")
             .expect("persist");
         let commit = body.find("round_state.commit()").expect("commit");
         assert!(open < first_mutation);
@@ -6911,5 +8840,534 @@ mod producer_panic_breaker {
             .find("self.panic_breaker.lock().filter(")
             .expect("breaker filter");
         assert!(filter < first_mutation);
+    }
+}
+
+/// A failed ECVRF prove must skip the slot. The producer never builds, stores or
+/// broadcasts a block whose VRF proof is not a real ECVRF proof (a stub proof is
+/// rejected by every peer, so building one only wastes the slot and forks the producer
+/// off on its own). Producer-side only: block validity rules are unchanged.
+#[cfg(test)]
+mod producer_vrf_fail_closed {
+    use super::*;
+    use citrate_execution::types::Address;
+    use citrate_network::{Peer, PeerId, PeerInfo, PeerManagerConfig};
+    use citrate_sequencer::mempool::{MempoolConfig, TxClass};
+    use citrate_storage::pruning::PruningConfig;
+    use primitive_types::U256;
+    use std::sync::atomic::AtomicU32;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    const SENDER: Address = Address([0x5A; 20]);
+    const RECIPIENT: Address = Address([0x33; 20]);
+
+    fn embedded(a: Address) -> PublicKey {
+        let mut bytes = [0u8; 32];
+        bytes[..20].copy_from_slice(&a.0);
+        PublicKey::new(bytes)
+    }
+
+    /// Captured tracing output for one test (thread-local subscriber).
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    struct Node {
+        _dir: TempDir,
+        storage: Arc<StorageManager>,
+        mempool: Arc<Mempool>,
+        producer: BlockProducer,
+        /// What a connected peer receives from this producer.
+        peer_rx: mpsc::Receiver<NetworkMessage>,
+    }
+
+    async fn node(prover: VrfProver) -> Node {
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let state_db = Arc::new(citrate_execution::StateDB::new());
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            state_db.clone(),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        state_db.accounts.create_account_if_not_exists(SENDER);
+        state_db
+            .accounts
+            .set_balance(SENDER, U256::from(10u64).pow(U256::from(21u64)));
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
+
+        // One connected peer whose outbound queue the test reads.
+        let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+        let (send_tx, peer_rx) = mpsc::channel(64);
+        let (_recv_tx, recv_rx) = mpsc::channel(1);
+        let info = PeerInfo::new(
+            PeerId::new("observer".to_string()),
+            "127.0.0.1:30999".parse().expect("addr"),
+            citrate_network::peer::Direction::Outbound,
+        );
+        pm.add_peer(Arc::new(Peer::new(info, send_tx, recv_rx)))
+            .await
+            .expect("add observer peer");
+
+        let mut producer = BlockProducer::with_peer_manager(
+            storage.clone(),
+            executor,
+            mempool.clone(),
+            Some(pm),
+            embedded(Address([0x44; 20])),
+            Ed25519SigningKey::from_bytes(&[42u8; 32]),
+            2,
+        );
+        producer.vrf_prover = prover;
+        Node {
+            _dir: dir,
+            storage,
+            mempool,
+            producer,
+            peer_rx,
+        }
+    }
+
+    fn failing_prover() -> VrfProver {
+        Arc::new(|_, _| Err(citrate_consensus::ecvrf::EcvrfError::HashToCurveFailed))
+    }
+
+    /// Fails the first `n` calls, then proves for real.
+    fn fail_first(n: u32) -> VrfProver {
+        let calls = Arc::new(AtomicU32::new(0));
+        Arc::new(move |sk, alpha| {
+            if calls.fetch_add(1, Ordering::SeqCst) < n {
+                Err(citrate_consensus::ecvrf::EcvrfError::HashToCurveFailed)
+            } else {
+                citrate_consensus::ecvrf::prove(sk, alpha)
+            }
+        })
+    }
+
+    fn transfer() -> Transaction {
+        Transaction {
+            hash: Hash::new([0x77; 32]),
+            nonce: 0,
+            from: embedded(SENDER),
+            to: Some(embedded(RECIPIENT)),
+            value: 5,
+            gas_limit: 21_000,
+            gas_price: 1_000_000_000,
+            signature: citrate_consensus::types::Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ecdsa_verified: true,
+            ..Default::default()
+        }
+    }
+
+    /// Wait briefly for a broadcast (the producer sends from a spawned task).
+    async fn next_broadcast(rx: &mut mpsc::Receiver<NetworkMessage>) -> Option<NetworkMessage> {
+        tokio::time::timeout(Duration::from_millis(300), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn assert_real_ecvrf(block: &Block, parent_vrf: &Hash) {
+        let proof = &block.header.vrf_reveal;
+        assert_eq!(
+            proof.proof.len(),
+            114,
+            "sealed proof must be a full ECVRF proof"
+        );
+        let mut alpha = Vec::with_capacity(72);
+        alpha.extend_from_slice(block.header.proposer_pubkey.as_bytes());
+        alpha.extend_from_slice(parent_vrf.as_bytes());
+        alpha.extend_from_slice(&block.header.height.to_le_bytes());
+        let ecvrf = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&proof.proof)
+            .expect("decodes as ECVRF");
+        let beta = citrate_consensus::ecvrf::verify(&alpha, &ecvrf).expect("ECVRF verifies");
+        assert_eq!(Hash::from_bytes(&beta), proof.output);
+    }
+
+    #[tokio::test]
+    async fn a_failed_vrf_prove_skips_the_slot_and_nothing_is_built_or_broadcast() {
+        let mut n = node(failing_prover()).await;
+        n.mempool
+            .add_transaction(transfer(), TxClass::Standard)
+            .await
+            .expect("admitted");
+        let failures_before = citrate_api::metrics_server::producer_vrf_prove_failures();
+
+        let logs = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let result = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            n.producer.produce_block().await
+        };
+
+        let err = result.expect_err("a failed VRF prove must skip the slot");
+        assert!(
+            err.to_string().contains("VRF"),
+            "the skip must name the VRF failure, got: {err}"
+        );
+        assert_eq!(
+            n.storage.blocks.get_block_by_height(1).expect("read"),
+            None,
+            "no block may be stored for a slot whose VRF prove failed"
+        );
+        assert!(
+            n.producer.dag_store.get_tips().await.is_empty(),
+            "no block may enter the DAG for a skipped slot"
+        );
+        assert!(
+            next_broadcast(&mut n.peer_rx).await.is_none(),
+            "nothing may be broadcast for a skipped slot"
+        );
+        assert!(
+            n.mempool.contains(&transfer().hash).await,
+            "a skipped slot must leave the mempool untouched"
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("ERROR") && text.contains("VRF prove failed"),
+            "the skip must be logged at ERROR, got logs: {text}"
+        );
+        assert!(
+            !text.contains("fallback"),
+            "no fallback proof may be attempted, got logs: {text}"
+        );
+        assert!(
+            citrate_api::metrics_server::producer_vrf_prove_failures() >= failures_before + 1.0,
+            "the skip must be counted on citrate_producer_vrf_prove_failures_total"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_next_slot_with_a_working_prover_produces_normally() {
+        let mut n = node(fail_first(1)).await;
+        n.mempool
+            .add_transaction(transfer(), TxClass::Standard)
+            .await
+            .expect("admitted");
+
+        n.producer
+            .produce_block()
+            .await
+            .expect_err("slot 1: prover fails, slot skipped");
+        assert!(next_broadcast(&mut n.peer_rx).await.is_none());
+
+        let hash = n
+            .producer
+            .produce_block()
+            .await
+            .expect("slot 2: prover works, block produced");
+        let block = n
+            .storage
+            .blocks
+            .get_block(&hash)
+            .expect("read")
+            .expect("stored");
+        assert_eq!(
+            block.header.height, 1,
+            "the skipped slot left no gap or block"
+        );
+        assert_eq!(block.transactions.len(), 1, "the pending tx is included");
+        assert_real_ecvrf(&block, &Hash::default());
+        match next_broadcast(&mut n.peer_rx).await {
+            Some(NetworkMessage::NewBlock { block: sent }) => {
+                assert_eq!(sent.header.block_hash, hash)
+            }
+            other => panic!("the produced block must be broadcast, got {other:?}"),
+        }
+    }
+
+    /// PRE-SEAL PEER CHECK. A candidate that fails a rule peers apply on admission
+    /// must never be sealed, applied or broadcast: the slot is skipped instead. The
+    /// tamper hook stands in for any producer rule that drifts from a peer rule (the
+    /// r1006 split was one: a merge parent heavier than the selected parent). Before
+    /// the check the tampered block was persisted as the applied tip and broadcast,
+    /// and the peer verdict only surfaced afterwards as a warning.
+    #[tokio::test]
+    async fn a_candidate_failing_a_peer_rule_is_not_sealed_applied_or_broadcast() {
+        let mut n = node(super::real_vrf_prover()).await;
+
+        // Height 1 on the parentless bring-up path, then a normal block on it.
+        let first = n.producer.produce_block().await.expect("height 1");
+        assert!(matches!(
+            next_broadcast(&mut n.peer_rx).await,
+            Some(NetworkMessage::NewBlock { .. })
+        ));
+        let tip_before = n
+            .storage
+            .blocks
+            .get_applied_tip()
+            .expect("read applied tip");
+
+        // Stand-in for drift: a header blue_score above the band peers accept.
+        fn out_of_band_score(b: &mut Block) {
+            b.header.blue_score = b.header.blue_score.saturating_add(5);
+            b.header.blue_work = citrate_consensus::types::blue_work_for_score(b.header.blue_score);
+        }
+        n.producer.panic_breaker.lock().seal_tamper = Some(out_of_band_score);
+        let skipped_before = citrate_api::metrics_server::producer_preseal_rejects();
+
+        let out = n.producer.produce_block().await;
+        assert!(
+            out.is_err(),
+            "a candidate peers would reject must not be sealed (got {out:?})"
+        );
+        assert!(
+            next_broadcast(&mut n.peer_rx).await.is_none(),
+            "nothing may be broadcast for a skipped slot"
+        );
+        assert_eq!(
+            n.storage
+                .blocks
+                .get_applied_tip()
+                .expect("read applied tip"),
+            tip_before,
+            "the applied tip must not move to a block peers reject"
+        );
+        assert!(
+            n.storage
+                .blocks
+                .get_block_by_height(2)
+                .expect("read height index")
+                .is_none(),
+            "no block may be persisted at the skipped height"
+        );
+        assert!(
+            citrate_api::metrics_server::producer_preseal_rejects() >= skipped_before + 1.0,
+            "the skip must be counted on citrate_producer_preseal_rejects_total"
+        );
+
+        // The next slot, with producer and peer rules agreeing again, seals normally.
+        n.producer.panic_breaker.lock().seal_tamper = None;
+        let hash = n
+            .producer
+            .produce_block()
+            .await
+            .expect("next slot produces");
+        let block = n
+            .storage
+            .blocks
+            .get_block(&hash)
+            .expect("read")
+            .expect("stored");
+        assert_eq!(block.header.height, 2);
+        assert_eq!(block.header.selected_parent_hash, first);
+        match next_broadcast(&mut n.peer_rx).await {
+            Some(NetworkMessage::NewBlock { block: sent }) => {
+                assert_eq!(sent.header.block_hash, hash)
+            }
+            other => panic!("the produced block must be broadcast, got {other:?}"),
+        }
+    }
+
+    /// A prover that returns a well-formed proof for the WRONG input (any bug that
+    /// desynchronises the proof from the header) is caught by the self-check before
+    /// sealing: the slot is skipped, nothing is built.
+    #[tokio::test]
+    async fn a_proof_that_does_not_verify_for_this_header_is_not_sealed() {
+        let wrong_input: VrfProver =
+            Arc::new(|sk, _alpha| citrate_consensus::ecvrf::prove(sk, b"some other input"));
+        let mut n = node(wrong_input).await;
+        let err = n
+            .producer
+            .produce_block()
+            .await
+            .expect_err("a proof that does not verify for this header must not be sealed");
+        assert!(err.to_string().contains("VRF"), "got: {err}");
+        assert_eq!(n.storage.blocks.get_block_by_height(1).expect("read"), None);
+        assert!(next_broadcast(&mut n.peer_rx).await.is_none());
+    }
+
+    /// A prover that returns a proof which DOES verify for this header but reports
+    /// a different output than the proof commits to. The re-verify passes, so only
+    /// the output-match check stands between this and a sealed block whose header
+    /// output disagrees with its proof.
+    fn mismatched_output_prover() -> VrfProver {
+        Arc::new(|sk, alpha| {
+            let (proof, beta) = citrate_consensus::ecvrf::prove(sk, alpha)?;
+            let mut other = beta;
+            other[0] ^= 0xFF;
+            Ok((proof, other))
+        })
+    }
+
+    #[test]
+    fn generate_block_vrf_refuses_an_output_the_proof_does_not_commit_to() {
+        let sk = Ed25519SigningKey::from_bytes(&[42u8; 32]);
+        let pk = PublicKey::new(sk.verifying_key().to_bytes());
+        // Control: the proof itself is valid for this header's alpha.
+        let ok = generate_block_vrf(&real_vrf_prover(), &sk, &pk, &Hash::default(), 1)
+            .expect("the real prover proves");
+        let out = generate_block_vrf(&mismatched_output_prover(), &sk, &pk, &Hash::default(), 1);
+        match out {
+            Err(e) => assert!(
+                e.to_string().contains("output does not match"),
+                "the refusal must name the output mismatch, got: {e}"
+            ),
+            Ok(p) => panic!(
+                "a proof whose committed output differs from the reported one must not be \
+                 sealed (sealed output {:?}, proof output {:?})",
+                p.output, ok.output
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proof_with_a_mismatched_output_is_not_sealed() {
+        let mut n = node(mismatched_output_prover()).await;
+        let err = n
+            .producer
+            .produce_block()
+            .await
+            .expect_err("a proof with a mismatched output must not be sealed");
+        assert!(
+            format!("{err:#}").contains("output does not match"),
+            "the skip must name the output mismatch, got: {err:#}"
+        );
+        assert_eq!(n.storage.blocks.get_block_by_height(1).expect("read"), None);
+        assert!(n.producer.dag_store.get_tips().await.is_empty());
+        assert!(next_broadcast(&mut n.peer_rx).await.is_none());
+    }
+
+    /// A pooled transaction that transaction selection removes from the pool
+    /// (its sender holds no committed balance, so it can never be included).
+    fn unpayable() -> Transaction {
+        Transaction {
+            hash: Hash::new([0x78; 32]),
+            from: embedded(Address([0x6B; 20])),
+            ..transfer()
+        }
+    }
+
+    /// The prove runs BEFORE transaction selection, and selection is the first step
+    /// that changes the pool. A skipped slot must therefore leave even a candidate
+    /// that selection would remove in the pool.
+    #[tokio::test]
+    async fn a_failed_prove_runs_before_selection_so_nothing_is_dropped_from_the_pool() {
+        // Control: with a working prover, selection really does drop this candidate.
+        let ok = node(real_vrf_prover()).await;
+        ok.mempool
+            .add_transaction(unpayable(), TxClass::Standard)
+            .await
+            .expect("admitted to the pool (no balance reader wired)");
+        ok.producer.produce_block().await.expect("block produced");
+        assert!(
+            !ok.mempool.contains(&unpayable().hash).await,
+            "control: selection removes an unpayable candidate from the pool"
+        );
+
+        let n = node(failing_prover()).await;
+        n.mempool
+            .add_transaction(unpayable(), TxClass::Standard)
+            .await
+            .expect("admitted to the pool (no balance reader wired)");
+        n.producer
+            .produce_block()
+            .await
+            .expect_err("a failed VRF prove must skip the slot");
+        assert!(
+            n.mempool.contains(&unpayable().hash).await,
+            "a skipped slot must not run transaction selection: the candidate it would \
+             drop is still pooled"
+        );
+    }
+
+    #[test]
+    fn generate_block_vrf_returns_an_error_instead_of_a_stub() {
+        let sk = Ed25519SigningKey::from_bytes(&[42u8; 32]);
+        let pk = PublicKey::new(sk.verifying_key().to_bytes());
+        let out = generate_block_vrf(&failing_prover(), &sk, &pk, &Hash::default(), 1);
+        assert!(
+            out.is_err(),
+            "a failed prove must be an error, not a placeholder proof: {:?}",
+            out.map(|p| p.proof.len())
+        );
+    }
+
+    /// The source tripwire (scripts/ci/vrf_proof_source_tripwire.sh) runs in local CI;
+    /// this pins it from the test suite too: its engine still detects the stub shape
+    /// (negative control) and the tree is clean.
+    #[test]
+    fn vrf_proof_source_tripwire_passes_and_still_detects_a_stub() {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/ci/vrf_proof_source_tripwire.sh"
+        );
+        let self_test = std::process::Command::new("bash")
+            .arg(script)
+            .arg("--self-test")
+            .output()
+            .expect("run tripwire self-test");
+        assert!(
+            self_test.status.success(),
+            "tripwire self-test failed: {}",
+            String::from_utf8_lossy(&self_test.stdout)
+        );
+        let scan = std::process::Command::new("bash")
+            .arg(script)
+            .output()
+            .expect("run tripwire");
+        assert!(
+            scan.status.success(),
+            "production code builds a non-ECVRF VRF proof:\n{}",
+            String::from_utf8_lossy(&scan.stdout)
+        );
+    }
+}
+
+#[cfg(test)]
+mod mine_on_demand_tests {
+    use super::check_mine_on_demand;
+
+    #[test]
+    fn only_a_loopback_default_profile_devnet_may_mine_on_demand() {
+        assert_eq!(
+            check_mine_on_demand(None, Some("testnet_beta"), false),
+            Ok(false)
+        );
+        assert_eq!(
+            check_mine_on_demand(Some("1"), Some("default"), true),
+            Ok(true)
+        );
+        for (p, lo) in [
+            (Some("testnet_beta"), true),
+            (Some("r1006"), true),
+            (None, true),
+            (Some("default"), false),
+        ] {
+            assert!(
+                check_mine_on_demand(Some("1"), p, lo).is_err(),
+                "{p:?} {lo}"
+            );
+        }
+        assert!(check_mine_on_demand(Some("yes"), Some("default"), true).is_err());
     }
 }

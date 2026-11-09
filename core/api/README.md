@@ -87,6 +87,157 @@ The server includes production-grade infrastructure: per-client sliding-window r
 | `citrate_runInference` | Execute model inference |
 | `citrate_gasPrice` | Dynamic gas price |
 | `citrate_getEconomicState` | Economic metrics snapshot |
+| `citrate_executedHead` | The persisted applied tip `{number, hash}`: the tip `eth_getLogs` serves up to (see below) |
+| `citrate_isExecuted` | Whether a block hash is on the executed chain: `{executed, number}` (see below) |
+| `citrate_getLogs` | `eth_getLogs` plus `through`, the executed block the answer is complete through (see below) |
+
+#### `citrate_executedHead`
+
+Params: none. Result: `{"number": "0x…", "hash": "0x…"}`, the persisted applied
+tip, which is the newest block whose transactions this node executed. It is the
+same tip `eth_getLogs` walks from (`canonical_logs::executed_head`), and
+`eth_getLogs` serves no log above it.
+
+`eth_blockNumber` reports the stored-header height. It can be ahead of the
+executed head while blocks are admitted but not yet applied, so it does not bound
+what `eth_getLogs` has served.
+
+In every log query (`eth_getLogs`, `citrate_getLogs`, `eth_newFilter`,
+`eth_getFilterChanges`, `eth_getFilterLogs`) the `latest` and `pending` tags,
+and an omitted `toBlock`, resolve to the executed head, not to
+`eth_blockNumber`. The tag and the walk use one read of the tip, so
+`latest..latest` is the executed head's block even while admitted blocks are
+ahead of it or the tip moves during the call. A numeric range above the
+executed head has nothing executed in it and answers `[]` (for
+`citrate_getLogs`, `through` says how far it served). Log filters read the
+executed chain too: `eth_getFilterChanges` delivers each applied height once,
+starting at `fromBlock` or the executed head at creation, at most 1,001 heights
+per poll (`tests/getlogs_latest_applied_tip.rs`).
+
+Every log-returning method reads through one shared guard
+(`read_executed_logs` in `src/eth_rpc.rs`; a tripwire test enforces it):
+
+- `eth_getLogs`, `eth_getFilterLogs` and `citrate_getLogs` answer a range wider
+  than 1,001 heights with `-32005` and `data.maxBlockRange`, never a truncated
+  list.
+- `eth_getFilterChanges` and `citrate_getLogs` move a cursor, so an executed
+  block in the range whose receipts are not stored yet (the producer commits
+  the tip just before it writes them) is a retryable `-32002`, and a filter's
+  poll position does not move: the next poll reads the same window again.
+  `eth_getLogs` and `eth_getFilterLogs` skip such a transaction.
+- Open: on a reorg below a filter's last poll, the replacement blocks at those
+  heights are not delivered and no `removed: true` entries are sent.
+
+When no applied tip is persisted, or it cannot be read, the method returns
+JSON-RPC error `-32603`. It never falls back to the height index.
+
+`number` and `hash` come from one stored record, so `eth_getBlockByHash(hash)`
+returns the executed block at `number`. **Confirm the head by hash, never by
+number:** `eth_getBlockByNumber(number)` reads the height index, where the last
+block stored at a height wins. A non-executed sibling stored after the executed
+block at the head height makes `eth_getBlockByNumber(head.number)` return the
+sibling while `citrate_executedHead` and `eth_getLogs` both name the executed
+block (`tests/executed_head.rs`,
+`executed_head_names_the_executed_block_not_a_later_sibling`).
+
+`citrate_executedHead` is a point-in-time read. Two reads around an
+`eth_getLogs` call do not tell how far that call served: the tip can rewind
+while the call runs and come back before the second read. Do not persist
+scan progress from it; use `citrate_getLogs` below.
+
+#### `citrate_isExecuted`
+
+Params: `[blockHash]` (32-byte `0x` hex). Result: `{"executed": true, "number":
+"0x…"}` when the block is on the selected-parent chain of the persisted applied
+tip, else `{"executed": false, "number": null}` (never stored, stored above the
+tip, a losing sibling or merge parent, or a block a reorg abandoned). It uses the
+same resolver as `eth_getLogs`. `eth_getBlockByHash` serves any stored block,
+including abandoned ones, so it only proves storage. Errors: `-32602` for a
+malformed hash, `-32603` when no applied tip is persisted, `-32002`
+(`data.retryable`) while a cold lookup deep below the tip warms the index.
+Point-in-time: a later reorg can abandon a block reported executed.
+
+#### `citrate_getLogs`
+
+Params: `[filter]`, the `eth_getLogs` filter (`fromBlock`, `toBlock`, `address`,
+`topics`; the same 1,000-block limit and `-32005`) plus an optional
+`afterBlockHash`. Result:
+
+```json
+{"logs": [ /* exactly as eth_getLogs */ ], "through": {"number": "0x…", "hash": "0x…"} | null}
+```
+
+- Every executed block of the answer comes from **one** read of the applied
+  tip. `through` is the highest of them: the answer is complete for every
+  height from `fromBlock` to `through.number` on `through`'s chain. It is
+  below `toBlock` when the executed head is (it never reaches past what this
+  call served), and `null` when nothing in the range has executed yet.
+- `afterBlockHash` (needs `fromBlock >= 1`) is the caller's previous `through`.
+  The call is served only if the executed block at `fromBlock - 1` is that block.
+  Otherwise it is `-32001` (`data.reorged: true`): the chain the caller scanned
+  was replaced. If the executed head is below `fromBlock - 1`, the result is
+  `{"logs": [], "through": null}` and the cursor is checked again once the chain
+  is back above it.
+- A transaction of an executed block in the range with no receipt recorded for
+  that block is `-32002` (`data.retryable: true`, `data.blockNumber`), never
+  an answer that claims to be complete. This covers the producer's receipt
+  write just after its tip commit (`node/src/producer.rs`:
+  `persist_state_changes_with_tip`, then `put_receipts`) and a node that does
+  not store receipts for peer blocks. `eth_getLogs` keeps skipping such a
+  transaction.
+- Never clamped: `CITRATE_RPC_GETLOGS_CLAMP_RANGE` does not apply.
+
+##### Log scanner protocol
+
+A scanner keeps a cursor: the last `through` it persisted (`{number, hash}`),
+or none before its first window. `start` is the first height it cares about
+(for example a contract's deployment block).
+
+1. Request a window with `citrate_getLogs`: `fromBlock = cursor.number + 1`
+   (or `start`), `toBlock` at most 1,000 above it, and
+   `afterBlockHash = cursor.hash` when there is a cursor.
+2. On success, take the logs and persist `through` as the new cursor
+   (with the logs, atomically). If `through` is `null` or below `toBlock`, the
+   scanner has reached the executed head: stop this pass.
+3. On `-32001`, the scanned chain was replaced: drop the cursor and what was
+   found from it, and scan again from `start` (or from an older cursor the
+   application kept and still finds executed with `citrate_isExecuted`).
+4. On `-32002` with `data.retryable`, retry the same window with back-off. On
+   `-32005`, use a smaller window. On any other error, stop and don't advance.
+5. Persist nothing derived from `citrate_executedHead`, `eth_blockNumber` or
+   `eth_syncing`. Only a `through` says what was served.
+
+Why this never skips a log: every window is complete through its `through` on
+`through`'s chain, and each window is served only on a chain that contains the
+previous `through`. So the persisted cursor's ancestry is exactly what was
+scanned. A rewind during a call shortens that call's `through`. A rewind and
+return between calls is checked by `afterBlockHash`. A reorg below the cursor is
+`-32001`. No confirmation margin is needed for completeness.
+
+Remaining assumptions:
+- Logs are discovery hints. A cursor that is complete now can still be
+  abandoned by a later reorg; the next window's `afterBlockHash` check reports
+  it. Confirm anything that moves value from contract state.
+- A receipt lost in a crash between the producer's tip commit and its receipt
+  write keeps that block at `-32002` (the scan does not advance past it). It is
+  never answered as complete. That needs operator repair.
+- The answer covers what this node executed. A scanner that needs another
+  node's view scans that node.
+
+`tests/executed_head.rs` covers this: `citrate_getLogs` under concurrent apply
+and reorg (`get_logs_through_is_atomic_under_concurrent_apply`), a later sibling
+at the head (`get_logs_through_names_the_executed_block_not_a_later_sibling`),
+a rewind mid-scan, including a rewind and return within one call
+(`cursor_scan_never_skips_logs_across_a_rewind`), a reorg below the cursor
+(`cursor_scan_restarts_on_a_reorg_below_the_cursor`), a node restart with the
+tip below the cursor (`cursor_scan_resumes_across_a_node_restart`) and missing
+receipts (`get_logs_refuses_a_range_with_missing_receipts`).
+
+**Deploy dependency.** A follower or RPC-only node needs chain#336 (followers
+persist receipts for the blocks they apply). Without it, `citrate_getLogs`
+answers `-32002` for every peer block with transactions, so a scanner does not
+advance there, and `eth_getLogs` returns nothing for those blocks. Merge and
+deploy #334, #336 and #337 together on the serving RPC nodes.
 
 ### WebSocket
 

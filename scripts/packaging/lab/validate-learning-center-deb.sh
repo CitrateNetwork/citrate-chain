@@ -25,7 +25,7 @@ if ! command -v dpkg-deb >/dev/null 2>&1; then
 fi
 
 TMPDIR="$(mktemp -d /tmp/citrate-learning-center-deb-validate.XXXXXX)"
-trap 'rm -rf "$TMPDIR"' EXIT
+trap 'rm -rf "${TMPDIR:?}"' EXIT
 
 dpkg-deb --info "$DEB_PATH" > "$TMPDIR/info.txt"
 dpkg-deb --contents "$DEB_PATH" > "$TMPDIR/contents.txt"

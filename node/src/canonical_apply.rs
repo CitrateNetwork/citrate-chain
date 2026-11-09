@@ -45,18 +45,22 @@
 
 use std::sync::Arc;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::types::{Block, Hash};
 use citrate_economics::{RewardCalculator, RewardConfig};
+use citrate_execution::executor::{ReceiptIndexBatch, ReceiptReconcileMarker};
+use citrate_execution::state::state_db::StoragePreImage;
 use citrate_execution::state::StateSnapshot;
 use citrate_execution::types::ExecutionError;
 use citrate_execution::Executor;
+use citrate_storage::chain::StoredReceipt;
 use citrate_storage::StorageManager;
 use primitive_types::U256;
 use tokio::sync::Mutex;
@@ -73,7 +77,11 @@ use tracing::{debug, info, warn};
 /// NOT bound the FORWARD reapply length — a shallow fork point beneath a long
 /// winning branch (the drain lagged the fork-choice tip) is cheap to revert and
 /// must reorg, not wedge. See `MAX_REORG_FORWARD` and `reorg_to`.
-const MAX_REORG_DEPTH: u64 = 100;
+pub(crate) const MAX_REORG_DEPTH: u64 = 100;
+
+// The store keeps one undo record per applied height for exactly this window,
+// so a restart can rebuild the ring (see `restore_reorg_window`).
+const _: () = assert!(MAX_REORG_DEPTH == citrate_storage::state::REORG_UNDO_DEPTH);
 
 /// Memory guard on a single in-memory reorg's FORWARD reapply: the winning branch
 /// (fork point → new tip) is collected into a `Vec<Block>` and re-executed under
@@ -85,10 +93,249 @@ const MAX_REORG_DEPTH: u64 = 100;
 /// the 2026-08-09 wedge (winning branch 513) sits well inside it.
 const MAX_REORG_FORWARD: u64 = 10_000;
 
+/// [`MAX_REORG_FORWARD`], or a test's override on this thread.
+fn reorg_forward_cap() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = test_reorg_forward::get() {
+        return n.max(1);
+    }
+    MAX_REORG_FORWARD
+}
+
+/// Test-only per-thread override of the forward branch cap, so tests can reach
+/// the far-ahead paths with a few hundred blocks.
+#[cfg(test)]
+pub(crate) mod test_reorg_forward {
+    use std::cell::Cell;
+    thread_local! {
+        static CAP: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(n: Option<u64>) {
+        CAP.with(|c| c.set(n));
+    }
+    pub(crate) fn get() -> Option<u64> {
+        CAP.with(|c| c.get())
+    }
+}
+
+/// Wall-clock budget for rebuilding the reorg window at start-up
+/// (`restore_reorg_window`). Past it the window stops where it got to: a
+/// shorter window, never a wrong one, and a start that is not held up.
+const REORG_WINDOW_RESTORE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`REORG_WINDOW_RESTORE_BUDGET`], or a test's override on this thread.
+fn restore_budget() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(d) = test_restore_budget::get() {
+        return d;
+    }
+    REORG_WINDOW_RESTORE_BUDGET
+}
+
+/// Test-only per-thread override of the window restore budget.
+#[cfg(test)]
+pub(crate) mod test_restore_budget {
+    use std::cell::Cell;
+    thread_local! {
+        static BUDGET: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(d: Option<std::time::Duration>) {
+        BUDGET.with(|c| c.set(d));
+    }
+    pub(crate) fn get() -> Option<std::time::Duration> {
+        BUDGET.with(|c| c.get())
+    }
+}
+
+/// How long the receive path waits for the advance lock before it re-checks
+/// whether a rebuild has started (see [`CanonicalApplicator::apply_received`]).
+const RECEIVE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Upper bound on the blocks a from-genesis spine rebuild (`recover_to_head`)
+/// walks, and on the blocks the interrupted-rebuild receipt cleanup walks.
+const MAX_RECOVERY_SPINE: usize = 20_000_000;
+
+/// Receipt removals committed per batch by the interrupted-rebuild cleanup and
+/// by the spine rebuild's reset, so a long abandoned span never becomes one
+/// unbounded write batch. Each chunk is idempotent; the cleanup clears the
+/// marker only with the last one.
+const RECEIPT_RECONCILE_CHUNK: usize = 100_000;
+
+/// [`RECEIPT_RECONCILE_CHUNK`], or a test's override on this thread.
+fn receipt_reconcile_chunk() -> usize {
+    #[cfg(test)]
+    if let Some(n) = test_receipt_chunk::get() {
+        return n.max(1);
+    }
+    RECEIPT_RECONCILE_CHUNK
+}
+
+/// Test-only per-thread override of the receipt removal chunk size, so tests
+/// can drive the multi-chunk paths with a handful of transactions.
+#[cfg(test)]
+pub(crate) mod test_receipt_chunk {
+    use std::cell::Cell;
+    thread_local! {
+        static CHUNK: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(n: Option<usize>) {
+        CHUNK.with(|c| c.set(n));
+    }
+    pub(crate) fn get() -> Option<usize> {
+        CHUNK.with(|c| c.get())
+    }
+}
+
 /// Treasury address that receives the treasury slice of each block reward.
 /// Mirrors the producer's `settle_block_rewards` basic-credit list and
 /// `RewardConfig.treasury_address`.
 const TREASURY_ADDR: [u8; 20] = [0x11; 20];
+
+// C1-R: the storage reads of the reorg, rebuild and receipt-index paths. Each one
+// returns the store's error to its caller; none of them turns a read error into
+// "absent", because "absent" decides what gets removed, restored or skipped.
+// The one exception is a stored receipt that does not DECODE (see
+// `read_receipt`): the receipt index is RPC data, so it must never decide
+// whether the node follows fork choice.
+// Under `cfg(test)` each read first consults the fault-injection table in
+// `read_faults`, so tests can fail any one of these reads.
+
+fn read_block(storage: &StorageManager, h: &Hash) -> anyhow::Result<Option<Block>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::Block, Some(h))?;
+    storage
+        .blocks
+        .get_block(h)
+        .map_err(|e| anyhow::anyhow!("could not read block {h}: {e}"))
+}
+
+/// The stored receipt of `tx`, for the receipt-index reconcile of a reorg or
+/// rebuild. A value that does not decode reads as `None` with a `warn!`: the
+/// caller still removes the `(block, tx)` entry (the store deletes an
+/// undecodable receipt with its marker) and leaves it out of any abort's restore
+/// set, so the reorg or rebuild proceeds. A storage READ error stays an `Err`:
+/// the same operation reads and writes state on that store, so it cannot
+/// proceed safely on a failing store anyway, and it is retried on the next
+/// fork-choice trigger or start.
+fn read_receipt(
+    storage: &StorageManager,
+    tx: &Hash,
+) -> anyhow::Result<Option<citrate_execution::types::TransactionReceipt>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::Receipt, Some(tx))?;
+    match storage.transactions.get_stored_receipt(tx) {
+        Ok(StoredReceipt::Decoded(r)) => Ok(Some(r)),
+        Ok(StoredReceipt::Absent) => Ok(None),
+        Ok(StoredReceipt::Undecodable(e)) => {
+            warn!("C1-R: the stored receipt of {tx} does not decode ({e}); it is dropped from the receipt index");
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("could not read the receipt of {tx}: {e}")),
+    }
+}
+
+fn read_reconcile_marker(storage: &StorageManager) -> anyhow::Result<Option<(Hash, u64)>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::Marker, None)?;
+    storage
+        .transactions
+        .get_receipt_reconcile_marker()
+        .map_err(|e| anyhow::anyhow!("could not read the receipt rebuild marker: {e}"))
+}
+
+/// Visit every block→transaction index entry, streamed in key order (the
+/// entries of one block arrive together). A read error, or an `Err` from
+/// `visit`, ends the scan with that error.
+fn read_receipt_index(
+    storage: &StorageManager,
+    visit: impl FnMut(Hash, Hash) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::ReceiptIndex, None)?;
+    storage
+        .transactions
+        .for_each_receipt_index_entry(visit)
+        .map_err(|e| anyhow::anyhow!("could not read the receipt index: {e}"))
+}
+
+fn read_applied_tip(storage: &StorageManager) -> anyhow::Result<Option<(Hash, u64)>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::AppliedTip, None)?;
+    storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| anyhow::anyhow!("could not read the applied tip: {e}"))
+}
+
+/// Test-only read-fault table for the reads above. Per thread (each test runs on
+/// its own thread and the applicator's reads run on it), so parallel tests do not
+/// see each other's faults.
+#[cfg(test)]
+pub(crate) mod read_faults {
+    use super::Hash;
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Site {
+        Block,
+        Receipt,
+        Marker,
+        AppliedTip,
+        ReceiptIndex,
+    }
+
+    /// Fail reads at `site` (of `key` only, when set) after letting `skip`
+    /// matching reads through.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Fault {
+        pub site: Site,
+        pub key: Option<Hash>,
+        pub skip: u32,
+    }
+
+    thread_local! {
+        static FAULTS: RefCell<Vec<Fault>> = const { RefCell::new(Vec::new()) };
+        static HITS: RefCell<u32> = const { RefCell::new(0) };
+    }
+
+    pub(crate) fn set(faults: Vec<Fault>) {
+        FAULTS.with(|f| *f.borrow_mut() = faults);
+        HITS.with(|h| *h.borrow_mut() = 0);
+    }
+
+    pub(crate) fn clear() {
+        set(Vec::new());
+    }
+
+    /// How many reads failed since the last `set`.
+    pub(crate) fn hits() -> u32 {
+        HITS.with(|h| *h.borrow())
+    }
+
+    pub(crate) fn check(site: Site, key: Option<&Hash>) -> anyhow::Result<()> {
+        let hit = FAULTS.with(|f| {
+            for fault in f.borrow_mut().iter_mut() {
+                if fault.site != site || (fault.key.is_some() && fault.key.as_ref() != key) {
+                    continue;
+                }
+                if fault.skip > 0 {
+                    fault.skip = fault.skip.saturating_sub(1);
+                    continue;
+                }
+                return true;
+            }
+            false
+        });
+        if hit {
+            HITS.with(|h| {
+                let mut n = h.borrow_mut();
+                *n = n.saturating_add(1);
+            });
+            anyhow::bail!("injected read fault at {site:?} {key:?}");
+        }
+        Ok(())
+    }
+}
 
 /// Canonical block-reward parameters. **Single source of truth** shared by the
 /// producer (basic reward path) and the receive-side driver, so both credit
@@ -103,6 +350,44 @@ pub fn canonical_reward_config() -> RewardConfig {
         treasury_percentage: 10,
         treasury_address: citrate_execution::types::Address(TREASURY_ADDR),
     }
+}
+
+/// The block reward for `block` under the rule in force at its height — the
+/// ONE selection the producer and every receive path share.
+///
+/// Below `supply_hardening_height` (`citrate_execution::supply_hardening`) the
+/// legacy rule applies unchanged, so historical blocks replay to the mints
+/// they were produced with. At/after it the bonus arms are computed from the
+/// block's executed `receipts` (positionally aligned with
+/// `block.transactions`), halved with the base subsidy and capped at it.
+pub fn canonical_block_reward(
+    calculator: &RewardCalculator,
+    block: &Block,
+    receipts: &[citrate_execution::types::TransactionReceipt],
+) -> Result<citrate_economics::BlockReward, citrate_economics::rewards::RewardError> {
+    canonical_block_reward_at(
+        calculator,
+        block,
+        receipts,
+        citrate_execution::supply_hardening::supply_hardening_height(),
+    )
+}
+
+/// [`canonical_block_reward`] under an explicit activation height (pure).
+pub fn canonical_block_reward_at(
+    calculator: &RewardCalculator,
+    block: &Block,
+    receipts: &[citrate_execution::types::TransactionReceipt],
+    supply_hardening_height: Option<u64>,
+) -> Result<citrate_economics::BlockReward, citrate_economics::rewards::RewardError> {
+    calculator.calculate_block_reward(
+        block,
+        receipts,
+        citrate_execution::supply_hardening::active_at(
+            supply_hardening_height,
+            block.header.height,
+        ),
+    )
 }
 
 /// The block whose post-execution world state the executor currently reflects.
@@ -147,6 +432,64 @@ impl AppliedState {
 /// A boxed async closure so production wires `GhostDag::select_tip` while tests
 /// inject a fixed tip — avoiding an async-trait dependency.
 type ForkChoice = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<Hash>> + Send>> + Send + Sync>;
+
+/// Fork-choice weight of a block (GhostDAG blue score in production), `None`
+/// when fork choice does not know the block. See
+/// [`CanonicalApplicator::rebuild_target`].
+type ForkWeight =
+    Arc<dyn Fn(Hash) -> Pin<Box<dyn Future<Output = Option<u64>> + Send>> + Send + Sync>;
+
+/// Why [`CanonicalApplicator::rebuild_target`] refused a from-genesis rebuild.
+/// Every refusal leaves the node exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildRefusal {
+    /// The head is a block of the applied chain (the tip or an ancestor): there
+    /// is no fork, whatever the reorg ring or the DAG store still holds.
+    OnAppliedChain { height: u64 },
+    /// The head descends from the applied tip: the drain reaches it forward.
+    DescendsFromTip,
+    /// The head's ancestry has a block this node does not hold before it meets
+    /// the applied chain. A missing (or pruned) ancestor is not divergence.
+    MissingAncestor { missing: Hash },
+    /// Fork choice does not rank the head above the applied tip (higher score;
+    /// equal scores to the smaller hash), or does not score the head at all:
+    /// nothing justifies abandoning the tip.
+    NotHeavier { head: u64, tip: u64 },
+    /// A storage read failed; nothing was concluded.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for RebuildRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OnAppliedChain { height } => {
+                write!(
+                    f,
+                    "the head is the applied chain's own block at height {height}"
+                )
+            }
+            Self::DescendsFromTip => write!(f, "the head descends from the applied tip"),
+            Self::MissingAncestor { missing } => write!(
+                f,
+                "the head's ancestry is missing block {missing} before it meets the applied chain"
+            ),
+            Self::NotHeavier { head, tip } => write!(
+                f,
+                "the head (weight {head}) does not outrank the applied tip (weight {tip})"
+            ),
+            Self::Unreadable(e) => write!(f, "storage read failed: {e}"),
+        }
+    }
+}
+
+/// What a from-genesis rebuild would do, established before anything changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildPlan {
+    /// The highest block shared by the applied chain and the head's ancestry.
+    pub fork: AppliedTip,
+    /// Applied blocks the switch abandons (`tip.height - fork.height`).
+    pub abandoned: u64,
+}
 
 /// Registry snapshot-sync hook: given a snapshot-boundary height, rebuild the
 /// proposer selector and return the validator count (or an error string). A boxed
@@ -198,6 +541,125 @@ pub enum ReorgOutcome {
     Rejected(String),
 }
 
+/// How many times [`CanonicalApplicator::verify_certified_floor`] re-walks when
+/// the applied chain moved (other than forward) during a check.
+pub const FLOOR_VERIFY_ATTEMPTS: usize = 3;
+
+/// Bound, in blocks, on the under-lock re-confirmation walk of
+/// [`CanonicalApplicator::verify_certified_floor`]: a tip that advanced further
+/// than this during the check is re-walked from scratch instead.
+pub const FLOOR_RECHECK_MAX_STEPS: u64 = 256;
+
+/// One descending walk of an applied chain's selected-parent ancestry
+/// (`StorageManager.blocks.get_header`), answering "which block is at height
+/// `h` on this chain?" for a sequence of STRICTLY DESCENDING heights in a
+/// single pass: total header reads <= `tip.height + 1` however many heights
+/// are asked. Heights must strictly decrease between calls; a call that does
+/// not is answered `Err` (never a wrong `Ok`).
+pub struct AppliedWalk<'a> {
+    storage: &'a StorageManager,
+    tip: AppliedTip,
+    /// The block the walk stands on and its verified height, once read.
+    at: Option<(Hash, u64)>,
+    /// Hash to read next (the tip, then selected parents).
+    next: Hash,
+    /// Heights must stay strictly below this (and below the previous read).
+    max_height: u64,
+    /// Last height asked (strict descent check).
+    last_target: Option<u64>,
+    /// The walk failed; every later call returns this error.
+    failed: Option<String>,
+}
+
+impl<'a> AppliedWalk<'a> {
+    fn new(storage: &'a StorageManager, tip: AppliedTip) -> Self {
+        Self {
+            storage,
+            tip,
+            at: None,
+            next: tip.hash,
+            max_height: tip.height,
+            last_target: None,
+            failed: None,
+        }
+    }
+
+    /// The block at `target` on the walked chain: `Ok(None)` when the chain
+    /// steps over `target` or `target` is above the tip.
+    pub fn hash_at(&mut self, target: u64) -> Result<Option<Hash>, String> {
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
+        }
+        if self.last_target.is_some_and(|last| target >= last) {
+            return Err(format!(
+                "applied walk asked for height {target} after {:?} (must descend)",
+                self.last_target
+            ));
+        }
+        self.last_target = Some(target);
+        if target > self.tip.height {
+            return Ok(None);
+        }
+        loop {
+            let (hash, height) = match self.at {
+                Some(at) => at,
+                None => {
+                    let cursor = self.next;
+                    let header = match self.storage.blocks.get_header(&cursor) {
+                        Ok(Some(h)) => h,
+                        Ok(None) => {
+                            return Err(
+                                self.fail(format!("header {cursor} missing on the applied chain"))
+                            )
+                        }
+                        Err(e) => return Err(self.fail(format!("header {cursor}: {e}"))),
+                    };
+                    if header.height > self.max_height {
+                        return Err(self.fail(format!(
+                            "header {cursor} at height {} is not below its child (max {})",
+                            header.height, self.max_height
+                        )));
+                    }
+                    self.next = header.selected_parent_hash;
+                    let at = (cursor, header.height);
+                    self.at = Some(at);
+                    at
+                }
+            };
+            if height == target {
+                return Ok(Some(hash));
+            }
+            if height < target || height == 0 {
+                return Ok(None);
+            }
+            // Step to the selected parent (strictly lower: checked on read).
+            self.max_height = height.saturating_sub(1);
+            self.at = None;
+        }
+    }
+
+    fn fail(&mut self, e: String) -> String {
+        self.failed = Some(e.clone());
+        e
+    }
+}
+
+/// Outcome of [`CanonicalApplicator::verify_certified_floor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorCheck {
+    /// The certified block IS the block at its height on this node's applied
+    /// chain (and, if raising was requested, the floor now covers it).
+    Match,
+    /// This node's applied chain holds a different block at the certified
+    /// height (`canonical: Some`), or steps over that height (`canonical: None`).
+    Mismatch { canonical: Option<Hash> },
+    /// The applied tip is still below the certified height.
+    NotYetApplied { applied_height: u64 },
+    /// The check could not complete (a header missing from the store, or the
+    /// applied chain kept moving). Nothing was concluded or raised.
+    Unverifiable(String),
+}
+
 /// Result of attempting to apply a received block on the fast path.
 #[derive(Debug)]
 pub enum ApplyOutcome {
@@ -242,9 +704,48 @@ pub struct CanonicalApplicator {
     /// drain the driver reorgs the applied tip toward the selected tip. `None`
     /// disables reorg (steps 2–3 behavior only). Wired under `CITRATE_BLOCK_V2`.
     fork_choice: Option<ForkChoice>,
+    /// Fork-choice weight source (`GhostDag::fork_choice_score`), wired with
+    /// `with_fork_choice`. `None` (a fixed fork-choice cell) leaves the explicit
+    /// `recover_to_head` ranking to fork choice itself (see
+    /// [`Self::rebuild_target`]); the node's own triggers then refuse (see
+    /// [`Self::weight`]).
+    fork_weight: Option<ForkWeight>,
     /// Last finalized height — the reorg floor (I4: never revert below finality).
-    /// Defaults to 0 (genesis); tightened when wired to the checkpoint manager.
+    /// Defaults to 0 (genesis). Raised only under the advance lock, and only to a
+    /// certified height whose certified hash is this node's block there:
+    /// `verify_certified_floor` (Stage 1c, enforcement pin ON — at finalization
+    /// and on the verifier poll) and [`Self::effective_floor`] (a registered
+    /// certificate that has since become canonical). Never lowered.
     finalized_height: Arc<AtomicU64>,
+    /// Finalized certificates `(height, hash)` registered by the Enforced floor
+    /// verifier ([`Self::register_certified`]) that the floor does not cover
+    /// yet: their blocks were not confirmed on this node's applied chain when
+    /// checked (mismatch, not yet applied, unverifiable), or were loaded from
+    /// the store at boot above the highest one that is
+    /// (`FloorVerifier::restore_certified_floor`). Every reorg consults them
+    /// under the advance lock ([`Self::effective_floor`]): the highest one whose
+    /// certified block IS canonical by then raises the floor before the reorg is
+    /// judged — so a certified block that becomes canonical is protected at
+    /// once, not at the verifier's next poll. Always empty in Legacy / Observed
+    /// mode.
+    ///
+    /// NO COUNT BOUND, deliberately (review of #335 @ 5236d2b: keeping only the
+    /// highest 64 could drop the one certificate whose block is canonical here,
+    /// leaving it unprotected). An entry leaves the set only when the floor
+    /// reaches its height ([`Self::settle_certified`]), and that is the only
+    /// safe subsumption: the floor is raised only to a certified block that is
+    /// canonical here, and a reorg is judged by HEIGHT (fork point >= floor), so
+    /// every block at or below the floor is protected whichever certificate
+    /// covered it — a lower certificate adds nothing. A higher certificate does
+    /// NOT subsume a lower one while it is not canonical here (the lower one
+    /// may be the only protection for its block), so nothing above the floor
+    /// is ever dropped. Size: at most the verified quorum certificates above
+    /// the floor (one per checkpoint height; two at one height only if quorums
+    /// conflicted), ~40 bytes each. It grows only while this node is off the
+    /// certified chain, i.e. halted, and empties as soon as the highest one is
+    /// canonical. Entries come only from certificates the verifier checked
+    /// (quorum + signatures), so no peer can grow it without a quorum.
+    certified_pending: parking_lot::Mutex<BTreeSet<(u64, Hash)>>,
     /// The height this node has actually APPLIED, published for readers outside
     /// the advance lock. The sync manager judges completion against this: the
     /// height of the last block RECEIVED is not evidence of holding its ancestry
@@ -291,6 +792,12 @@ pub struct CanonicalApplicator {
     /// the rebuild forever and wedged the miner. `None` (tests without fork-choice, or
     /// a fixed-tip stub) means "treat as hydrated" so the rebuild is not gated.
     dag_hydrated: Option<Arc<AtomicBool>>,
+    /// The DAG store whose pruning floor bounds the runtime from-genesis
+    /// rebuild (see [`Self::with_dag_prune_floor`]). `None`: not wired.
+    dag_prune_floor: Option<Arc<DagStore>>,
+    /// The last fork-choice head a from-genesis rebuild was refused for, so the
+    /// refusal is logged once per head rather than on every 1 s drain tick.
+    refused_rebuild_head: parking_lot::Mutex<Option<Hash>>,
 }
 
 impl CanonicalApplicator {
@@ -302,11 +809,14 @@ impl CanonicalApplicator {
     /// through `latest_height`" is the correct default. A pure receiver that has
     /// only genesis seeds to (genesis_hash, 0).
     pub fn new(executor: Arc<Executor>, storage: Arc<StorageManager>) -> Self {
-        let tip = storage
-            .blocks
-            .get_applied_tip()
-            .ok()
-            .flatten()
+        let durable_tip = read_applied_tip(&storage).unwrap_or_else(|e| {
+            // Seeding falls back to the latest stored block (as for a store with
+            // no pointer). The receipt cleanup below re-reads the pointer itself
+            // and does not run on this guess.
+            warn!("execute-on-receive: {e}; seeding the applied tip from the latest block");
+            None
+        });
+        let tip = durable_tip
             .map(|(hash, height)| AppliedTip { hash, height })
             .unwrap_or_else(|| {
                 let height = storage.blocks.get_latest_height().unwrap_or(0);
@@ -322,11 +832,55 @@ impl CanonicalApplicator {
             "execute-on-receive: applied tip seeded at {} @ height {}",
             tip.hash, tip.height
         );
+        // chain#421: bring the canonical height index (by-number RPC reads) to the
+        // durable applied tip before serving. Tip writes keep it current from here;
+        // a data dir from a binary without the index is rebuilt once, here. A
+        // failure only delays that: the first by-number read retries it.
+        if let Err(e) = storage.blocks.sync_canonical_index() {
+            warn!("execute-on-receive: canonical height index not synced at start: {e}");
+        }
+        // C1-R: a from-genesis rebuild that stopped mid-replay may have left the
+        // receipts of its old applied chain above the durable tip. Make the receipt
+        // index match the durable applied chain before anything reads or extends it.
+        // A failure (a read or a write) keeps the marker; the cleanup repeats on
+        // the next start or before the next from-genesis rebuild (which refuses
+        // to run until it completes).
+        let cleaned = Self::interrupted_rebuild_cleanup(&storage).and_then(|batches| {
+            batches.iter().enumerate().try_for_each(|(i, b)| {
+                executor.persist_receipt_index_at_startup(b).map_err(|e| {
+                    anyhow::anyhow!(
+                        "write {} of {} failed (the rebuild marker is kept): {e}",
+                        i.saturating_add(1),
+                        batches.len()
+                    )
+                })
+            })
+        });
+        if let Err(e) = cleaned {
+            warn!(
+                "C1-R: receipt cleanup after an unfinished rebuild did not complete: {e}; it is retried on the next start or rebuild"
+            );
+        }
         // Seed the reorg ring with the current state as-of the seeded tip: the
         // executor reflects this tip's state at construction, so it is the base a
-        // reorg can revert to before any new block is applied.
+        // reorg can revert to before any new block is applied. Below it, the ring
+        // is rebuilt from the undo records the store keeps for the last
+        // `MAX_REORG_DEPTH` applied blocks, so a restarted node reverts a fork
+        // inside the window exactly as a node that never stopped (no replay from
+        // genesis, which a pruned node refuses).
+        let at_tip = executor.state_snapshot();
+        let restored = restore_reorg_window(&storage, tip, &at_tip);
+        if let Some((lowest, _, _)) = restored.last() {
+            info!(
+                "execute-on-receive: reorg window restored from undo records: heights {} to {}",
+                lowest, tip.height
+            );
+        }
         let mut snapshots = BTreeMap::new();
-        snapshots.insert(tip.height, (tip.hash, executor.state_snapshot()));
+        snapshots.insert(tip.height, (tip.hash, at_tip));
+        for (height, hash, snap) in restored {
+            snapshots.insert(height, (hash, snap));
+        }
         let seeded_height = tip.height;
         Self {
             executor,
@@ -334,7 +888,9 @@ impl CanonicalApplicator {
             reward_calculator: RewardCalculator::new(canonical_reward_config()),
             lock: Arc::new(Mutex::new(AppliedState { tip, snapshots })),
             fork_choice: None,
+            fork_weight: None,
             finalized_height: Arc::new(AtomicU64::new(0)),
+            certified_pending: parking_lot::Mutex::new(BTreeSet::new()),
             applied_height: Arc::new(AtomicU64::new(seeded_height)),
             registry_sync: None,
             registry_policy_resync: None,
@@ -342,6 +898,8 @@ impl CanonicalApplicator {
             genesis: OnceLock::new(),
             rebuild_in_progress: Arc::new(AtomicBool::new(false)),
             dag_hydrated: None,
+            dag_prune_floor: None,
+            refused_rebuild_head: parking_lot::Mutex::new(None),
         }
     }
 
@@ -359,12 +917,55 @@ impl CanonicalApplicator {
     /// Also captures GhostDAG's "DAG hydration complete" signal, so the runtime
     /// deep-fork rebuild fires only once the tip set is authoritative after a
     /// restart (see `dag_hydrated` + `maybe_runtime_rebuild`).
+    /// Test-only fork choice: the head is whatever `head` holds (`None` = no
+    /// head, which every fork-choice path treats as "nothing to follow").
+    #[cfg(test)]
+    pub(crate) fn with_fork_choice_cell(
+        mut self,
+        head: Arc<parking_lot::Mutex<Option<Hash>>>,
+    ) -> Self {
+        self.fork_choice = Some(Arc::new(move || {
+            let h = *head.lock();
+            Box::pin(async move { h })
+        }));
+        self
+    }
+
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
         self.dag_hydrated = Some(ghostdag.dag_hydrated_handle());
+        let weights = ghostdag.clone();
+        self.fork_weight = Some(Arc::new(move |h: Hash| {
+            let g = weights.clone();
+            Box::pin(async move { g.fork_choice_score(&h).await })
+        }));
         self.fork_choice = Some(Arc::new(move || {
             let g = ghostdag.clone();
             Box::pin(async move { g.select_tip().await.ok() })
         }));
+        self
+    }
+
+    /// Wire the DAG store whose pruning floor bounds the runtime from-genesis
+    /// rebuild.
+    ///
+    /// The rebuild (`maybe_runtime_rebuild` -> `recover_to_head`) resets the
+    /// durable applied tip and world state to GENESIS, then replays the head's
+    /// spine under the advance lock. After a restart the reorg ring holds only
+    /// the tip's snapshot, so ANY fork-choice head whose fork point is below
+    /// the restart tip (even one block) lands here. On a long chain the replay
+    /// cannot finish before the P2P-stall watchdog exits the process, and the
+    /// node restarts from whatever height the replay had reached (r1006 prod-5,
+    /// 2026-10-28: tip 99,591, restarted at 2,331).
+    ///
+    /// On a node whose DAG store has been pruned (`dag_prune`), the rebuild is
+    /// refused: moving the applied tip below the pruning floor contradicts the
+    /// premise pruning rests on (nothing more than `MAX_REORG_DEPTH` below the
+    /// applied tip is ever reorged onto). The node keeps its applied tip and
+    /// logs the refusal once per head; an operator resync is the recovery for
+    /// a pruned node genuinely stranded on a fork. Unpruned nodes keep the
+    /// rebuild.
+    pub fn with_dag_prune_floor(mut self, dag_store: Arc<DagStore>) -> Self {
+        self.dag_prune_floor = Some(dag_store);
         self
     }
 
@@ -450,19 +1051,220 @@ impl CanonicalApplicator {
         self.finalized_height.load(Ordering::SeqCst)
     }
 
+    /// Register a finalized certificate `(height, hash)` whose block the reorg
+    /// floor does not cover yet (see the `certified_pending` field: nothing is
+    /// dropped until the floor covers it). A pair at or below the floor is
+    /// ignored. Called only by the Enforced floor verifier, with certificates
+    /// it has verified.
+    pub fn register_certified(&self, height: u64, hash: Hash) {
+        if height <= self.finalized_height() {
+            return;
+        }
+        self.certified_pending.lock().insert((height, hash));
+    }
+
+    /// Raise the floor, under the advance lock, to the highest registered
+    /// certificate whose block is on the applied chain (any depth: heights
+    /// below the snapshot ring are checked by one header walk), exactly as the
+    /// next reorg decision would. Used at boot after the stored certificates
+    /// are registered, so the floor is restored before any block admission,
+    /// drain or recovery. Returns the floor.
+    pub async fn settle_registered_floor(&self) -> u64 {
+        let state = self.lock.lock().await;
+        self.effective_floor(&state, true)
+    }
+
+    /// A single descending walk of the applied chain ending at `tip` (see
+    /// [`AppliedWalk`]).
+    pub fn walk_applied(&self, tip: AppliedTip) -> AppliedWalk<'_> {
+        AppliedWalk::new(&self.storage, tip)
+    }
+
+    /// The registered certificates the floor does not cover yet, ascending
+    /// (tests / diagnostics).
+    #[cfg(test)]
+    pub fn certified_pending(&self) -> Vec<(u64, Hash)> {
+        self.certified_pending.lock().iter().copied().collect()
+    }
+
+    /// Drop the registered certificates the floor now covers.
+    fn settle_certified(&self, floor: u64) {
+        self.certified_pending.lock().retain(|(h, _)| *h > floor);
+    }
+
+    /// The reorg floor for a reorg judged under the advance lock (`state`):
+    /// the floor, raised first to the highest registered certificate
+    /// (`certified_pending`) whose certified block is now at its height on the
+    /// applied chain — the same `(height, hash)` check as
+    /// `verify_certified_floor`, in the same critical section as the reorg
+    /// decision. Heights inside the snapshot ring are read from it; with
+    /// `walk_below_ring` (the spine-rebuild path, whose fork point can be below
+    /// the ring) older ones are checked by ONE descending header walk shared by
+    /// all of them ([`AppliedWalk`]), which stops at the first match.
+    fn effective_floor(&self, state: &AppliedState, walk_below_ring: bool) -> u64 {
+        let floor = self.finalized_height();
+        let candidates: Vec<(u64, Hash)> = {
+            let pending = self.certified_pending.lock();
+            if pending.is_empty() {
+                return floor;
+            }
+            pending
+                .iter()
+                .rev()
+                .filter(|(h, _)| *h > floor && *h <= state.tip.height)
+                .copied()
+                .collect()
+        };
+        let mut walk = walk_below_ring.then(|| AppliedWalk::new(&self.storage, state.tip));
+        for (height, hash) in candidates {
+            let here = match state.snapshots.get(&height) {
+                Some((h, _)) => Some(*h),
+                None => match walk.as_mut() {
+                    // An unreadable chain proves no match; keep checking the
+                    // ring-held candidates (nothing is dropped either way).
+                    Some(w) => w.hash_at(height).ok().flatten(),
+                    None => None,
+                },
+            };
+            if here != Some(hash) {
+                continue;
+            }
+            self.finalized_height.fetch_max(height, Ordering::SeqCst);
+            let raised = self.finalized_height();
+            self.settle_certified(raised);
+            info!(
+                "finality floor: certified block {} @ {} is canonical on this node; reorg \
+                 floor raised to it",
+                hash, height
+            );
+            return raised;
+        }
+        floor
+    }
+
+    /// The block at `target` on the applied chain ending at `tip`, walking
+    /// selected parents through the persisted headers
+    /// (`StorageManager.blocks.get_header`). `Ok(None)` when the chain steps
+    /// over `target` (a selected parent more than one height below its child)
+    /// or `target` is above `tip`. Headers are immutable by hash, so the walk
+    /// needs no lock: it describes the chain ending at `tip` whatever happens to
+    /// the applied tip meanwhile.
+    fn applied_hash_at_height(&self, tip: AppliedTip, target: u64) -> Result<Option<Hash>, String> {
+        if target > tip.height {
+            return Ok(None);
+        }
+        let mut cursor = tip.hash;
+        let mut max_height = tip.height;
+        // Heights strictly decrease, so `tip.height - target + 1` reads suffice.
+        let mut reads_left = tip.height.saturating_sub(target).saturating_add(1);
+        while reads_left > 0 {
+            reads_left = reads_left.saturating_sub(1);
+            let header = self
+                .storage
+                .blocks
+                .get_header(&cursor)
+                .map_err(|e| format!("header {cursor}: {e}"))?
+                .ok_or_else(|| format!("header {cursor} missing on the applied chain"))?;
+            let h = header.height;
+            if h > max_height {
+                return Err(format!(
+                    "header {cursor} at height {h} is not below its child (max {max_height})"
+                ));
+            }
+            if h == target {
+                return Ok(Some(cursor));
+            }
+            if h < target || h == 0 {
+                return Ok(None);
+            }
+            max_height = h.saturating_sub(1);
+            cursor = header.selected_parent_hash;
+        }
+        Err(format!(
+            "walk from {} @ {} did not reach height {target}",
+            tip.hash, tip.height
+        ))
+    }
+
+    /// Stage 1c (spec §4.5): is the finality certificate's `(height, hash)` the
+    /// block at `height` on THIS node's applied chain — and, if `raise`, raise
+    /// the reorg floor to `height` atomically with that answer.
+    ///
+    /// The selected-parent walk (header reads, possibly long at boot) runs
+    /// OUTSIDE the advance lock so it never stalls the producer. The verdict is
+    /// then re-confirmed UNDER the lock: the applied tip must still be the walked
+    /// tip, or a forward extension of it (the walked tip is on the current tip's
+    /// selected-parent chain, checked within [`FLOOR_RECHECK_MAX_STEPS`]). Only
+    /// then is the floor raised, before the lock is released — so no reorg can
+    /// slip between "the certified block is canonical here" and "the floor
+    /// protects it" (no TOCTOU). If the chain moved otherwise, the check is
+    /// retried up to [`FLOOR_VERIFY_ATTEMPTS`] times, then `Unverifiable`.
+    ///
+    /// A chain that steps over `height` is a `Mismatch { canonical: None }`:
+    /// the certified block is not on it.
+    pub async fn verify_certified_floor(&self, height: u64, hash: Hash, raise: bool) -> FloorCheck {
+        for _ in 0..FLOOR_VERIFY_ATTEMPTS {
+            let walked = self.applied_tip().await;
+            if height > walked.height {
+                return FloorCheck::NotYetApplied {
+                    applied_height: walked.height,
+                };
+            }
+            let at = match self.applied_hash_at_height(walked, height) {
+                Ok(at) => at,
+                Err(e) => return FloorCheck::Unverifiable(e),
+            };
+            let state = self.lock.lock().await;
+            let now = state.tip;
+            let unchanged = now == walked
+                || (now.height > walked.height
+                    && now.height.saturating_sub(walked.height) <= FLOOR_RECHECK_MAX_STEPS
+                    && matches!(
+                        self.applied_hash_at_height(now, walked.height),
+                        Ok(Some(h)) if h == walked.hash
+                    ));
+            if !unchanged {
+                drop(state);
+                debug!(
+                    "finality floor: applied tip moved {} @ {} -> {} @ {} during the certificate \
+                     check at {}; re-checking",
+                    walked.hash, walked.height, now.hash, now.height, height
+                );
+                continue;
+            }
+            if at != Some(hash) {
+                return FloorCheck::Mismatch { canonical: at };
+            }
+            if raise {
+                self.finalized_height.fetch_max(height, Ordering::SeqCst);
+                self.settle_certified(height);
+            }
+            drop(state);
+            return FloorCheck::Match;
+        }
+        FloorCheck::Unverifiable(format!(
+            "the applied chain kept moving during {FLOOR_VERIFY_ATTEMPTS} attempts"
+        ))
+    }
+
     /// Walk `start`'s selected-parent ancestry down to `target` height and return the hash of
     /// the ancestor at that height (`None` if a block is missing or `target` is above `start`).
     /// Used by the I4 finality guard on the spine-rebuild path (CHAIN-B-A002).
-    fn ancestor_hash_at_height(&self, start: Hash, target: u64) -> Option<Hash> {
+    ///
+    /// A storage read error is returned, never read as "missing": the caller is a
+    /// finality guard, and a skipped guard is not a passed one.
+    fn ancestor_hash_at_height(&self, start: Hash, target: u64) -> anyhow::Result<Option<Hash>> {
         let mut cursor = start;
         loop {
-            let block = self.storage.blocks.get_block(&cursor).ok().flatten()?;
+            let Some(block) = read_block(&self.storage, &cursor)? else {
+                return Ok(None);
+            };
             let h = block.header.height;
             if h == target {
-                return Some(cursor);
+                return Ok(Some(cursor));
             }
             if h < target || h == 0 {
-                return None;
+                return Ok(None);
             }
             cursor = block.selected_parent();
         }
@@ -471,29 +1273,194 @@ impl CanonicalApplicator {
     /// Whether `head`'s selected-parent ancestry passes through `ancestor` (at
     /// `ancestor_height`). Used by the I4 finality guard (CHAIN-B-A002) to confirm a
     /// spine-rebuild target still contains the currently-finalized block.
-    fn head_descends_from(&self, head: Hash, ancestor: Hash, ancestor_height: u64) -> bool {
+    /// A storage read error is returned (never read as "does not descend").
+    fn head_descends_from(
+        &self,
+        head: Hash,
+        ancestor: Hash,
+        ancestor_height: u64,
+    ) -> anyhow::Result<bool> {
         let mut cursor = head;
         loop {
             if cursor == ancestor {
-                return true;
+                return Ok(true);
             }
-            let block = match self.storage.blocks.get_block(&cursor).ok().flatten() {
-                Some(b) => b,
-                None => return false,
+            let Some(block) = read_block(&self.storage, &cursor)? else {
+                return Ok(false);
             };
             if block.header.height <= ancestor_height {
                 // Reached (or passed) the finalized height without hitting `ancestor`.
-                return cursor == ancestor;
+                return Ok(cursor == ancestor);
             }
             cursor = block.selected_parent();
         }
     }
 
     /// Whether the applied tip lies on `head`'s selected-parent chain: the node
-    /// is only behind `head`, and the drain reaches it by applying forward.
+    /// is only behind `head`, and the drain reaches it by applying forward. A
+    /// storage read error answers `false` (logged): the caller then takes the
+    /// rebuild path, which reads the same blocks and aborts on the same error.
     pub async fn applied_tip_is_ancestor_of(&self, head: Hash) -> bool {
         let tip = self.applied_tip().await;
         self.head_descends_from(head, tip.hash, tip.height)
+            .unwrap_or_else(|e| {
+                warn!("execute-on-receive: ancestry check toward {head} failed: {e}");
+                false
+            })
+    }
+
+    /// The block at `height` on the applied chain ending at `state.tip`, or
+    /// `None` above the tip or where the chain steps over `height`.
+    ///
+    /// The reorg ring answers the last `MAX_REORG_DEPTH` heights, but after a
+    /// restart only as far down as the undo records rebuilt it (possibly the
+    /// tip alone). Below it the canonical height index answers (rewritten with
+    /// every durable tip write) when it describes this very tip; otherwise the
+    /// stored headers are walked. A block being absent from the ring, or from
+    /// the (pruned) DAG store, never makes it "not applied".
+    fn applied_block_at(&self, state: &AppliedState, height: u64) -> Result<Option<Hash>, String> {
+        if height > state.tip.height {
+            return Ok(None);
+        }
+        if let Some((h, _)) = state.snapshots.get(&height) {
+            return Ok(Some(*h));
+        }
+        let index_tip = self
+            .storage
+            .blocks
+            .canonical_index_tip()
+            .map_err(|e| format!("canonical index: {e}"))?;
+        if index_tip == Some((state.tip.hash, state.tip.height)) {
+            return self
+                .storage
+                .blocks
+                .get_canonical_block_by_height(height)
+                .map_err(|e| format!("canonical index at {height}: {e}"));
+        }
+        self.applied_hash_at_height(state.tip, height)
+    }
+
+    /// Whether `hash` (at `height`) is a block of the applied chain.
+    fn is_applied(&self, state: &AppliedState, hash: Hash, height: u64) -> Result<bool, String> {
+        Ok(self.applied_block_at(state, height)? == Some(hash))
+    }
+
+    /// Whether fork choice ranks `head` above the applied `tip`, in its own
+    /// total order (`GhostDag::select_tip`: higher blue score, equal scores to
+    /// the SMALLEST hash). Fork choice already picked `head` among every block
+    /// it scores, so a tip it does not score (a dropped stale branch, a sibling
+    /// the by-height rehydration never registered) is ranked below it, as is
+    /// every tip when no weight source is wired (a fixed fork-choice cell).
+    /// Header-claimed scores are never used (SECREM-01 CONS-2).
+    async fn outranks_tip(&self, head: Hash, tip: Hash) -> Result<(), RebuildRefusal> {
+        let Some(weight) = &self.fork_weight else {
+            return Ok(());
+        };
+        let Some(h) = weight(head).await else {
+            return Err(RebuildRefusal::NotHeavier { head: 0, tip: 0 });
+        };
+        let Some(t) = weight(tip).await else {
+            return Ok(());
+        };
+        // The tie-break is what converges a node restarted on the losing one of
+        // two equal-score siblings (2026-08-06).
+        if h > t || (h == t && head < tip) {
+            Ok(())
+        } else {
+            Err(RebuildRefusal::NotHeavier { head: h, tip: t })
+        }
+    }
+
+    /// The precondition of every from-genesis rebuild, checked under the
+    /// advance lock BEFORE anything is changed (the rebuild's first write moves
+    /// the durable applied tip to genesis, and a process that stops mid-replay
+    /// keeps whatever height the replay reached).
+    ///
+    /// A rebuild toward `head` is allowed only when `head`'s ancestry is fully
+    /// stored down to a block of the applied chain (the fork point), that fork
+    /// point is BELOW the applied tip (otherwise there is nothing to abandon; a
+    /// genesis tip is the exception, where the replay is a plain forward apply),
+    /// and `head` outranks the applied tip in fork choice's order. The depth of
+    /// the switch is NOT capped at `MAX_REORG_DEPTH`: a node that sealed a long
+    /// branch of its own (r1006, 3,300+ blocks) must still be able to rejoin a
+    /// heavier chain. The finality floor (I4) bounds it in `recover_to_head`.
+    pub(crate) async fn rebuild_target(
+        &self,
+        state: &AppliedState,
+        head: Hash,
+        genesis_hash: Hash,
+    ) -> Result<RebuildPlan, RebuildRefusal> {
+        let unreadable = RebuildRefusal::Unreadable;
+        let tip = state.tip;
+        let mut cursor = head;
+        let fork = loop {
+            // Genesis (stored, or the unstored `Hash::default` sentinel) is the
+            // base of every chain this node can rebuild.
+            if cursor == genesis_hash {
+                break AppliedTip {
+                    hash: cursor,
+                    height: 0,
+                };
+            }
+            let header = match self.storage.blocks.get_header(&cursor) {
+                Ok(Some(h)) => h,
+                Ok(None) => return Err(RebuildRefusal::MissingAncestor { missing: cursor }),
+                Err(e) => return Err(unreadable(format!("header {cursor}: {e}"))),
+            };
+            let height = header.height;
+            if self.is_applied(state, cursor, height).map_err(unreadable)? {
+                break AppliedTip {
+                    hash: cursor,
+                    height,
+                };
+            }
+            if height == 0 {
+                // A height-0 block that is not this chain's genesis.
+                return Err(RebuildRefusal::MissingAncestor { missing: cursor });
+            }
+            cursor = header.selected_parent_hash;
+        };
+        if fork.hash == head {
+            return Err(RebuildRefusal::OnAppliedChain {
+                height: fork.height,
+            });
+        }
+        // From a genesis tip the replay abandons nothing (it is the forward
+        // apply, trusted); above it, the drain reaches a descendant forward.
+        if fork.hash == tip.hash && tip.height > 0 {
+            return Err(RebuildRefusal::DescendsFromTip);
+        }
+        self.outranks_tip(head, tip.hash).await?;
+        Ok(RebuildPlan {
+            fork,
+            abandoned: tip.height.saturating_sub(fork.height),
+        })
+    }
+
+    /// For a fork-choice head that DESCENDS from the applied tip but lies past
+    /// the forward cap: the block on its ancestry at most `reorg_forward_cap()
+    /// - 1` above the tip, which `reorg_to` reaches by applying forward from the
+    /// tip (no revert). `Ok(None)` when `head` does not descend from the tip.
+    fn forward_step_toward(
+        &self,
+        state: &AppliedState,
+        head: Hash,
+    ) -> anyhow::Result<Option<Hash>> {
+        let tip = state.tip;
+        if !self.head_descends_from(head, tip.hash, tip.height)? {
+            return Ok(None);
+        }
+        let limit = tip
+            .height
+            .saturating_add(reorg_forward_cap().saturating_sub(1));
+        let mut cursor = head;
+        while let Some(block) = read_block(&self.storage, &cursor)? {
+            if block.header.height <= limit {
+                return Ok((cursor != tip.hash).then_some(cursor));
+            }
+            cursor = block.selected_parent();
+        }
+        Ok(None)
     }
 
     /// The shared state-advance lock (applied tip + reorg snapshot ring). The
@@ -525,24 +1492,25 @@ impl CanonicalApplicator {
         self.lock.lock().await.tip
     }
 
-    /// Deterministic reward credits for `block` — the SAME mints the producer
-    /// applied on the basic reward path: `[(coinbase, validator_reward),
-    /// (treasury, treasury_reward)]`. `coinbase` comes from the committed v2
-    /// header field (`block.header.coinbase`).
+    /// Deterministic reward credits for `block` given its EXECUTED `receipts` —
+    /// the SAME mints the producer applied on the basic reward path:
+    /// `[(coinbase, validator_reward), (treasury, treasury_reward)]`. `coinbase`
+    /// comes from the committed v2 header field (`block.header.coinbase`). The
+    /// rule in force at the block's height is chosen by
+    /// [`canonical_block_reward`].
     ///
-    /// PANIC-S1 D3: a reward that cannot be computed (overflow / invalid config) is
-    /// an ERROR, never a panic or a saturated amount. Callers fold it into their
-    /// existing reject path via `ExecutionError::RewardSettlement`, so the block is
-    /// rejected (or the reorg aborted and rolled back) exactly like any other
-    /// execution failure.
+    /// PANIC-S1 D3: a reward that cannot be computed (overflow / invalid config /
+    /// receipts that do not match the block) is an ERROR
+    /// (`ExecutionError::RewardSettlement`), never a panic or a saturated amount,
+    /// so the block is rejected (or the reorg aborted and rolled back) exactly
+    /// like any other execution failure.
     fn reward_credits(
         &self,
         block: &Block,
-    ) -> Result<
-        Vec<(citrate_execution::types::Address, U256)>,
-        citrate_economics::rewards::RewardError,
-    > {
-        let reward = self.reward_calculator.calculate_reward(block)?;
+        receipts: &[citrate_execution::types::TransactionReceipt],
+    ) -> Result<Vec<(citrate_execution::types::Address, U256)>, ExecutionError> {
+        let reward = canonical_block_reward(&self.reward_calculator, block, receipts)
+            .map_err(|e| ExecutionError::RewardSettlement(e.to_string()))?;
         Ok(vec![
             (
                 citrate_execution::types::Address(block.header.coinbase),
@@ -600,14 +1568,25 @@ impl CanonicalApplicator {
                 return Ok(None);
             }
         };
-        let mut extensions: Vec<Block> = children
-            .into_iter()
-            .filter_map(|h| self.storage.blocks.get_block(&h).ok().flatten())
-            .filter(|b| {
-                b.selected_parent() == tip.hash
-                    && Some(b.header.height) == tip.height.checked_add(1)
-            })
-            .collect();
+        // A child that cannot be read is not "no child": skipping it could make a
+        // fork look like a unique extension. Do not advance on this pass.
+        let mut extensions: Vec<Block> = Vec::new();
+        for h in children {
+            match read_block(&self.storage, &h) {
+                Ok(Some(b)) => {
+                    if b.selected_parent() == tip.hash
+                        && Some(b.header.height) == tip.height.checked_add(1)
+                    {
+                        extensions.push(b);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("execute-on-receive: {e}; not advancing past {}", tip.hash);
+                    return Ok(None);
+                }
+            }
+        }
         match extensions.len() {
             0 => Ok(None),
             1 => Ok(extensions.pop()),
@@ -642,14 +1621,13 @@ impl CanonicalApplicator {
             };
             let block_hash = block.header.block_hash;
             let height = block.header.height;
-            let apply_result = match self.reward_credits(&block) {
-                Ok(credits) => {
-                    self.executor
-                        .apply_block(&block, block.header.coinbase, &credits)
-                        .await
-                }
-                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+                self.reward_credits(b, r)
             };
+            let apply_result = self
+                .executor
+                .apply_block(&block, block.header.coinbase, &reward)
+                .await;
             match apply_result {
                 Ok(_root) => {
                     state.record(block_hash, height, self.executor.state_snapshot());
@@ -746,8 +1724,27 @@ impl CanonicalApplicator {
         // producer's sealed state root (every subsequent block re-sealed the fork-point root
         // while balances advanced) and wedging the fleet (block-174). If the block's height
         // is unknown (not persisted), fall through to the normal fork-point walk.
-        if let Ok(Some(nb)) = self.storage.blocks.get_block(&new_tip) {
-            if self.on_applied_chain(state, new_tip, nb.header.height) {
+        // A read ERROR is not "not persisted": decline the reorg (nothing changed yet).
+        let new_tip_block = match read_block(&self.storage, &new_tip) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("execute-on-receive: reorg to {new_tip} declined: {e}");
+                return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+            }
+        };
+        // The ring alone cannot answer this: after a restart it may hold only
+        // the tip (no undo records), so an older applied block (or one below the DAG pruning point)
+        // would read as a fork and walk past the ring into `BeyondReorgWindow`
+        // and a from-genesis rebuild TOWARD THE NODE'S OWN ANCESTOR (r1006,
+        // 2026-10-28). `is_applied` falls back to the canonical height index.
+        if let Some(nb) = new_tip_block {
+            let applied = match self.is_applied(state, new_tip, nb.header.height) {
+                Ok(a) => a,
+                Err(e) => {
+                    return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+                }
+            };
+            if applied {
                 debug!(
                     "execute-on-receive: fork-choice tip {} @ {} is already on the applied chain (ancestor of tip {} @ {}) — declining backwards reorg",
                     new_tip, nb.header.height, state.tip.hash, state.tip.height
@@ -784,9 +1781,14 @@ impl CanonicalApplicator {
         let mut branch: Vec<Block> = Vec::new(); // new_tip .. fork_point+1
         let mut cursor = new_tip;
         let fork = loop {
-            let block = match self.storage.blocks.get_block(&cursor).ok().flatten() {
-                Some(b) => b,
-                None => {
+            let block = match read_block(&self.storage, &cursor) {
+                Ok(Some(b)) => b,
+                Err(e) => {
+                    // Nothing has changed yet; a read error is never a missing block
+                    // (which could pass for the genesis sentinel).
+                    return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+                }
+                Ok(None) => {
                     // The genesis base is a sentinel (`Hash::default` @ height 0)
                     // seeded into the ring at construction with no stored block. A
                     // branch that forks at genesis walks down to it — that is the
@@ -831,7 +1833,7 @@ impl CanonicalApplicator {
             // Memory guard: bound the forward branch Vec. A far-ahead fork-choice
             // head (huge drain lag / long outage) is rebuilt via the hash-only
             // spine path instead of collecting tens of thousands of full blocks.
-            if branch.len() as u64 >= MAX_REORG_FORWARD {
+            if branch.len() as u64 >= reorg_forward_cap() {
                 return ReorgOutcome::BeyondReorgWindow {
                     new_tip,
                     stopped_at: h,
@@ -841,14 +1843,41 @@ impl CanonicalApplicator {
             branch.push(block);
         };
 
-        // I4: never revert below the finalized floor.
-        let floor = self.finalized_height();
+        // I4: never revert below the finalized floor (including a registered
+        // certificate whose block has become canonical since it was checked).
+        let floor = self.effective_floor(state, false);
         if fork.height < floor {
             return ReorgOutcome::Rejected(format!(
                 "reorg fork point height {} below finalized height {}",
                 fork.height, floor
             ));
         }
+
+        // C1-R: the receipts of the abandoned applied blocks (fork point, pre_tip]
+        // leave the receipt index in the SAME batch that moves the durable tip to the
+        // fork point; every abort below puts them back with the tip it restores.
+        // Both are prepared in full BEFORE anything is changed: a read error (or an
+        // incomplete walk) declines the reorg with memory, store, receipts and tip
+        // untouched, so no abort below can ever restore from a partial copy.
+        let fork_height = fork.height;
+        let (abandon_index, restore_index) = match self.abandoned_receipt_index(
+            pre_tip.hash,
+            pre_tip.height,
+            usize::try_from(MAX_REORG_DEPTH).unwrap_or(usize::MAX),
+            |b| b.header.height > fork_height,
+        ) {
+            Ok((abandon, restore, Some(base))) if base == fork => (abandon, restore),
+            Ok((_, _, base)) => {
+                return ReorgOutcome::Rejected(format!(
+                    "reorg to {new_tip}: the applied chain from {} does not reach the fork point {} @ {} (walk ended at {base:?})",
+                    pre_tip.hash, fork.hash, fork.height
+                ));
+            }
+            Err(e) => {
+                warn!("execute-on-receive: reorg to {new_tip} declined: {e}");
+                return ReorgOutcome::Rejected(format!("reorg to {new_tip}: {e}"));
+            }
+        };
 
         // Revert IN-MEMORY state to the fork point. `base_snapshot` is RETAINED
         // (cloned into `state_restore`) because it is also the reconcile baseline for
@@ -893,19 +1922,27 @@ impl CanonicalApplicator {
         // state, so a crash during the (in-memory-only) reapply below leaves durable
         // state and durable tip both AT THE FORK POINT — never torn. On success the tip
         // advances to the winning tip (below); on abort it is restored to pre_tip.
-        if let Err(e) = self
-            .executor
-            .reconcile_store_from(&pre_state, Some((fork.hash, fork.height)))
-        {
+        if let Err(e) = self.executor.reconcile_store_from_with_index(
+            &pre_state,
+            Some((fork.hash, fork.height)),
+            &abandon_index,
+        ) {
             // The reconcile is a single atomic batch (unchanged on failure).
             // Restore in-memory state + the §R' policy cell and best-effort re-reconcile
             // the store back to pre_state (with pre_tip), then decline the reorg — world
             // state is left as before the attempt (invariant I3).
             self.executor.state_restore(pre_state.clone());
             self.executor.restore_reward_policy(pre_policy.clone());
-            let _ = self
-                .executor
-                .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)));
+            if let Err(re) = self.executor.reconcile_store_from_with_index(
+                &base_snapshot,
+                Some((pre_tip.hash, pre_tip.height)),
+                &restore_index,
+            ) {
+                warn!(
+                    "execute-on-receive: reorg to {} abort — store restore failed: {re}",
+                    new_tip
+                );
+            }
             warn!(
                 "execute-on-receive: reorg to {} aborted — could not revert store to fork point {} @ {}: {} (reverted to {})",
                 new_tip, fork.hash, fork.height, e, pre_tip.hash
@@ -958,10 +1995,11 @@ impl CanonicalApplicator {
                 if let Err(e) = hook(gov).await {
                     self.executor.state_restore(pre_state.clone());
                     self.executor.restore_reward_policy(pre_policy.clone());
-                    if let Err(re) = self
-                        .executor
-                        .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)))
-                    {
+                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                        &base_snapshot,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &restore_index,
+                    ) {
                         warn!(
                             "execute-on-receive: reorg to {} abort — store restore failed: {re}",
                             new_tip
@@ -978,17 +2016,19 @@ impl CanonicalApplicator {
             }
         }
 
+        // C1-R: the winning branch's receipts, committed with its state + tip below.
+        let mut win_index = ReceiptIndexBatch::default();
         for block in &branch {
-            let apply_result = match self.reward_credits(block) {
-                Ok(credits) => {
-                    self.executor
-                        .apply_block_no_persist(block, block.header.coinbase, &credits)
-                        .await
-                }
-                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+                self.reward_credits(b, r)
             };
+            let apply_result = self
+                .executor
+                .apply_block_no_persist_with_receipts(block, block.header.coinbase, &reward)
+                .await;
             match apply_result {
-                Ok(_) => {
+                Ok((_, receipts)) => {
+                    win_index.extend(ReceiptIndexBatch::for_block(block, &receipts));
                     let h = block.header.height;
                     let hh = block.header.block_hash;
                     tip = AppliedTip {
@@ -1012,9 +2052,10 @@ impl CanonicalApplicator {
                                 // atomic batch) so the abort leaves the durable store AND
                                 // durable tip byte-identical to before the reorg (I2).
                                 // memory == pre_state, store == fork point (== base_snapshot).
-                                if let Err(re) = self.executor.reconcile_store_from(
+                                if let Err(re) = self.executor.reconcile_store_from_with_index(
                                     &base_snapshot,
                                     Some((pre_tip.hash, pre_tip.height)),
+                                    &restore_index,
                                 ) {
                                     warn!(
                                         "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
@@ -1043,10 +2084,11 @@ impl CanonicalApplicator {
                     self.executor.state_restore(pre_state);
                     self.executor.restore_reward_policy(pre_policy.clone());
                     // memory == pre_state, store == fork point (== base_snapshot).
-                    if let Err(re) = self
-                        .executor
-                        .reconcile_store_from(&base_snapshot, Some((pre_tip.hash, pre_tip.height)))
-                    {
+                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                        &base_snapshot,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &restore_index,
+                    ) {
                         warn!(
                             "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
                             new_tip
@@ -1077,22 +2119,52 @@ impl CanonicalApplicator {
         // reconcile (and came AFTER a state batch that OMITTED the tip) was the bug. The
         // `put_applied_tip` below is kept only as a redundant idempotent re-write (and as
         // the durable write for store-less test executors); see its comment.
-        if let Err(e) = self
-            .executor
-            .reconcile_store_from(&base_snapshot, Some((tip.hash, tip.height)))
-        {
+        // The undo records of the winning branch's last `MAX_REORG_DEPTH` blocks,
+        // from the states the reapply just produced, commit with it, so a restart
+        // keeps the window on the new branch.
+        let undo = branch_undo(fork, &base_snapshot, &new_snaps, tip.height);
+        if let Err(e) = self.executor.reconcile_store_from_with_undo(
+            &base_snapshot,
+            Some((tip.hash, tip.height)),
+            &win_index,
+            &undo,
+        ) {
+            // The batch is atomic, so the store (and its receipts and tip) is still
+            // at the fork point. Adopting the winning branch in memory only would
+            // leave memory ahead of a store that never received it; abort exactly
+            // like a failed reapply instead: memory back to pre_state, store back
+            // to pre_state with pre_tip and the abandoned receipts restored.
+            self.executor.state_restore(pre_state);
+            self.executor.restore_reward_policy(pre_policy);
+            if let Err(re) = self.executor.reconcile_store_from_with_index(
+                &base_snapshot,
+                Some((pre_tip.hash, pre_tip.height)),
+                &restore_index,
+            ) {
+                warn!(
+                    "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
+                    new_tip
+                );
+            }
             warn!(
-                "execute-on-receive: reorg to {} applied in-memory but store reconcile failed: {}",
-                new_tip, e
+                "execute-on-receive: reorg to {} aborted — store commit of the winning branch failed: {} (reverted to {})",
+                new_tip, e, pre_tip.hash
             );
+            return ReorgOutcome::Rejected(format!("reorg store commit to {new_tip} failed: {e}"));
         }
         // Persist the new branch's state roots + re-sync the selector at any S(E)
         // the reorg crossed (deferred to here so an abort writes nothing durable).
         for block in &branch {
-            let _ = self
+            if let Err(e) = self
                 .storage
                 .state
-                .put_state_root(&block.header.block_hash, &block.state_root);
+                .put_state_root(&block.header.block_hash, &block.state_root)
+            {
+                warn!(
+                    "execute-on-receive: failed to persist state root for {}: {}",
+                    block.header.block_hash, e
+                );
+            }
             self.maybe_sync_registry(block.header.height).await;
         }
 
@@ -1158,7 +2230,23 @@ impl CanonicalApplicator {
     /// on the applied chain (via drain or reorg); `Rejected` iff it was reached and
     /// rejected; otherwise `Deferred`.
     pub async fn apply_received(&self, block: &Block) -> ApplyOutcome {
-        let mut state = self.lock.lock().await;
+        // The receive path runs inside the P2P message handler. A from-genesis
+        // rebuild holds the advance lock for its whole replay; waiting for it
+        // here stalled the handler until the stall watchdog exited the node
+        // mid-replay (r1006, 2026-10-28). The block is already stored, so it is
+        // deferred to the drain, which applies it once the rebuild is over.
+        let mut state = loop {
+            if self.rebuild_in_progress.load(Ordering::SeqCst) {
+                return ApplyOutcome::Deferred;
+            }
+            match tokio::time::timeout(RECEIVE_LOCK_POLL, self.lock.lock()).await {
+                Ok(guard) => break guard,
+                Err(_) => continue,
+            }
+        };
+        if self.rebuild_in_progress.load(Ordering::SeqCst) {
+            return ApplyOutcome::Deferred;
+        }
 
         let block_hash = block.header.block_hash;
         let height = block.header.height;
@@ -1291,13 +2379,31 @@ impl CanonicalApplicator {
                             ReorgOutcome::BeyondReorgWindow {
                                 new_tip,
                                 stopped_at,
-                            } => {
-                                warn!(
-                                    "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window (stopped at {stopped_at}, applied tip {} @ {}) — scheduling a from-genesis spine rebuild",
-                                    state.tip.hash, state.tip.height
-                                );
-                                rebuild_toward = Some(new_tip);
-                            }
+                            } => match self.forward_step_toward(&state, new_tip) {
+                                // The head extends the applied chain: apply
+                                // forward in bounded steps. A from-genesis rebuild
+                                // would first move the durable tip to genesis.
+                                Ok(Some(step)) => {
+                                    let out = self.reorg_to(&mut state, step).await;
+                                    info!(
+                                        "periodic drain: fork-choice head {new_tip} extends the applied chain beyond the forward cap; stepped toward it via {step}: {out:?}"
+                                    );
+                                }
+                                // Every precondition of the rebuild (strictly
+                                // heavier head, a real fork, the prune floor) is
+                                // checked under the advance lock before the reset
+                                // (`recover_guarded`).
+                                Ok(None) => {
+                                    debug!(
+                                        "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window (stopped at {stopped_at}, applied tip {} @ {}) — considering a from-genesis spine rebuild",
+                                        state.tip.hash, state.tip.height
+                                    );
+                                    rebuild_toward = Some(new_tip);
+                                }
+                                Err(e) => warn!(
+                                    "periodic drain: fork-choice head {new_tip} is beyond the in-memory reorg window and its ancestry could not be read: {e}"
+                                ),
+                            },
                             ReorgOutcome::Rejected(why) => {
                                 debug!(
                                     "periodic drain: fork-choice reorg to {best} declined: {why}"
@@ -1328,6 +2434,42 @@ impl CanonicalApplicator {
         applied_count
     }
 
+    /// The DAG pruning floor, or 0 when no DAG store is wired or it has never
+    /// been pruned (see [`Self::with_dag_prune_floor`]).
+    async fn dag_prune_floor(&self) -> u64 {
+        match &self.dag_prune_floor {
+            Some(dag) => crate::dag_prune::pruned_below(dag).await,
+            None => 0,
+        }
+    }
+
+    /// A block's weight for [`rebuild_decision`], for the head and the applied
+    /// tip alike: fork choice's own score ([`GhostDag::fork_choice_score`]),
+    /// so both sides are compared on the same scale. `None` when fork choice
+    /// cannot score it, or no weight source is wired; the decision then
+    /// refuses. A header-claimed score is never used (SECREM-01 CONS-2).
+    async fn weight(&self, hash: Hash) -> Option<u64> {
+        match &self.fork_weight {
+            Some(w) => w(hash).await,
+            None => None,
+        }
+    }
+
+    /// Log a refused from-genesis rebuild, once per fork-choice head.
+    fn refuse_rebuild(&self, head: Hash, why: &str, tip: AppliedTip) {
+        let mut last = self.refused_rebuild_head.lock();
+        if *last == Some(head) {
+            debug!("canonical recovery: from-genesis rebuild toward {head} still refused: {why}");
+            return;
+        }
+        *last = Some(head);
+        warn!(
+            "canonical recovery: NOT rebuilding from genesis toward {head} (applied tip {} @ {}): \
+             {why}. The applied tip is kept and sync continues forward.",
+            tip.hash, tip.height
+        );
+    }
+
     /// Runtime fallback for a fork-choice head that `reorg_to` reported as
     /// `BeyondReorgWindow` (deeper than the retained snapshot ring, or a forward
     /// branch past `MAX_REORG_FORWARD`). Rebuilds the applied state from genesis via
@@ -1336,7 +2478,7 @@ impl CanonicalApplicator {
     /// was never wired via `set_genesis` (a restart-time recovery still covers it).
     ///
     /// Must be called WITHOUT the advance lock held (`recover_to_head` re-locks).
-    async fn maybe_runtime_rebuild(&self, head: Hash) {
+    pub(crate) async fn maybe_runtime_rebuild(&self, head: Hash) {
         // HYDRATION GUARD (rewritten 2026-08-11). The DAG store hydrates its in-memory
         // tips ASYNCHRONOUSLY after boot, so for the first seconds fork-choice surfaces
         // a partial tip set; rebuilding toward a partially-loaded head would REGRESS
@@ -1372,40 +2514,31 @@ impl CanonicalApplicator {
                 return;
             }
         };
-        // One rebuild at a time. A rebuild holds the advance lock for its whole
-        // replay, so subsequent 1s drain ticks already serialize behind it; this
-        // flag also prevents a second trigger from re-entering after the lock frees.
-        if self.rebuild_in_progress.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        // F3: clear `rebuild_in_progress` on EVERY exit path via an RAII guard. This flag
-        // gates block production (the #126 catch-up gate refuses while it is set), so a
-        // PANIC or future cancellation inside `recover_to_head` used to leave it stuck
-        // true and wedge production until a node restart. The guard's `Drop` runs on a
-        // normal return AND during unwind, so a panic mid-rebuild now clears it.
-        let _rebuild_guard = RebuildInProgressGuard {
-            flag: self.rebuild_in_progress.clone(),
-        };
+        // One rebuild at a time, and the `rebuild_in_progress` flag (with its F3
+        // RAII guard): both are owned by `recover_to_head` now, so the startup
+        // recovery is covered too.
         warn!("runtime reorg: rebuilding applied state from genesis via the canonical spine (deep-fork self-heal)");
-        match self.recover_to_head(genesis_state, genesis_hash).await {
+        match self
+            .recover_automatic(genesis_state, genesis_hash, head)
+            .await
+        {
             Ok(true) => info!("runtime reorg: spine rebuild converged to the fork-choice head"),
             Ok(false) => {
                 warn!("runtime reorg: spine rebuild made no change (already at head, or aborted)")
             }
             Err(e) => warn!("runtime reorg: spine rebuild failed (continuing on current tip): {e}"),
         }
-        // `_rebuild_guard` clears `rebuild_in_progress` here as it drops.
     }
 
     /// STARTUP RECOVERY for the same-height-sibling wedge (2026-08-06; chain 40204
     /// halted at 90,998 then 91,109). When a node RESTARTS with its persisted
-    /// applied tip on a NON-canonical sibling, it can never converge on its own:
-    /// `new` seeds the reorg ring with ONLY the tip's snapshot, so `reorg_to(head)`
-    /// walks the winning branch to the fork point (the tip's PARENT) and finds no
-    /// snapshot to revert to — every 1s `drive_drain` tick re-attempts and is
-    /// rejected. The tie-break fix (producer and drain agree on the winner) is
-    /// necessary but not sufficient: a node stranded on the LOSING sibling stays
-    /// wedged, and a plain restart re-seeds the same single-snapshot ring.
+    /// applied tip on a NON-canonical sibling and its ring holds only the tip's
+    /// snapshot (no undo records below it), it can never converge on its own:
+    /// `reorg_to(head)` walks the winning branch to the fork point (the tip's
+    /// PARENT) and finds no snapshot to revert to — every 1s `drive_drain` tick
+    /// re-attempts and is rejected. With the undo records `new` rebuilds the ring
+    /// for the last `MAX_REORG_DEPTH` heights, and such a fork is reverted in
+    /// place (see `recover_automatic`); this rebuild remains for forks below it.
     ///
     /// This rebuilds deterministically from the node's OWN stored blocks (no
     /// network / cold-sync): reset the executor to genesis, then re-apply the
@@ -1422,10 +2555,75 @@ impl CanonicalApplicator {
     /// rebuild ran and reached the head. `genesis_state`/`genesis_hash` are the
     /// world state and block hash at height 0, supplied by the caller (which owns
     /// the genesis config); the executor is reset to exactly this before replay.
+    ///
+    /// Test-only since 2026-10-28: the node's own triggers go through
+    /// [`Self::recover_automatic`], which adds the strictly-heavier and prune-floor
+    /// rules. This entry keeps fork choice's own order (equal scores to the
+    /// smaller hash), so tests can pin the rebuild mechanics directly.
+    #[cfg(test)]
     pub async fn recover_to_head(
         &self,
         genesis_state: StateSnapshot,
         genesis_hash: Hash,
+    ) -> anyhow::Result<bool> {
+        self.recover_guarded(genesis_state, genesis_hash, None)
+            .await
+    }
+
+    /// The from-genesis rebuild as the node triggers it on its own: the
+    /// runtime drain fallback (`maybe_runtime_rebuild`) and the start-up
+    /// recovery in `start_node`. On top of [`Self::recover_to_head`]'s
+    /// preconditions ([`Self::rebuild_target`]):
+    /// - fork choice must still name `expected`;
+    /// - the head must be STRICTLY heavier than the applied tip
+    ///   ([`rebuild_decision`]): a sibling that wins only the smaller-hash
+    ///   tie-break never resets the applied chain to genesis; the node keeps its
+    ///   tip and converges forward (or rebuilds once the other branch is
+    ///   heavier);
+    /// - on a DAG-pruned node, never when the fork point is below the snapshot
+    ///   window (see [`Self::with_dag_prune_floor`]).
+    ///
+    /// A fork point inside the snapshot window (rebuilt after a restart from the
+    /// undo records) is reverted in place by [`Self::reorg_to`] instead: no
+    /// reset to genesis. Refusals are logged once per head.
+    pub(crate) async fn recover_automatic(
+        &self,
+        genesis_state: StateSnapshot,
+        genesis_hash: Hash,
+        expected: Hash,
+    ) -> anyhow::Result<bool> {
+        self.recover_guarded(genesis_state, genesis_hash, Some(expected))
+            .await
+    }
+
+    /// `expected`: `None` for [`Self::recover_to_head`], `Some(head)` for
+    /// [`Self::recover_automatic`].
+    async fn recover_guarded(
+        &self,
+        genesis_state: StateSnapshot,
+        genesis_hash: Hash,
+        expected: Option<Hash>,
+    ) -> anyhow::Result<bool> {
+        // One rebuild at a time. A rebuild holds the advance lock for its whole
+        // replay; the flag also tells the producer not to seal (#126) and the
+        // receive path not to wait for the lock (`apply_received`).
+        if self.rebuild_in_progress.swap(true, Ordering::SeqCst) {
+            return Ok(false);
+        }
+        // F3: clear `rebuild_in_progress` on EVERY exit path via an RAII guard, on a
+        // normal return AND during a panic unwind or task cancellation.
+        let _rebuild_guard = RebuildInProgressGuard {
+            flag: self.rebuild_in_progress.clone(),
+        };
+        self.recover_to_head_inner(genesis_state, genesis_hash, expected)
+            .await
+    }
+
+    async fn recover_to_head_inner(
+        &self,
+        genesis_state: StateSnapshot,
+        genesis_hash: Hash,
+        expected: Option<Hash>,
     ) -> anyhow::Result<bool> {
         let head = match &self.fork_choice {
             Some(fc) => match fc().await {
@@ -1434,10 +2632,115 @@ impl CanonicalApplicator {
             },
             None => return Ok(false),
         };
+        if expected.is_some_and(|e| e != head) {
+            debug!("canonical recovery: fork-choice head moved to {head} since the rebuild was scheduled; not rebuilding");
+            return Ok(false);
+        }
         let mut state = self.lock.lock().await;
+        // C1-R: settle any receipts an earlier, unfinished rebuild left above the
+        // durable tip before this rebuild records its own marker. The writes go
+        // through the executor's store (the same fsync'd path as the rebuild). If
+        // the cleanup does not complete, ABORT before changing anything: recording
+        // this rebuild's marker would overwrite the earlier one, and the receipts
+        // only that marker reaches would stay visible for good.
+        let batches = Self::interrupted_rebuild_cleanup(&self.storage).map_err(|e| {
+            anyhow::anyhow!(
+                "C1-R: receipt cleanup before the rebuild failed (rebuild aborted): {e}"
+            )
+        })?;
+        for (i, batch) in batches.iter().enumerate() {
+            self.executor.persist_receipt_index(batch).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "C1-R: receipt cleanup write {} of {} failed (the rebuild marker is kept; rebuild aborted): {e}",
+                    i.saturating_add(1),
+                    batches.len()
+                )
+            })?;
+        }
         if state.tip.hash == head {
             return Ok(false);
         }
+        // NO REWIND BELOW A VERIFIED TIP (r1006, 2026-10-28). The reset below moves
+        // the durable applied tip to genesis; a process that stops mid-replay keeps
+        // the height the replay reached. Before anything changes, establish that
+        // the head outranks the tip in fork choice, really forks off the applied chain,
+        // and has an ancestry this node holds — not its own ancestor, not a descendant
+        // the drain reaches forward, not a branch whose missing (or pruned) ancestor
+        // only looks like divergence, and not a branch fork choice ranks below it.
+        let plan = match self.rebuild_target(&state, head, genesis_hash).await {
+            Ok(plan) => plan,
+            Err(why) => {
+                if expected.is_some() {
+                    self.refuse_rebuild(head, &why.to_string(), state.tip);
+                } else {
+                    warn!(
+                        "canonical recovery: not rebuilding toward {head} (applied tip {} @ {}): {why}",
+                        state.tip.hash, state.tip.height
+                    );
+                }
+                return Ok(false);
+            }
+        };
+        if expected.is_some() {
+            // The node's own triggers: strictly heavier, and never below the
+            // floor of a pruned DAG store (see `recover_automatic`). "Below the
+            // snapshot window" is the fork point having no ring snapshot, which
+            // is what forces the from-genesis path; a fork point inside the ring
+            // under a branch past the forward cap is not refused for pruning.
+            let below_ring = !state.snapshots.contains_key(&plan.fork.height);
+            let floor = self.dag_prune_floor().await;
+            let head_w = self.weight(head).await;
+            let tip_w = self.weight(state.tip.hash).await;
+            // A read error is never "not held".
+            let tip_held = self
+                .storage
+                .blocks
+                .has_block(&state.tip.hash)
+                .unwrap_or(true);
+            match rebuild_decision(below_ring, floor, head_w, tip_w, tip_held) {
+                RebuildDecision::Rebuild => {}
+                refused => {
+                    self.refuse_rebuild(head, &refused.to_string(), state.tip);
+                    return Ok(false);
+                }
+            }
+            // A fork point inside the ring is reverted in place, as the drain
+            // does: the durable tip never goes below it. A winning branch past
+            // the forward cap goes on to the rebuild. So does a rejected
+            // in-place reorg on an unpruned node (a reapply that does not
+            // reproduce a root, a failed commit, a gap in the receipt walk:
+            // `reorg_to` leaves state as it was), as before the ring was
+            // rebuilt from undo records; the rebuild keeps its own guards. A
+            // rejection stops here on a pruned node (no rebuild from genesis)
+            // and when the fork point is below the finalized floor.
+            if !below_ring {
+                match self.reorg_to(&mut state, head).await {
+                    ReorgOutcome::Reorged { .. } => {
+                        self.publish_applied_height(&state);
+                        return Ok(true);
+                    }
+                    ReorgOutcome::BeyondReorgWindow { .. } => {}
+                    ReorgOutcome::NoChange => return Ok(false),
+                    ReorgOutcome::Rejected(why) => {
+                        let finalized = self.effective_floor(&state, false);
+                        if floor > 0 || plan.fork.height < finalized {
+                            warn!(
+                                "canonical recovery: bounded reorg toward {head} declined: {why}"
+                            );
+                            return Ok(false);
+                        }
+                        warn!(
+                            "canonical recovery: bounded reorg toward {head} declined ({why}); \
+                             falling back to the rebuild"
+                        );
+                    }
+                }
+            }
+        }
+        info!(
+            "canonical recovery: fork-choice head {head} outranks the applied tip {} @ {}; fork point {} @ {} ({} applied block(s) abandoned)",
+            state.tip.hash, state.tip.height, plan.fork.hash, plan.fork.height, plan.abandoned
+        );
         // I4 (CHAIN-B-A002): NEVER revert past finality on the spine-rebuild path either.
         // `reorg_to` checks `fork.height < finalized_height()`, but the deep-reorg escape
         // hatch (`BeyondReorgWindow` → `maybe_runtime_rebuild` → here) reset world state to
@@ -1448,10 +2751,17 @@ impl CanonicalApplicator {
         // consensus alarm instead of self-healing onto a finality-violating fork. (Inert
         // while `finalized_height()` is 0 — no checkpoint proposed yet — so this changes no
         // honest-traffic outcome today; it is the floor the guard needs once finality wires.)
-        let floor = self.finalized_height();
+        let floor = self.effective_floor(&state, true);
         if floor > 0 && floor <= state.tip.height {
-            if let Some(finalized_hash) = self.ancestor_hash_at_height(state.tip.hash, floor) {
-                if !self.head_descends_from(head, finalized_hash, floor) {
+            // A read error aborts the rebuild: the guard is never skipped on one.
+            let finalized = self
+                .ancestor_hash_at_height(state.tip.hash, floor)
+                .map_err(|e| anyhow::anyhow!("I4 guard: {e} (rebuild aborted)"))?;
+            if let Some(finalized_hash) = finalized {
+                let descends = self
+                    .head_descends_from(head, finalized_hash, floor)
+                    .map_err(|e| anyhow::anyhow!("I4 guard: {e} (rebuild aborted)"))?;
+                if !descends {
                     warn!(
                         "CONSENSUS ALARM (I4/CHAIN-B-A002): refusing spine rebuild to head {} — \
                          it does not descend from the finalized block {} @ {} (applied tip {} @ {}). \
@@ -1467,12 +2777,129 @@ impl CanonicalApplicator {
              rebuilding state from genesis (same-height-sibling wedge remediation)",
             state.tip.hash, state.tip.height, head
         );
-        // Capture the pre-recovery world state + applied pointer + ring so the whole
-        // operation is ATOMIC: it either fully converges on the head and commits, or
-        // it aborts leaving the node byte-identical to how it started. The store
-        // currently reflects `pre` (the losing applied tip).
-        let pre = self.executor.state_snapshot();
+        // C1-R: every read the rebuild and its rollback depend on happens HERE,
+        // before anything is changed. A read error returns `Err` with memory, store,
+        // receipts, tip and ring untouched; no abort below reads storage to decide
+        // what to restore.
+        let read_err = |e: anyhow::Error| anyhow::anyhow!("C1-R: {e} (rebuild aborted)");
+        let genesis_block = read_block(&self.storage, &genesis_hash).map_err(read_err)?;
+
+        // The canonical spine to replay (see the replay loop below for why the head's
+        // own ancestry is used), ascending. A block that is not stored ends the walk
+        // (the replay then cannot reach the head and rolls back); a read error aborts.
+        let mut spine: Vec<Hash> = Vec::new();
+        let mut spine_heights: Vec<u64> = Vec::new();
+        let mut cursor = head;
+        let mut reached_genesis = false;
+        while let Some(block) = read_block(&self.storage, &cursor).map_err(read_err)? {
+            if block.header.height == 0 {
+                reached_genesis = cursor == genesis_hash;
+                break; // reached genesis (the reset base) — do not re-apply it
+            }
+            spine.push(cursor);
+            spine_heights.push(block.header.height);
+            cursor = block.selected_parent();
+            if spine.len() >= MAX_RECOVERY_SPINE {
+                break;
+            }
+        }
+        // An unstored genesis is the ring's sentinel base (`Hash::default`).
+        reached_genesis = reached_genesis || (cursor == genesis_hash && genesis_block.is_none());
+        if !reached_genesis {
+            // The replay could not reach the head from this genesis. Refuse BEFORE
+            // the reset rather than reset, replay part of it and roll back.
+            warn!(
+                "canonical recovery: the spine of {head} does not reach genesis {genesis_hash} (stopped at {cursor}); not rebuilding"
+            );
+            return Ok(false);
+        }
+        spine.reverse(); // ascending height: genesis+1 .. head
+        spine_heights.reverse();
+
+        // C1-R: the receipts of the applied blocks NOT on the spine (the losing
+        // segment above the common ancestor) leave the receipt index in the SAME
+        // batch as the genesis reset; the spine replay re-writes the spine's own
+        // receipts per block. `common` is the highest pre-recovery block that is also
+        // on the spine; every abort removes the receipts the replay wrote above it
+        // and puts the losing segment's back.
+        //
+        // The shared prefix (genesis, common] keeps its receipts while the durable
+        // tip is below it. The reset batch therefore also records `pre_tip` as the
+        // rebuild marker: if the process stops before the replay passes the prefix,
+        // the next start removes every receipt of that old chain that is not on the
+        // durable applied chain (`interrupted_rebuild_cleanup`), whatever
+        // branch fork choice picks then. Success and every abort clear the marker.
         let pre_tip = state.tip;
+        let spine_set: std::collections::HashSet<Hash> = spine.iter().copied().collect();
+        let (abandon_index, restore_index, common) = self
+            .abandoned_receipt_index(pre_tip.hash, pre_tip.height, MAX_RECOVERY_SPINE, |b| {
+                b.header.height > 0 && !spine_set.contains(&b.header.block_hash)
+            })
+            .map_err(read_err)?;
+        // Without a known base, the old chain's walk ended at a block that is not
+        // stored: the start-up hardening purge removed it (and its receipts) and
+        // left the applied tip on it. The old chain's blocks below it still hold
+        // receipts, but nothing links them to `pre_tip` any more, so the walk
+        // cannot find them. Reconcile the whole receipt index against the spine
+        // instead: every entry of a block that is not on the spine leaves in the
+        // reset batch, and every abort puts the receipts back.
+        let (abandon_index, restore_index) = match common {
+            Some(_) => (abandon_index, restore_index),
+            None => {
+                warn!(
+                    "canonical recovery: the applied chain from {} @ {} is not fully stored; reconciling the receipt index against the spine",
+                    pre_tip.hash, pre_tip.height
+                );
+                Self::off_chain_receipt_index(&self.storage, |block| {
+                    *block == genesis_hash || spine_set.contains(block)
+                })
+                .map_err(read_err)?
+            }
+        };
+        // Every spine block is then treated as possibly new; the receipt check
+        // below keeps the ones the old chain already had.
+        let common_height = common.map(|c| c.height).unwrap_or(0);
+        // The removals an abort needs: the receipts the replay writes fresh for
+        // spine blocks above `common`, keyed by spine position. A receipt that
+        // already names its spine block was there before the rebuild (the replay
+        // rewrites it identically), so the abort keeps it.
+        let mut new_removals: Vec<(usize, Vec<(Hash, Hash)>)> = Vec::new();
+        for (i, (h, height)) in spine.iter().zip(&spine_heights).enumerate() {
+            if *height <= common_height {
+                continue;
+            }
+            let block = read_block(&self.storage, h)
+                .map_err(read_err)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "C1-R: spine block {h} vanished during preparation (rebuild aborted)"
+                    )
+                })?;
+            let mut removals = Vec::new();
+            for tx in &block.transactions {
+                let existing = read_receipt(&self.storage, &tx.hash).map_err(read_err)?;
+                if existing.map(|r| r.block_hash) != Some(*h) {
+                    removals.push((*h, tx.hash));
+                }
+            }
+            new_removals.push((i, removals));
+        }
+        let rollback_index = |applied_through: usize| {
+            let mut idx = ReceiptIndexBatch::default();
+            for (_, removals) in new_removals.iter().filter(|(i, _)| *i < applied_through) {
+                idx.removals.extend(removals.iter().copied());
+            }
+            idx.extend(restore_index.clone());
+            // Back on pre_tip with its receipts restored: nothing is left above the
+            // durable tip, so the rebuild marker goes in the same batch.
+            idx.with_marker(ReceiptReconcileMarker::Clear)
+        };
+
+        // Capture the pre-recovery world state + ring so the whole operation is
+        // ATOMIC: it either fully converges on the head and commits, or it aborts
+        // leaving the node byte-identical to how it started. The store currently
+        // reflects `pre` (the losing applied tip).
+        let pre = self.executor.state_snapshot();
         let pre_snapshots = std::mem::take(&mut state.snapshots);
 
         // Reset BOTH in-memory world state AND the durable store to genesis. The
@@ -1489,21 +2916,61 @@ impl CanonicalApplicator {
         // tip both AT GENESIS (consistent — the node just re-syncs from genesis) rather
         // than a genesis store under a stale higher tip (torn → fork on restart). The
         // forward spine replay below re-advances the tip atomically per block.
-        self.executor
-            .reconcile_store_from(&pre, Some((genesis_hash, 0)))?;
+        //
+        // C1-R: the reset batch carries at most one chunk of the losing segment's
+        // receipt removals (all of them, for any losing segment of up to
+        // RECEIPT_RECONCILE_CHUNK transactions), so it stays bounded however deep
+        // the fork is. The rest are written in chunks right after it. That is
+        // safe across a crash: the reset batch records `pre_tip` as the rebuild
+        // marker, and the cleanup a restart runs for it removes every receipt of
+        // the old chain that is not on the durable applied chain, a superset of
+        // the removals still pending.
+        let mut removal_chunks = abandon_index
+            .removals
+            .chunks(receipt_reconcile_chunk())
+            .map(<[(Hash, Hash)]>::to_vec);
+        let reset_index = ReceiptIndexBatch {
+            removals: removal_chunks.next().unwrap_or_default(),
+            ..ReceiptIndexBatch::default()
+        }
+        .with_marker(ReceiptReconcileMarker::Set(pre_tip.hash, pre_tip.height));
+        let residual_removals: Vec<Vec<(Hash, Hash)>> = removal_chunks.collect();
+        drop(abandon_index);
+        if let Err(e) = self.executor.reconcile_store_from_with_index(
+            &pre,
+            Some((genesis_hash, 0)),
+            &reset_index,
+        ) {
+            // The reset batch is atomic: the store is still at `pre`. Put memory and
+            // the ring back with it.
+            self.executor.state_restore(pre);
+            state.snapshots = pre_snapshots;
+            return Err(anyhow::anyhow!(
+                "canonical recovery: genesis reset failed (nothing changed): {e}"
+            ));
+        }
         // VALIDATE the reconstructed genesis against the persisted genesis block. A
         // wrong reconstruction (chain-id / genesis-profile drift) aborts here; restore
         // both memory and store to the pre-recovery state first.
-        if let Ok(Some(g0)) = self.storage.blocks.get_block(&genesis_hash) {
+        if let Some(g0) = &genesis_block {
             let rebuilt_root = self.executor.calculate_state_root();
             if rebuilt_root != g0.state_root {
                 let genesis_now = self.executor.state_snapshot();
                 self.executor.state_restore(pre);
-                // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
-                let _ = self
-                    .executor
-                    .reconcile_store_from(&genesis_now, Some((pre_tip.hash, pre_tip.height)));
                 state.snapshots = pre_snapshots;
+                // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
+                self.executor
+                    .reconcile_store_from_with_index(
+                        &genesis_now,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &rollback_index(0),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "canonical recovery: genesis root mismatch, and restoring the store to {} failed: {e}",
+                            pre_tip.hash
+                        )
+                    })?;
                 warn!(
                     "canonical recovery: reconstructed genesis root {} != persisted block-0 root {} — \
                      aborting without changes (genesis config drift?)",
@@ -1512,6 +2979,41 @@ impl CanonicalApplicator {
                 return Ok(false);
             }
         }
+        // C1-R: the losing segment's remaining receipt removals, one bounded
+        // batch each. A failed write rolls back to `pre_tip` exactly like a
+        // genesis mismatch: memory, store, receipts (the restore set puts back
+        // whatever the reset or an earlier chunk removed) and tip.
+        for (i, chunk) in residual_removals.iter().enumerate() {
+            let batch = ReceiptIndexBatch {
+                removals: chunk.clone(),
+                ..ReceiptIndexBatch::default()
+            };
+            if let Err(e) = self.executor.persist_receipt_index(&batch).await {
+                let genesis_now = self.executor.state_snapshot();
+                self.executor.state_restore(pre);
+                state.snapshots = pre_snapshots;
+                self.executor
+                    .reconcile_store_from_with_index(
+                        &genesis_now,
+                        Some((pre_tip.hash, pre_tip.height)),
+                        &rollback_index(0),
+                    )
+                    .map_err(|e2| {
+                        anyhow::anyhow!(
+                            "canonical recovery: receipt removal write {} failed ({e}), and restoring the store to {} failed: {e2}",
+                            i.saturating_add(2),
+                            pre_tip.hash
+                        )
+                    })?;
+                return Err(anyhow::anyhow!(
+                    "canonical recovery: receipt removal write {} failed (rolled back to {} @ {}): {e}",
+                    i.saturating_add(2),
+                    pre_tip.hash,
+                    pre_tip.height
+                ));
+            }
+        }
+        drop(residual_removals);
         state.tip = AppliedTip {
             hash: genesis_hash,
             height: 0,
@@ -1529,38 +3031,29 @@ impl CanonicalApplicator {
         // reproduces canonical state with no reorg and no depth limit. `state.record`
         // keeps the ring bounded to the last MAX_REORG_DEPTH heights, so the rebuilt
         // ring ends populated across the recent window (future live reorgs work).
-        const MAX_RECOVERY_SPINE: usize = 20_000_000;
-        let mut spine: Vec<Hash> = Vec::new();
-        let mut cursor = head;
-        while let Some(block) = self.storage.blocks.get_block(&cursor).ok().flatten() {
-            if block.header.height == 0 {
-                break; // reached genesis (the reset base) — do not re-apply it
-            }
-            spine.push(cursor);
-            cursor = block.selected_parent();
-            if spine.len() >= MAX_RECOVERY_SPINE {
-                break;
-            }
-        }
-        spine.reverse(); // ascending height: genesis+1 .. head
+        let mut replayed: usize = 0;
         for h in &spine {
-            let block = match self.storage.blocks.get_block(h).ok().flatten() {
-                Some(b) => b,
-                None => break, // missing block — reach check below rolls back
+            let block = match read_block(&self.storage, h) {
+                Ok(Some(b)) => b,
+                Ok(None) => break, // missing block — reach check below rolls back
+                Err(e) => {
+                    warn!("canonical recovery: {e} — aborting rebuild");
+                    break; // the reach check below rolls back
+                }
             };
             // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
             // wall that made a from-genesis rebuild take hours). Correctness is
             // recovered by verifying the FINAL head root once, below.
-            let apply_result = match self.reward_credits(&block) {
-                Ok(credits) => {
-                    self.executor
-                        .apply_block_trusted(&block, block.header.coinbase, &credits)
-                        .await
-                }
-                Err(e) => Err(ExecutionError::RewardSettlement(e.to_string())),
+            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+                self.reward_credits(b, r)
             };
+            let apply_result = self
+                .executor
+                .apply_block_trusted(&block, block.header.coinbase, &reward)
+                .await;
             match apply_result {
                 Ok(_) => {
+                    replayed = replayed.saturating_add(1);
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
                     let snap = self.executor.state_snapshot();
@@ -1586,15 +3079,21 @@ impl CanonicalApplicator {
         // rebuild with a SINGLE final root check: a wrong block anywhere in the spine
         // yields a wrong final state root. Converged iff we reached the head AND its
         // state root reproduces.
-        let head_root_ok = state.tip.hash == head
-            && self
-                .storage
-                .blocks
-                .get_block(&head)
-                .ok()
-                .flatten()
-                .map(|hb| self.executor.calculate_state_root() == hb.state_root)
-                .unwrap_or(false);
+        let head_block = if state.tip.hash == head {
+            match read_block(&self.storage, &head) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("canonical recovery: {e} — cannot verify the head root");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let head_root_ok = head_block
+            .as_ref()
+            .map(|hb| self.executor.calculate_state_root() == hb.state_root)
+            .unwrap_or(false);
         if !head_root_ok {
             // Did not converge — exceptional after the genesis validation above (would
             // require a corrupt/missing stored block or a divergent replay). Roll the
@@ -1604,12 +3103,20 @@ impl CanonicalApplicator {
             let partial = self.executor.state_snapshot();
             self.executor.state_restore(pre);
             // #126: restore the durable tip to pre_tip alongside the reverse reconcile.
-            let _ = self
-                .executor
-                .reconcile_store_from(&partial, Some((pre_tip.hash, pre_tip.height)));
+            let restored = self.executor.reconcile_store_from_with_index(
+                &partial,
+                Some((pre_tip.hash, pre_tip.height)),
+                &rollback_index(replayed),
+            );
             state.tip = pre_tip;
             state.snapshots = pre_snapshots;
             self.publish_applied_height(&state);
+            restored.map_err(|e| {
+                anyhow::anyhow!(
+                    "canonical recovery: did not reach head {head}, and restoring the store to {} failed: {e}",
+                    pre_tip.hash
+                )
+            })?;
             warn!(
                 "canonical recovery: did not reach head {} (stopped at {} @ {}) — rolled back to prior state",
                 head, pre_tip.hash, pre_tip.height
@@ -1621,8 +3128,20 @@ impl CanonicalApplicator {
         // reset to genesis before replay, and each spine block's `apply_block`
         // persisted its changes forward — so no losing-branch residue remains and no
         // final reconcile is needed.
-        if let Ok(Some(head_block)) = self.storage.blocks.get_block(&state.tip.hash) {
+        if let Some(head_block) = &head_block {
             self.persist_applied(&state.tip.hash, state.tip.height, &head_block.state_root);
+        }
+        // C1-R: the replay rewrote the whole shared prefix, so the receipt index
+        // matches the applied chain again; drop the rebuild marker. If this write is
+        // lost, the next start's cleanup finds nothing left to remove and clears it.
+        if let Err(e) = self
+            .executor
+            .persist_receipt_index(
+                &ReceiptIndexBatch::default().with_marker(ReceiptReconcileMarker::Clear),
+            )
+            .await
+        {
+            warn!("canonical recovery: could not clear the receipt rebuild marker: {e}");
         }
         self.publish_applied_height(&state);
         info!(
@@ -1641,6 +3160,285 @@ impl CanonicalApplicator {
                 .get(&height)
                 .map(|(h, _)| *h == hash)
                 .unwrap_or(false)
+    }
+
+    /// C1-R: the receipt-index changes for blocks that stop being executed. Walks
+    /// `from`'s selected-parent ancestry (`from` sits at `from_height`) while
+    /// `abandoned(block)` holds and returns:
+    /// - `removals`: every `(block, tx)` of those blocks, for the batch that moves
+    ///   the durable applied tip off them;
+    /// - `restore`: the receipts currently stored for them, for an abort that
+    ///   moves the tip back onto them;
+    /// - the first ancestor that is NOT abandoned (the common base), or `None`
+    ///   when an unstored block above height 0 ended the walk. An unstored block
+    ///   at height 0 is the genesis sentinel and is the base.
+    ///
+    /// Read-only. A storage read error, or more than `max_blocks` abandoned
+    /// blocks, is an `Err`, so no caller ever commits a partial removal set or
+    /// rolls back with a partial restore set because a read failed. An unstored
+    /// block is not an error here: the start-up hardening purge removes invalid
+    /// blocks together with their receipts, and the applied tip can sit on them.
+    /// A caller that needs the walk to reach a known base checks `base`.
+    fn abandoned_receipt_index(
+        &self,
+        from: Hash,
+        from_height: u64,
+        max_blocks: usize,
+        abandoned: impl Fn(&Block) -> bool,
+    ) -> anyhow::Result<(ReceiptIndexBatch, ReceiptIndexBatch, Option<AppliedTip>)> {
+        let mut removals = ReceiptIndexBatch::default();
+        let mut restore = ReceiptIndexBatch::default();
+        let mut cursor = from;
+        let mut expected_height = from_height;
+        let mut walked: usize = 0;
+        let base = loop {
+            let Some(block) = read_block(&self.storage, &cursor)? else {
+                if expected_height == 0 {
+                    break Some(AppliedTip {
+                        hash: cursor,
+                        height: 0,
+                    });
+                }
+                warn!(
+                    "C1-R: abandoned-receipt walk from {from} ended at unstored block {cursor} @ {expected_height}"
+                );
+                break None;
+            };
+            if !abandoned(&block) {
+                break Some(AppliedTip {
+                    hash: cursor,
+                    height: block.header.height,
+                });
+            }
+            if walked >= max_blocks {
+                anyhow::bail!(
+                    "C1-R: abandoned-receipt walk from {from} passed {walked} blocks without reaching a kept ancestor"
+                );
+            }
+            if block.header.height == 0 {
+                anyhow::bail!(
+                    "C1-R: abandoned-receipt walk from {from} reached genesis without a kept ancestor"
+                );
+            }
+            walked = walked.saturating_add(1);
+            for tx in &block.transactions {
+                removals.removals.push((cursor, tx.hash));
+                if let Some(r) = read_receipt(&self.storage, &tx.hash)? {
+                    if r.block_hash == cursor {
+                        restore.receipts.push(r);
+                    }
+                }
+            }
+            expected_height = block.header.height.saturating_sub(1);
+            cursor = block.selected_parent();
+        };
+        Ok((removals, restore, base))
+    }
+
+    /// C1-R: the receipt-index changes that drop every indexed block for which
+    /// `keep` is false, for when the old applied chain cannot be walked. Scans
+    /// the block→transaction index once. Returns the removals and, for an abort,
+    /// the receipts currently stored for those blocks. Read-only; a read error
+    /// is an `Err`, so no caller commits a partial set.
+    fn off_chain_receipt_index(
+        storage: &StorageManager,
+        keep: impl Fn(&Hash) -> bool,
+    ) -> anyhow::Result<(ReceiptIndexBatch, ReceiptIndexBatch)> {
+        let mut removals = ReceiptIndexBatch::default();
+        let mut restore = ReceiptIndexBatch::default();
+        read_receipt_index(storage, |block, tx| {
+            if keep(&block) {
+                return Ok(());
+            }
+            removals.removals.push((block, tx));
+            if let Some(r) = read_receipt(storage, &tx)? {
+                if r.block_hash == block {
+                    restore.receipts.push(r);
+                }
+            }
+            Ok(())
+        })?;
+        Ok((removals, restore))
+    }
+
+    /// C1-R: finish the receipt side of a from-genesis rebuild that stopped before
+    /// it converged (see [`ReceiptReconcileMarker`]). No-op without a marker.
+    ///
+    /// Removes the receipts and block markers of every block on the marked old
+    /// chain that is not on the durable applied chain ending at `durable`, then
+    /// clears the marker. The walk descends both chains from their tips to their
+    /// common ancestor, so it costs the span the rebuild had left to replay, never
+    /// a scan of all stored receipts. This returns the batches to commit, in
+    /// order: bounded, idempotent removal chunks, each written as one fsync'd
+    /// batch, with the marker clear in the SAME batch as the last chunk, so the
+    /// clear becomes durable only together with the cleanup's final write. A
+    /// caller stops at the first failed write and leaves the rest unwritten: the
+    /// marker is then still in place and the cleanup runs again on the next start
+    /// or rebuild. A storage READ failure is returned as `Err` (no batches), for
+    /// the same reason. Blocks re-applied later rewrite their receipts as usual.
+    ///
+    /// The durable applied tip is read from the store here, not taken from the
+    /// caller: the receipts to keep are those of the chain the store says is
+    /// applied. A marker with no durable tip is an error (the marker is only ever
+    /// set in the same batch as a tip). A durable tip that is not stored (the
+    /// start-up hardening purge removed it) leaves nothing to compare against:
+    /// this returns no batches and keeps the marker, and the rebuild that a
+    /// removed tip forces reconciles the index against its spine.
+    fn interrupted_rebuild_cleanup(
+        storage: &StorageManager,
+    ) -> anyhow::Result<Vec<ReceiptIndexBatch>> {
+        let marker = match read_reconcile_marker(storage)? {
+            Some(m) => m,
+            None => return Ok(Vec::new()),
+        };
+        let durable = match read_applied_tip(storage)? {
+            Some((hash, height)) => AppliedTip { hash, height },
+            None => anyhow::bail!(
+                "the receipt rebuild marker is set ({} @ {}) but no applied tip is stored",
+                marker.0,
+                marker.1
+            ),
+        };
+        if durable.height > 0 && read_block(storage, &durable.hash)?.is_none() {
+            warn!(
+                "C1-R: unfinished rebuild from {} @ {}: the durable applied tip {} @ {} is not stored; the receipt cleanup waits for the rebuild",
+                marker.0, marker.1, durable.hash, durable.height
+            );
+            return Ok(Vec::new());
+        }
+        let removals = Self::interrupted_rebuild_removals(storage, marker, durable)?;
+        info!(
+            "C1-R: unfinished rebuild from {} @ {}: removing {} receipt entr(y/ies) off the durable applied chain at {} @ {}",
+            marker.0,
+            marker.1,
+            removals.len(),
+            durable.hash,
+            durable.height
+        );
+        let mut batches: Vec<ReceiptIndexBatch> = removals
+            .chunks(receipt_reconcile_chunk())
+            .map(|chunk| ReceiptIndexBatch {
+                removals: chunk.to_vec(),
+                ..ReceiptIndexBatch::default()
+            })
+            .collect();
+        match batches.pop() {
+            Some(last) => batches.push(last.with_marker(ReceiptReconcileMarker::Clear)),
+            None => batches
+                .push(ReceiptIndexBatch::default().with_marker(ReceiptReconcileMarker::Clear)),
+        }
+        Ok(batches)
+    }
+
+    /// The `(block, tx)` removals for [`Self::interrupted_rebuild_cleanup`]:
+    /// every transaction of every block on the chain ending at `old` that is not on
+    /// the chain ending at `durable`. Read-only. A storage read error, or a walk
+    /// longer than `MAX_RECOVERY_SPINE`, is returned as an error, so the marker
+    /// is never cleared on a walk a failure cut short. A block that is not stored
+    /// ends the walk on that side (the genesis sentinel, or a block the start-up
+    /// hardening purge removed together with its receipts).
+    ///
+    /// When the purge removed a block of the old chain, the old chain's blocks
+    /// below it can no longer be reached from the marker, yet still hold
+    /// receipts. Then every index entry above the durable tip goes instead (see
+    /// [`Self::receipt_index_above`]); that is a superset of what the walk
+    /// would have found.
+    fn interrupted_rebuild_removals(
+        storage: &StorageManager,
+        old: (Hash, u64),
+        durable: AppliedTip,
+    ) -> anyhow::Result<Vec<(Hash, Hash)>> {
+        let load = |h: &Hash| read_block(storage, h);
+        let mut out = Vec::new();
+        let (mut old_hash, mut old_height) = old;
+        let (mut cur_hash, mut cur_height) = (durable.hash, durable.height);
+        let mut steps: usize = 0;
+        while old_hash != cur_hash && steps < MAX_RECOVERY_SPINE {
+            steps = steps.saturating_add(1);
+            if old_height >= cur_height {
+                // Above the durable tip, or a different block at the same height:
+                // not on the durable applied chain.
+                let Some(b) = load(&old_hash)? else {
+                    // Not stored: the genesis sentinel (the walk is done), or a
+                    // block the start-up hardening purge removed together with
+                    // its receipts. Its stored ancestors cannot be reached from
+                    // here, so fall back to the index scan.
+                    if old_height > 0 {
+                        warn!(
+                            "C1-R: receipt cleanup: old-chain block {old_hash} @ {old_height} is not stored; removing every receipt above the durable tip"
+                        );
+                        return Self::receipt_index_above(storage, durable.height);
+                    }
+                    break;
+                };
+                out.extend(b.transactions.iter().map(|tx| (old_hash, tx.hash)));
+                if b.header.height == 0 {
+                    break;
+                }
+                old_hash = b.selected_parent();
+                // Consensus: a block's height is its selected parent's plus one.
+                old_height = b.header.height.saturating_sub(1);
+            } else {
+                let Some(b) = load(&cur_hash)? else {
+                    if cur_height > 0 {
+                        warn!(
+                            "C1-R: receipt cleanup: applied-chain block {cur_hash} @ {cur_height} is not stored; the walk ends there"
+                        );
+                    }
+                    break;
+                };
+                if b.header.height == 0 {
+                    break;
+                }
+                cur_hash = b.selected_parent();
+                cur_height = b.header.height.saturating_sub(1);
+            }
+        }
+        if old_hash != cur_hash && steps >= MAX_RECOVERY_SPINE {
+            // A partial walk must not clear the marker: it would leave the rest
+            // of the old chain's receipts out of reach for good.
+            anyhow::bail!(
+                "C1-R: receipt cleanup walk from {} stopped after {} blocks before the common ancestor",
+                old.0,
+                steps
+            );
+        }
+        Ok(out)
+    }
+
+    /// C1-R: every block→transaction index entry of a block above
+    /// `durable_height`, or of a block that is not stored. None of them can be
+    /// on the durable applied chain: it ends at `durable_height`, and its blocks
+    /// are stored. Entries at or below the tip are kept: the rebuild that set
+    /// the marker removed every receipt off its spine in its reset batch and
+    /// rewrote the spine up to the durable tip. Read-only; a read error is an
+    /// `Err`.
+    fn receipt_index_above(
+        storage: &StorageManager,
+        durable_height: u64,
+    ) -> anyhow::Result<Vec<(Hash, Hash)>> {
+        // The scan is in key order, so one block's entries are contiguous:
+        // remembering the last block's verdict reads each block once without
+        // a chain-wide cache.
+        let mut last: Option<(Hash, bool)> = None;
+        let mut out = Vec::new();
+        read_receipt_index(storage, |block, tx| {
+            let remove = match last {
+                Some((b, r)) if b == block => r,
+                _ => {
+                    let r = read_block(storage, &block)?
+                        .map(|b| b.header.height > durable_height)
+                        .unwrap_or(true);
+                    last = Some((block, r));
+                    r
+                }
+            };
+            if remove {
+                out.push((block, tx));
+            }
+            Ok(())
+        })?;
+        Ok(out)
     }
 }
 
@@ -1679,8 +3477,279 @@ pub fn record_produced(
     }
 }
 
+/// The state root of `snap` as the post-state of the block at `height`, and
+/// the snapshot as a running node would hold it after that block (account
+/// storage roots folded in, nothing dirty).
+fn rooted(snap: StateSnapshot, height: u64) -> (Hash, StateSnapshot) {
+    let scratch = citrate_execution::StateDB::new();
+    scratch.restore(snap);
+    scratch.set_root_height(height);
+    let root = scratch.calculate_state_root();
+    scratch.accounts.clear_dirty();
+    let _ = scratch.take_dirty_storage();
+    (root, scratch.snapshot())
+}
+
+/// A storage pre-image as a node restarted at the reverted height would have
+/// hydrated it: below the storage-root hardening height only 32-byte slots,
+/// values cut or padded to 32 bytes (`legacy_hydration_view`).
+fn hydrated_pre_images(storage: &[StoragePreImage], full: bool) -> Vec<StoragePreImage> {
+    use citrate_storage::state::{legacy_hydration_view, StorageBytes};
+    if full {
+        return storage.to_vec();
+    }
+    storage
+        .iter()
+        .filter_map(|(addr, key, value)| match value {
+            Some(v) => legacy_hydration_view(vec![(
+                (*addr, StorageBytes(key.clone())),
+                StorageBytes(v.clone()),
+            )])
+            .pop()
+            .map(|((a, k), v)| (a, k.into_vec(), Some(v.into_vec()))),
+            None => (key.len() == 32).then(|| (*addr, key.clone(), None)),
+        })
+        .collect()
+}
+
+/// The reorg ring below the tip a restarted node can rebuild: walking down
+/// from `tip`, each height's undo record applied to the state above it gives
+/// the state of the parent block. Every rebuilt height is checked before it is
+/// used: the record names the block the walk is on and its parent, the parent
+/// block is stored at the height below, and the rebuilt state reproduces that
+/// block's state root. The walk stops at the first height that fails (a
+/// missing record only shortens the window; it never yields a wrong state),
+/// where the storage-root hydration rule changes, or `MAX_REORG_DEPTH` below
+/// the tip. Nothing is rebuilt unless `at_tip` reproduces the tip's own root.
+/// Returned highest first.
+///
+/// LIMIT (models and training jobs): they are outside the state root, are not
+/// persisted to the flat store and are not loaded at start-up, so `at_tip`
+/// holds none after a restart. The records' model/job pre-images then only
+/// restore what changed inside the window: a model created inside it reverts
+/// correctly, but one created before it is absent at every rebuilt height
+/// where it was not changed (and present, with its earlier value, below a
+/// height that changed it). The root check cannot see this. Model/job parity
+/// across a restart needs the start-up load (tracked separately; see
+/// `pre_window_model_updated_in_the_window_survives_a_restart_reorg`).
+fn restore_reorg_window(
+    storage: &StorageManager,
+    tip: AppliedTip,
+    at_tip: &StateSnapshot,
+) -> Vec<(u64, Hash, StateSnapshot)> {
+    use citrate_execution::storage_root_hardening::{active_at, storage_root_hardening_height};
+    let mut out = Vec::new();
+    if tip.height == 0 {
+        return out;
+    }
+    // The budget covers the whole restore, the tip's own root check included.
+    let started = std::time::Instant::now();
+    let budget = restore_budget();
+    let mut block = match read_block(storage, &tip.hash) {
+        Ok(Some(b)) => b,
+        Ok(None) => return out,
+        Err(e) => {
+            warn!("reorg window: not restored: {e}");
+            return out;
+        }
+    };
+    if rooted(at_tip.clone(), tip.height).0 != block.state_root {
+        debug!(
+            "reorg window: the executor does not hold the state of the applied tip @ {}; not restored",
+            tip.height
+        );
+        return out;
+    }
+    let activation = storage_root_hardening_height();
+    let full = active_at(activation, tip.height.saturating_add(1));
+    let floor = tip.height.saturating_sub(MAX_REORG_DEPTH);
+    let mut above = at_tip.clone();
+    while block.header.height > floor {
+        let height = block.header.height;
+        if started.elapsed() > budget {
+            warn!(
+                "reorg window: restore stopped at {height} after {:?} (budget {budget:?})",
+                started.elapsed()
+            );
+            break;
+        }
+        let Some(below) = height.checked_sub(1) else {
+            break;
+        };
+        let stop = |why: String| {
+            debug!("reorg window: restored down to {height}: {why}");
+        };
+        let record = match storage.state.get_reorg_undo(height) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                stop("no undo record".into());
+                break;
+            }
+            Err(e) => {
+                warn!("reorg window: undo record at {height} unreadable: {e}");
+                break;
+            }
+        };
+        let parent_hash = block.selected_parent();
+        if record.hash != block.header.block_hash || record.height != height {
+            stop(format!(
+                "the record names {} @ {}",
+                record.hash, record.height
+            ));
+            break;
+        }
+        if record.parent != Some((parent_hash, below)) {
+            stop("the record names another parent, or none".into());
+            break;
+        }
+        if active_at(activation, height) != full {
+            stop("the storage-root hydration rule changes below".into());
+            break;
+        }
+        let Some(models_jobs) = record.models_jobs.as_ref() else {
+            stop("the record has no model/job pre-images".into());
+            break;
+        };
+        let parent = match read_block(storage, &parent_hash) {
+            Ok(Some(b)) if b.header.height == below => b,
+            Ok(_) => {
+                stop(format!("parent {parent_hash} is not stored at {below}"));
+                break;
+            }
+            Err(e) => {
+                warn!("reorg window: {e}");
+                break;
+            }
+        };
+        let pre = hydrated_pre_images(&record.storage, full);
+        let reverted = above
+            .with_pre_images(&record.accounts, &pre, below)
+            .with_model_job_pre_images(models_jobs);
+        let (root, snap) = rooted(reverted, below);
+        if root != parent.state_root {
+            warn!(
+                "reorg window: the state rebuilt for {} @ {below} does not reproduce its root; restored down to {height}",
+                parent_hash
+            );
+            break;
+        }
+        out.push((below, parent_hash, snap.clone()));
+        above = snap;
+        block = parent;
+    }
+    if !out.is_empty() {
+        info!(
+            "reorg window: rebuilt {} height(s) below the applied tip in {:?}",
+            out.len(),
+            started.elapsed()
+        );
+    }
+    out
+}
+
+/// The undo records of a reorg's winning branch: for each reapplied block in
+/// the window at the new tip `tip`, the pre-images, in the state of its
+/// parent, of what it changed. `fork`/`base` are the fork point and its state;
+/// `branch` the reapplied blocks with their post-states, in order.
+fn branch_undo(
+    fork: AppliedTip,
+    base: &StateSnapshot,
+    branch: &[(u64, Hash, StateSnapshot)],
+    tip: u64,
+) -> Vec<citrate_execution::executor::BlockUndo> {
+    let floor = tip.saturating_sub(MAX_REORG_DEPTH);
+    let mut out = Vec::new();
+    let mut prev: (Hash, u64, &StateSnapshot) = (fork.hash, fork.height, base);
+    for (height, hash, snap) in branch {
+        if *height > floor {
+            let (accounts, storage) = snap.pre_images_since(prev.2);
+            out.push(citrate_execution::executor::BlockUndo {
+                height: *height,
+                hash: *hash,
+                parent: Some((prev.0, prev.1)),
+                accounts,
+                storage,
+                models_jobs: Some(snap.model_job_pre_images_since(prev.2)),
+            });
+        }
+        prev = (*hash, *height, snap);
+    }
+    out
+}
+
+/// Whether a from-genesis rebuild the node triggers itself
+/// ([`CanonicalApplicator::recover_automatic`]) may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RebuildDecision {
+    Rebuild,
+    /// The DAG store is pruned below `floor` and the fork point is below the
+    /// snapshot window.
+    RefusePruned {
+        floor: u64,
+    },
+    /// The head is not strictly heavier than the applied tip, or fork choice
+    /// cannot score one of them.
+    RefuseNotHeavier {
+        head: Option<u64>,
+        tip: Option<u64>,
+    },
+}
+
+impl std::fmt::Display for RebuildDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rebuild => write!(f, "rebuild allowed"),
+            Self::RefusePruned { floor } => write!(
+                f,
+                "the fork point is below the snapshot window on a node whose DAG store is \
+                 pruned below height {floor}; if this node stays off the network's chain, \
+                 resync it from a snapshot or an empty data dir"
+            ),
+            Self::RefuseNotHeavier { head, tip } => write!(
+                f,
+                "the head (blue score {head:?}) is not strictly heavier than the applied tip \
+                 (blue score {tip:?})"
+            ),
+        }
+    }
+}
+
+/// The rebuild policy. `below_ring`: the fork point is below the snapshot
+/// window (not only the forward-branch memory cap); `prune_floor`: the DAG
+/// pruning floor (0 = unpruned); `head`/`tip`: fork choice's blue scores,
+/// both from the same source. Either one unknown refuses (fails closed),
+/// except an applied tip that is not held at all (`tip_held == false`).
+///
+/// Weight is the blue score: GhostDAG fork choice (`select_tip`) ranks tips by
+/// blue score and breaks ties by the smaller hash, and a header's blue work is
+/// a pure function of its blue score (`blue_work_for_score`, enforced at
+/// admission), so "strictly heavier by blue work" and "strictly higher blue
+/// score" are the same test. The hash tie-break is not weight: a head that
+/// wins only on it never justifies resetting the applied chain to genesis.
+pub(crate) fn rebuild_decision(
+    below_ring: bool,
+    prune_floor: u64,
+    head: Option<u64>,
+    tip: Option<u64>,
+    tip_held: bool,
+) -> RebuildDecision {
+    match (head, tip) {
+        (Some(hw), Some(tw)) if hw > tw => {}
+        // The applied-tip pointer names a block this node no longer holds at
+        // all: the start-up hardening purge removed it (a local action; no
+        // peer can remove a stored block). There is no applied branch left to
+        // weigh or protect, and the rebuild is the only way back.
+        (Some(_), None) if !tip_held => {}
+        _ => return RebuildDecision::RefuseNotHeavier { head, tip },
+    }
+    if below_ring && prune_floor > 0 {
+        return RebuildDecision::RefusePruned { floor: prune_floor };
+    }
+    RebuildDecision::Rebuild
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use citrate_consensus::dag_store::DagStore;
     use citrate_consensus::types::{BlockBuilder, PublicKey, Signature, Transaction, VrfProof};
@@ -1692,11 +3761,69 @@ mod tests {
     const CB: [u8; 20] = [0x33; 20];
     const VRF_OUT: [u8; 32] = [0x5A; 32];
 
+    /// Rebuild policy: only toward a STRICTLY heavier head, on every node; on
+    /// a pruned node, never when the fork point is below the snapshot window,
+    /// but the forward-branch memory cap alone does not refuse.
+    #[test]
+    fn rebuild_decision_requires_a_strictly_heavier_head() {
+        use RebuildDecision::*;
+        let nh = |head, tip| RefuseNotHeavier { head, tip };
+        // Unpruned.
+        assert_eq!(rebuild_decision(true, 0, Some(11), Some(10), true), Rebuild);
+        assert_eq!(
+            rebuild_decision(true, 0, Some(10), Some(10), true),
+            nh(Some(10), Some(10)),
+            "an equal-weight head (tie-break winner) never rebuilds"
+        );
+        assert_eq!(
+            rebuild_decision(true, 0, Some(9), Some(10), true),
+            nh(Some(9), Some(10))
+        );
+        assert_eq!(
+            rebuild_decision(false, 0, Some(10), Some(10), true),
+            nh(Some(10), Some(10)),
+            "the forward-cap arm is weight-checked too"
+        );
+        // A weight fork choice cannot give, for either side, fails closed.
+        assert_eq!(
+            rebuild_decision(true, 0, None, Some(10), true),
+            nh(None, Some(10))
+        );
+        assert_eq!(rebuild_decision(true, 0, None, None, true), nh(None, None));
+        assert_eq!(
+            rebuild_decision(true, 0, Some(11), None, true),
+            nh(Some(11), None),
+            "an applied tip fork choice cannot score never loses to a rival"
+        );
+        // A dangling applied-tip pointer (the block was purged at start-up).
+        assert_eq!(rebuild_decision(true, 0, Some(11), None, false), Rebuild);
+        assert_eq!(rebuild_decision(true, 0, None, None, false), nh(None, None));
+        // Pruned: below the window refuses; the forward cap alone does not.
+        assert_eq!(
+            rebuild_decision(true, 500, Some(11), Some(10), true),
+            RefusePruned { floor: 500 }
+        );
+        assert_eq!(
+            rebuild_decision(false, 500, Some(11), Some(10), true),
+            Rebuild,
+            "the MAX_REORG_FORWARD arm is not a reorg below the floor"
+        );
+        assert_eq!(
+            rebuild_decision(false, 500, Some(10), Some(10), true),
+            nh(Some(10), Some(10))
+        );
+    }
+
     /// Build an empty (reward-only) v2 block with an explicit VRF output.
     /// `vrf` only distinguishes block HASHES (it feeds prevrandao, which
     /// reward-only blocks never read) — so two branches can share a state root
     /// while forking, exactly as sibling blocks from different producers do.
-    fn mk_block_vrf(height: u64, parent: Hash, state_root: Hash, vrf: [u8; 32]) -> Block {
+    pub(crate) fn mk_block_vrf(
+        height: u64,
+        parent: Hash,
+        state_root: Hash,
+        vrf: [u8; 32],
+    ) -> Block {
         let mut b = BlockBuilder::new()
             .version(2)
             .height(height)
@@ -1716,13 +3843,13 @@ mod tests {
 
     /// A-branch block (canonical VRF). Transactions are exercised by the
     /// executor's own `apply_block` tests; here we isolate the DRIVER.
-    fn mk_block(height: u64, parent: Hash, state_root: Hash) -> Block {
+    pub(crate) fn mk_block(height: u64, parent: Hash, state_root: Hash) -> Block {
         mk_block_vrf(height, parent, state_root, VRF_OUT)
     }
 
     /// B-branch block — distinct VRF so it forks from the A-branch at the same
     /// height with an identical (reward-only) state root but a different hash.
-    fn mk_block_b(height: u64, parent: Hash, state_root: Hash) -> Block {
+    pub(crate) fn mk_block_b(height: u64, parent: Hash, state_root: Hash) -> Block {
         mk_block_vrf(height, parent, state_root, [0x5B; 32])
     }
 
@@ -1754,7 +3881,7 @@ mod tests {
         exec.calculate_state_root()
     }
 
-    fn fresh() -> (Arc<Executor>, Arc<StorageManager>, tempfile::TempDir) {
+    pub(crate) fn fresh() -> (Arc<Executor>, Arc<StorageManager>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -1764,7 +3891,7 @@ mod tests {
 
     /// Persist a block exactly as the receive path does (`put_block` precedes the
     /// driver), so the drain can find it via the DAG parent→children index.
-    fn persist(storage: &StorageManager, block: &Block) {
+    pub(crate) fn persist(storage: &StorageManager, block: &Block) {
         storage.blocks.put_block(block).expect("put_block");
     }
 
@@ -1795,7 +3922,7 @@ mod tests {
     /// Build a linked chain of `n` reward-only blocks from genesis, each carrying
     /// the correct CUMULATIVE post-execution state root (computed on a mirror
     /// executor). `blocks[i].parent == blocks[i-1].hash`.
-    fn chain(n: u64) -> Vec<Block> {
+    pub(crate) fn chain(n: u64) -> Vec<Block> {
         let exec = Executor::new(Arc::new(StateDB::new()));
         let mut blocks = Vec::new();
         let mut parent = Hash::default();
@@ -1998,14 +4125,14 @@ mod tests {
     }
 
     /// Cumulative reward-only state roots for heights 1..=n (mirrors `chain`).
-    fn roots(n: u64) -> Vec<Hash> {
+    pub(crate) fn roots(n: u64) -> Vec<Hash> {
         chain(n).iter().map(|b| b.state_root).collect()
     }
 
     /// Apply the A-branch [a1, a2] so the applied tip is a2 @ height 2, then
     /// persist a competing B-branch [b2, b3] that forks at a1. Returns everything
     /// the reorg tests need. b2/b3 are persisted but NOT applied (a fork above a1).
-    async fn setup_fork(
+    pub(crate) async fn setup_fork(
         app: &CanonicalApplicator,
         storage: &StorageManager,
     ) -> (Block, Block, Block, Block) {
@@ -2091,6 +4218,60 @@ mod tests {
         assert_eq!(
             storage.blocks.get_applied_tip().expect("tip"),
             Some((b3.header.block_hash, 3))
+        );
+    }
+
+    /// `citrate_executedHead` (citrate-api) reads the tip this applicator
+    /// persists: it follows apply and reorg, matches the block eth_getLogs'
+    /// resolver ends at, and stays below the stored-header height while a
+    /// persisted fork sits above the tip.
+    #[tokio::test]
+    async fn executed_head_rpc_follows_apply_and_reorg() {
+        use citrate_api::canonical_logs::{executed_head, executed_head_json, ExecutedChainIndex};
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let hex_of = |h: &Hash| format!("0x{}", hex::encode(h.as_bytes()));
+
+        let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await;
+        let a2h = a2.header.block_hash;
+        assert_eq!(executed_head(&storage), Ok((a2h, 2)));
+        assert_eq!(
+            executed_head_json(&storage).expect("head"),
+            serde_json::json!({"number": "0x2", "hash": hex_of(&a2h)})
+        );
+        assert_eq!(
+            storage.blocks.get_latest_height().expect("latest"),
+            3,
+            "b3 is stored above the applied tip (eth_blockNumber reports 3)"
+        );
+        // This fixture stores no genesis block (a1's parent is the zero hash),
+        // so the executed chain is resolved from height 1.
+        let idx = ExecutedChainIndex::new();
+        assert_eq!(
+            idx.executed_hashes(&storage, 1, u64::MAX)
+                .expect("executed")
+                .last(),
+            Some(&(2, a2h))
+        );
+
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        assert!(matches!(
+            app.reorg_to(&mut state, b3.header.block_hash).await,
+            ReorgOutcome::Reorged { .. }
+        ));
+        drop(state);
+        let b3h = b3.header.block_hash;
+        assert_eq!(executed_head(&storage), Ok((b3h, 3)));
+        assert_eq!(
+            executed_head_json(&storage).expect("head"),
+            serde_json::json!({"number": "0x3", "hash": hex_of(&b3h)})
+        );
+        assert_eq!(
+            idx.executed_hashes(&storage, 1, u64::MAX)
+                .expect("executed")
+                .last(),
+            Some(&(3, b3h))
         );
     }
 
@@ -2238,6 +4419,16 @@ mod tests {
     /// GhostDAG's `select_tip` so the trigger path is testable in isolation).
     fn fork_choice_returning(hash: Hash) -> ForkChoice {
         Arc::new(move || Box::pin(async move { Some(hash) }))
+    }
+
+    /// Fork-choice weights (blue scores) for the named blocks; any other block
+    /// falls back to its stored header's score.
+    fn weights(of: &[(Hash, u64)]) -> ForkWeight {
+        let map: std::collections::HashMap<Hash, u64> = of.iter().copied().collect();
+        Arc::new(move |h| {
+            let w = map.get(&h).copied();
+            Box::pin(async move { w })
+        })
     }
 
     /// STEP 3 UNBLOCK: prove the fork-above-tip wedge (a drain stalled at a fork
@@ -2592,6 +4783,275 @@ mod tests {
     /// tick. `recover_to_head` rebuilds deterministically from the node's own stored
     /// blocks (reset to genesis, re-apply the canonical chain forward, repopulating
     /// the ring) and lands on the fork-choice winner.
+    /// Two equal-score siblings at height 1 off genesis; the node applied the
+    /// one with the LARGER hash (the tie-break loser) and restarted (ring =
+    /// tip only). Returns (genesis state, genesis, winner, loser, app) with
+    /// fork choice naming the winner. Headers claim score 1 (`mk_block_scored`),
+    /// the relation score GhostDAG recomputes is 2 (genesis 1 + 1).
+    async fn restarted_on_tie_loser(
+        exec: &Arc<Executor>,
+        storage: &Arc<StorageManager>,
+    ) -> (StateSnapshot, Block, Block, Block) {
+        let genesis_state = exec.state_snapshot();
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        persist(storage, &genesis);
+        let r = roots(1);
+        let s_a = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
+        let s_b = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x5B; 32]);
+        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+        let app1 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        persist(storage, &loser);
+        assert!(matches!(
+            app1.apply_received(&loser).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        persist(storage, &winner);
+        (genesis_state, genesis, winner, loser)
+    }
+
+    /// DGX P1 at 14afe643: fork choice scores the rival (relation score 2) but
+    /// not the applied tip, whose stored header claims 1. Comparing the
+    /// rival's relation score with the tip's header score let an
+    /// equal-weight sibling pass "strictly heavier". An applied tip fork
+    /// choice cannot score must refuse.
+    #[tokio::test]
+    async fn automatic_rebuild_refuses_when_the_tip_is_unscored() {
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(winner.header.block_hash));
+        app.fork_weight = Some(weights(&[(winner.header.block_hash, 2)]));
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, winner.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(
+            !rebuilt,
+            "rebuilt against an applied tip fork choice did not score"
+        );
+        assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
+    }
+
+    /// The mirror: the applied tip is scored, the rival is not. Refused.
+    #[tokio::test]
+    async fn automatic_rebuild_refuses_when_the_rival_is_unscored() {
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(winner.header.block_hash));
+        app.fork_weight = Some(weights(&[(loser.header.block_hash, 1)]));
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, winner.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "rebuilt toward a head fork choice did not score");
+        assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
+    }
+
+    /// Like with like, on real GhostDAG: the rival is registered (relation
+    /// score 2), the applied tip is in the DAG store but not in `relations`
+    /// (a restart registers tips only). The tip must be scored the way fork
+    /// choice scores the rival (recomputed: 2), so the equal-weight rival is
+    /// refused.
+    #[tokio::test]
+    async fn automatic_rebuild_scores_an_unregistered_tip_like_fork_choice() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        dag.store_block(genesis.clone()).await.expect("genesis");
+        ghostdag.add_block(&genesis).await.expect("genesis");
+        dag.store_block(loser.clone())
+            .await
+            .expect("loser into DAG");
+        dag.store_block(winner.clone())
+            .await
+            .expect("winner into DAG");
+        ghostdag
+            .add_block(&winner)
+            .await
+            .expect("winner registered");
+        assert_eq!(
+            ghostdag.select_tip().await.expect("tip"),
+            winner.header.block_hash
+        );
+        assert!(ghostdag
+            .get_blue_score(&loser.header.block_hash)
+            .await
+            .is_err());
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, winner.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "an equal-weight rival was rebuilt onto");
+        assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
+    }
+
+    /// rvHH: a restarted tie-loser whose applied tip is STORED in the DAG but
+    /// not registered in GhostDAG `relations` (a restart registers tips only)
+    /// refuses the rebuild at equal weight, and rebuilds once the winner gains
+    /// a child. Pins "rejoins one block later" on real GhostDAG scoring: with
+    /// registered-only scoring the tip is unscored and the second step would
+    /// refuse as well (the node would never rejoin).
+    #[tokio::test]
+    async fn unregistered_tie_loser_refuses_then_rejoins_one_block_later() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        dag.store_block(genesis.clone()).await.expect("genesis");
+        ghostdag.add_block(&genesis).await.expect("genesis");
+        dag.store_block(loser.clone()).await.expect("loser stored");
+        dag.store_block(winner.clone())
+            .await
+            .expect("winner stored");
+        ghostdag
+            .add_block(&winner)
+            .await
+            .expect("winner registered");
+        assert!(
+            ghostdag
+                .get_blue_score(&loser.header.block_hash)
+                .await
+                .is_err(),
+            "fixture: the applied tip is stored but not registered"
+        );
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        let loser_tip = AppliedTip {
+            hash: loser.header.block_hash,
+            height: 1,
+        };
+
+        // Equal weight: refused.
+        let rebuilt = app
+            .recover_automatic(
+                gs.clone(),
+                genesis.header.block_hash,
+                winner.header.block_hash,
+            )
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "rebuilt toward an equal-weight sibling");
+        assert_eq!(app.applied_tip().await, loser_tip);
+
+        // The winner gains a child: strictly heavier, rebuilt onto.
+        let r = roots(2);
+        let child = mk_block_scored(2, winner.header.block_hash, r[1], 2, VRF_OUT);
+        dag.store_block(child.clone()).await.expect("child stored");
+        ghostdag.add_block(&child).await.expect("child registered");
+        persist(&storage, &child);
+        let head = ghostdag.select_tip().await.expect("tip");
+        assert_eq!(head, child.header.block_hash);
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, head)
+            .await
+            .expect("recovery");
+        assert!(rebuilt, "the strictly heavier branch was not rebuilt onto");
+        assert_eq!(
+            app.applied_tip().await,
+            AppliedTip {
+                hash: child.header.block_hash,
+                height: 2
+            }
+        );
+        assert!(
+            ghostdag
+                .get_blue_score(&loser.header.block_hash)
+                .await
+                .is_err(),
+            "the loser was scored without being registered"
+        );
+    }
+
+    /// The 2026-08-06 shape through the node's OWN triggers (start-up recovery
+    /// and the drain fallback, `recover_automatic`): restarted on the losing
+    /// one of two equal-score siblings, the node does not rebuild from genesis
+    /// toward the tie-break winner (equal weight). It converges once the
+    /// winner's branch is strictly heavier.
+    #[tokio::test]
+    async fn automatic_recovery_waits_for_a_strictly_heavier_winner() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+
+        let (exec, storage, _dir) = fresh();
+        let genesis_state = exec.state_snapshot();
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let genesis = mk_block(0, Hash::default(), exec.calculate_state_root());
+        seed_genesis(&storage, &dag, &ghostdag, &genesis).await;
+
+        let r = roots(2);
+        let s_a = mk_block_scored(1, genesis.header.block_hash, r[0], 1, VRF_OUT);
+        let s_b = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x5B; 32]);
+        let (winner, loser) = if s_a.header.block_hash < s_b.header.block_hash {
+            (s_a, s_b)
+        } else {
+            (s_b, s_a)
+        };
+        {
+            let app1 = CanonicalApplicator::new(exec.clone(), storage.clone());
+            persist(&storage, &loser);
+            assert!(matches!(
+                app1.apply_received(&loser).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        for blk in [&winner, &loser] {
+            dag.store_block(blk.clone()).await.expect("into DAG");
+            ghostdag.add_block(blk).await.expect("admit");
+        }
+        persist(&storage, &winner);
+        let app2 = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        let loser_tip = AppliedTip {
+            hash: loser.header.block_hash,
+            height: 1,
+        };
+
+        // Equal weight: refused, the applied tip is kept.
+        let rebuilt = app2
+            .recover_automatic(
+                genesis_state.clone(),
+                genesis.header.block_hash,
+                winner.header.block_hash,
+            )
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "an equal-weight tie-break winner never rebuilds");
+        assert_eq!(app2.applied_tip().await, loser_tip);
+
+        // The winner's branch grows: strictly heavier, so the rebuild runs.
+        let child = mk_block_scored(2, winner.header.block_hash, r[1], 2, VRF_OUT);
+        dag.store_block(child.clone()).await.expect("into DAG");
+        ghostdag.add_block(&child).await.expect("admit");
+        persist(&storage, &child);
+        let head = ghostdag.select_tip().await.expect("select_tip");
+        assert_eq!(head, child.header.block_hash);
+        let rebuilt = app2
+            .recover_automatic(genesis_state, genesis.header.block_hash, head)
+            .await
+            .expect("recovery");
+        assert!(rebuilt, "a strictly heavier winner is rebuilt onto");
+        assert_eq!(
+            app2.applied_tip().await,
+            AppliedTip {
+                hash: child.header.block_hash,
+                height: 2
+            }
+        );
+    }
+
     #[tokio::test]
     async fn recover_to_head_converges_a_restarted_node_off_the_losing_sibling() {
         use citrate_consensus::dag_store::DagStore;
@@ -3068,9 +5528,11 @@ mod tests {
             winner_tip = blk.header.block_hash;
         }
 
-        // Fork choice names the winner. WITHOUT genesis wired, the drain cannot heal
-        // a fork below the ring — it stays wedged (BeyondReorgWindow, no rebuild).
+        // Fork choice names the winner (strictly heavier). WITHOUT genesis wired,
+        // the drain cannot heal a fork below the ring — it stays wedged
+        // (BeyondReorgWindow, no rebuild).
         app.fork_choice = Some(fork_choice_returning(winner_tip));
+        app.fork_weight = Some(weights(&[(winner_tip, DEPTH + 1), (loser_tip, DEPTH)]));
         app.drive_drain().await;
         assert_eq!(
             app.applied_tip().await.hash,
@@ -3121,9 +5583,11 @@ mod tests {
 
         // Apply the LOSING branch LOSER_DEPTH deep — applied tip climbs to 105.
         let mut parent = Hash::default();
+        let mut loser_tip = Hash::default();
         for h in 1..=LOSER_DEPTH {
             let blk = mk_block(h, parent, r[(h - 1) as usize]);
             parent = blk.header.block_hash;
+            loser_tip = parent;
             persist(&storage, &blk);
             assert!(matches!(
                 app.apply_received(&blk).await,
@@ -3152,6 +5616,10 @@ mod tests {
         // the hydration signal (none wired == hydrated) the rebuild converges.
         app.set_genesis(genesis_state, Hash::default());
         app.fork_choice = Some(fork_choice_returning(winner_tip));
+        app.fork_weight = Some(weights(&[
+            (winner_tip, 2 * LOSER_DEPTH),
+            (loser_tip, LOSER_DEPTH),
+        ]));
         app.drive_drain().await;
         assert_eq!(
             app.applied_tip().await,
@@ -3206,6 +5674,7 @@ mod tests {
         }
         app.set_genesis(genesis_state, Hash::default());
         app.fork_choice = Some(fork_choice_returning(winner_tip));
+        app.fork_weight = Some(weights(&[(winner_tip, DEPTH + 1), (loser_tip, DEPTH)]));
 
         // Hydration NOT complete → the rebuild defers; applied tip stays put (no
         // regression toward a possibly-partial view).
@@ -3739,6 +6208,158 @@ mod tests {
         // reflects the shared funded state.
         let app = CanonicalApplicator::new(follower.clone(), storage.clone());
         (producer, app, follower, storage, dir)
+    }
+
+    /// A transaction that carries the inference operation's selector but
+    /// reverts (no such model).
+    fn reverting_inference(from: [u8; 20], nonce: u64) -> Transaction {
+        let mut data = vec![0x02, 0x00, 0x00, 0x00];
+        data.extend_from_slice(&[0x5A; 32]);
+        Transaction {
+            nonce,
+            from: embedded(from),
+            to: Some(embedded(BOB)),
+            value: 0,
+            gas_limit: 100_000,
+            gas_price: 1_000_000_000,
+            data,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        }
+    }
+
+    /// Produce on `exec` with the reward rule selected for `activation`, the
+    /// way the producer does (execute → reward from the executed receipts →
+    /// settle → root).
+    async fn produce_gated(
+        exec: &Executor,
+        height: u64,
+        txs: Vec<Transaction>,
+        activation: Option<u64>,
+    ) -> (Block, citrate_economics::BlockReward) {
+        exec.set_block_context(BlockContext {
+            coinbase: CB,
+            prevrandao: VRF_OUT,
+            block_hashes: std::collections::HashMap::new(),
+        });
+        let provisional = mk_block_txs(
+            height,
+            Hash::default(),
+            Hash::default(),
+            VRF_OUT,
+            txs.clone(),
+        );
+        let mut receipts = Vec::new();
+        for tx in &txs {
+            receipts.push(
+                exec.execute_transaction(&provisional, tx)
+                    .await
+                    .expect("producer tx must execute"),
+            );
+        }
+        let calc = RewardCalculator::new(canonical_reward_config());
+        let reward = canonical_block_reward_at(&calc, &provisional, &receipts, activation)
+            .expect("canonical reward");
+        for (addr, amt) in [
+            (Address(CB), reward.validator_reward),
+            (Address(TREASURY_ADDR), reward.treasury_reward),
+        ] {
+            let bal = exec.get_balance(&addr);
+            exec.set_balance(&addr, bal + amt);
+        }
+        let root = exec.calculate_state_root();
+        (
+            mk_block_txs(height, Hash::default(), root, VRF_OUT, txs),
+            reward,
+        )
+    }
+
+    /// Receiver-side application with the reward rule selected for `activation`.
+    async fn receive_gated(
+        exec: &Executor,
+        block: &Block,
+        activation: Option<u64>,
+    ) -> Result<Hash, ExecutionError> {
+        let calc = RewardCalculator::new(canonical_reward_config());
+        let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
+            let rw = canonical_block_reward_at(&calc, b, r, activation)
+                .map_err(|e| ExecutionError::RewardSettlement(e.to_string()))?;
+            Ok(vec![
+                (Address(b.header.coinbase), rw.validator_reward),
+                (Address(TREASURY_ADDR), rw.treasury_reward),
+            ])
+        };
+        exec.apply_block(block, block.header.coinbase, &reward)
+            .await
+    }
+
+    fn funded_exec() -> Executor {
+        let e = Executor::new(Arc::new(StateDB::new()));
+        e.set_balance(&Address(ALICE), U256::from(FUND));
+        e
+    }
+
+    /// At/after the supply hardening height, reverted calls carrying the
+    /// inference selector mint no bonus; producer and receiver agree on the
+    /// root. Below it, the legacy mint is reproduced exactly.
+    #[tokio::test]
+    async fn reward_gate_reverted_selector_calls_mint_nothing_after_activation() {
+        let txs: Vec<_> = (0..5).map(|n| reverting_inference(ALICE, n)).collect();
+        let base = U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64));
+
+        // Active.
+        let producer = funded_exec();
+        let (block, reward) = produce_gated(&producer, 7, txs.clone(), Some(1)).await;
+        assert_eq!(reward.total_reward, base, "no bonus for reverted calls");
+        let receiver = funded_exec();
+        let got = receive_gated(&receiver, &block, Some(1))
+            .await
+            .expect("receiver reproduces the gated root");
+        assert_eq!(got, block.state_root);
+        // A receiver on the legacy rule rejects the gated block (different mint).
+        let legacy_receiver = funded_exec();
+        assert!(matches!(
+            receive_gated(&legacy_receiver, &block, None).await,
+            Err(ExecutionError::StateRootMismatch { .. })
+        ));
+
+        // Below the height (and unset): the legacy mint, byte-identical replay.
+        for activation in [None, Some(8)] {
+            let producer = funded_exec();
+            let (block, reward) = produce_gated(&producer, 7, txs.clone(), activation).await;
+            let centi = U256::from(10u64).pow(U256::from(16u64));
+            assert_eq!(reward.total_reward, base + centi * U256::from(5u8));
+            let receiver = funded_exec();
+            assert_eq!(
+                receive_gated(&receiver, &block, activation)
+                    .await
+                    .expect("replays"),
+                block.state_root
+            );
+        }
+    }
+
+    /// A reward function that errors rejects the block and leaves world state
+    /// untouched (fail closed).
+    #[tokio::test]
+    async fn reward_fn_error_rejects_block_and_reverts_state() {
+        let producer = funded_exec();
+        let (block, _) =
+            produce_gated(&producer, 7, vec![reverting_inference(ALICE, 0)], Some(1)).await;
+        let receiver = funded_exec();
+        let before = receiver.calculate_state_root();
+        let failing = |_: &Block, _: &[citrate_execution::types::TransactionReceipt]| {
+            Err(ExecutionError::RewardSettlement("uncomputable".into()))
+        };
+        assert!(matches!(
+            receiver
+                .apply_block(&block, block.header.coinbase, &failing)
+                .await,
+            Err(ExecutionError::RewardSettlement(_))
+        ));
+        assert_eq!(receiver.calculate_state_root(), before, "state reverted");
+        assert_eq!(receiver.get_balance(&Address(ALICE)), U256::from(FUND));
     }
 
     #[tokio::test]
@@ -7147,10 +9768,23 @@ mod tests {
         inner: Arc<citrate_storage::state::StateStore>,
         writes: AtomicU64,
         abort_at: u64,
+        /// C1-R failure injection: while set, `put_receipt_index` returns a
+        /// storage error without writing (a transient disk / I/O failure).
+        fail_receipt_index: AtomicBool,
+        /// Failure injection: `write_reorg_batch_sync` call number N (1-based,
+        /// counted in `reorg_batches`) returns a storage error without writing.
+        /// 0 = never.
+        fail_reorg_batch_at: AtomicU64,
+        reorg_batches: AtomicU64,
     }
 
+    /// Env: abort the process right AFTER write `k` commits (`V251_ABORT_AFTER=k`),
+    /// for the batch writes: a kill between a commit and whatever the caller
+    /// does next.
+    const V251_ABORT_AFTER: &str = "V251_ABORT_AFTER";
+
     impl V251AbortStore {
-        fn w(&self, what: &str) {
+        fn w(&self, what: &str) -> u64 {
             let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
             if std::env::var("V251_TRACE").is_ok() {
                 eprintln!("V251 write#{n} {what}");
@@ -7159,6 +9793,19 @@ mod tests {
                 eprintln!("V251 ABORT before write#{n} {what}");
                 std::process::abort();
             }
+            n
+        }
+
+        /// After write `n` committed: abort if it is the `V251_ABORT_AFTER` one.
+        fn after(&self, n: u64, what: &str, result: anyhow::Result<()>) -> anyhow::Result<()> {
+            let at = std::env::var(V251_ABORT_AFTER)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            if result.is_ok() && at == Some(n) {
+                eprintln!("V251 ABORT after write#{n} {what}");
+                std::process::abort();
+            }
+            result
         }
     }
 
@@ -7205,9 +9852,12 @@ mod tests {
             a: &[(Address, V251Acct)],
             s: &[V251Change],
             t: Option<(Hash, u64)>,
+            i: &citrate_execution::executor::ReceiptIndexBatch,
+            m: Option<&citrate_execution::executor::ModelJobUndo>,
         ) -> anyhow::Result<()> {
-            self.w("write_state_batch_with_applied_tip");
-            V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t)
+            let n = self.w("write_state_batch_with_applied_tip");
+            let r = V251Trait::write_state_batch_with_applied_tip(&*self.inner, a, s, t, i, m);
+            self.after(n, "write_state_batch_with_applied_tip", r)
         }
         // V251_REORG_OVERRIDE_BEGIN
         fn write_reorg_batch_sync(
@@ -7217,14 +9867,31 @@ mod tests {
             d: &[Address],
             c: &[(Hash, Vec<u8>)],
             t: Option<(Hash, u64)>,
+            i: &citrate_execution::executor::ReceiptIndexBatch,
+            u: &[citrate_execution::executor::BlockUndo],
         ) -> anyhow::Result<()> {
-            self.w("write_reorg_batch_sync");
-            V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t)
+            let k = self.w("write_reorg_batch_sync");
+            let n = self.reorg_batches.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.fail_reorg_batch_at.load(Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure (write_reorg_batch_sync #{n})");
+            }
+            let r = V251Trait::write_reorg_batch_sync(&*self.inner, a, s, d, c, t, i, u);
+            self.after(k, "write_reorg_batch_sync", r)
         }
         // V251_REORG_OVERRIDE_END
         fn put_applied_tip_meta(&self, h: &Hash, n: u64) -> anyhow::Result<()> {
             self.w("put_applied_tip_meta");
             V251Trait::put_applied_tip_meta(&*self.inner, h, n)
+        }
+        fn put_receipt_index(
+            &self,
+            i: &citrate_execution::executor::ReceiptIndexBatch,
+        ) -> anyhow::Result<()> {
+            self.w("put_receipt_index");
+            if self.fail_receipt_index.load(Ordering::SeqCst) {
+                anyhow::bail!("injected storage failure (put_receipt_index)");
+            }
+            V251Trait::put_receipt_index(&*self.inner, i)
         }
         fn put_account_version(&self, a: &Address, v: u64) -> anyhow::Result<()> {
             self.w("put_account_version");
@@ -7255,8 +9922,241 @@ mod tests {
     /// A scenario transfer at the sender's CURRENT account nonce in the producing
     /// executor (read from its state, not hard-coded), so each block's txs carry the
     /// exact sequence the producer will accept: 0, 1 on branch A; 0, 1, 2 on branch B.
+    ///
+    /// C1-R: each transfer also gets a distinct hash (from, to, nonce), so the
+    /// receipt index (keyed by tx hash) can be checked at every crash point.
     fn v251_transfer(exec: &Executor, from: [u8; 20], to: [u8; 20], value: u128) -> Transaction {
-        transfer(from, to, value, exec.get_nonce(&Address(from)))
+        let nonce = exec.get_nonce(&Address(from));
+        c1r_hashed(transfer(from, to, value, nonce), from, to, nonce)
+    }
+
+    /// C1-R: stamp a deterministic, distinct hash on a test transaction.
+    fn c1r_hashed(mut tx: Transaction, from: [u8; 20], to: [u8; 20], nonce: u64) -> Transaction {
+        let mut h = [0u8; 32];
+        h[0] = from[0];
+        h[1] = to[0];
+        h[2..10].copy_from_slice(&nonce.to_be_bytes());
+        h[31] = 0xC1;
+        tx.hash = Hash::new(h);
+        tx
+    }
+
+    /// C1-R receipt-index invariant over a store: every transaction of every
+    /// block on the applied chain (walked down from `tip`) has a receipt naming
+    /// that block and height plus its `t‖block‖tx` marker, and no block of
+    /// `all` that is OFF the applied chain has a marker or a receipt naming it.
+    /// Returns `Err(detail)` on the first violation.
+    ///
+    /// `rebuild_prefix`: blocks a from-genesis rebuild (`recover_to_head`) is
+    /// re-executing because they are on BOTH the old applied chain and the target
+    /// spine. While the durable tip is below them mid-rebuild they keep their
+    /// (identical, about-to-be-rewritten) receipts — only the losing segment's
+    /// receipts are removed. They must still name their own block, AND the rebuild
+    /// marker must be durable, so a restart that converges elsewhere removes them.
+    fn c1r_receipts_consistent_with(
+        storage: &StorageManager,
+        tip: Option<Hash>,
+        all: &[&Block],
+        rebuild_prefix: &[Hash],
+    ) -> Result<(), String> {
+        let mut applied: Vec<Hash> = Vec::new();
+        let mut cursor = tip;
+        while let Some(h) = cursor {
+            match all.iter().find(|b| b.header.block_hash == h) {
+                Some(b) => {
+                    applied.push(h);
+                    cursor = Some(b.selected_parent());
+                }
+                None => cursor = None,
+            }
+        }
+        for b in all {
+            let h = b.header.block_hash;
+            let markers = storage
+                .transactions
+                .get_block_transactions(&h)
+                .map_err(|e| e.to_string())?;
+            if applied.contains(&h) {
+                for tx in &b.transactions {
+                    let r = storage
+                        .transactions
+                        .get_receipt(&tx.hash)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| {
+                            format!("GAP: no receipt for tx {} of applied {}", tx.hash, h)
+                        })?;
+                    if r.block_hash != h || r.block_number != b.header.height {
+                        return Err(format!(
+                            "receipt for {} names {}@{} not applied {}@{}",
+                            tx.hash, r.block_hash, r.block_number, h, b.header.height
+                        ));
+                    }
+                    if !markers.contains(&tx.hash) {
+                        return Err(format!("GAP: no block marker for tx {} in {}", tx.hash, h));
+                    }
+                }
+            } else if rebuild_prefix.contains(&h) {
+                let marked = storage
+                    .transactions
+                    .get_receipt_reconcile_marker()
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                if !markers.is_empty() && !marked {
+                    return Err(format!(
+                        "STALE: prefix block {} above the tip keeps markers with no rebuild marker",
+                        h
+                    ));
+                }
+                for tx in &b.transactions {
+                    if let Ok(Some(r)) = storage.transactions.get_receipt(&tx.hash) {
+                        if r.block_hash != h {
+                            return Err(format!(
+                                "prefix receipt for {} names {}",
+                                tx.hash, r.block_hash
+                            ));
+                        }
+                        if !marked {
+                            return Err(format!(
+                                "STALE: prefix receipt for {} above the tip with no rebuild marker",
+                                tx.hash
+                            ));
+                        }
+                    }
+                }
+            } else {
+                if !markers.is_empty() {
+                    return Err(format!(
+                        "STALE: unexecuted block {} keeps {} marker(s)",
+                        h,
+                        markers.len()
+                    ));
+                }
+                for tx in &b.transactions {
+                    if let Ok(Some(r)) = storage.transactions.get_receipt(&tx.hash) {
+                        if r.block_hash == h {
+                            return Err(format!(
+                                "STALE: receipt for {} names unexecuted {}",
+                                tx.hash, h
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn c1r_receipts_consistent(
+        storage: &StorageManager,
+        tip: Option<Hash>,
+        all: &[&Block],
+    ) -> Result<(), String> {
+        c1r_receipts_consistent_with(storage, tip, all, &[])
+    }
+
+    /// C1-R: after a crash, a restarted node must be able to finish converging and
+    /// end with a complete receipt index (no permanent gap). Reopens `dir`, seeds the
+    /// genesis tip if the crash preceded the first block, then drains / rebuilds to
+    /// `head` (fork choice on restart). `blocks` are every block of the scenario,
+    /// re-delivered as peers would; the check covers all of them, so a receipt kept
+    /// for a block that is NOT on `head`'s chain fails it.
+    async fn c1r_resume_and_check(
+        dir: &std::path::Path,
+        blocks: &[&Block],
+        head: &Block,
+    ) -> Result<(), String> {
+        let storage = Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("reopen"));
+        let n_accounts = storage
+            .state
+            .get_all_accounts()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if n_accounts == 0 {
+            return Ok(()); // crashed before genesis was persisted: a fresh start
+        }
+        if storage.blocks.get_applied_tip().ok().flatten().is_none() {
+            // Genesis state is durable but no block applied yet: production writes
+            // the genesis tip at startup; mirror that.
+            storage
+                .blocks
+                .put_applied_tip(&Hash::default(), 0)
+                .map_err(|e| e.to_string())?;
+        }
+        // Hydrate exactly as `start_node` does (bulk reload of the durable state).
+        let sdb = StateDB::new();
+        for (addr, acct) in storage
+            .state
+            .get_all_accounts()
+            .map_err(|e| e.to_string())?
+        {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().map_err(|e| e.to_string())? {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let exec = Arc::new(Executor::with_storage(
+            Arc::new(sdb),
+            Some(storage.state.clone()),
+        ));
+        // The crash may have preceded receipt of later blocks; a restarted node
+        // gets them again from peers (sync / gossip). `put_block` is idempotent.
+        for b in blocks {
+            persist(&storage, b);
+        }
+        let mut app = CanonicalApplicator::new(exec, storage.clone());
+        app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        app.set_genesis(g.state_snapshot(), Hash::default());
+        app.drive_drain().await;
+        if app.applied_tip().await.hash != head.header.block_hash {
+            // A restart on the losing sibling: the startup recovery path.
+            app.recover_to_head(g.state_snapshot(), Hash::default())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let tip = app.applied_tip().await;
+        if tip.hash != head.header.block_hash {
+            return Err(format!(
+                "resume did not reach {} (tip @ {})",
+                head.header.block_hash, tip.height
+            ));
+        }
+        if storage
+            .transactions
+            .get_receipt_reconcile_marker()
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Err("rebuild marker still set after convergence".to_string());
+        }
+        c1r_receipts_consistent(&storage, Some(tip.hash), blocks)
+    }
+
+    /// C1-R: a third branch C (c1 ← c2) forking off GENESIS, below the rebuild's
+    /// shared prefix a1. Fork choice moving to it after a crash abandons a1 too.
+    /// Transaction hashes are distinct from every A/B transaction.
+    async fn c1r_fork_c() -> (Block, Block) {
+        let pc = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pc.set_balance(&Address(ALICE), U256::from(FUND));
+        let vrf_c = [0x7C; 32];
+        let c1 = produce(
+            &pc,
+            Hash::default(),
+            1,
+            vrf_c,
+            vec![v251_transfer(&pc, ALICE, CAROL, 1_000)],
+        )
+        .await;
+        let c2 = produce(
+            &pc,
+            c1.header.block_hash,
+            2,
+            vrf_c,
+            vec![v251_transfer(&pc, ALICE, DAVE, 1_000)],
+        )
+        .await;
+        (c1, c2)
     }
 
     /// The deterministic blocks of the scenario (independent in-memory producers).
@@ -7318,6 +10218,9 @@ mod tests {
             inner: storage.state.clone(),
             writes: AtomicU64::new(0),
             abort_at,
+            fail_receipt_index: AtomicBool::new(false),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
         });
         let exec = Arc::new(Executor::with_storage(
             Arc::new(StateDB::new()),
@@ -7363,6 +10266,7 @@ mod tests {
         a2: &Block,
         b2: &Block,
         b3: &Block,
+        prefix: &[Hash],
     ) -> (Option<u64>, bool, String) {
         let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
         let sdb = StateDB::new();
@@ -7425,14 +10329,25 @@ mod tests {
         .find(|(_, r)| *r == root)
         .map(|(n, _)| n.to_string())
         .unwrap_or_else(|| "UNKNOWN".to_string());
+        // C1-R: the receipt index must describe exactly the durable applied chain.
+        let receipts =
+            c1r_receipts_consistent_with(&storage, tip.map(|t| t.0), &[a1, a2, b2, b3], prefix);
         let detail = format!(
-            "tip={} durable_state_is={} ok={}",
+            "tip={} durable_state_is={} ok={} receipts={}",
             tip.map(|(h, n)| format!("{}@{n}", label(&h)))
                 .unwrap_or_else(|| "none".into()),
             which_root,
-            root == expected
+            root == expected,
+            match &receipts {
+                Ok(()) => "consistent".to_string(),
+                Err(e) => e.clone(),
+            }
         );
-        (tip.map(|t| t.1), root == expected, detail)
+        (
+            tip.map(|t| t.1),
+            root == expected && receipts.is_ok(),
+            detail,
+        )
     }
 
     fn v251_spawn(test: &str, envs: &[(&str, String)]) -> std::process::Child {
@@ -7489,6 +10404,14 @@ mod tests {
         }
         let test = "canonical_apply::tests::verify251_child";
         let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        // C1-R: in the `recover` scenario a1 is the rebuild's common prefix (see
+        // `c1r_receipts_consistent_with`); the `reorg` scenario allows nothing ahead.
+        let prefix: Vec<Hash> = if scenario == "recover" {
+            vec![a1.header.block_hash]
+        } else {
+            Vec::new()
+        };
         // Dry run: count writes.
         let dry = tempfile::tempdir().expect("dir");
         let out = v251_spawn(
@@ -7514,7 +10437,7 @@ mod tests {
                     String::from_utf8_lossy(&out.stderr)
                 )
             });
-        let (_, ok, d) = v251_check(dry.path(), &a1, &a2, &b2, &b3);
+        let (_, ok, d) = v251_check(dry.path(), &a1, &a2, &b2, &b3, &prefix);
         println!("V251 [{scenario}] dry run: total_writes={total} final: {d}");
         assert!(ok);
         let mut torn = Vec::new();
@@ -7536,16 +10459,240 @@ mod tests {
                 .find(|l| l.contains("V251 ABORT"))
                 .unwrap_or("?")
                 .to_string();
-            let (_, ok, d) = v251_check(dir.path(), &a1, &a2, &b2, &b3);
+            let (_, ok, d) = v251_check(dir.path(), &a1, &a2, &b2, &b3, &prefix);
             println!("V251 [{scenario}] abort k={k:>2} [{what}] -> {d}");
             if !ok {
                 torn.push(format!("k={k} {what} {d}"));
+            }
+            // C1-R: the restarted node converges with no receipt gap — toward the
+            // same head, and (on a copy of the crashed store) toward branch C,
+            // which forks below the rebuild's shared prefix.
+            let other = tempfile::tempdir().expect("dir");
+            c1r_copy_dir(dir.path(), other.path());
+            if let Err(e) = c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3], &b3).await {
+                torn.push(format!("k={k} {what} resume: {e}"));
+            }
+            if let Err(e) =
+                c1r_resume_and_check(other.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2).await
+            {
+                torn.push(format!("k={k} {what} resume toward C: {e}"));
             }
         }
         assert!(
             torn.is_empty(),
             "TORN durable state/tip after crash: {torn:#?}"
         );
+    }
+
+    /// C1-R (Codex re-check on #336): a from-genesis rebuild A→B keeps the shared
+    /// prefix a1's receipts while the durable tip sits at genesis. Crash right
+    /// after that reset batch, then restart with fork choice on branch C (forks
+    /// below a1): a1's receipt and block marker must be gone once C is applied.
+    /// Before the rebuild marker, nothing ever revisited a1 and its receipt stayed
+    /// (`eth_getTransactionReceipt` reported an abandoned transaction as mined).
+    #[tokio::test]
+    async fn c1r_crash_after_rebuild_reset_then_fork_choice_below_prefix() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2)
+            .await
+            .expect("restart converging on C leaves no receipt of the abandoned prefix");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .is_none(),
+            "a1 is not executed on C: its receipt is gone"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a1.header.block_hash)
+            .expect("read")
+            .is_empty());
+    }
+
+    /// C1-R: run the `recover` scenario in a child and crash it right after the
+    /// rebuild's reset batch (before the first replayed block), leaving the durable
+    /// tip at genesis, a1's receipt above it and the rebuild marker at a2. Asserts
+    /// that precondition.
+    fn c1r_crash_after_rebuild_reset(dir: &std::path::Path, a1: &Block, a2: &Block) {
+        let test = "canonical_apply::tests::verify251_child";
+        // Find the rebuild's reset batch: the first reorg batch of the `recover`
+        // scenario (the linear a1/a2 applies use the applied-tip batch).
+        let dry = tempfile::tempdir().expect("dir");
+        let out = v251_spawn(
+            test,
+            &[
+                (V251_DIR, dry.path().to_string_lossy().into()),
+                ("V251_SCENARIO", "recover".to_string()),
+                ("V251_TRACE", "1".to_string()),
+            ],
+        )
+        .wait_with_output()
+        .expect("dry");
+        let trace = String::from_utf8_lossy(&out.stderr);
+        let reset_at: u64 = trace
+            .lines()
+            .find(|l| l.contains("write_reorg_batch_sync"))
+            .and_then(|l| l.split("write#").nth(1))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no reset batch in trace:\n{trace}"));
+        // Crash before the write that follows the reset (the first replay block).
+        let out = v251_spawn(
+            test,
+            &[
+                (V251_DIR, dir.to_string_lossy().into()),
+                ("V251_SCENARIO", "recover".to_string()),
+                (V251_ABORT_AT, (reset_at + 1).to_string()),
+            ],
+        )
+        .wait_with_output()
+        .expect("child");
+        assert!(!out.status.success(), "child must have crashed");
+        // Precondition: the crash left exactly the state Codex described.
+        let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
+        let tip = storage.blocks.get_applied_tip().expect("tip");
+        assert_eq!(tip.map(|t| t.1), Some(0), "durable tip reset to genesis");
+        let r = storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read");
+        assert_eq!(
+            r.map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "shared prefix a1 keeps its receipt above the durable tip"
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            Some((a2.header.block_hash, 2)),
+            "the reset batch recorded the old applied tip"
+        );
+    }
+
+    /// C1-R: the interrupted-rebuild cleanup hits a STORAGE FAILURE. The marker
+    /// must survive it, and the next rebuild (toward branch C, which forks below
+    /// the old prefix a1) must not record its own marker over it: before this, the
+    /// cleanup logged the error and the rebuild went on, replacing the marker with
+    /// its own lower `pre_tip`, so a1's receipt was out of the cleanup's reach and
+    /// `eth_getTransactionReceipt` reported the abandoned transaction as mined for
+    /// good. Once the store recovers, the retried cleanup removes it and the
+    /// rebuild converges on C with a consistent receipt index.
+    #[tokio::test]
+    async fn c1r_failed_cleanup_keeps_marker_and_blocks_rebuild_until_it_succeeds() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        let sdb = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("storage") {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at: u64::MAX,
+            fail_receipt_index: AtomicBool::new(true),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
+        });
+        let exec = Arc::new(Executor::with_storage(Arc::new(sdb), Some(store.clone())));
+        let all = [&a1, &a2, &b2, &b3, &c1, &c2];
+        for b in all {
+            persist(&storage, b);
+        }
+        let marker =
+            |s: &StorageManager| s.transactions.get_receipt_reconcile_marker().expect("read");
+        let a1_receipt = |s: &StorageManager| {
+            s.transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .map(|r| r.block_hash)
+        };
+
+        // Startup cleanup fails: the marker and a1's receipt are untouched.
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(
+            marker(&storage),
+            Some((a2.header.block_hash, 2)),
+            "startup failure keeps the marker"
+        );
+        assert_eq!(a1_receipt(&storage), Some(a1.header.block_hash));
+
+        // A rebuild toward C while the store still fails: refused, nothing changed.
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        app.set_genesis(g.state_snapshot(), Hash::default());
+        let res = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(
+            res.is_err(),
+            "the rebuild must abort when the cleanup cannot commit: {res:?}"
+        );
+        assert_eq!(
+            marker(&storage),
+            Some((a2.header.block_hash, 2)),
+            "the original marker is not replaced by the rebuild's own"
+        );
+        assert_eq!(app.applied_tip().await.height, 0, "applied tip unchanged");
+        assert_eq!(a1_receipt(&storage), Some(a1.header.block_hash));
+
+        // The store recovers: the retried cleanup and the rebuild both complete.
+        store.fail_receipt_index.store(false, Ordering::SeqCst);
+        let ok = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("rebuild after the store recovers");
+        assert!(ok, "rebuild converged");
+        let tip = app.applied_tip().await;
+        assert_eq!(tip.hash, c2.header.block_hash, "converged on C");
+        assert_eq!(
+            marker(&storage),
+            None,
+            "marker cleared once the cleanup is durable"
+        );
+        assert_eq!(
+            a1_receipt(&storage),
+            None,
+            "a1 is not executed on C: its receipt is gone"
+        );
+        c1r_receipts_consistent(&storage, Some(tip.hash), &all).expect("receipt index matches C");
+    }
+
+    /// Copy a (closed) RocksDB directory, so one crashed store can be resumed
+    /// along two different fork choices.
+    fn c1r_copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let dst = to.join(entry.file_name());
+            if entry.file_type().expect("type").is_dir() {
+                std::fs::create_dir_all(&dst).expect("mkdir");
+                c1r_copy_dir(&entry.path(), &dst);
+            } else {
+                std::fs::copy(entry.path(), &dst).expect("copy");
+            }
+        }
     }
 
     /// Random wall-clock SIGKILL of a child looping the scenario.
@@ -7580,7 +10727,7 @@ mod tests {
                 println!("V251 sigkill r={r}: child had not started a run");
                 continue;
             }
-            let (_, ok, d) = v251_check(std::path::Path::new(&current), &a1, &a2, &b2, &b3);
+            let (_, ok, d) = v251_check(std::path::Path::new(&current), &a1, &a2, &b2, &b3, &[]);
             println!("V251 sigkill r={r} after {wait_ms} ms -> {d}");
             if !ok {
                 torn.push(format!("r={r} {d}"));
@@ -7623,5 +10770,3749 @@ mod tests {
             assert!(flag.load(Ordering::SeqCst), "flag held during the rebuild");
         }
         assert!(!flag.load(Ordering::SeqCst), "flag cleared on normal drop");
+    }
+
+    // =====================================================================
+    // C1-R (betanet): a node that APPLIES a block it did not produce must store
+    // that block's receipts (same store + format as the producer), atomically
+    // with the apply, and a reorg must move them to the winning branch.
+    // =====================================================================
+
+    const C1R_TOPIC: [u8; 32] = [0xC1; 32];
+
+    /// A deploy whose init code emits `LOG1(C1R_TOPIC)` over empty data and
+    /// deploys empty runtime code: `PUSH32 topic; PUSH1 0; PUSH1 0; LOG1; STOP`.
+    fn c1r_log_deploy(from: [u8; 20], nonce: u64) -> Transaction {
+        let mut code = vec![0x7f];
+        code.extend_from_slice(&C1R_TOPIC);
+        code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xa1, 0x00]);
+        let tx = Transaction {
+            nonce,
+            from: embedded(from),
+            to: None,
+            value: 0,
+            gas_limit: 200_000,
+            gas_price: 1_000_000_000,
+            data: code,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+        c1r_hashed(tx, from, [0xDE; 20], nonce)
+    }
+
+    fn c1r_rpc(storage: Arc<StorageManager>, exec: Arc<Executor>) -> jsonrpc_core::IoHandler {
+        std::env::set_var("CITRATE_ALLOW_ANONYMOUS_RATE_LIMIT", "1");
+        let mut io = jsonrpc_core::IoHandler::new();
+        citrate_api::eth_rpc::register_eth_methods_with_finality(
+            &mut io,
+            storage,
+            Arc::new(citrate_sequencer::mempool::Mempool::new(
+                citrate_sequencer::mempool::MempoolConfig::default(),
+            )),
+            exec,
+            40204,
+            Arc::new(citrate_api::FilterRegistry::new()),
+            None,
+            Arc::new(AtomicU64::new(0)),
+        );
+        io
+    }
+
+    /// One JSON-RPC call, off the async runtime (the handlers `block_on`).
+    async fn c1r_call(
+        io: &Arc<jsonrpc_core::IoHandler>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let io = io.clone();
+        let req =
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+        let resp = tokio::task::spawn_blocking(move || io.handle_request_sync(&req))
+            .await
+            .expect("rpc task")
+            .expect("rpc response");
+        serde_json::from_str(&resp).expect("rpc json")
+    }
+
+    fn c1r_hex(h: &Hash) -> String {
+        format!("0x{}", hex::encode(h.as_bytes()))
+    }
+
+    /// C1-R: a FOLLOWER (store-backed, produces nothing) that applies a peer's
+    /// block serves `eth_getTransactionReceipt` and `eth_getLogs` for it from the
+    /// real RPC handlers. Before the block is applied, the receipt is null (the
+    /// block bytes alone carry no receipts) — the gap followers had for every
+    /// block they did not produce.
+    #[tokio::test]
+    async fn c1r_follower_serves_receipt_and_logs_for_applied_peer_block() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        // The peer (an independent producer) builds block 1: a transfer and a
+        // deploy that emits one log.
+        let peer = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        peer.set_balance(&Address(ALICE), U256::from(FUND));
+        let xfer = c1r_hashed(transfer(ALICE, BOB, 1_000, 0), ALICE, BOB, 0);
+        let deploy = c1r_log_deploy(ALICE, 1);
+        let block = produce(
+            &peer,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![xfer.clone(), deploy.clone()],
+        )
+        .await;
+        let bh = block.header.block_hash;
+
+        let io = Arc::new(c1r_rpc(storage.clone(), follower.clone()));
+        persist(&storage, &block);
+        let before = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&deploy.hash)]),
+        )
+        .await;
+        assert!(
+            before["result"].is_null(),
+            "not yet applied: no receipt ({before})"
+        );
+
+        assert!(matches!(
+            app.apply_received(&block).await,
+            ApplyOutcome::Applied { height: 1, .. }
+        ));
+
+        // Same store + format as the producer: CF_RECEIPTS by tx hash, block marker.
+        for tx in [&xfer, &deploy] {
+            let r = storage
+                .transactions
+                .get_receipt(&tx.hash)
+                .expect("read receipt")
+                .expect("follower stored the receipt");
+            assert_eq!(r.block_hash, bh);
+            assert_eq!(r.block_number, 1);
+            assert!(r.status, "tx {} succeeded", tx.hash);
+            assert!(storage
+                .transactions
+                .get_transaction(&tx.hash)
+                .expect("read tx")
+                .is_some());
+        }
+        let mut marked = storage
+            .transactions
+            .get_block_transactions(&bh)
+            .expect("markers");
+        marked.sort();
+        let mut want = vec![xfer.hash, deploy.hash];
+        want.sort();
+        assert_eq!(marked, want);
+
+        let rcpt = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&deploy.hash)]),
+        )
+        .await;
+        let rcpt = &rcpt["result"];
+        assert_eq!(rcpt["blockHash"], c1r_hex(&bh), "{rcpt}");
+        assert_eq!(rcpt["blockNumber"], "0x1");
+        assert_eq!(rcpt["status"], "0x1");
+        assert_eq!(
+            rcpt["logs"][0]["topics"][0],
+            c1r_hex(&Hash::new(C1R_TOPIC)),
+            "{rcpt}"
+        );
+
+        let logs = c1r_call(
+            &io,
+            "eth_getLogs",
+            serde_json::json!([{"fromBlock": "0x1", "toBlock": "0x1"}]),
+        )
+        .await;
+        let logs = logs["result"].as_array().cloned().unwrap_or_default();
+        assert_eq!(logs.len(), 1, "one log in block 1: {logs:?}");
+        assert_eq!(logs[0]["blockHash"], c1r_hex(&bh));
+        assert_eq!(logs[0]["transactionHash"], c1r_hex(&deploy.hash));
+        assert_eq!(logs[0]["topics"][0], c1r_hex(&Hash::new(C1R_TOPIC)));
+    }
+
+    /// C1-R: receipts are not consensus data — storing them must not move the
+    /// state root. The follower's applied root equals the peer's sealed root and
+    /// equals the root of an executor that applied the same block without a
+    /// receipt-indexing store.
+    #[tokio::test]
+    async fn c1r_receipt_index_does_not_change_state_root() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let indexed = store_backed(&storage);
+        indexed.set_balance(&Address(ALICE), U256::from(FUND));
+        indexed
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let plain = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        plain.set_balance(&Address(ALICE), U256::from(FUND));
+
+        let peer = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        peer.set_balance(&Address(ALICE), U256::from(FUND));
+        let block = produce(
+            &peer,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![
+                c1r_hashed(transfer(ALICE, BOB, 7, 0), ALICE, BOB, 0),
+                c1r_log_deploy(ALICE, 1),
+            ],
+        )
+        .await;
+        let (validator, treasury) = reward_for(&block);
+        let credits = [(Address(CB), validator), (Address(TREASURY_ADDR), treasury)];
+        let r_indexed = indexed
+            .apply_block(
+                &block,
+                CB,
+                &citrate_execution::executor::fixed_reward(&credits),
+            )
+            .await
+            .expect("indexed apply");
+        let r_plain = plain
+            .apply_block(
+                &block,
+                CB,
+                &citrate_execution::executor::fixed_reward(&credits),
+            )
+            .await
+            .expect("plain apply");
+        assert_eq!(r_indexed, block.state_root);
+        assert_eq!(r_plain, block.state_root);
+        assert_eq!(indexed.calculate_state_root(), plain.calculate_state_root());
+        assert!(storage
+            .transactions
+            .get_receipt(&block.transactions[0].hash)
+            .expect("read")
+            .is_some());
+    }
+
+    /// C1-R: a reorg REPLACES receipts. A tx included on both branches ends with
+    /// the winning block's receipt; the abandoned block keeps no marker and no
+    /// receipt names it. A reorg that ABORTS (bad block on the winning branch)
+    /// leaves the original branch's receipts exactly in place.
+    #[tokio::test]
+    async fn c1r_reorg_replaces_receipts_and_abort_restores_them() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        let shared = c1r_hashed(transfer(ALICE, DAVE, 1_000, 0), ALICE, DAVE, 0);
+        let both = c1r_hashed(transfer(ALICE, BOB, 1_000, 1), ALICE, BOB, 1);
+        let only_b = c1r_hashed(transfer(ALICE, CAROL, 1_000, 2), ALICE, CAROL, 2);
+
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let a2 = produce(&pa, a1.header.block_hash, 2, VRF_OUT, vec![both.clone()]).await;
+
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![both.clone()]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![only_b.clone()]).await;
+        let b3_bad = mk_block_txs(
+            3,
+            b2.header.block_hash,
+            Hash::new([0xEE; 32]),
+            [0x5C; 32],
+            vec![only_b.clone()],
+        );
+
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        let all = [&a1, &a2, &b2, &b3, &b3_bad];
+        c1r_receipts_consistent(&storage, Some(a2.header.block_hash), &all).expect("A applied");
+
+        // Aborted reorg: b2 reapplies in memory, b3_bad fails its root check.
+        persist(&storage, &b2);
+        persist(&storage, &b3_bad);
+        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
+        app.apply_received(&b3_bad).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            a2.header.block_hash,
+            "abort keeps A"
+        );
+        c1r_receipts_consistent(&storage, Some(a2.header.block_hash), &all)
+            .expect("abort restored A's receipts");
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&both.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a2.header.block_hash)
+        );
+
+        // Successful reorg to the heavier B branch.
+        persist(&storage, &b3);
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            b3.header.block_hash,
+            "reorged to B"
+        );
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow the executed chain");
+        let r = storage
+            .transactions
+            .get_receipt(&both.hash)
+            .expect("read")
+            .expect("tx on both branches keeps a receipt");
+        assert_eq!((r.block_hash, r.block_number), (b2.header.block_hash, 2));
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers")
+            .is_empty());
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&only_b.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(b3.header.block_hash)
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&shared.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "the common ancestor's receipt is untouched"
+        );
+    }
+
+    /// C1-R: the from-genesis spine rebuild (startup / deep-fork recovery) also
+    /// leaves the receipt index describing exactly the rebuilt chain.
+    #[tokio::test]
+    async fn c1r_recover_to_head_moves_receipts_to_the_spine() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        drop(app);
+        // Restart on the losing sibling: a fresh ring cannot reorg; recover.
+        let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        assert!(app2
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        assert_eq!(app2.applied_tip().await.hash, b3.header.block_hash);
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &[&a1, &a2, &b2, &b3])
+            .expect("receipts follow the rebuilt spine");
+    }
+
+    // ---------------------------------------------------------------------
+    // C1-R: the receipt index is RPC data, not consensus data. A stored receipt
+    // that does not decode (a damaged value, or one written by a binary with a
+    // different receipt layout) must never stop the node from following fork
+    // choice: the reorg / rebuild proceeds, and the unreadable receipt goes with
+    // the block it was indexed under.
+    // ---------------------------------------------------------------------
+
+    /// Replace the stored receipt of `tx` with its own encoding minus the last
+    /// byte, so it no longer decodes. Asserts that it no longer does.
+    fn c1r_corrupt_receipt(storage: &StorageManager, tx: &Hash) {
+        use citrate_storage::db::column_families::CF_RECEIPTS;
+        let mut bytes = storage
+            .db
+            .get_cf(CF_RECEIPTS, tx.as_bytes())
+            .expect("read")
+            .expect("a stored receipt to corrupt");
+        bytes.pop();
+        storage
+            .db
+            .put_cf(CF_RECEIPTS, tx.as_bytes(), &bytes)
+            .expect("write");
+        assert!(
+            storage.transactions.get_receipt(tx).is_err(),
+            "precondition: the receipt of {tx} no longer decodes"
+        );
+    }
+
+    /// The follower scenario: A = a1 ← a2 (a2 carries `both`, also on B, and
+    /// `only_a`), B = a1 ← b2 ← b3 (heavier). Returns the blocks and the txs.
+    async fn c1r_corrupt_scenario() -> (Block, Block, Block, Block, Transaction, Transaction) {
+        let shared = c1r_hashed(transfer(ALICE, DAVE, 1_000, 0), ALICE, DAVE, 0);
+        let both = c1r_hashed(transfer(ALICE, BOB, 1_000, 1), ALICE, BOB, 1);
+        let only_a = c1r_hashed(transfer(ALICE, CAROL, 2_000, 2), ALICE, CAROL, 2);
+        let only_b = c1r_hashed(transfer(ALICE, DAVE, 3_000, 2), ALICE, DAVE, 2);
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let a2 = produce(
+            &pa,
+            a1.header.block_hash,
+            2,
+            VRF_OUT,
+            vec![both.clone(), only_a.clone()],
+        )
+        .await;
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![both.clone()]).await;
+        let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![only_b]).await;
+        (a1, a2, b2, b3, both, only_a)
+    }
+
+    /// The corrupt receipts are gone and the index matches the B chain.
+    fn c1r_assert_corrupt_receipts_replaced(
+        storage: &StorageManager,
+        blocks: &[&Block],
+        a2: &Block,
+        b2: &Block,
+        b3: &Block,
+        both: &Transaction,
+        only_a: &Transaction,
+    ) {
+        let r = storage
+            .transactions
+            .get_receipt(&both.hash)
+            .expect("the receipt of the tx on both branches decodes again")
+            .expect("and is stored");
+        assert_eq!((r.block_hash, r.block_number), (b2.header.block_hash, 2));
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&only_a.hash)
+                .expect("no undecodable receipt is left")
+                .is_none(),
+            "the corrupt receipt of the abandoned-only tx is removed"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers")
+            .is_empty());
+        c1r_receipts_consistent(storage, Some(b3.header.block_hash), blocks)
+            .expect("receipts follow the executed chain");
+    }
+
+    /// `reorg_to`: an undecodable stored receipt in the abandoned block does not
+    /// decline the reorg. Negative control: the same scenario without the
+    /// corruption reorgs too (`c1r_reorg_replaces_receipts_and_abort_restores_them`).
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_does_not_block_reorg() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        c1r_corrupt_receipt(&storage, &both.hash);
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.apply_received(&b3).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            b3.header.block_hash,
+            "the node follows the heavier branch"
+        );
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((b3.header.block_hash, 3)),
+            "the durable tip follows it too"
+        );
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// An aborted reorg with an undecodable receipt in the abandoned block: the
+    /// node stays on A, nothing it could read is lost, and the abort does not
+    /// fail on the receipt it could not read.
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_aborted_reorg_keeps_the_tip() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let (a1, a2, b2, _b3, both, only_a) = c1r_corrupt_scenario().await;
+        let b3_bad = mk_block_txs(
+            3,
+            b2.header.block_hash,
+            Hash::new([0xEE; 32]),
+            [0x5C; 32],
+            vec![],
+        );
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        persist(&storage, &b2);
+        persist(&storage, &b3_bad);
+        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
+        app.apply_received(&b3_bad).await;
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip"),
+            Some((a2.header.block_hash, 2))
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&both.hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a2.header.block_hash),
+            "the readable receipt of the abandoned block is restored"
+        );
+        let markers = storage
+            .transactions
+            .get_block_transactions(&a2.header.block_hash)
+            .expect("markers");
+        assert!(markers.contains(&both.hash), "its marker is restored");
+    }
+
+    /// `recover_to_head`: the same corruption must not abort the from-genesis
+    /// rebuild onto the heavier branch.
+    #[tokio::test]
+    async fn c1r_undecodable_receipt_does_not_block_rebuild() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        drop(app);
+        c1r_corrupt_receipt(&storage, &both.hash);
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        let res = app2
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(
+            matches!(res, Ok(true)),
+            "the rebuild converges on the heavier branch: {res:?}"
+        );
+        assert_eq!(app2.applied_tip().await.hash, b3.header.block_hash);
+        assert!(storage
+            .transactions
+            .get_receipt_reconcile_marker()
+            .expect("marker")
+            .is_none());
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// Resets this thread's receipt chunk override when a test ends.
+    struct ChunkGuard;
+    impl ChunkGuard {
+        fn set(n: usize) -> Self {
+            super::test_receipt_chunk::set(Some(n));
+            ChunkGuard
+        }
+    }
+    impl Drop for ChunkGuard {
+        fn drop(&mut self) {
+            super::test_receipt_chunk::set(None);
+        }
+    }
+
+    /// A follower on A (a1 ← a2, a2 with two txs) whose executor writes through
+    /// a `V251AbortStore`, with B (b2 ← b3) stored. Returns the abort store too.
+    async fn c1r_chunk_follower(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<StorageManager>,
+        Arc<V251AbortStore>,
+        Arc<Executor>,
+        [Block; 4],
+        Transaction,
+        Transaction,
+    ) {
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at: u64::MAX,
+            fail_receipt_index: AtomicBool::new(false),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
+        });
+        let exec = Arc::new(Executor::with_storage(
+            Arc::new(StateDB::new()),
+            Some(store.clone()),
+        ));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        (storage, store, exec, [a1, a2, b2, b3], both, only_a)
+    }
+
+    fn c1r_genesis() -> StateSnapshot {
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        g.state_snapshot()
+    }
+
+    /// The spine rebuild with the losing segment's removals split over several
+    /// batches (chunk size 1: one in the reset batch, one after it), one of
+    /// them on an undecodable receipt: it converges and the index matches B.
+    #[tokio::test]
+    async fn c1r_rebuild_chunked_removals_converge() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _chunk = ChunkGuard::set(1);
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, _store, exec, [a1, a2, b2, b3], both, only_a) =
+            c1r_chunk_follower(dir.path()).await;
+        c1r_corrupt_receipt(&storage, &only_a.hash);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(matches!(res, Ok(true)), "{res:?}");
+        assert_eq!(app.applied_tip().await.hash, b3.header.block_hash);
+        c1r_assert_corrupt_receipts_replaced(
+            &storage,
+            &[&a1, &a2, &b2, &b3],
+            &a2,
+            &b2,
+            &b3,
+            &both,
+            &only_a,
+        );
+    }
+
+    /// A removal chunk written after the reset batch fails: the rebuild rolls
+    /// back to a2 with memory, store, receipts, marker and tip as before, and
+    /// a retry once the store recovers converges.
+    #[tokio::test]
+    async fn c1r_rebuild_failed_removal_chunk_rolls_back() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _chunk = ChunkGuard::set(1);
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, store, exec, [a1, a2, b2, b3], _both, _only_a) =
+            c1r_chunk_follower(dir.path()).await;
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        store.fail_receipt_index.store(true, Ordering::SeqCst);
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(res.is_err(), "a failed removal write aborts: {res:?}");
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(exec.calculate_state_root(), root_before, "memory");
+        assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
+
+        store.fail_receipt_index.store(false, Ordering::SeqCst);
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(matches!(res, Ok(true)), "{res:?}");
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    /// The node stops between the reset batch and the removal chunk after it
+    /// (emulated: the chunk write fails and so does the rollback). The losing
+    /// segment keeps a receipt above the durable tip, but the reset batch's
+    /// marker covers it: the next start removes it, and the rebuild converges.
+    #[tokio::test]
+    async fn c1r_stop_after_reset_before_removal_chunk_is_cleaned_on_restart() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _chunk = ChunkGuard::set(1);
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, store, exec, [a1, a2, b2, b3], both, only_a) =
+            c1r_chunk_follower(dir.path()).await;
+        let all = [&a1, &a2, &b2, &b3];
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        store.fail_receipt_index.store(true, Ordering::SeqCst);
+        // Reorg batch +1 is the reset; +2 is the rollback, which fails too.
+        store.fail_reorg_batch_at.store(
+            store.reorg_batches.load(Ordering::SeqCst) + 2,
+            Ordering::SeqCst,
+        );
+        let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(res.is_err(), "{res:?}");
+        drop(app);
+        // The emulated stop: tip at genesis, the marker names a2, and one of
+        // a2's two receipts is still stored.
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("tip").map(|t| t.1),
+            Some(0)
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("marker"),
+            Some((a2.header.block_hash, 2))
+        );
+        let left = [&both, &only_a]
+            .iter()
+            .filter(|t| {
+                storage
+                    .transactions
+                    .get_receipt(&t.hash)
+                    .expect("read")
+                    .map(|r| r.block_hash)
+                    == Some(a2.header.block_hash)
+            })
+            .count();
+        assert_eq!(left, 1, "precondition: one removal was still pending");
+
+        // Restart: a fresh executor over the durable store.
+        let sdb = StateDB::new();
+        for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+            sdb.accounts.load_account(addr, acct);
+        }
+        for ((addr, key), val) in storage.state.get_all_storage().expect("storage") {
+            sdb.set_storage(addr, key.as_bytes().to_vec(), val.as_bytes().to_vec());
+        }
+        let exec2 = Arc::new(Executor::with_storage(
+            Arc::new(sdb),
+            Some(storage.state.clone()),
+        ));
+        let mut app2 = CanonicalApplicator::new(exec2.clone(), storage.clone());
+        assert!(
+            storage
+                .transactions
+                .get_block_transactions(&a2.header.block_hash)
+                .expect("markers")
+                .is_empty(),
+            "the start-up cleanup removed the pending entry"
+        );
+        for t in [&both, &only_a] {
+            assert_ne!(
+                storage
+                    .transactions
+                    .get_receipt(&t.hash)
+                    .expect("read")
+                    .map(|r| r.block_hash),
+                Some(a2.header.block_hash)
+            );
+        }
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app2.set_genesis(c1r_genesis(), Hash::default());
+        let res = app2.recover_to_head(c1r_genesis(), Hash::default()).await;
+        assert!(matches!(res, Ok(true)), "{res:?}");
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    /// The interrupted-rebuild cleanup and the purge-fallback scan
+    /// (`receipt_index_above`) never include the durable tip's own block: its
+    /// receipts are on the applied chain. Pins the `>` boundary; also covers a
+    /// block above the tip and an index entry whose block is not stored.
+    #[tokio::test]
+    async fn c1r_receipt_index_above_keeps_the_durable_tips_receipts() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, _, _) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        let ghost_block = Hash::new([0xAB; 32]);
+        let ghost_tx = Hash::new([0xAC; 32]);
+        let mut ghost = storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read")
+            .expect("a1 receipt");
+        ghost.tx_hash = ghost_tx;
+        ghost.block_hash = ghost_block;
+        storage
+            .transactions
+            .put_receipts(&[(ghost_tx, ghost)])
+            .expect("ghost entry");
+        let a1_entries: Vec<(Hash, Hash)> = a1
+            .transactions
+            .iter()
+            .map(|t| (a1.header.block_hash, t.hash))
+            .collect();
+        let a2_entries: Vec<(Hash, Hash)> = a2
+            .transactions
+            .iter()
+            .map(|t| (a2.header.block_hash, t.hash))
+            .collect();
+        let sorted = |mut v: Vec<(Hash, Hash)>| {
+            v.sort();
+            v
+        };
+
+        // Durable tip a1 @ 1: a1 stays; a2 (above) and the unstored block go.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 1).expect("scan");
+        let mut want = a2_entries.clone();
+        want.push((ghost_block, ghost_tx));
+        assert_eq!(sorted(got.clone()), sorted(want));
+        for e in &a1_entries {
+            assert!(!got.contains(e), "the durable tip's own receipt is kept");
+        }
+        // Durable tip a2 @ 2: only the unstored block goes.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 2).expect("scan");
+        assert_eq!(got, vec![(ghost_block, ghost_tx)]);
+        // Negative control: below a1 both blocks are above the tip.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 0).expect("scan");
+        let mut want = a1_entries;
+        want.extend(a2_entries);
+        want.push((ghost_block, ghost_tx));
+        assert_eq!(sorted(got), sorted(want));
+    }
+
+    // ---------------------------------------------------------------------
+    // C1-R read-fault injection: every storage read on the reorg, rebuild and
+    // receipt-index paths fails in turn. A failing read must abort the operation
+    // with memory, store, receipts, rebuild marker, tip and ring unchanged; it is
+    // never read as "absent".
+    // ---------------------------------------------------------------------
+
+    use super::read_faults::{self, Fault, Site};
+
+    fn fault(site: Site, key: Option<Hash>, skip: u32) -> Fault {
+        Fault { site, key, skip }
+    }
+
+    /// Clears the thread's fault table when a test ends (also on panic).
+    struct FaultGuard;
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            read_faults::clear();
+        }
+    }
+
+    /// Everything durable the receipt index, the reorg and the rebuild touch:
+    /// applied tip, rebuild marker, accounts, storage slots, and for every block
+    /// in `blocks` its `t‖block‖tx` markers and the receipt stored for each tx.
+    fn c1r_durable_view(storage: &StorageManager, blocks: &[&Block]) -> String {
+        let mut out = format!(
+            "tip={:?} marker={:?}\n",
+            storage.blocks.get_applied_tip().expect("tip"),
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("marker")
+        );
+        let mut accounts = storage.state.get_all_accounts().expect("accounts");
+        accounts.sort_by_key(|(a, _)| a.0);
+        out.push_str(&format!("accounts={accounts:?}\n"));
+        let mut slots = storage.state.get_all_storage().expect("storage");
+        slots.sort_by_key(|((a, k), _)| (a.0, k.clone()));
+        out.push_str(&format!("storage={slots:?}\n"));
+        for b in blocks {
+            let mut markers = storage
+                .transactions
+                .get_block_transactions(&b.header.block_hash)
+                .expect("markers");
+            markers.sort_by_key(|h| *h.as_bytes());
+            out.push_str(&format!(
+                "block {} markers={markers:?}\n",
+                b.header.block_hash
+            ));
+            for tx in &b.transactions {
+                let r = storage.transactions.get_receipt(&tx.hash).expect("receipt");
+                out.push_str(&format!("  tx {} receipt={r:?}\n", tx.hash));
+            }
+        }
+        out
+    }
+
+    /// Reorg: a read error at each site (the new tip's lookup, the branch walk,
+    /// the abandoned blocks and the abandoned receipts) declines the reorg before
+    /// anything moves. Before this, an abandoned-receipt read error dropped that
+    /// receipt from the abort's restore set, and a block read error ended the
+    /// abandoned walk early. With the faults cleared, the same reorg succeeds.
+    #[tokio::test]
+    async fn c1r_reorg_read_faults_change_nothing() {
+        let _g = FaultGuard;
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+        let ring_before: Vec<(u64, Hash)> = app
+            .lock
+            .lock()
+            .await
+            .snapshots
+            .iter()
+            .map(|(h, (hh, _))| (*h, *hh))
+            .collect();
+        let a2_tx = a2.transactions[0].hash;
+
+        let cases = [
+            (
+                "new-tip lookup",
+                fault(Site::Block, Some(b3.header.block_hash), 0),
+            ),
+            (
+                "branch walk",
+                fault(Site::Block, Some(b3.header.block_hash), 1),
+            ),
+            (
+                "branch walk (fork point)",
+                fault(Site::Block, Some(a1.header.block_hash), 0),
+            ),
+            (
+                "abandoned block",
+                fault(Site::Block, Some(a2.header.block_hash), 0),
+            ),
+            (
+                "abandoned walk base",
+                fault(Site::Block, Some(a1.header.block_hash), 1),
+            ),
+            ("abandoned receipt", fault(Site::Receipt, Some(a2_tx), 0)),
+        ];
+        for (what, f) in cases {
+            read_faults::set(vec![f]);
+            let outcome = {
+                let mut st = app.lock.lock().await;
+                app.reorg_to(&mut st, b3.header.block_hash).await
+            };
+            assert!(read_faults::hits() > 0, "{what}: the fault was not reached");
+            read_faults::clear();
+            assert!(
+                matches!(outcome, ReorgOutcome::Rejected(_)),
+                "{what}: a read error must decline the reorg, got {outcome:?}"
+            );
+            assert_eq!(
+                app.applied_tip().await.hash,
+                a2.header.block_hash,
+                "{what}: tip"
+            );
+            assert_eq!(exec.calculate_state_root(), root_before, "{what}: memory");
+            let ring: Vec<(u64, Hash)> = app
+                .lock
+                .lock()
+                .await
+                .snapshots
+                .iter()
+                .map(|(h, (hh, _))| (*h, *hh))
+                .collect();
+            assert_eq!(ring, ring_before, "{what}: ring");
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: durable state"
+            );
+        }
+
+        // No fault: the same reorg goes through and the index follows B.
+        let outcome = {
+            let mut st = app.lock.lock().await;
+            app.reorg_to(&mut st, b3.header.block_hash).await
+        };
+        assert!(
+            matches!(outcome, ReorgOutcome::Reorged { .. }),
+            "{outcome:?}"
+        );
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    /// The setup of the rebuild fault tests: A (a1 ← a2) applied, B (b2 ← b3)
+    /// stored, and a restarted applicator whose fork choice names b3.
+    async fn c1r_rebuild_setup(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<StorageManager>,
+        Arc<Executor>,
+        CanonicalApplicator,
+        [Block; 4],
+        StateSnapshot,
+    ) {
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        drop(app);
+        let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        (storage, exec, app2, [a1, a2, b2, b3], g.state_snapshot())
+    }
+
+    /// Rebuild: a read error in the preparation (marker, genesis block, spine,
+    /// abandoned blocks and receipts, the rollback removals) aborts with `Err`
+    /// before anything changes. A read error during the replay or the final head
+    /// check rolls back, and the rollback restores the receipt index exactly:
+    /// it was prepared in full beforehand and reads nothing itself.
+    #[tokio::test]
+    async fn c1r_rebuild_read_faults_change_nothing() {
+        let _g = FaultGuard;
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, app, [a1, a2, b2, b3], genesis) = c1r_rebuild_setup(dir.path()).await;
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+        let tip_before = app.applied_tip().await;
+        let ring_len_before = app.lock.lock().await.snapshots.len();
+        let b3h = b3.header.block_hash;
+
+        // (what, fault, aborts with Err before any change)
+        let cases = [
+            ("rebuild marker", fault(Site::Marker, None, 0), true),
+            (
+                "genesis block",
+                fault(Site::Block, Some(Hash::default()), 0),
+                true,
+            ),
+            (
+                "spine walk",
+                fault(Site::Block, Some(b2.header.block_hash), 0),
+                true,
+            ),
+            (
+                "spine walk end",
+                fault(Site::Block, Some(Hash::default()), 1),
+                true,
+            ),
+            (
+                "abandoned block",
+                fault(Site::Block, Some(a2.header.block_hash), 0),
+                true,
+            ),
+            (
+                "abandoned receipt",
+                fault(Site::Receipt, Some(a2.transactions[0].hash), 0),
+                true,
+            ),
+            ("rollback removals", fault(Site::Block, Some(b3h), 1), true),
+            ("replay", fault(Site::Block, Some(b3h), 2), false),
+            ("head-root check", fault(Site::Block, Some(b3h), 3), false),
+        ];
+        for (what, f, early) in cases {
+            read_faults::set(vec![f]);
+            let res = app.recover_to_head(genesis.clone(), Hash::default()).await;
+            assert!(read_faults::hits() > 0, "{what}: the fault was not reached");
+            read_faults::clear();
+            if early {
+                assert!(res.is_err(), "{what}: must abort with Err, got {res:?}");
+            } else {
+                assert!(
+                    matches!(res, Ok(false)),
+                    "{what}: must roll back (Ok(false)), got {res:?}"
+                );
+            }
+            assert_eq!(app.applied_tip().await, tip_before, "{what}: tip");
+            assert_eq!(exec.calculate_state_root(), root_before, "{what}: memory");
+            assert_eq!(
+                app.lock.lock().await.snapshots.len(),
+                ring_len_before,
+                "{what}: ring"
+            );
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: durable state"
+            );
+        }
+
+        assert!(app
+            .recover_to_head(genesis.clone(), Hash::default())
+            .await
+            .expect("recover"));
+        assert_eq!(app.applied_tip().await.hash, b3h);
+        c1r_receipts_consistent(&storage, Some(b3h), &all).expect("receipts follow B");
+    }
+
+    /// Interrupted-rebuild cleanup: a read error on the marker, the durable tip or
+    /// an old-chain block keeps the marker and every receipt, at startup and
+    /// before a rebuild (which then refuses to run). Once reads succeed, the
+    /// cleanup completes and the marker is cleared.
+    #[tokio::test]
+    async fn c1r_interrupted_cleanup_read_faults_keep_the_marker() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _g = FaultGuard;
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        for b in [&a1, &a2, &b2, &b3] {
+            persist(&storage, b);
+        }
+        let exec = store_backed(&storage);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+
+        let cases = [
+            ("marker", fault(Site::Marker, None, 0)),
+            ("durable tip", fault(Site::AppliedTip, None, 0)),
+            (
+                "old-chain block",
+                fault(Site::Block, Some(a2.header.block_hash), 0),
+            ),
+        ];
+        for (what, f) in cases {
+            read_faults::set(vec![f]);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            assert!(
+                read_faults::hits() > 0,
+                "{what}: startup did not reach the fault"
+            );
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: startup cleanup must change nothing"
+            );
+            app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            let res = app
+                .recover_to_head(g.state_snapshot(), Hash::default())
+                .await;
+            read_faults::clear();
+            assert!(res.is_err(), "{what}: the rebuild must refuse: {res:?}");
+            assert_eq!(
+                c1r_durable_view(&storage, &all),
+                before,
+                "{what}: a refused rebuild must change nothing"
+            );
+        }
+
+        let _app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None,
+            "marker cleared once the cleanup reads succeed"
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&a2.transactions[0].hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            None,
+            "a2 is above the durable tip: its receipt is gone"
+        );
+    }
+
+    /// Reorg: the winning branch's store commit (one atomic batch) fails. The
+    /// store, receipts and tip are still at the fork point; the reorg must abort
+    /// and put everything back to pre_tip, not adopt the winning branch in memory
+    /// over a store that never received it (before: it logged and committed the
+    /// new tip in memory anyway).
+    #[tokio::test]
+    async fn c1r_reorg_winning_commit_failure_aborts_and_restores() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let store = Arc::new(V251AbortStore {
+            inner: storage.state.clone(),
+            writes: AtomicU64::new(0),
+            abort_at: u64::MAX,
+            fail_receipt_index: AtomicBool::new(false),
+            fail_reorg_batch_at: AtomicU64::new(0),
+            reorg_batches: AtomicU64::new(0),
+        });
+        let exec = Arc::new(Executor::with_storage(
+            Arc::new(StateDB::new()),
+            Some(store.clone()),
+        ));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        persist(&storage, &b2);
+        persist(&storage, &b3);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        let root_before = exec.calculate_state_root();
+
+        // Reorg batch 1 reverts to the fork point; batch 2 commits the winner.
+        store.fail_reorg_batch_at.store(
+            store.reorg_batches.load(Ordering::SeqCst) + 2,
+            Ordering::SeqCst,
+        );
+        let outcome = {
+            let mut st = app.lock.lock().await;
+            app.reorg_to(&mut st, b3.header.block_hash).await
+        };
+        assert!(
+            matches!(outcome, ReorgOutcome::Rejected(_)),
+            "a failed winning commit must abort the reorg: {outcome:?}"
+        );
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(exec.calculate_state_root(), root_before, "memory");
+        assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
+
+        store.fail_reorg_batch_at.store(0, Ordering::SeqCst);
+        let outcome = {
+            let mut st = app.lock.lock().await;
+            app.reorg_to(&mut st, b3.header.block_hash).await
+        };
+        assert!(
+            matches!(outcome, ReorgOutcome::Reorged { .. }),
+            "{outcome:?}"
+        );
+        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+            .expect("receipts follow B");
+    }
+
+    // ---------------------------------------------------------------------
+    // C1-R: the receipt index after the start-up hardening purge. The purge
+    // removes the invalid blocks (and their receipts) but leaves the applied-tip
+    // pointer on a removed block, so the old applied chain can no longer be
+    // walked from its tip. The blocks below the removed ones keep their
+    // receipts; once the node moves to another chain, those receipts must go.
+    // ---------------------------------------------------------------------
+
+    /// A follower that applied a1 ← a2, then restarted on a release whose block
+    /// rules start at height 2 (the purge removes a2), with a1 still stored.
+    async fn c1r_purged_follower(
+        dir: &std::path::Path,
+    ) -> (Arc<StorageManager>, Arc<Executor>, Block, Block) {
+        let storage =
+            Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("persist genesis");
+        let (a1, a2, _, _) = v251_blocks().await;
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        for b in [&a1, &a2] {
+            persist(&storage, b);
+            assert!(matches!(
+                app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
+        drop(app);
+        c1r_startup_purge(&storage, &a1, &a2);
+        (storage, exec, a1, a2)
+    }
+
+    /// The real start-up purge with the rules active from height 2: a2 (and
+    /// anything above it) goes, a1 stays with its receipt, and the applied-tip
+    /// pointer stays on a2. Asserts that precondition.
+    fn c1r_startup_purge(storage: &StorageManager, a1: &Block, a2: &Block) {
+        let report = crate::hardening_rejoin::purge_invalid_post_activation(
+            storage,
+            citrate_consensus::hardening::PbaHardening::at(2),
+            40204,
+        )
+        .expect("purge");
+        assert!(report.purged.contains(&a2.header.block_hash), "a2 removed");
+        assert!(!report.purged.contains(&a1.header.block_hash), "a1 kept");
+        assert!(storage
+            .blocks
+            .get_block(&a2.header.block_hash)
+            .expect("read")
+            .is_none());
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .map(|r| r.block_hash),
+            Some(a1.header.block_hash),
+            "a1 keeps its receipt through the purge"
+        );
+    }
+
+    /// After the purge, the start-up rebuild moves the node to branch C, which
+    /// forks off genesis and so excludes a1. a1's transaction is not on the
+    /// applied chain any more: `eth_getTransactionReceipt` must return null, and
+    /// a1 keeps no block marker. The walk down the old applied chain starts at
+    /// the removed a2 and cannot reach a1, so the rebuild has to find it another
+    /// way.
+    #[tokio::test]
+    async fn c1r_rebuild_after_startup_purge_leaves_no_receipt_off_the_spine() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        // Sync fetches the canonical chain from upgraded peers.
+        persist(&storage, &c1);
+        persist(&storage, &c2);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        assert_eq!(app.applied_tip().await.hash, c2.header.block_hash);
+
+        let io = Arc::new(c1r_rpc(storage.clone(), exec.clone()));
+        let r = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&a1.transactions[0].hash)]),
+        )
+        .await;
+        assert!(
+            r["result"].is_null(),
+            "a1 is not on the applied chain: its receipt must be null, got {r}"
+        );
+        let r = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&c1.transactions[0].hash)]),
+        )
+        .await;
+        assert_eq!(
+            r["result"]["blockHash"],
+            serde_json::json!(c1r_hex(&c1.header.block_hash)),
+            "c1's receipt is served: {r}"
+        );
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &[&a1, &a2, &c1, &c2])
+            .expect("receipts follow C");
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None,
+            "no rebuild marker after convergence"
+        );
+    }
+
+    /// The same rebuild, but it cannot converge (c1 was never fetched, so the
+    /// replay stops short of c2). The rollback must leave the receipt index
+    /// exactly as it was: the node is back on its old state, so a1's receipt
+    /// is restored together with it.
+    #[tokio::test]
+    async fn c1r_failed_rebuild_after_startup_purge_restores_receipts() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        persist(&storage, &c2);
+        let all = [&a1, &a2, &c1, &c2];
+        let before = c1r_durable_view(&storage, &all);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let root_before = exec.calculate_state_root();
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        let res = app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await;
+        assert!(matches!(res, Ok(false)), "must roll back, got {res:?}");
+        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(exec.calculate_state_root(), root_before, "memory");
+        assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
+
+        // c1 arrives; the retried rebuild converges and cleans up.
+        persist(&storage, &c1);
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &all)
+            .expect("receipts follow C");
+    }
+
+    /// A rebuild A → B is interrupted right after its reset batch (durable tip
+    /// at genesis, a1 kept as shared prefix, rebuild marker on a2). The node
+    /// restarts on a release whose rules start at height 2: the purge removes
+    /// a2, b2 and b3, so the marker names a removed block. Fork choice then
+    /// picks C. The start-up cleanup can no longer walk down from the marker,
+    /// and must still remove a1's receipt instead of clearing the marker.
+    #[tokio::test]
+    async fn c1r_interrupted_rebuild_then_startup_purge_removes_the_prefix_receipt() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (c1, c2) = c1r_fork_c().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        {
+            let storage =
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+            c1r_startup_purge(&storage, &a1, &a2);
+            for b in [&b2, &b3] {
+                assert!(storage
+                    .blocks
+                    .get_block(&b.header.block_hash)
+                    .expect("read")
+                    .is_none());
+            }
+        }
+        c1r_resume_and_check(dir.path(), &[&a1, &c1, &c2], &c2)
+            .await
+            .expect("restart converging on C leaves no receipt of a1");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+        assert!(
+            storage
+                .transactions
+                .get_receipt(&a1.transactions[0].hash)
+                .expect("read")
+                .is_none(),
+            "a1 is not executed on C: its receipt is gone"
+        );
+        assert!(storage
+            .transactions
+            .get_block_transactions(&a1.header.block_hash)
+            .expect("read")
+            .is_empty());
+    }
+
+    /// The index scan the purge cases fall back on is read like every other
+    /// rebuild input: a failed scan, or a failed receipt read during it, aborts
+    /// the rebuild before anything changes, and a failed scan in the start-up
+    /// cleanup keeps the marker. Once reads succeed, both complete.
+    #[tokio::test]
+    async fn c1r_receipt_index_scan_read_faults_change_nothing() {
+        if std::env::var(V251_DIR).is_ok() {
+            return;
+        }
+        let _g = FaultGuard;
+        // Rebuild after the purge.
+        let dir = tempfile::tempdir().expect("dir");
+        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (c1, c2) = c1r_fork_c().await;
+        persist(&storage, &c1);
+        persist(&storage, &c2);
+        let all = [&a1, &a2, &c1, &c2];
+        let before = c1r_durable_view(&storage, &all);
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
+        let root_before = exec.calculate_state_root();
+        let g = Executor::new(Arc::new(StateDB::new()));
+        g.set_balance(&Address(ALICE), U256::from(FUND));
+        for (what, f) in [
+            ("index scan", fault(Site::ReceiptIndex, None, 0)),
+            (
+                "scanned receipt",
+                fault(Site::Receipt, Some(a1.transactions[0].hash), 0),
+            ),
+        ] {
+            read_faults::set(vec![f]);
+            let res = app
+                .recover_to_head(g.state_snapshot(), Hash::default())
+                .await;
+            assert!(read_faults::hits() > 0, "{what}: the fault was not reached");
+            read_faults::clear();
+            assert!(res.is_err(), "{what}: must abort with Err, got {res:?}");
+            assert_eq!(
+                app.applied_tip().await.hash,
+                a2.header.block_hash,
+                "{what}: tip"
+            );
+            assert_eq!(exec.calculate_state_root(), root_before, "{what}: memory");
+            assert_eq!(c1r_durable_view(&storage, &all), before, "{what}: durable");
+        }
+        assert!(app
+            .recover_to_head(g.state_snapshot(), Hash::default())
+            .await
+            .expect("recover"));
+        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &all)
+            .expect("receipts follow C");
+
+        // Start-up cleanup after an interrupted rebuild and a purge.
+        let (a1, a2, b2, b3) = v251_blocks().await;
+        let dir = tempfile::tempdir().expect("dir");
+        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
+        c1r_startup_purge(&storage, &a1, &a2);
+        let exec = store_backed(&storage);
+        let all = [&a1, &a2, &b2, &b3];
+        let before = c1r_durable_view(&storage, &all);
+        read_faults::set(vec![fault(Site::ReceiptIndex, None, 0)]);
+        drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
+        assert!(
+            read_faults::hits() > 0,
+            "cleanup scan: the fault was not reached"
+        );
+        read_faults::clear();
+        assert_eq!(
+            c1r_durable_view(&storage, &all),
+            before,
+            "cleanup scan: durable"
+        );
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            Some((a2.header.block_hash, 2)),
+            "the marker survives a failed scan"
+        );
+        drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
+        assert_eq!(
+            storage
+                .transactions
+                .get_receipt_reconcile_marker()
+                .expect("read"),
+            None
+        );
+        assert!(storage
+            .transactions
+            .get_receipt(&a1.transactions[0].hash)
+            .expect("read")
+            .is_none());
+    }
+
+    /// Stage 1c §4.5: the floor is raised only for the certified hash that IS
+    /// this node's block at that height, only when raising is asked for, and
+    /// never lowered.
+    #[tokio::test]
+    async fn certified_floor_raises_only_on_hash_match() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (a1, a2, b2, _b3) = setup_fork(&app, &storage).await; // tip a2 @ 2
+        let floor = app.finalized_height_handle();
+
+        // Wrong hash at height 2 (the competing sibling): mismatch, no raise.
+        assert_eq!(
+            app.verify_certified_floor(2, b2.header.block_hash, true)
+                .await,
+            FloorCheck::Mismatch {
+                canonical: Some(a2.header.block_hash)
+            }
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 0, "mismatch never raises");
+
+        // Right hash, observe-only: match, no raise.
+        assert_eq!(
+            app.verify_certified_floor(2, a2.header.block_hash, false)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 0, "observe-only never raises");
+
+        // Right hash, enforce: raised.
+        assert_eq!(
+            app.verify_certified_floor(2, a2.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 2);
+
+        // A lower certified height matches but never lowers the floor.
+        assert_eq!(
+            app.verify_certified_floor(1, a1.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 2, "monotonic");
+
+        // Above the applied tip: not yet applied, nothing concluded.
+        assert_eq!(
+            app.verify_certified_floor(3, Hash::new([7; 32]), true)
+                .await,
+            FloorCheck::NotYetApplied { applied_height: 2 }
+        );
+        assert_eq!(floor.load(Ordering::SeqCst), 2);
+    }
+
+    /// Stage 1c: a chain that steps over the certified height does not contain
+    /// the certified block — a mismatch, never a match and never a raise.
+    #[tokio::test]
+    async fn certified_floor_on_a_skipped_height_is_a_mismatch() {
+        let (exec, storage, _dir) = fresh();
+        let r = roots(3);
+        let b1 = mk_block(1, Hash::default(), r[0]);
+        // Selected parent jumps from height 3 straight to height 1.
+        let b3 = mk_block(3, b1.header.block_hash, r[2]);
+        persist(&storage, &b1);
+        persist(&storage, &b3);
+        storage
+            .blocks
+            .put_applied_tip(&b3.header.block_hash, 3)
+            .expect("applied tip");
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        assert_eq!(app.applied_tip().await.height, 3);
+        assert_eq!(
+            app.verify_certified_floor(2, Hash::new([2; 32]), true)
+                .await,
+            FloorCheck::Mismatch { canonical: None }
+        );
+        assert_eq!(app.finalized_height_handle().load(Ordering::SeqCst), 0);
+        assert_eq!(
+            app.verify_certified_floor(1, b1.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        assert_eq!(app.finalized_height_handle().load(Ordering::SeqCst), 1);
+    }
+
+    /// Stage 1c: a header missing from the applied chain makes the check
+    /// unverifiable — nothing is concluded and nothing is raised.
+    #[tokio::test]
+    async fn certified_floor_with_missing_header_is_unverifiable() {
+        let (exec, storage, _dir) = fresh();
+        let r = roots(3);
+        let b1 = mk_block(1, Hash::default(), r[0]);
+        let b2 = mk_block(2, b1.header.block_hash, r[1]);
+        let b3 = mk_block(3, b2.header.block_hash, r[2]);
+        persist(&storage, &b1);
+        persist(&storage, &b3); // b2 never stored
+        storage
+            .blocks
+            .put_applied_tip(&b3.header.block_hash, 3)
+            .expect("applied tip");
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        assert!(matches!(
+            app.verify_certified_floor(1, b1.header.block_hash, true)
+                .await,
+            FloorCheck::Unverifiable(_)
+        ));
+        assert_eq!(app.finalized_height_handle().load(Ordering::SeqCst), 0);
+    }
+
+    /// Stage 1c end-to-end through the applicator: once a VERIFIED certificate
+    /// raised the floor, a reorg whose fork point is below it is `Rejected` and
+    /// the applied tip keeps the finalized block.
+    #[tokio::test]
+    async fn reorg_below_a_certified_floor_is_rejected() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, a2, _b2, b3) = setup_fork(&app, &storage).await;
+        assert_eq!(
+            app.verify_certified_floor(2, a2.header.block_hash, true)
+                .await,
+            FloorCheck::Match
+        );
+        let lock = app.advance_lock();
+        let mut state = lock.lock().await;
+        match app.reorg_to(&mut state, b3.header.block_hash).await {
+            ReorgOutcome::Rejected(why) => assert!(why.contains("finalized"), "got: {why}"),
+            other => panic!("expected Rejected (finality), got {other:?}"),
+        }
+        assert_eq!(state.tip.hash, a2.header.block_hash);
+    }
+
+    /// S2: a registered certificate whose block is canonical raises the floor
+    /// at the next reorg decision (under the advance lock), before the reorg is
+    /// judged; one whose block is not canonical changes nothing until it is.
+    #[tokio::test]
+    async fn registered_certificate_raises_the_floor_once_canonical() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let (_a1, a2, b2, b3) = setup_fork(&app, &storage).await; // tip a2
+        let floor = app.finalized_height_handle();
+
+        // b2 is certified but this node is on a2: no effect, the reorg onto
+        // the certified branch proceeds (fork point a1 @ 1 >= floor 0).
+        app.register_certified(2, b2.header.block_hash);
+        {
+            let lock = app.advance_lock();
+            let mut state = lock.lock().await;
+            assert_eq!(app.effective_floor(&state, true), 0);
+            match app.reorg_to(&mut state, b3.header.block_hash).await {
+                ReorgOutcome::Reorged { .. } => {}
+                other => panic!("expected Reorged onto b3, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            floor.load(Ordering::SeqCst),
+            0,
+            "not raised by the reorg onto it"
+        );
+        assert_eq!(app.certified_pending(), vec![(2, b2.header.block_hash)]);
+
+        // b2 is now canonical: a reorg back to a2 (fork point 1) is refused,
+        // and the floor is raised to 2 by that decision.
+        {
+            let lock = app.advance_lock();
+            let mut state = lock.lock().await;
+            match app.reorg_to(&mut state, a2.header.block_hash).await {
+                ReorgOutcome::Rejected(why) => {
+                    assert!(why.contains("below finalized height 2"), "{why}")
+                }
+                other => panic!("expected Rejected, got {other:?}"),
+            }
+        }
+        assert_eq!(floor.load(Ordering::SeqCst), 2);
+        assert!(app.certified_pending().is_empty(), "settled");
+        assert_eq!(app.applied_tip().await.hash, b3.header.block_hash);
+
+        // At or below the floor: ignored.
+        app.register_certified(2, a2.header.block_hash);
+        assert!(app.certified_pending().is_empty());
+    }
+
+    /// The registered set has no count bound: nothing above the floor is
+    /// dropped (two certificates at one height are both kept), and only the
+    /// floor reaching a height settles the entries at or below it.
+    #[tokio::test]
+    async fn registered_certificates_are_kept_until_the_floor_covers_them() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage);
+        let n: u64 = 1_000;
+        for h in 1..=n {
+            app.register_certified(h, Hash::new([1; 32]));
+        }
+        app.register_certified(7, Hash::new([2; 32]));
+        let held = app.certified_pending();
+        assert_eq!(held.len(), usize::try_from(n + 1).expect("fits"));
+        assert_eq!(held.first(), Some(&(1, Hash::new([1; 32]))));
+        assert!(held.contains(&(7, Hash::new([2; 32]))));
+        assert_eq!(held.last(), Some(&(n, Hash::new([1; 32]))));
+        app.finalized_height_handle().store(500, Ordering::SeqCst);
+        app.settle_certified(500);
+        let held = app.certified_pending();
+        assert_eq!(held.len(), 500);
+        assert_eq!(held.first().map(|(h, _)| *h), Some(501));
+        app.register_certified(500, Hash::new([3; 32]));
+        assert_eq!(app.certified_pending().len(), 500, "at the floor: ignored");
+    }
+
+    /// One descending walk answers many heights (strictly descending, else
+    /// `Err`), and `settle_registered_floor` raises the floor to the highest
+    /// registered certificate on the applied chain at any depth.
+    #[tokio::test]
+    async fn applied_walk_and_settle_registered_floor() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let (a1, a2, b2, _b3) = setup_fork(&app, &storage).await; // tip a2
+        let tip = app.applied_tip().await;
+        let mut w = app.walk_applied(tip);
+        assert_eq!(w.hash_at(3), Ok(None), "above the tip");
+        assert_eq!(w.hash_at(2), Ok(Some(a2.header.block_hash)));
+        assert_eq!(w.hash_at(1), Ok(Some(a1.header.block_hash)));
+        assert!(w.hash_at(1).is_err(), "must strictly descend");
+
+        app.register_certified(2, b2.header.block_hash); // not canonical here
+        app.register_certified(1, a1.header.block_hash); // canonical
+        assert_eq!(app.settle_registered_floor().await, 1);
+        assert_eq!(app.finalized_height(), 1);
+        assert_eq!(app.certified_pending(), vec![(2, b2.header.block_hash)]);
+    }
+
+    // ───────────── replay parity with the supply-hardening height unset ─────────────
+    //
+    // A scripted multi-block range that touches every rule the supply-hardening
+    // height gates: transfers, reverted calls carrying the inference operation's
+    // selector, successful and reverted contract creations, a PayPerUse model
+    // with successful and failing paid inference (owner, treasury and provider
+    // fees), governance-precompile queue / execute / rejected writes, and
+    // artifact-precompile model registration (including a duplicate).
+    //
+    // Each block is produced the way the producer does and applied by a
+    // follower through the real receive path (`apply_received`). With the
+    // height unset (the 40204 release default) every per-block state root,
+    // reward and witness digest below must equal the values recorded on the
+    // code before the activation height existed: blocks below activation
+    // replay byte-identically.
+
+    const RP_PROVIDER: [u8; 20] = [0x9E; 20];
+    const RP_MODEL: [u8; 32] = [0x77; 32];
+    const RP_ART_MODEL: [u8; 32] = [0x4D; 32];
+    const RP_PKEY: [u8; 32] = [0xC1; 32];
+    const RP_FEE: u64 = 1_000_000_000_000; // 1e12 wei per paid call
+    const RP_PROVIDER_FEE: u64 = 1_000_000_000; // 1e9 wei per served call
+
+    /// Serves a call when the input starts with 1, fails otherwise (after the
+    /// executor has already handled the model-access fee).
+    struct RpInference;
+
+    #[async_trait::async_trait]
+    impl citrate_execution::InferenceService for RpInference {
+        async fn run_inference(
+            &self,
+            _model_id: citrate_execution::types::ModelId,
+            input: Vec<u8>,
+            _max_gas: u64,
+        ) -> Result<(Vec<u8>, u64, Address, U256, Option<Vec<u8>>), ExecutionError> {
+            if input.first() == Some(&1) {
+                Ok((
+                    vec![0xAA],
+                    0,
+                    Address(RP_PROVIDER),
+                    U256::from(RP_PROVIDER_FEE),
+                    None,
+                ))
+            } else {
+                Err(ExecutionError::InvalidInput)
+            }
+        }
+    }
+
+    fn rp_selector(sig: &[u8]) -> [u8; 4] {
+        use sha3::{Digest, Keccak256};
+        let d = Keccak256::digest(sig);
+        [d[0], d[1], d[2], d[3]]
+    }
+
+    fn rp_word(v: u64) -> [u8; 32] {
+        let mut w = [0u8; 32];
+        w[24..].copy_from_slice(&v.to_be_bytes());
+        w
+    }
+
+    fn rp_precompile(last: u8) -> [u8; 20] {
+        let mut a = [0u8; 20];
+        a[18] = 0x10;
+        a[19] = last;
+        a
+    }
+
+    fn rp_tx(
+        from: [u8; 20],
+        to: Option<[u8; 20]>,
+        value: u128,
+        data: Vec<u8>,
+        nonce: u64,
+        gas_limit: u64,
+    ) -> Transaction {
+        let mut seed = [0u8; 32];
+        seed[..20].copy_from_slice(&from);
+        seed[24..].copy_from_slice(&nonce.to_be_bytes());
+        Transaction {
+            hash: Hash::new(seed),
+            nonce,
+            from: embedded(from),
+            to: to.map(embedded),
+            value,
+            gas_limit,
+            gas_price: 1_000_000_000,
+            data,
+            signature: Signature::new([1; 64]),
+            chain_id: Some(40204),
+            ..Default::default()
+        }
+    }
+
+    fn rp_register_pay_per_use(from: [u8; 20], nonce: u64) -> Transaction {
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": "Replay Model",
+            "version": "1.0.0",
+            "description": "replay parity",
+            "framework": "onnx",
+            "input_shape": [1, 4],
+            "output_shape": [1],
+            "size_bytes": 1024
+        }))
+        .expect("metadata serializes");
+        let mut data = vec![0x01, 0x00, 0x00, 0x00];
+        data.extend_from_slice(&RP_MODEL);
+        data.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+        data.extend_from_slice(&meta);
+        data.push(3); // AccessPolicy::PayPerUse
+        data.extend_from_slice(&rp_word(RP_FEE));
+        rp_tx(from, Some(rp_precompile(0x00)), 0, data, nonce, 400_000)
+    }
+
+    fn rp_infer(from: [u8; 20], model: [u8; 32], first_input: u8, nonce: u64) -> Transaction {
+        let mut data = vec![0x02, 0x00, 0x00, 0x00];
+        data.extend_from_slice(&model);
+        data.extend_from_slice(&[first_input, 2, 3, 4]);
+        rp_tx(from, Some(rp_precompile(0x00)), 0, data, nonce, 400_000)
+    }
+
+    fn rp_gov_queue(from: [u8; 20], value: &[u8], nonce: u64) -> Transaction {
+        let mut d = rp_selector(b"queueSetParam(bytes32,bytes,uint64)").to_vec();
+        d.extend_from_slice(&RP_PKEY);
+        d.extend_from_slice(&rp_word(96));
+        d.extend_from_slice(&rp_word(0));
+        d.extend_from_slice(&rp_word(value.len() as u64));
+        d.extend_from_slice(value);
+        rp_tx(from, Some(rp_precompile(0x03)), 0, d, nonce, 400_000)
+    }
+
+    fn rp_gov_execute(from: [u8; 20], nonce: u64) -> Transaction {
+        let mut d = rp_selector(b"executeSetParam(bytes32)").to_vec();
+        d.extend_from_slice(&RP_PKEY);
+        rp_tx(from, Some(rp_precompile(0x03)), 0, d, nonce, 400_000)
+    }
+
+    fn rp_art_register(from: [u8; 20], nonce: u64) -> Transaction {
+        let cid = b"bafy-replay-cid";
+        let mut d = rp_selector(b"registerModel(bytes32,string)").to_vec();
+        d.extend_from_slice(&RP_ART_MODEL);
+        d.extend_from_slice(&rp_word(64));
+        d.extend_from_slice(&rp_word(cid.len() as u64));
+        d.extend_from_slice(cid);
+        rp_tx(from, Some(rp_precompile(0x02)), 0, d, nonce, 400_000)
+    }
+
+    /// The scripted range: (height, transactions).
+    fn rp_range() -> Vec<(u64, Vec<Transaction>)> {
+        let a = |n| n; // ALICE nonces
+        vec![
+            (
+                1,
+                vec![
+                    transfer(ALICE, BOB, 300_000_000_000_000_000, a(0)),
+                    rp_register_pay_per_use(ALICE, a(1)),
+                    rp_infer(ALICE, [0x5A; 32], 1, a(2)),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    rp_infer(BOB, RP_MODEL, 1, 0),
+                    rp_infer(BOB, RP_MODEL, 0, 1),
+                    rp_infer(BOB, RP_MODEL, 1, 2),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    rp_tx(ALICE, None, 0, vec![0x00], a(3), 200_000),
+                    rp_tx(
+                        ALICE,
+                        None,
+                        0,
+                        vec![0x60, 0x00, 0x60, 0x00, 0xfd],
+                        a(4),
+                        200_000,
+                    ),
+                    rp_infer(ALICE, [0x5A; 32], 1, a(5)),
+                    rp_infer(ALICE, [0x5B; 32], 1, a(6)),
+                    rp_infer(ALICE, [0x5C; 32], 1, a(7)),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    rp_gov_queue(ALICE, b"v1", a(8)),
+                    rp_gov_queue(BOB, b"v2", 3),
+                    rp_art_register(ALICE, a(9)),
+                ],
+            ),
+            (
+                5,
+                vec![
+                    rp_gov_execute(ALICE, a(10)),
+                    rp_gov_execute(ALICE, a(11)),
+                    rp_art_register(ALICE, a(12)),
+                ],
+            ),
+            (6, vec![]),
+            (
+                7,
+                vec![
+                    rp_infer(BOB, RP_MODEL, 1, 4),
+                    transfer(BOB, ALICE, 1_000, 5),
+                ],
+            ),
+        ]
+    }
+
+    /// One block's observable result: root, reward credits, receipts, and the
+    /// precompile storage and model registry entries the range writes (the
+    /// precompile addresses hold no account, so the root alone does not fold
+    /// them).
+    fn rp_witness(
+        exec: &Executor,
+        root: Hash,
+        reward: (U256, U256),
+        receipts: &[citrate_execution::types::TransactionReceipt],
+    ) -> String {
+        use sha3::{Digest, Keccak256};
+        let mut h = Keccak256::new();
+        h.update(root.as_bytes());
+        for v in [reward.0, reward.1] {
+            let mut b = [0u8; 32];
+            v.to_big_endian(&mut b);
+            h.update(b);
+        }
+        for r in receipts {
+            h.update([r.status as u8]);
+            h.update(r.gas_used.to_be_bytes());
+            h.update((r.output.len() as u64).to_be_bytes());
+            h.update(&r.output);
+        }
+        for who in [ALICE, BOB, CB, TREASURY_ADDR, RP_PROVIDER] {
+            let mut b = [0u8; 32];
+            exec.get_balance(&Address(who)).to_big_endian(&mut b);
+            h.update(b);
+        }
+        let gov = Address(rp_precompile(0x03));
+        let art = Address(rp_precompile(0x02));
+        let mut keyed = |addr: &Address, prefix: &[u8], suffix: &[u8]| {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(suffix);
+            match exec.state_db().get_storage(addr, &k) {
+                Some(v) => {
+                    h.update([1]);
+                    h.update((v.len() as u64).to_be_bytes());
+                    h.update(&v);
+                }
+                None => h.update([0]),
+            }
+        };
+        keyed(&gov, b"ADMIN", b"");
+        keyed(&gov, b"PENDING:", &RP_PKEY);
+        keyed(&gov, b"PARAM:", &RP_PKEY);
+        keyed(&art, b"MODEL_CID:", &RP_ART_MODEL);
+        keyed(&art, b"MODEL_ARTS:", &RP_ART_MODEL);
+        for m in [RP_MODEL, RP_ART_MODEL] {
+            let id = citrate_execution::types::ModelId(Hash::new(m));
+            match exec.state_db().get_model(&id) {
+                Some(s) => {
+                    h.update([1]);
+                    h.update(serde_json::to_vec(&s).expect("model serializes"));
+                }
+                None => h.update([0]),
+            }
+        }
+        hex::encode(h.finalize())
+    }
+
+    fn rp_node() -> Arc<Executor> {
+        let state = Arc::new(StateDB::new());
+        state.set_storage(
+            Address(rp_precompile(0x03)),
+            b"ADMIN".to_vec(),
+            ALICE.to_vec(),
+        );
+        let exec = Arc::new(Executor::new(state).with_inference_service(Arc::new(RpInference)));
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec
+    }
+
+    /// Per height: (state root, witness digest), recorded on the code before
+    /// the supply-hardening height existed (citrate-chain 253d3287).
+    const RP_RECORDED: &[(&str, &str)] = &[
+        (
+            "c2cee92b39b8e7a3a3b55081ba9eb2e05bace34dba1f1b0a09f478dbed19f1f5",
+            "d5aaf722142b55e6641488a6193168b18111646aad2286bacf507873a4ef32e6",
+        ),
+        (
+            "937a24a6fff2d2db82fa31f25bf8e0219dc2a7c8f94df734f34766f1e8701cb1",
+            "95e4102ef80c72b334a187071813814a6b3167dbef1823aa3ca9f5d153a2cb21",
+        ),
+        (
+            "f14ae165ae04175e58ab0a213e593def361e83cdcd4434ed062c2e2b68c179b5",
+            "31fbe18aaf0e4ffb23b88558fdf8703a1c0c30fc5473ba7827ce070e06b35fd3",
+        ),
+        (
+            "b0069e5b96e012cab5650bb36df9697cc0adf145091d53dc92d8771eaf6986e5",
+            "ce7d04a2261a211c6b5520dba136250178e704384a89e5d9d4e03d0f991b9b9d",
+        ),
+        (
+            "7bd3fd1ca5227a2ef960692bed64d904577524b0e7811ea80186c16ee33b781f",
+            "72c865483670298bbcbeb67034e2c4e66fd8074c2a86472e410a2fbe35180e42",
+        ),
+        (
+            "ee4d28a03156757980a3bd6976aaf1f4d578d7e004d975e355f9e1fd1ae8d131",
+            "7a9dafa81caa99346933fcf74468118a0b79cb9590012146dc7993a42d8c1023",
+        ),
+        (
+            "966cb7af31be11b9654bb40f91cd3be3df5d434aa36b49d16286437ef7328b06",
+            "546a216b72fd8e19bdf39da08db976f3e49fff6b630efb7bcb329855671abf44",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn unset_supply_hardening_height_replays_the_legacy_range_byte_identically() {
+        // The 40204 release default: a release network with no height scheduled.
+        let r1005 = citrate_consensus::hardening::RELEASE_GENESIS[0].1;
+        assert_eq!(
+            citrate_execution::supply_hardening::pin_for_genesis(40204, Some(&r1005)),
+            Some(None)
+        );
+        let (height, _) =
+            citrate_execution::supply_hardening::init_for_genesis(40204, Some(&r1005), None)
+                .expect("40204 resolves with no override");
+        assert_eq!(height, None, "40204 ships with the height unset");
+        let producer = rp_node();
+        let follower = rp_node();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let app = CanonicalApplicator::new(follower.clone(), storage.clone());
+        let calc = RewardCalculator::new(canonical_reward_config());
+
+        let mut parent = Hash::default();
+        let mut got: Vec<(String, String)> = Vec::new();
+        for (height, txs) in rp_range() {
+            producer.set_block_context(BlockContext {
+                coinbase: CB,
+                prevrandao: VRF_OUT,
+                block_hashes: std::collections::HashMap::new(),
+            });
+            let provisional = mk_block_txs(height, parent, Hash::default(), VRF_OUT, txs.clone());
+            let mut receipts = Vec::new();
+            for tx in &txs {
+                receipts.push(
+                    producer
+                        .execute_transaction(&provisional, tx)
+                        .await
+                        .expect("producer tx must execute"),
+                );
+            }
+            let reward =
+                canonical_block_reward(&calc, &provisional, &receipts).expect("canonical reward");
+            for (addr, amt) in [
+                (Address(CB), reward.validator_reward),
+                (Address(TREASURY_ADDR), reward.treasury_reward),
+            ] {
+                if amt > U256::zero() {
+                    let bal = producer.get_balance(&addr);
+                    producer.set_balance(&addr, bal + amt);
+                }
+            }
+            let root = producer.calculate_state_root();
+            let block = mk_block_txs(height, parent, root, VRF_OUT, txs);
+
+            persist(&storage, &block);
+            assert!(
+                matches!(
+                    app.apply_received(&block).await,
+                    ApplyOutcome::Applied { .. }
+                ),
+                "the follower must apply block {height}"
+            );
+            assert_eq!(
+                follower.calculate_state_root(),
+                root,
+                "root parity at {height}"
+            );
+
+            let witness = rp_witness(
+                &producer,
+                root,
+                (reward.validator_reward, reward.treasury_reward),
+                &receipts,
+            );
+            assert_eq!(
+                witness,
+                rp_witness(
+                    &follower,
+                    root,
+                    (reward.validator_reward, reward.treasury_reward),
+                    &receipts
+                ),
+                "producer and follower witness parity at {height}"
+            );
+            eprintln!(
+                "RP_RECORDED ({:?}, {:?}),",
+                hex::encode(root.as_bytes()),
+                witness
+            );
+            got.push((hex::encode(root.as_bytes()), witness));
+            parent = block.header.block_hash;
+        }
+
+        // The range must reach every gated site, or the recorded values prove
+        // nothing about them.
+        assert!(follower
+            .state_db()
+            .get_model(&citrate_execution::types::ModelId(Hash::new(RP_MODEL)))
+            .is_some());
+        assert!(follower.get_balance(&Address(RP_PROVIDER)) > U256::zero());
+
+        let recorded: Vec<(String, String)> = RP_RECORDED
+            .iter()
+            .map(|(r, w)| (r.to_string(), w.to_string()))
+            .collect();
+        assert_eq!(
+            got, recorded,
+            "with the height unset, the range must replay to the recorded roots"
+        );
+    }
+
+    /// chain#421: by-number lookups name the block this applicator executed at
+    /// each height, through apply, catch-up drain, reorg and restart — never a
+    /// sibling stored after it.
+    mod by_number {
+        use super::*;
+
+        fn canonical(storage: &StorageManager, h: u64) -> Option<Hash> {
+            storage
+                .blocks
+                .get_canonical_block_by_height(h)
+                .expect("by-number read")
+        }
+
+        /// Two producers race at height 2; the losing producer's blocks reach
+        /// this node after its own are applied, then fork choice reorgs onto
+        /// them, then a third sibling arrives late.
+        #[tokio::test]
+        async fn two_producer_race_names_the_applied_block_through_reorg() {
+            let (exec, storage, _dir) = fresh();
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let (a1, a2, b2, b3) = setup_fork(&app, &storage).await; // tip a2; b2, b3 stored after
+            assert_eq!(canonical(&storage, 1), Some(a1.header.block_hash));
+            assert_eq!(
+                canonical(&storage, 2),
+                Some(a2.header.block_hash),
+                "the applied a2, not the later-stored b2"
+            );
+
+            app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            app.apply_received(&b2).await;
+            assert_eq!(app.applied_tip().await.hash, b3.header.block_hash);
+            assert_eq!(canonical(&storage, 2), Some(b2.header.block_hash));
+            assert_eq!(canonical(&storage, 3), Some(b3.header.block_hash));
+
+            let c2 = mk_block_vrf(2, a1.header.block_hash, b2.state_root, [0x5C; 32]);
+            persist(&storage, &c2);
+            assert_eq!(
+                canonical(&storage, 2),
+                Some(b2.header.block_hash),
+                "a sibling stored after the reorg does not take the height"
+            );
+        }
+
+        /// A follower catching up: every block of the range is stored first,
+        /// with a losing sibling stored after the winner at every height, and
+        /// one delivery drains the whole range.
+        #[tokio::test]
+        async fn follower_catch_up_drain_names_the_applied_chain_at_every_height() {
+            let (exec, storage, _dir) = fresh();
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let c = chain(40);
+            for (i, b) in c.iter().enumerate() {
+                persist(&storage, b);
+                let parent = if i == 0 {
+                    Hash::default()
+                } else {
+                    c[i - 1].header.block_hash
+                };
+                persist(&storage, &mk_block_b(b.header.height, parent, b.state_root));
+            }
+            // Every height has two children of the tip; fork choice names the chain.
+            app.fork_choice = Some(fork_choice_returning(c[39].header.block_hash));
+            app.apply_received(&c[39]).await;
+            assert_eq!(
+                app.applied_tip().await,
+                AppliedTip {
+                    hash: c[39].header.block_hash,
+                    height: 40
+                }
+            );
+            let wrong: Vec<u64> = (1..=40u64)
+                .filter(|h| canonical(&storage, *h) != Some(c[*h as usize - 1].header.block_hash))
+                .collect();
+            assert!(wrong.is_empty(), "heights naming a sibling: {wrong:?}");
+        }
+
+        /// Store-backed (the production commit path: the tip and the index are
+        /// written in the state batch), across a reorg and a restart.
+        #[tokio::test]
+        async fn store_backed_reorg_then_restart_keeps_the_applied_chain() {
+            let dir = tempfile::tempdir().expect("dir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let follower = store_backed(&storage);
+            follower.set_balance(&Address(ALICE), U256::from(FUND));
+            follower.persist_state_changes().await.expect("genesis");
+            let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+            let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+            pa.set_balance(&Address(ALICE), U256::from(FUND));
+            let a1 = produce(
+                &pa,
+                Hash::default(),
+                1,
+                VRF_OUT,
+                vec![transfer(ALICE, DAVE, 1_000, 0)],
+            )
+            .await;
+            let a2 = produce(
+                &pa,
+                a1.header.block_hash,
+                2,
+                VRF_OUT,
+                vec![transfer(ALICE, BOB, 1_000, 1)],
+            )
+            .await;
+            let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+            pb.set_balance(&Address(ALICE), U256::from(FUND));
+            let _ = produce(
+                &pb,
+                Hash::default(),
+                1,
+                VRF_OUT,
+                vec![transfer(ALICE, DAVE, 1_000, 0)],
+            )
+            .await;
+            let b2 = produce(
+                &pb,
+                a1.header.block_hash,
+                2,
+                [0x5B; 32],
+                vec![transfer(ALICE, CAROL, 1_000, 1)],
+            )
+            .await;
+            let b3 = produce(
+                &pb,
+                b2.header.block_hash,
+                3,
+                [0x5B; 32],
+                vec![transfer(ALICE, CAROL, 1_000, 2)],
+            )
+            .await;
+
+            // The winner b2 is stored BEFORE the loser a2; a2 is applied first.
+            persist(&storage, &a1);
+            app.apply_received(&a1).await;
+            persist(&storage, &b2);
+            persist(&storage, &a2);
+            app.fork_choice = Some(fork_choice_returning(a2.header.block_hash));
+            app.apply_received(&a2).await;
+            assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+            assert_eq!(canonical(&storage, 2), Some(a2.header.block_hash));
+
+            persist(&storage, &b3);
+            app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+            app.apply_received(&b3).await;
+            assert_eq!(app.applied_tip().await.height, 3, "reorged to B");
+            assert_eq!(
+                canonical(&storage, 2),
+                Some(b2.header.block_hash),
+                "the reorg rewrote height 2 (the stored index still names a2)"
+            );
+            assert_eq!(canonical(&storage, 3), Some(b3.header.block_hash));
+
+            drop(app);
+            drop(follower);
+            let storage = Arc::into_inner(storage).expect("sole owner");
+            drop(storage);
+            let reopened =
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
+            assert_eq!(
+                reopened.blocks.get_applied_tip().expect("tip"),
+                Some((b3.header.block_hash, 3))
+            );
+            assert_eq!(canonical(&reopened, 1), Some(a1.header.block_hash));
+            assert_eq!(canonical(&reopened, 2), Some(b2.header.block_hash));
+            assert_eq!(canonical(&reopened, 3), Some(b3.header.block_hash));
+        }
+    }
+
+    // =====================================================================
+    // Restart-safe reorg window. A restarted node must switch branches by a
+    // bounded reorg (fork point at most MAX_REORG_DEPTH below its tip), from
+    // the undo records persisted with every applied block, and not by the
+    // from-genesis rebuild that a pruned node refuses.
+    // =====================================================================
+    mod restart_safe_reorg {
+        use super::*;
+
+        /// The genesis state of these scenarios: ALICE funded.
+        fn rsr_genesis() -> StateSnapshot {
+            let e = Executor::new(Arc::new(StateDB::new()));
+            e.set_balance(&Address(ALICE), U256::from(FUND));
+            e.state_snapshot()
+        }
+
+        /// A branch of `n` blocks from `start` (the state after `parent` at
+        /// `first - 1`): one ALICE→`to` transfer per block, sealed like the
+        /// producer. Returns the blocks and the state after each one.
+        async fn rsr_extend(
+            start: StateSnapshot,
+            parent: Hash,
+            first: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+        ) -> (Vec<Block>, Vec<StateSnapshot>) {
+            rsr_extend_registering(start, parent, first, n, vrf, to, None).await
+        }
+
+        /// A model-registration transaction (public model `model`) from ALICE.
+        fn rsr_register(model: [u8; 32], nonce: u64) -> Transaction {
+            let meta = serde_json::to_vec(&serde_json::json!({
+                "name": "window model",
+                "version": "1.0.0",
+                "description": "registered inside the reorg window",
+                "framework": "onnx",
+                "input_shape": [1, 4],
+                "output_shape": [1],
+                "size_bytes": 1024
+            }))
+            .expect("metadata");
+            let mut data = vec![0x01, 0x00, 0x00, 0x00];
+            data.extend_from_slice(&model);
+            data.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+            data.extend_from_slice(&meta);
+            data.push(0); // AccessPolicy::Public
+            let tx = Transaction {
+                nonce,
+                from: embedded(ALICE),
+                to: Some(embedded(BOB)),
+                value: 0,
+                gas_limit: 400_000,
+                gas_price: 1_000_000_000,
+                data,
+                signature: Signature::new([1; 64]),
+                chain_id: Some(40204),
+                ..Default::default()
+            };
+            c1r_hashed(tx, ALICE, [model[0]; 20], nonce)
+        }
+
+        /// A model-update transaction (new metadata for `model`) from ALICE.
+        fn rsr_update(model: [u8; 32], nonce: u64) -> Transaction {
+            let meta = serde_json::to_vec(&serde_json::json!({
+                "name": "window model",
+                "version": "2.0.0",
+                "description": "updated inside the reorg window",
+                "framework": "onnx",
+                "input_shape": [1, 4],
+                "output_shape": [1],
+                "size_bytes": 2048
+            }))
+            .expect("metadata");
+            let mut data = vec![0x03, 0x00, 0x00, 0x00];
+            data.extend_from_slice(&model);
+            data.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+            data.extend_from_slice(&meta);
+            let tx = Transaction {
+                nonce,
+                from: embedded(ALICE),
+                to: Some(embedded(BOB)),
+                value: 0,
+                gas_limit: 400_000,
+                gas_price: 1_000_000_000,
+                data,
+                signature: Signature::new([1; 64]),
+                chain_id: Some(40204),
+                ..Default::default()
+            };
+            c1r_hashed(tx, ALICE, [0xD0; 20], nonce)
+        }
+
+        /// [`rsr_extend`], with a model registered at `model_at`'s height.
+        async fn rsr_extend_registering(
+            start: StateSnapshot,
+            parent: Hash,
+            first: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+            model_at: Option<(u64, [u8; 32])>,
+        ) -> (Vec<Block>, Vec<StateSnapshot>) {
+            let register = |h: u64, nonce: u64| {
+                model_at
+                    .filter(|(at, _)| *at == h)
+                    .map(|(_, model)| rsr_register(model, nonce))
+            };
+            rsr_extend_with(start, parent, first, n, vrf, to, &register).await
+        }
+
+        /// [`rsr_extend`], plus `extra(height, nonce)`'s transaction (if any)
+        /// after each block's transfer.
+        async fn rsr_extend_with(
+            start: StateSnapshot,
+            parent: Hash,
+            first: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+            extra: &(dyn Fn(u64, u64) -> Option<Transaction> + Sync),
+        ) -> (Vec<Block>, Vec<StateSnapshot>) {
+            let exec = Executor::new(Arc::new(StateDB::new()));
+            exec.state_restore(start);
+            let mut blocks = Vec::new();
+            let mut snaps = Vec::new();
+            let mut parent = parent;
+            for h in first..first + n {
+                let mut txs = vec![v251_transfer(&exec, ALICE, to, 1_000)];
+                // The nonce after the transfer: the producer executes in order.
+                if let Some(tx) = extra(h, exec.get_nonce(&Address(ALICE)) + 1) {
+                    txs.push(tx);
+                }
+                let b = produce(&exec, parent, h, vrf, txs).await;
+                parent = b.header.block_hash;
+                blocks.push(b);
+                snaps.push(exec.state_snapshot());
+            }
+            (blocks, snaps)
+        }
+
+        /// The main chain `1..=n` from genesis (ALICE→BOB).
+        async fn rsr_main(n: u64) -> (Vec<Block>, Vec<StateSnapshot>) {
+            rsr_extend(rsr_genesis(), Hash::default(), 1, n, VRF_OUT, BOB).await
+        }
+
+        /// A branch forking from `main` after height `fork` (ALICE→`to`).
+        async fn rsr_fork(
+            main: &[Block],
+            snaps: &[StateSnapshot],
+            fork: u64,
+            n: u64,
+            vrf: [u8; 32],
+            to: [u8; 20],
+        ) -> Vec<Block> {
+            let i = usize::try_from(fork - 1).expect("index");
+            rsr_extend(
+                snaps[i].clone(),
+                main[i].header.block_hash,
+                fork + 1,
+                n,
+                vrf,
+                to,
+            )
+            .await
+            .0
+        }
+
+        /// A store-backed node with the genesis state persisted.
+        async fn rsr_node() -> (Arc<StorageManager>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("dir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let exec = store_backed(&storage);
+            exec.state_restore(rsr_genesis());
+            exec.set_balance(&Address(ALICE), U256::from(FUND));
+            exec.persist_state_changes().await.expect("persist genesis");
+            (storage, dir)
+        }
+
+        /// Apply `blocks` in order on a running node over `storage`.
+        async fn rsr_apply(storage: &Arc<StorageManager>, exec: &Arc<Executor>, blocks: &[Block]) {
+            let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in blocks {
+                persist(storage, b);
+                assert!(
+                    matches!(app.apply_received(b).await, ApplyOutcome::Applied { .. }),
+                    "fixture: block {} applies",
+                    b.header.height
+                );
+            }
+        }
+
+        /// The executor a restarted node runs: hydrated from the durable store
+        /// the way `start_node` does (every account and storage record, the
+        /// root height of the applied tip, dirty sets cleared).
+        pub(crate) fn rsr_hydrated(storage: &Arc<StorageManager>) -> Arc<Executor> {
+            let exec = store_backed(storage);
+            let sdb = exec.state_db();
+            for (addr, acct) in storage.state.get_all_accounts().expect("accounts") {
+                sdb.accounts.load_account(addr, acct);
+            }
+            let tip_height = storage
+                .blocks
+                .get_applied_tip()
+                .expect("tip")
+                .map(|t| t.1)
+                .unwrap_or(0);
+            let records = storage.state.get_all_storage().expect("storage");
+            let records = if citrate_execution::storage_root_hardening::active_at(
+                citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+                tip_height.saturating_add(1),
+            ) {
+                records
+            } else {
+                citrate_storage::state::legacy_hydration_view(records)
+            };
+            for ((addr, key), val) in records {
+                sdb.set_storage(addr, key.into_vec(), val.into_vec());
+            }
+            let _ = sdb.take_dirty_storage();
+            sdb.set_root_height(tip_height);
+            let _ = sdb.calculate_state_root();
+            sdb.accounts.clear_dirty();
+            exec
+        }
+
+        /// The lowest durable applied height seen while it runs (a from-genesis
+        /// rebuild resets the durable tip to genesis inside one drain).
+        struct LowestTip {
+            stop: Arc<AtomicBool>,
+            lowest: Arc<AtomicU64>,
+            handle: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl LowestTip {
+            fn start(storage: Arc<StorageManager>) -> Self {
+                let stop = Arc::new(AtomicBool::new(false));
+                let lowest = Arc::new(AtomicU64::new(u64::MAX));
+                let (s, l) = (stop.clone(), lowest.clone());
+                let handle = std::thread::spawn(move || {
+                    while !s.load(Ordering::SeqCst) {
+                        if let Ok(Some((_, h))) = storage.blocks.get_applied_tip() {
+                            l.fetch_min(h, Ordering::SeqCst);
+                        }
+                    }
+                });
+                Self {
+                    stop,
+                    lowest,
+                    handle: Some(handle),
+                }
+            }
+
+            fn finish(mut self) -> u64 {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(h) = self.handle.take() {
+                    h.join().expect("watch thread");
+                }
+                self.lowest.load(Ordering::SeqCst)
+            }
+        }
+
+        /// The root a node reaches by applying `blocks` from genesis with no
+        /// restart and no reorg, read back from its durable store.
+        async fn rsr_fresh_root(blocks: &[Block]) -> Hash {
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, blocks).await;
+            let restarted = rsr_hydrated(&storage);
+            let root = restarted.calculate_state_root();
+            assert_eq!(
+                root,
+                exec.calculate_state_root(),
+                "fixture: fresh node durable"
+            );
+            root
+        }
+
+        /// Heights of the reorg ring a node holds right now.
+        async fn ring_heights(app: &CanonicalApplicator) -> Vec<u64> {
+            app.lock.lock().await.snapshots.keys().copied().collect()
+        }
+
+        /// A restarted node: 150 blocks applied, then stopped. A heavier branch
+        /// forking 40 below its tip arrives. The node switches by a bounded
+        /// reorg: the durable tip never goes below the fork point (no rebuild
+        /// from genesis), and the state equals a fresh node's on the winner.
+        #[tokio::test]
+        async fn restarted_node_reorgs_40_below_its_tip_without_a_rebuild() {
+            let (main, snaps) = rsr_main(150).await;
+            let fork = 110u64;
+            let side = rsr_fork(&main, &snaps, fork, 45, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            drop(exec);
+
+            // Restart.
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            assert_eq!(app.applied_tip().await.height, 150, "fixture: restart tip");
+            app.set_genesis(rsr_genesis(), Hash::default());
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            let tip = main.last().expect("main").header.block_hash;
+            app.fork_weight = Some(weights(&[(head.header.block_hash, 1_000), (tip, 150)]));
+            for b in &side {
+                persist(&storage, b);
+            }
+            let watch = LowestTip::start(storage.clone());
+            app.drive_drain().await;
+            let lowest = watch.finish();
+
+            assert_eq!(
+                app.applied_tip().await,
+                AppliedTip {
+                    hash: head.header.block_hash,
+                    height: head.header.height
+                },
+                "the restarted node switches to the heavier branch"
+            );
+            assert!(
+                lowest >= fork,
+                "the switch went below the fork point {fork} (lowest durable tip {lowest}): \
+                 a rebuild from genesis, not a bounded reorg"
+            );
+            let winner: Vec<Block> = main[..fork as usize]
+                .iter()
+                .chain(side.iter())
+                .cloned()
+                .collect();
+            let fresh = rsr_fresh_root(&winner).await;
+            assert_eq!(exec.calculate_state_root(), head.state_root);
+            assert_eq!(exec.calculate_state_root(), fresh, "memory == a fresh node");
+            assert_eq!(
+                rsr_hydrated(&storage).calculate_state_root(),
+                fresh,
+                "durable state == a fresh node"
+            );
+        }
+
+        /// A fork more than MAX_REORG_DEPTH below the restart tip is still beyond
+        /// the window: `reorg_to` reports it as before and changes nothing.
+        #[tokio::test]
+        async fn restarted_node_still_refuses_a_fork_deeper_than_the_window() {
+            let (main, snaps) = rsr_main(150).await;
+            let fork = 150 - MAX_REORG_DEPTH - 5;
+            let side = rsr_fork(&main, &snaps, fork, 120, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            drop(exec);
+
+            let exec = rsr_hydrated(&storage);
+            let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &side {
+                persist(&storage, b);
+            }
+            let before = exec.calculate_state_root();
+            let out = {
+                let mut state = app.lock.lock().await;
+                app.reorg_to(&mut state, head.header.block_hash).await
+            };
+            assert!(
+                matches!(out, ReorgOutcome::BeyondReorgWindow { stopped_at, .. } if stopped_at <= 150 - MAX_REORG_DEPTH),
+                "a fork {} below the tip is beyond the window: {out:?}",
+                150 - fork
+            );
+            assert_eq!(app.applied_tip().await.height, 150);
+            assert_eq!(exec.calculate_state_root(), before, "state untouched");
+            assert_eq!(
+                storage.blocks.get_applied_tip().expect("tip").map(|t| t.1),
+                Some(150)
+            );
+        }
+
+        /// The store keeps undo records for exactly the last MAX_REORG_DEPTH
+        /// applied heights, through linear growth and through a reorg.
+        #[tokio::test]
+        async fn undo_records_cover_exactly_the_last_window() {
+            let (main, snaps) = rsr_main(150).await;
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                app.apply_received(b).await;
+            }
+            assert_eq!(
+                storage.state.reorg_undo_heights().expect("heights"),
+                (151 - MAX_REORG_DEPTH..=150).collect::<Vec<u64>>(),
+                "linear: the last {MAX_REORG_DEPTH} heights"
+            );
+            // A reorg 30 below the tip onto a longer branch (to 160).
+            let side = rsr_fork(&main, &snaps, 120, 40, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            for b in &side {
+                persist(&storage, b);
+            }
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.drive_drain().await;
+            assert_eq!(app.applied_tip().await.height, 160, "fixture: reorged");
+            assert_eq!(
+                storage.state.reorg_undo_heights().expect("heights"),
+                (161 - MAX_REORG_DEPTH..=160).collect::<Vec<u64>>(),
+                "after a reorg: the last {MAX_REORG_DEPTH} heights of the new chain"
+            );
+            for h in 121..=160u64 {
+                let rec = storage
+                    .state
+                    .get_reorg_undo(h)
+                    .expect("read")
+                    .expect("record");
+                assert_eq!(
+                    rec.hash,
+                    side[usize::try_from(h - 121).expect("i")].header.block_hash,
+                    "the record at {h} names the new chain's block"
+                );
+            }
+            let sizes: Vec<usize> = (61..=160u64)
+                .map(|h| {
+                    let rec = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+                    bincode::serialize(&rec).expect("encode").len()
+                })
+                .collect();
+            println!(
+                "RSR undo bytes per one-transfer block: min {} max {} total window {}",
+                sizes.iter().min().expect("sizes"),
+                sizes.iter().max().expect("sizes"),
+                sizes.iter().sum::<usize>()
+            );
+        }
+
+        /// A restart seeds the reorg ring with every verified height of the
+        /// window, each snapshot reproducing its block's state root.
+        #[tokio::test]
+        async fn restart_seeds_the_full_window_from_the_undo_records() {
+            let (main, _) = rsr_main(130).await;
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            drop(exec);
+            let exec = rsr_hydrated(&storage);
+            let app = CanonicalApplicator::new(exec, storage.clone());
+            assert_eq!(
+                ring_heights(&app).await,
+                (130 - MAX_REORG_DEPTH..=130).collect::<Vec<u64>>(),
+                "the restart rebuilds the whole reorg window"
+            );
+            let state = app.lock.lock().await;
+            for (h, (hash, snap)) in &state.snapshots {
+                let b = &main[usize::try_from(h - 1).expect("i")];
+                assert_eq!(*hash, b.header.block_hash, "ring block at {h}");
+                let scratch = StateDB::new();
+                scratch.restore(snap.clone());
+                assert_eq!(
+                    scratch.calculate_state_root(),
+                    b.state_root,
+                    "ring root at {h}"
+                );
+            }
+        }
+
+        /// The model ids a node holds, sorted.
+        fn model_ids(exec: &Executor) -> Vec<Hash> {
+            let mut ids: Vec<Hash> = exec
+                .state_db()
+                .all_models()
+                .into_iter()
+                .map(|(id, _)| id.0)
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        /// Models live in memory, outside the state root. A model registered
+        /// on the abandoned branch inside the window must be gone after a
+        /// restarted node's reorg, and one registered on the winning branch
+        /// present: the same models as a node that never stopped.
+        #[tokio::test]
+        async fn models_across_a_restart_reorg_match_a_node_that_never_stopped() {
+            let (m_lost, m_won) = ([0x4D; 32], [0x4E; 32]);
+            let (main, snaps) = rsr_extend_registering(
+                rsr_genesis(),
+                Hash::default(),
+                1,
+                130,
+                VRF_OUT,
+                BOB,
+                Some((120, m_lost)),
+            )
+            .await;
+            let fork = 110u64;
+            let i = usize::try_from(fork - 1).expect("i");
+            let (side, _) = rsr_extend_registering(
+                snaps[i].clone(),
+                main[i].header.block_hash,
+                fork + 1,
+                30,
+                [0x5B; 32],
+                CAROL,
+                Some((125, m_won)),
+            )
+            .await;
+            let head = side.last().expect("side").clone();
+
+            // A node that never stopped.
+            let (s1, _d1) = rsr_node().await;
+            let live = rsr_hydrated(&s1);
+            let mut app1 = CanonicalApplicator::new(live.clone(), s1.clone());
+            for b in &main {
+                persist(&s1, b);
+                app1.apply_received(b).await;
+            }
+            assert_eq!(
+                model_ids(&live),
+                vec![Hash::new(m_lost)],
+                "fixture: registered"
+            );
+            for b in &side {
+                persist(&s1, b);
+            }
+            app1.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app1.drive_drain().await;
+            assert_eq!(app1.applied_tip().await.hash, head.header.block_hash);
+
+            // A node that stopped at 130 and restarted from its own state.
+            let (s2, _d2) = rsr_node().await;
+            let before = rsr_hydrated(&s2);
+            rsr_apply(&s2, &before, &main).await;
+            let restarted = store_backed(&s2);
+            restarted.state_restore(before.state_snapshot());
+            drop(before);
+            let mut app2 = CanonicalApplicator::new(restarted.clone(), s2.clone());
+            for b in &side {
+                persist(&s2, b);
+            }
+            app2.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            let watch = LowestTip::start(s2.clone());
+            app2.drive_drain().await;
+            let lowest = watch.finish();
+            assert_eq!(app2.applied_tip().await.hash, head.header.block_hash);
+            assert!(
+                lowest >= fork,
+                "bounded reorg (lowest durable tip {lowest})"
+            );
+            assert_eq!(
+                model_ids(&restarted),
+                model_ids(&live),
+                "the restarted node's models match the node that never stopped"
+            );
+            assert_eq!(model_ids(&restarted), vec![Hash::new(m_won)]);
+            assert_eq!(restarted.calculate_state_root(), head.state_root);
+        }
+
+        /// A node with 30 blocks applied and stopped: its store and the blocks.
+        async fn rsr_stopped_at_30() -> (Arc<StorageManager>, tempfile::TempDir, Vec<Block>) {
+            let (main, _) = rsr_main(30).await;
+            let (storage, dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            (storage, dir, main)
+        }
+
+        /// Replace the kept undo record at its height with `record`, through the
+        /// store's own reorg commit (tip unchanged).
+        fn rsr_put_record(
+            storage: &StorageManager,
+            tip: &Block,
+            record: citrate_execution::executor::BlockUndo,
+        ) {
+            use citrate_execution::executor::StateStoreTrait;
+            storage
+                .state
+                .write_reorg_batch_sync(
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    Some((tip.header.block_hash, tip.header.height)),
+                    &ReceiptIndexBatch::default(),
+                    &[record],
+                )
+                .expect("put record");
+        }
+
+        /// The ring a node restarted on `storage` rebuilds.
+        async fn rsr_restart_ring(storage: &Arc<StorageManager>) -> Vec<u64> {
+            ring_heights(&CanonicalApplicator::new(
+                rsr_hydrated(storage),
+                storage.clone(),
+            ))
+            .await
+        }
+
+        /// Fail-safe seeding: a record without model/job pre-images (an older
+        /// binary's, a corrupt one) is never used. At the tip, the restart keeps
+        /// the tip alone; mid-window, the window ends at that height. Never
+        /// treated as "no model changed".
+        #[tokio::test]
+        async fn a_record_without_model_job_pre_images_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (1..=30).collect::<Vec<u64>>(),
+                "fixture: the whole chain"
+            );
+            for (h, want) in [(30u64, vec![30u64]), (20, (20..=30).collect())] {
+                let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+                assert!(original.models_jobs.is_some(), "fixture: complete record");
+                let mut stripped = original.clone();
+                stripped.models_jobs = None;
+                rsr_put_record(&storage, &tip, stripped);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    want,
+                    "a record at {h} without model/job pre-images ends the window there"
+                );
+                rsr_put_record(&storage, &tip, original);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    (1..=30).collect::<Vec<u64>>()
+                );
+            }
+        }
+
+        /// Fail-safe seeding: a record whose pre-images were tampered with, or
+        /// that names another block, ends the window at its height: the rebuilt
+        /// root (or the block check) rejects it. Each case keeps every other
+        /// field right, so each check is the only one that can catch it.
+        #[tokio::test]
+        async fn a_tampered_or_misnamed_record_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            let h = 20u64;
+            let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+            let mut tampered = original.clone();
+            let Some((_, Some(acct))) = tampered.accounts.iter_mut().find(|(_, s)| s.is_some())
+            else {
+                panic!("fixture: an account pre-image");
+            };
+            acct.balance = acct.balance.saturating_add(U256::from(1u64));
+            let mut misnamed = original.clone();
+            misnamed.hash = Hash::new([0xEE; 32]);
+            let mut wrong_parent = original.clone();
+            wrong_parent.parent = Some((Hash::new([0xEF; 32]), h - 1));
+            for (what, record) in [
+                ("a tampered account pre-image", tampered),
+                ("a record naming another block", misnamed),
+                ("a record naming another parent", wrong_parent),
+            ] {
+                rsr_put_record(&storage, &tip, record);
+                assert_eq!(
+                    rsr_restart_ring(&storage).await,
+                    (h..=30).collect::<Vec<u64>>(),
+                    "{what} at {h} ends the window there"
+                );
+                rsr_put_record(&storage, &tip, original.clone());
+            }
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (1..=30).collect::<Vec<u64>>()
+            );
+        }
+
+        /// Fail-safe seeding: a record that names no parent is not used either
+        /// (the walk only reverts to the block a record says it reverts to).
+        #[tokio::test]
+        async fn a_record_naming_no_parent_ends_the_restored_window() {
+            let (storage, _dir, main) = rsr_stopped_at_30().await;
+            let tip = main.last().expect("tip").clone();
+            let h = 20u64;
+            let original = storage.state.get_reorg_undo(h).expect("read").expect("rec");
+            assert!(original.parent.is_some(), "fixture: a parent is recorded");
+            let mut no_parent = original.clone();
+            no_parent.parent = None;
+            rsr_put_record(&storage, &tip, no_parent);
+            assert_eq!(
+                rsr_restart_ring(&storage).await,
+                (h..=30).collect::<Vec<u64>>(),
+                "a record at {h} naming no parent ends the window there"
+            );
+        }
+
+        /// A model registered BEFORE the window (height 10, tip 130) and updated
+        /// inside it (120), across a real restart (state hydrated from the store)
+        /// and a reorg forking at 125 onto a branch that leaves it alone: the
+        /// restarted node must hold the same model as a node that never stopped.
+        ///
+        /// It cannot today. Models and training jobs live in memory only: they
+        /// are not persisted to the flat store and not loaded at start-up, so a
+        /// restarted node holds none at its tip, and the window rebuilt from the
+        /// undo records only knows the pre-images of what changed inside it. See
+        /// `restore_reorg_window` (the limit), tracked as its own item.
+        #[tokio::test]
+        #[ignore = "tracked: startup model/job load"]
+        async fn pre_window_model_updated_in_the_window_survives_a_restart_reorg() {
+            let model = [0x4F; 32];
+            let ops = |h: u64, nonce: u64| match h {
+                10 => Some(rsr_register(model, nonce)),
+                120 => Some(rsr_update(model, nonce)),
+                _ => None,
+            };
+            let (main, snaps) =
+                rsr_extend_with(rsr_genesis(), Hash::default(), 1, 130, VRF_OUT, BOB, &ops).await;
+            let fork = 125u64;
+            let side = rsr_fork(&main, &snaps, fork, 10, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+            let version = |exec: &Executor| {
+                exec.state_db()
+                    .get_model(&citrate_execution::types::ModelId(Hash::new(model)))
+                    .map(|m| m.version)
+            };
+
+            // A node that never stopped.
+            let (s1, _d1) = rsr_node().await;
+            let live = rsr_hydrated(&s1);
+            let mut app1 = CanonicalApplicator::new(live.clone(), s1.clone());
+            for b in &main {
+                persist(&s1, b);
+                app1.apply_received(b).await;
+            }
+            assert_eq!(version(&live), Some(2), "fixture: registered, then updated");
+            for b in &side {
+                persist(&s1, b);
+            }
+            app1.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app1.drive_drain().await;
+            assert_eq!(app1.applied_tip().await.hash, head.header.block_hash);
+
+            // A node that stopped at 130 and restarted from its durable store.
+            let (s2, _d2) = rsr_node().await;
+            let before = rsr_hydrated(&s2);
+            rsr_apply(&s2, &before, &main).await;
+            drop(before);
+            let restarted = rsr_hydrated(&s2);
+            let mut app2 = CanonicalApplicator::new(restarted.clone(), s2.clone());
+            for b in &side {
+                persist(&s2, b);
+            }
+            app2.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app2.drive_drain().await;
+            assert_eq!(app2.applied_tip().await.hash, head.header.block_hash);
+            assert_eq!(restarted.calculate_state_root(), head.state_root);
+            assert_eq!(
+                version(&restarted),
+                version(&live),
+                "the restarted node's model matches the node that never stopped"
+            );
+        }
+
+        /// Rebuilding the window at start-up stops at its time budget: a shorter
+        /// window (here the tip alone), never a wrong one.
+        #[tokio::test]
+        async fn window_restore_stops_at_its_time_budget() {
+            let (main, _) = rsr_main(30).await;
+            let (storage, _dir) = rsr_node().await;
+            let exec = rsr_hydrated(&storage);
+            rsr_apply(&storage, &exec, &main).await;
+            drop(exec);
+            crate::canonical_apply::test_restore_budget::set(Some(std::time::Duration::ZERO));
+            let app = CanonicalApplicator::new(rsr_hydrated(&storage), storage.clone());
+            crate::canonical_apply::test_restore_budget::set(None);
+            assert_eq!(ring_heights(&app).await, vec![30]);
+            let app = CanonicalApplicator::new(rsr_hydrated(&storage), storage.clone());
+            assert_eq!(
+                ring_heights(&app).await,
+                (0..=30).filter(|h| *h >= 1).collect::<Vec<u64>>(),
+                "with the budget, the whole chain (genesis has no stored block)"
+            );
+        }
+
+        /// The outcome of [`rsr_rejected_reorg`].
+        struct RejectedReorg {
+            healed: bool,
+            tip: AppliedTip,
+            lowest: u64,
+            head: Block,
+            fork: u64,
+            root: Hash,
+            durable_root: Hash,
+            _dir: tempfile::TempDir,
+        }
+
+        /// A node at tip 30 (optionally with its DAG store pruned below
+        /// `prune_at`) meets a strictly heavier branch forking at 25, inside its
+        /// ring. `recover_automatic` runs while the in-place reorg's winning
+        /// commit fails once, so `reorg_to` is rejected (not for finality), or,
+        /// with `finalized` above the fork point, for finality.
+        async fn rsr_rejected_reorg(
+            prune_at: Option<u64>,
+            finalized: Option<u64>,
+        ) -> RejectedReorg {
+            use citrate_consensus::dag_store::DagStore;
+            let (main, snaps) = rsr_main(30).await;
+            let fork = 25u64;
+            let side = rsr_fork(&main, &snaps, fork, 10, [0x5B; 32], CAROL).await;
+            let head = side.last().expect("side").clone();
+
+            let dir = tempfile::tempdir().expect("dir");
+            let storage = Arc::new(
+                StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"),
+            );
+            let store = Arc::new(V251AbortStore {
+                inner: storage.state.clone(),
+                writes: AtomicU64::new(0),
+                abort_at: u64::MAX,
+                fail_receipt_index: AtomicBool::new(false),
+                fail_reorg_batch_at: AtomicU64::new(0),
+                reorg_batches: AtomicU64::new(0),
+            });
+            let exec = Arc::new(Executor::with_storage(
+                Arc::new(StateDB::new()),
+                Some(store.clone()),
+            ));
+            exec.state_restore(rsr_genesis());
+            exec.set_balance(&Address(ALICE), U256::from(FUND));
+            exec.persist_state_changes().await.expect("persist genesis");
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            if let Some(at) = prune_at {
+                let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+                let point = &main[usize::try_from(at - 1).expect("i")];
+                dag.store_block(point.clone()).await.expect("into DAG");
+                dag.update_pruning_point(point.header.block_hash)
+                    .await
+                    .expect("pruning point");
+                app = app.with_dag_prune_floor(dag);
+            }
+            for b in &main {
+                persist(&storage, b);
+                assert!(matches!(
+                    app.apply_received(b).await,
+                    ApplyOutcome::Applied { .. }
+                ));
+            }
+            for b in &side {
+                persist(&storage, b);
+            }
+            let tip = main.last().expect("main").header.block_hash;
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.fork_weight = Some(weights(&[(head.header.block_hash, 1_000), (tip, 30)]));
+            assert!(
+                app.lock.lock().await.snapshots.contains_key(&fork),
+                "fixture: the fork point is inside the ring"
+            );
+            // Reorg batch 1 reverts to the fork point; batch 2 (the winner's
+            // commit) fails once, so the in-place reorg is rejected.
+            store.fail_reorg_batch_at.store(
+                store.reorg_batches.load(Ordering::SeqCst) + 2,
+                Ordering::SeqCst,
+            );
+            if let Some(f) = finalized {
+                app.finalized_height_handle().store(f, Ordering::SeqCst);
+            }
+            let watch = LowestTip::start(storage.clone());
+            let healed = app
+                .recover_automatic(rsr_genesis(), Hash::default(), head.header.block_hash)
+                .await
+                .expect("recovery");
+            let lowest = watch.finish();
+            assert!(
+                finalized.is_some() || store.reorg_batches.load(Ordering::SeqCst) >= 2,
+                "fixture: the in-place reorg was attempted"
+            );
+            RejectedReorg {
+                healed,
+                tip: app.applied_tip().await,
+                lowest,
+                head,
+                fork,
+                root: exec.calculate_state_root(),
+                durable_root: rsr_hydrated(&storage).calculate_state_root(),
+                _dir: dir,
+            }
+        }
+
+        /// An UNPRUNED node whose in-place reorg toward a strictly heavier head is
+        /// rejected for a reason other than finality (here the winning branch's
+        /// store commit fails once) falls back to the from-genesis rebuild and
+        /// converges, as it did before the window was rebuilt from undo records.
+        /// A rejection must never leave it on its tip for good.
+        #[tokio::test]
+        async fn unpruned_node_heals_by_rebuild_when_the_in_place_reorg_is_rejected() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(None, None).await;
+            assert!(
+                r.healed,
+                "an unpruned node falls back to the rebuild when the in-place reorg is rejected"
+            );
+            assert_eq!(
+                r.tip,
+                AppliedTip {
+                    hash: r.head.header.block_hash,
+                    height: r.head.header.height
+                }
+            );
+            assert_eq!(r.root, r.head.state_root);
+            assert_eq!(
+                r.durable_root, r.head.state_root,
+                "durable state on the heavier branch"
+            );
+        }
+
+        /// The same rejection on a PRUNED node does not fall back: no rebuild
+        /// from genesis (the durable tip never goes below the fork point), and
+        /// the node keeps its tip and state.
+        #[tokio::test]
+        async fn pruned_node_never_rebuilds_after_a_rejected_in_place_reorg() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(Some(10), None).await;
+            assert!(!r.healed, "a pruned node never rebuilds from genesis");
+            assert_eq!(r.tip.height, 30, "the applied tip is kept");
+            assert!(
+                r.lowest >= r.fork,
+                "no rewind below the fork point (lowest durable tip {})",
+                r.lowest
+            );
+            assert_eq!(r.root, r.durable_root, "memory == store");
+        }
+
+        /// An unpruned node whose in-place reorg is rejected because the fork
+        /// point is below the finalized floor does not fall back to the
+        /// rebuild either: it keeps its tip.
+        #[tokio::test]
+        async fn a_reorg_rejected_for_finality_never_falls_back_to_the_rebuild() {
+            if std::env::var(RSR_DIR).is_ok() || std::env::var(V251_DIR).is_ok() {
+                return;
+            }
+            let r = rsr_rejected_reorg(None, Some(27)).await;
+            assert!(!r.healed, "no rebuild across the finalized floor");
+            assert_eq!(r.tip.height, 30, "the applied tip is kept");
+            assert!(
+                r.lowest >= r.fork,
+                "no rewind below the fork point (lowest durable tip {})",
+                r.lowest
+            );
+            assert_eq!(r.root, r.durable_root, "memory == store");
+        }
+
+        // -- crash consistency --------------------------------------------
+
+        const RSR_DIR: &str = "RSR_CHILD_DIR";
+        const RSR_ABORT_AT: &str = "RSR_ABORT_AT";
+        const RSR_MAIN: u64 = 12;
+        const RSR_FORK: u64 = 8;
+        const RSR_SIDE: u64 = 6;
+
+        async fn rsr_crash_blocks() -> (Vec<Block>, Vec<Block>, Vec<Block>) {
+            let (main, snaps) = rsr_main(RSR_MAIN).await;
+            let side = rsr_fork(&main, &snaps, RSR_FORK, RSR_SIDE, [0x5B; 32], CAROL).await;
+            // A third branch, forking low in the window, for the post-crash reorg.
+            let third = rsr_fork(&main, &snaps, 5, 16, [0x6C; 32], DAVE).await;
+            (main, side, third)
+        }
+
+        /// CHILD body: genesis, 12 linear blocks, then a reorg 4 below the tip
+        /// onto a heavier branch; every state write goes through the abort
+        /// store (kill -9 before its k-th write).
+        #[tokio::test]
+        async fn rsr_crash_child() {
+            let Ok(dir) = std::env::var(RSR_DIR) else {
+                return;
+            };
+            let abort_at: u64 = std::env::var(RSR_ABORT_AT)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX);
+            let storage = Arc::new(
+                StorageManager::new(std::path::Path::new(&dir), PruningConfig::default())
+                    .expect("storage"),
+            );
+            let store = Arc::new(V251AbortStore {
+                inner: storage.state.clone(),
+                writes: AtomicU64::new(0),
+                abort_at,
+                fail_receipt_index: AtomicBool::new(false),
+                fail_reorg_batch_at: AtomicU64::new(0),
+                reorg_batches: AtomicU64::new(0),
+            });
+            let exec = Arc::new(Executor::with_storage(
+                Arc::new(StateDB::new()),
+                Some(store.clone()),
+            ));
+            exec.set_balance(&Address(ALICE), U256::from(FUND));
+            exec.persist_state_changes().await.expect("persist genesis");
+            let (main, side, _) = rsr_crash_blocks().await;
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            for b in &main {
+                persist(&storage, b);
+                app.apply_received(b).await;
+            }
+            for b in &side {
+                persist(&storage, b);
+            }
+            let head = side.last().expect("side");
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            app.drive_drain().await;
+            assert_eq!(app.applied_tip().await.hash, head.header.block_hash);
+            println!("RSR_TOTAL_WRITES={}", store.writes.load(Ordering::SeqCst));
+        }
+
+        /// Reopen a crashed store like `start_node` and check: the hydrated state
+        /// reproduces the durable tip's root; the restart seeds a ring with every
+        /// height of the durable chain (the window survives the crash); every
+        /// seeded snapshot reproduces its block's root; and the node then
+        /// switches to a heavier branch forking at height 5 by a bounded reorg.
+        async fn rsr_check_crashed(
+            dir: &std::path::Path,
+            main: &[Block],
+            side: &[Block],
+            third: &[Block],
+        ) -> Result<String, String> {
+            let storage =
+                Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("reopen"));
+            let Some((tip_hash, tip_height)) = storage.blocks.get_applied_tip().expect("tip")
+            else {
+                return Ok("no block applied yet".into());
+            };
+            let all: Vec<&Block> = main.iter().chain(side).chain(third).collect();
+            let tip_block = all
+                .iter()
+                .find(|b| b.header.block_hash == tip_hash)
+                .ok_or("tip names an unknown block")?;
+            let exec = rsr_hydrated(&storage);
+            if exec.calculate_state_root() != tip_block.state_root {
+                return Err(format!("torn: hydrated root != tip {tip_height} root"));
+            }
+            let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+            let ring = ring_heights(&app).await;
+            if ring != (1..=tip_height).collect::<Vec<u64>>() {
+                return Err(format!("window lost: ring {ring:?} at tip {tip_height}"));
+            }
+            {
+                let state = app.lock.lock().await;
+                for (h, (hash, snap)) in &state.snapshots {
+                    let b = all
+                        .iter()
+                        .find(|b| b.header.block_hash == *hash)
+                        .ok_or(format!("ring {h} names an unknown block"))?;
+                    let scratch = StateDB::new();
+                    scratch.restore(snap.clone());
+                    if scratch.calculate_state_root() != b.state_root {
+                        return Err(format!("ring snapshot at {h} has a wrong root"));
+                    }
+                }
+            }
+            // A restarted node hears every block again from its peers.
+            for b in all.iter() {
+                persist(&storage, b);
+            }
+            let head = third.last().expect("third");
+            app.fork_choice = Some(fork_choice_returning(head.header.block_hash));
+            let watch = LowestTip::start(storage.clone());
+            app.drive_drain().await;
+            let lowest = watch.finish();
+            if app.applied_tip().await.hash != head.header.block_hash {
+                return Err(format!(
+                    "did not reorg to the third branch (tip {tip_height})"
+                ));
+            }
+            if lowest < tip_height.min(5) {
+                return Err(format!("went below the fork point: lowest {lowest}"));
+            }
+            if rsr_hydrated(&storage).calculate_state_root() != head.state_root {
+                return Err("durable state after the reorg has a wrong root".into());
+            }
+            Ok(format!("tip {tip_height}, ring 1..={tip_height}"))
+        }
+
+        /// Tripwire: every path that moves the durable tip with new state keeps
+        /// the undo records with it. If one stops, a restart loses the window
+        /// and falls back to the replay from genesis a pruned node refuses.
+        #[test]
+        fn undo_records_stay_wired() {
+            let apply = include_str!("canonical_apply.rs");
+            let store = include_str!("../../core/storage/src/state/state_store.rs");
+            let body = |src: &'static str, start: &str| -> &'static str {
+                let at = src.find(start).expect("function");
+                let tail = src.get(at..).expect("tail");
+                let end = [
+                    "\n    fn ",
+                    "\n    pub ",
+                    "\n    async fn ",
+                    "\n    pub(crate) ",
+                ]
+                .iter()
+                .filter_map(|p| tail.get(1..).and_then(|t| t.find(p)))
+                .min()
+                .unwrap_or(tail.len());
+                tail.get(..end).expect("body")
+            };
+            let reorg = body(apply, "pub async fn reorg_to(");
+            assert_eq!(
+                reorg.matches("reconcile_store_from_with_undo(").count(),
+                1,
+                "reorg_to commits the winning branch with its undo records"
+            );
+            assert!(reorg.contains("branch_undo(fork, &base_snapshot, &new_snaps, tip.height)"));
+            assert!(
+                body(apply, "pub fn new(executor: Arc<Executor>").contains("restore_reorg_window(")
+            );
+            let linear = body(store, "fn write_state_batch_with_applied_tip(");
+            assert!(
+                linear.contains("self.stage_block_undo(")
+                    && linear.contains("models_jobs,")
+                    && linear.contains("stage_applied_tip_locked("),
+                "a linear tip commit stages its whole undo record (model/job pre-images \
+                 included) under the index lock"
+            );
+            // The whole record commits in the block's batch: nothing completes it
+            // after the commit (a crash in between would lose the window).
+            let exec = include_str!("../../core/execution/src/executor.rs");
+            let inner = body(exec, "async fn apply_block_inner(");
+            assert!(
+                inner.contains(".persist_state_changes_with_undo(")
+                    && inner.contains("model_job_pre_images(&snapshot"),
+                "block import commits the block's model/job pre-images in its batch"
+            );
+            let producer = include_str!("producer.rs");
+            let produce = body(producer, "async fn produce_block(&self)");
+            assert!(
+                produce.contains("round_state.model_job_undo()")
+                    && produce.contains(".persist_state_changes_with_undo("),
+                "the producer commits the block's model/job pre-images in its batch"
+            );
+            for (name, src) in [("canonical_apply.rs", apply), ("state_store.rs", store)] {
+                let completion = ["complete_", "reorg_undo("].concat();
+                assert!(
+                    !src.contains(&completion),
+                    "{name}: an undo record must not be completed after its commit"
+                );
+            }
+            assert!(body(store, "fn write_reorg_batch_sync(").contains("self.stage_branch_undo("));
+            assert_eq!(
+                store.matches("self.stage_applied_tip(").count()
+                    + store.matches("self.stage_applied_tip_locked(").count(),
+                4,
+                "a new tip-moving write path in StateStore must keep the undo records too"
+            );
+        }
+
+        /// kill -9 before every state write of 12 blocks plus a reorg: the
+        /// restarted node always keeps the whole window, never a wrong
+        /// snapshot, and reorgs from it.
+        #[tokio::test]
+        async fn crash_at_every_write_keeps_the_reorg_window() {
+            if std::env::var(RSR_DIR).is_ok() {
+                return;
+            }
+            let test = "canonical_apply::tests::restart_safe_reorg::rsr_crash_child";
+            let (main, side, third) = rsr_crash_blocks().await;
+            let dry = tempfile::tempdir().expect("dir");
+            let out = v251_spawn(test, &[(RSR_DIR, dry.path().to_string_lossy().into())])
+                .wait_with_output()
+                .expect("dry");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let total: u64 = stdout
+                .lines()
+                .find_map(|l| {
+                    l.split("RSR_TOTAL_WRITES=")
+                        .nth(1)
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "dry run failed: {stdout}\n{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                });
+            let mut bad = Vec::new();
+            match rsr_check_crashed(dry.path(), &main, &side, &third).await {
+                Ok(d) => println!("RSR dry run: {total} writes; {d}"),
+                Err(e) => bad.push(format!("dry: {e}")),
+            }
+            for k in 1..=total {
+                let dir = tempfile::tempdir().expect("dir");
+                let out = v251_spawn(
+                    test,
+                    &[
+                        (RSR_DIR, dir.path().to_string_lossy().into()),
+                        (RSR_ABORT_AT, k.to_string()),
+                    ],
+                )
+                .wait_with_output()
+                .expect("child");
+                let err = String::from_utf8_lossy(&out.stderr);
+                let what = err
+                    .lines()
+                    .find(|l| l.contains("V251 ABORT"))
+                    .unwrap_or("?")
+                    .to_string();
+                match rsr_check_crashed(dir.path(), &main, &side, &third).await {
+                    Ok(d) => println!("RSR abort k={k} [{what}] -> {d}"),
+                    Err(e) => bad.push(format!("k={k} [{what}] {e}")),
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "crash points that lose or corrupt the window: {bad:#?}"
+            );
+        }
+
+        /// kill -9 right AFTER every state commit (the fsync'd linear batch or
+        /// a reorg batch) and before anything the caller writes next: the
+        /// restarted node still keeps the whole window. A block's undo record is
+        /// complete when its batch commits; nothing written after the commit is
+        /// needed to revert it.
+        #[tokio::test]
+        async fn crash_right_after_every_commit_keeps_the_reorg_window() {
+            if std::env::var(RSR_DIR).is_ok() {
+                return;
+            }
+            let test = "canonical_apply::tests::restart_safe_reorg::rsr_crash_child";
+            let (main, side, third) = rsr_crash_blocks().await;
+            let dry = tempfile::tempdir().expect("dir");
+            let out = v251_spawn(
+                test,
+                &[
+                    (RSR_DIR, dry.path().to_string_lossy().into()),
+                    ("V251_TRACE", "1".into()),
+                ],
+            )
+            .wait_with_output()
+            .expect("dry");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let commits: Vec<(u64, String)> = stderr
+                .lines()
+                .filter_map(|l| {
+                    let rest = l.strip_prefix("V251 write#")?;
+                    let (n, what) = rest.split_once(' ')?;
+                    let what = what.trim();
+                    (what == "write_state_batch_with_applied_tip"
+                        || what == "write_reorg_batch_sync")
+                        .then(|| Some((n.parse().ok()?, what.to_string())))
+                        .flatten()
+                })
+                .collect();
+            assert!(
+                commits
+                    .iter()
+                    .filter(|(_, w)| w == "write_state_batch_with_applied_tip")
+                    .count()
+                    >= usize::try_from(RSR_MAIN).expect("n"),
+                "fixture: every linear block commits through the store: {commits:?}\n{stderr}"
+            );
+            let mut bad = Vec::new();
+            for (k, what) in &commits {
+                let dir = tempfile::tempdir().expect("dir");
+                let out = v251_spawn(
+                    test,
+                    &[
+                        (RSR_DIR, dir.path().to_string_lossy().into()),
+                        (V251_ABORT_AFTER, k.to_string()),
+                    ],
+                )
+                .wait_with_output()
+                .expect("child");
+                let err = String::from_utf8_lossy(&out.stderr);
+                if !err.contains("V251 ABORT after") {
+                    bad.push(format!("k={k} [{what}]: the child did not abort"));
+                    continue;
+                }
+                match rsr_check_crashed(dir.path(), &main, &side, &third).await {
+                    Ok(d) => println!("RSR abort after k={k} [{what}] -> {d}"),
+                    Err(e) => bad.push(format!("after k={k} [{what}] {e}")),
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "crash points right after a commit that lose or corrupt the window: {bad:#?}"
+            );
+        }
     }
 }
