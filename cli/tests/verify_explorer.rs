@@ -113,6 +113,10 @@ struct Recorder {
     seen: Arc<Mutex<Vec<Seen>>>,
 }
 
+/// A scripted body of `ECHO` answers with the request line and body instead, the way a
+/// misbehaving proxy or error page reflects the request it got.
+const ECHO: &str = "<echo request>";
+
 /// Serve scripted (status, body) answers in order; the last one repeats.
 async fn recorder(script: Vec<(u16, &str)>) -> Recorder {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -169,6 +173,7 @@ async fn recorder(script: Vec<(u16, &str)>) -> Recorder {
                     .then(|| v.trim().to_owned())
             });
             let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+            let echo = format!("{method} {target}\n{body}");
             seen2.lock().expect("recorder mutex").push(Seen {
                 method,
                 target,
@@ -183,6 +188,7 @@ async fn recorder(script: Vec<(u16, &str)>) -> Recorder {
                     q.front().cloned().unwrap_or((200, "{}".to_owned()))
                 }
             };
+            let answer = if answer == ECHO { echo } else { answer };
             let resp = format!(
                 "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
                 answer.len()
@@ -934,6 +940,8 @@ async fn cli_output_never_carries_the_api_key() {
             "1",
         ],
         vec!["contract", "verify-get", FORGE_ADDR],
+        // `contract verify` itself: before #448 the debug binary panicked on the `-c` clash.
+        vec!["contract", "verify", FORGE_ADDR, "--get", FORGE_ADDR],
     ];
     for args in cases {
         let (ok, text) = run_cli_against_closed_port(&url, &args);
@@ -946,8 +954,7 @@ async fn cli_output_never_carries_the_api_key() {
     }
 
     // `verify --get` and `verify --watch`, in process: main prints the returned error with
-    // `{:?}`. (The binary's `contract verify` trips clap's debug assertion on the `-c` short
-    // flag shared by `--compiler` and the global `--config`, which predates this command.)
+    // `{:?}`.
     let bi = forge_build_info();
     let runs: Vec<Vec<&str>> = vec![
         vec!["citrate", "verify", FORGE_ADDR, "--get", FORGE_ADDR],
@@ -977,9 +984,130 @@ async fn cli_output_never_carries_the_api_key() {
     }
 }
 
+/// A key whose URL spelling differs from its raw spelling (space, `/`, `+`, `&`, `=`), so the
+/// percent-encoded branch of the redaction is what keeps it out of the error.
+const ENCODED_KEY: &str = "SEK RIT/+&=9";
+/// `ENCODED_KEY` as `application/x-www-form-urlencoded` writes it in a query or form body.
+const ENCODED_KEY_ON_WIRE: &str = "SEK+RIT%2F%2B%26%3D9";
+
+fn assert_error_hides(key: &str, what: &str, e: &VerifyError) {
+    let wrapped = anyhow::Error::new(e.clone());
+    for text in [
+        e.to_string(),
+        format!("{e:?}"),
+        format!("{wrapped:#}"),
+        format!("{wrapped:?}"),
+    ] {
+        assert!(!text.contains(key), "{what} leaked the raw API key: {text}");
+        if key == ENCODED_KEY {
+            assert!(
+                !text.contains(ENCODED_KEY_ON_WIRE),
+                "{what} leaked the percent-encoded API key: {text}"
+            );
+        }
+        assert!(text.contains("<redacted>"), "{what}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn http_and_protocol_error_bodies_never_carry_the_api_key() {
+    for key in [SECRET_KEY, ENCODED_KEY] {
+        // Non-2xx page that reflects the request: VerifyError::Http.
+        let srv = recorder(vec![(502, ECHO)]).await;
+        let c = ExplorerClient::new(&srv.url, Some(key.to_owned())).expect("client");
+        let e = c.check_status("g").await.expect_err("502");
+        assert!(matches!(e, VerifyError::Http { status: 502, .. }), "{e:?}");
+        assert_error_hides(key, "checkverifystatus HTTP body", &e);
+        if key == ENCODED_KEY {
+            // The reflected query really carried the encoded spelling, not the raw one.
+            assert!(srv.seen()[0].target.contains(ENCODED_KEY_ON_WIRE));
+        }
+
+        let e = c
+            .submit(&forge_request(None), &fast())
+            .await
+            .expect_err("502");
+        assert!(matches!(e, VerifyError::Http { status: 502, .. }), "{e:?}");
+        assert_error_hides(key, "verifysourcecode HTTP body", &e);
+
+        // 2xx answer that is not an envelope: VerifyError::Protocol.
+        let srv = recorder(vec![(200, ECHO)]).await;
+        let c = ExplorerClient::new(&srv.url, Some(key.to_owned())).expect("client");
+        let e = c.get_source_code(FORGE_ADDR).await.expect_err("not JSON");
+        assert!(matches!(e, VerifyError::Protocol(_)), "{e:?}");
+        assert_error_hides(key, "getsourcecode protocol body", &e);
+
+        let e = c
+            .submit(&forge_request(None), &fast())
+            .await
+            .expect_err("not JSON");
+        assert!(matches!(e, VerifyError::Protocol(_)), "{e:?}");
+        assert_error_hides(key, "verifysourcecode protocol body", &e);
+    }
+}
+
+#[tokio::test]
+async fn transport_errors_hide_a_key_that_changes_when_encoded() {
+    let url = closed_port_url().await;
+    let c = ExplorerClient::new(&url, Some(ENCODED_KEY.to_owned()))
+        .expect("client")
+        .with_chain_id(Some(40204));
+    let dbg = format!("{c:?}");
+    assert!(
+        !dbg.contains(ENCODED_KEY) && !dbg.contains(ENCODED_KEY_ON_WIRE),
+        "{dbg}"
+    );
+    for e in [
+        c.check_status("g").await.expect_err("closed port"),
+        c.get_source_code(FORGE_ADDR)
+            .await
+            .expect_err("closed port"),
+    ] {
+        assert!(matches!(e, VerifyError::Transport(_)), "{e:?}");
+        let text = format!("{e} {e:?}");
+        assert!(!text.contains(ENCODED_KEY), "{text}");
+        assert!(!text.contains(ENCODED_KEY_ON_WIRE), "{text}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // --watch rides out transient explorer errors
 // ---------------------------------------------------------------------------
+
+#[test]
+fn transient_backoff_doubles_from_the_interval_and_is_capped() {
+    let cfg = PollConfig {
+        interval: Duration::from_millis(10),
+        transient_backoff_max: Duration::from_millis(45),
+        ..fast()
+    };
+    let ms = |n: u32| cfg.transient_backoff(n).as_millis();
+    // The first error waits one interval, then each consecutive error doubles it.
+    assert_eq!(ms(1), 10);
+    assert_eq!(ms(2), 20);
+    assert_eq!(ms(3), 40);
+    // Capped at transient_backoff_max from then on, with no overflow on long outages.
+    assert_eq!(ms(4), 45);
+    assert_eq!(ms(5), 45);
+    assert_eq!(ms(40), 45);
+    assert_eq!(ms(u32::MAX), 45);
+    // Zero consecutive errors is the plain poll interval.
+    assert_eq!(ms(0), 10);
+
+    // A cap below the interval never shortens the poll interval.
+    let cfg = PollConfig {
+        interval: Duration::from_millis(50),
+        transient_backoff_max: Duration::from_millis(5),
+        ..fast()
+    };
+    assert_eq!(cfg.transient_backoff(1).as_millis(), 50);
+    assert_eq!(cfg.transient_backoff(9).as_millis(), 50);
+
+    // The defaults: 3 s doubling to a 30 s cap.
+    let d = PollConfig::default();
+    let secs: Vec<u64> = (1..=6).map(|n| d.transient_backoff(n).as_secs()).collect();
+    assert_eq!(secs, vec![3, 6, 12, 24, 30, 30]);
+}
 
 #[tokio::test]
 async fn wait_retries_transient_http_errors() {
