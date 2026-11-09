@@ -6,8 +6,8 @@ import {InitialAdmin} from "../lib/InitialAdmin.sol";
 
 /// @title ProviderRegistry: governed list state for the cloud model providers core already knows
 /// @notice AMC 0.5.3 planset 06 section 2; ADR-2026-10-26 P-4, P-12, P-13, P-14. Spec:
-///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or block 0: deployed after
-///         genesis through the GOVERNANCE timelock.
+///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or r1007: deployed in the
+///         ceremony genesis block 0 (0.6.0 owner answer 7), with the GUARDIAN council as its first guardian.
 ///
 ///         NARROWS ONLY (RT-3). The registry stores no host, path, model or URL. The hosts a vendor
 ///         key may be sent to are compiled into core (`provider_egress::VENDORS`); the registry

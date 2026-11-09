@@ -2,17 +2,29 @@
 created: 2026-10-26T19:30:00-07:00
 branch: feat/amc-provider-governance-contracts
 author: Larry Klosowski (owner) + Claude Opus 5.5 (MAC lane, contracts)
-status: spec + implementation (not deployed; audit required); owner decisions of 2026-10-26 applied
+status: spec + implementation (not deployed; audit required); owner decisions of 2026-10-26 applied; ceremony-genesis placement per 0.6.0 owner answers 2026-11-07 and 2026-11-09
 planset: amc053 (0.5.3), 06_CONTRACTS.md
 adr: ADR-2026-10-26-byok-provider-governance (P-12, P-13, P-14, P-15)
 ---
 
 # AMC provider-governance contracts
 
-**Status: not deployed. Not part of r1006 or the 12-01 genesis set.** These four contracts are deployed after genesis by
-the GOVERNANCE timelock (ADR P-13), and only after an audit: internal Agentile-Audit with a cross-model quorum, no
-external firm (owner decision Q-11, 2026-10-26). No existing contract, deploy script, genesis
-or ceremony script or address book is changed by this work.
+**Status: not deployed. Not part of r1006 or r1007.** These contracts are deployed in the **ceremony genesis
+block 0** (0.6.0 owner answer 7, 2026-11-07, which supersedes the post-genesis plan of ADR P-13 and amc053 Q-9 for
+them), built from the signed `v060-contracts-freeze` tag, and only after an audit: internal Agentile-Audit with a
+cross-model quorum, no external firm (owner decision Q-11, 2026-10-26). No existing contract, deploy script, genesis
+or ceremony script or address book is changed by this work; the ceremony genesis spec carries their constructor
+parameters (0.6.0 WP GEN-PARAMS).
+
+Genesis placement (owner, 2026-11-09):
+
+- **AgentSBT and OrganizationSBT move into the ceremony genesis too** (0.6.0 V60-GEN-Q8 (a)). `WorkAttestations`
+  and `OrgBudgets` take them as immutable constructor arguments, so they must exist at block 0.
+- **The registry guardian seat at block 0 is the GUARDIAN council** (V60-GEN-Q9 (a)). `ProviderRegistry` and
+  `RegistryGuardian2of3` would each need the other's address at construction, which CREATE2 cannot predict. So
+  `ProviderRegistry` deploys with the guardian council as `guardian`, and after genesis governance deploys
+  `RegistryGuardian2of3` against the registry's address and installs it with `setGuardian` (48 h timelock). No
+  code change.
 
 | Contract | Source | Tests |
 |---|---|---|
@@ -43,7 +55,7 @@ Principles the code holds to, from 06 section 1:
 
 | Contract | Decision | Why |
 |---|---|---|
-| all | Governance is `Governable` (two-step), seeded with the GOVERNANCE `TimelockController`. Constructor admins go through `InitialAdmin.check`. | Reuse. It also keeps PBA-L2-002 (the CREATE2-factory admin) and the pba-r2 semgrep rules satisfied. |
+| all | Governance is `Governable` (two-step), seeded with the GOVERNANCE `TimelockController`. Constructor admins go through `InitialAdmin.check`. | Reuse. It also refuses the CREATE2 factory as an admin and keeps the pba-r2 semgrep rules satisfied. |
 | ProviderRegistry | `vetoWindow` is a constructor argument bounded to 1 h to 7 d. The deploy profile uses `DEFAULT_VETO_WINDOW` = 24 h, the planset default. | Owner, 2026-10-26: no other value decided, so it stays a bounded deploy-time parameter. |
 | ProviderRegistry | `updateCommitments` queues the new commitments beside the old ones. The provider stays `Listed` on the old ones until the new ones clear the timelock and the veto window; then `finalizeUpdate` (anyone) swaps them atomically. A guardian `veto` drops the queued update and keeps the listing; `emergencyDelist` and `delist` still act at once and drop it. | Owner decision 2026-10-26: no outage on a commitment update. Invariant: a `Listed` provider always answers `isListedWith` on its current commitment. |
 | ProviderRegistry | The guardian can also `pause` the whole registry: `isListedWith` answers false and nothing finalizes. Only governance can `unpause`. | Owner decision Q-8(b): the guardian can remove or pause, never add. |
@@ -60,7 +72,7 @@ Principles the code holds to, from 06 section 1:
 | UsageReceipts | `maxBackfillDays` is a constructor argument bounded to 1 to 366. The deploy profile uses `DEFAULT_MAX_BACKFILL_DAYS` = 90. A closed day older than that is refused with `DayTooOld`. | Owner, 2026-10-26: cap backfill at 90 days to match history retention, as a bounded deploy-time parameter. |
 | RegistryGuardian2of3 | The guardian seat is a direct 2-of-3 with no delay, bound to one registry. It can only call `emergencyDelist`, `veto` and `pause`. Its owners are fixed; a proposal expires after 1 day and runs once. Rotation is a new instance plus `ProviderRegistry.setGuardian`, which it cannot block. | Owner decision Q-8(b), 2026-10-26. Tripwire A4 pins the three actions. |
 | WorkAttestations | `id = keccak256(abi.encode(a))`. Only the AgentSBT owner may attest, and not while the agent is quarantined. Revocation is sticky. A counterparty may acknowledge once, and never its own attestation or a revoked one. | 06 section 5 and RT-17. |
-| WorkAttestations | Benchmarks link by the shared AgentSBT id and are never copied or written. | `BenchmarkRegistry` series are keyed by `msg.sender` (PBA-L2-061), so a write from this contract would merge every member into one committer. The join is `byAgent(agentId)` next to `BenchmarkRegistry.getMetric(attester, agentId, ...)` (see `test_benchmarkJoinByAgentId`). |
+| WorkAttestations | Benchmarks link by the shared AgentSBT id and are never copied or written. | `BenchmarkRegistry` series are keyed by `msg.sender`, so a write from this contract would merge every member into one committer. The join is `byAgent(agentId)` next to `BenchmarkRegistry.getMetric(attester, agentId, ...)` (see `test_benchmarkJoinByAgentId`). |
 
 ## 3. Deltas from the original brief (superseded by the planset red team)
 
@@ -197,9 +209,12 @@ Decided and implemented:
     to reconcile with C2 D5:** either add `ProviderRegistry.setGuardian` to `GuardianCanceller`'s guardian-removal
     class, or accept that the GUARDIAN council can delay a rotation of the registry seat. The owners of the two seats
     may be the same people; their keys and contracts are distinct.
-- **Q-9, post-genesis deploy batch: all of them.** The batch is these five contracts (`ProviderRegistry`,
-  `RegistryGuardian2of3`, `UsageReceipts`, `OrgBudgets`, `WorkAttestations`) plus `BenchmarkRegistry`, `AnchorRegistry`,
-  `AgentSBT` and `OrganizationSBT`. `InferenceRouter` joins only once its held CHAIN-B items close.
+- **Q-9, deploy batch (superseded 2026-11-07 / 2026-11-09).** The original answer was a post-genesis batch of these
+  five contracts plus `BenchmarkRegistry`, `AnchorRegistry`, `AgentSBT` and `OrganizationSBT`. Now:
+  `ProviderRegistry`, `UsageReceipts`, `OrgBudgets`, `WorkAttestations`, `AgentSBT` and `OrganizationSBT` are in the
+  ceremony genesis block 0; `RegistryGuardian2of3` is deployed after genesis and installed with `setGuardian`;
+  `BenchmarkRegistry` and `AnchorRegistry` stay post-genesis. `InferenceRouter` joins only once its held CHAIN-B items
+  close.
 - **Q-10, holder only.** Only the OrganizationSBT holder administers an org's budgets. Lowering is immediate; raising
   waits 24 h (`RAISE_DELAY`).
 - **Q-11, audit.** An internal Agentile-Audit with a cross-model quorum, scoped to these contracts and the deploy
@@ -211,7 +226,8 @@ Decided and implemented:
 
 Still open:
 
-- **Deploy script.** Not included: it is WP-S4-DEPLOY (DGX), and nothing here deploys. It must deploy
-  `RegistryGuardian2of3` and pass it to `ProviderRegistry` (or install it with `setGuardian`), and use the
-  deploy-profile values above.
+- **Genesis entries.** Not included: the ceremony genesis builder and its GEN-PARAMS entries (CREATE2 salts,
+  governance timelock, guardian council as the registry's block-0 guardian, AgentSBT and OrganizationSBT addresses,
+  the deploy-profile values above). Nothing here deploys. The post-genesis governance batch deploys
+  `RegistryGuardian2of3` and installs it with `ProviderRegistry.setGuardian`.
 - **GuardianCanceller class (Q-8(a)).** As above, for DGX with C2 D5.
