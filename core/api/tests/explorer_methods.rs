@@ -556,16 +556,24 @@ fn block_tracer_traces_every_transaction_of_a_block() {
     assert_eq!(by_hash, by_number);
     // Genesis carries no transactions: an empty list, no replay.
     assert_eq!(
-        result(&c.io, "debug_traceBlockByNumber", json!(["0x0"])),
+        result(
+            &c.io,
+            "debug_traceBlockByNumber",
+            json!(["0x0", {"tracer": "callTracer"}])
+        ),
         json!([])
     );
     // Above the applied head, and an unknown hash: a -32000 refusal.
-    let above = call(&c.io, "debug_traceBlockByNumber", json!(["0x9"]));
+    let above = call(
+        &c.io,
+        "debug_traceBlockByNumber",
+        json!(["0x9", {"tracer": "callTracer"}]),
+    );
     assert_eq!(above["error"]["code"], -32000, "{above}");
     let unknown = call(
         &c.io,
         "debug_traceBlockByHash",
-        json!([hx(&Hash::new([0xEE; 32]))]),
+        json!([hx(&Hash::new([0xEE; 32])), {"tracer": "callTracer"}]),
     );
     assert_eq!(unknown["error"]["code"], -32000, "{unknown}");
     // Only callTracer is served per block.

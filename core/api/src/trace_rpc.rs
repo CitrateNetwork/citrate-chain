@@ -5,6 +5,8 @@
 //
 //   debug_traceTransaction(txHash, {tracer})      callTracer | prestateTracer
 //   debug_traceCall(call, blockTag, {tracer})     callTracer | prestateTracer
+//   debug_traceBlockByNumber(n, {tracer})         callTracer, every tx of a block
+//   debug_traceBlockByHash(hash, {tracer})        callTracer, every tx of a block
 //   ots_getContractCreator(address)               { hash, creator }
 //
 // HOW A TRANSACTION IS TRACED
@@ -468,6 +470,120 @@ fn with_timeout<T>(
     }
 }
 
+/// The applied-chain block a `debug_traceBlockByNumber` parameter names: a
+/// number (hex or JSON), `latest` / `pending` (the applied tip) or
+/// `earliest`. Source: the applied tip and the canonical height index.
+fn block_by_number_param(
+    storage: &StorageManager,
+    v: Option<&Value>,
+) -> Result<Hash, jsonrpc_core::Error> {
+    let tip = storage
+        .blocks
+        .get_applied_tip()
+        .map_err(internal)?
+        .ok_or_else(|| server_error("no block has executed on this node yet".into()))?;
+    let n = match v {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| bad("block number must be a non-negative integer"))?,
+        Some(Value::String(s)) => match s.as_str() {
+            "latest" | "pending" => tip.1,
+            "earliest" => 0,
+            other => {
+                let hex = other
+                    .strip_prefix("0x")
+                    .ok_or_else(|| bad(format!("invalid block number: {other}")))?;
+                u64::from_str_radix(hex, 16)
+                    .map_err(|_| bad(format!("invalid block number: {other}")))?
+            }
+        },
+        _ => return Err(bad("block number or tag is required")),
+    };
+    if n > tip.1 {
+        return Err(server_error(format!(
+            "block {n} is above the applied head {}",
+            tip.1
+        )));
+    }
+    storage
+        .blocks
+        .get_canonical_block_by_height(n)
+        .map_err(internal)?
+        .ok_or_else(|| server_error(format!("no applied-chain block at height {n}")))
+}
+
+/// `debug_traceBlockByNumber` / `debug_traceBlockByHash` (02 §3 bulk
+/// internal-tx indexing): every transaction of one applied-chain block,
+/// traced by one replay of the block (`replay_block` over the whole body,
+/// receipts checked as for a single trace), as geth's
+/// `[{txHash, result}]`. `callTracer` only: a per-block `prestateTracer`
+/// would need one state snapshot per transaction, and is refused (-32602).
+///
+/// Data sources: the block from `CF_BLOCKS` (checked on the applied chain by
+/// the canonical height index), its parent's verified state (undo records),
+/// and `CF_RECEIPTS` for each replayed transaction. Bounded by one block's
+/// body and [`TRACE_TIMEOUT`].
+pub fn trace_block(
+    storage: &Arc<StorageManager>,
+    executor: &Executor,
+    historical: &HistoricalStates,
+    block_hash: &Hash,
+    tracer: Tracer,
+) -> Result<Value, jsonrpc_core::Error> {
+    let Tracer::Call {
+        only_top_call,
+        with_log,
+    } = tracer
+    else {
+        return Err(bad(
+            "only callTracer is served for a whole block; trace one transaction with \
+             debug_traceTransaction for prestateTracer",
+        ));
+    };
+    let header = storage
+        .blocks
+        .get_header(block_hash)
+        .map_err(internal)?
+        .ok_or_else(|| server_error(format!("block {} is not stored", hx(block_hash))))?;
+    let canonical = storage
+        .blocks
+        .get_canonical_block_by_height(header.height)
+        .map_err(internal)?;
+    if canonical != Some(*block_hash) {
+        return Err(server_error(format!(
+            "block {} is not on the applied chain",
+            hx(block_hash)
+        )));
+    }
+    let block = storage
+        .blocks
+        .get_block(block_hash)
+        .map_err(internal)?
+        .ok_or_else(|| server_error(format!("block {} is not stored", hx(block_hash))))?;
+    let Some(last) = block.transactions.len().checked_sub(1) else {
+        return Ok(Value::Array(Vec::new()));
+    };
+    let replayed = with_timeout(replay_block(
+        storage, executor, historical, &block, last, None,
+    ))?;
+    Ok(Value::Array(
+        replayed
+            .into_iter()
+            .map(|t| {
+                let hash = hx(&t.tx.hash);
+                json!({
+                    "txHash": hash,
+                    "result": frame_json(
+                        &top_frame(&t.tx, &t.receipt, t.roots),
+                        only_top_call,
+                        with_log,
+                    ),
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// `debug_traceTransaction`.
 pub fn trace_transaction(
     storage: &Arc<StorageManager>,
@@ -741,7 +857,8 @@ pub fn contract_creator(
     )))
 }
 
-/// Register `debug_traceTransaction`, `debug_traceCall` and
+/// Register `debug_traceTransaction`, `debug_traceCall`,
+/// `debug_traceBlockByNumber`, `debug_traceBlockByHash` and
 /// `ots_getContractCreator`. Read-only. Their method budget is charged by the
 /// request middleware (`rpc_limits::heavy_method_cost`).
 pub fn register_trace_methods(
@@ -769,6 +886,28 @@ pub fn register_trace_methods(
             .parse()
             .map_err(|e: jsonrpc_core::Error| bad(e.message))?;
         trace_call(&st, &ex, &hs, policy, &p)
+    });
+
+    let (st, ex, hs) = (storage.clone(), executor.clone(), historical.clone());
+    io_handler.add_sync_method("debug_traceBlockByNumber", move |params: Params| {
+        rpc_request("debug_traceBlockByNumber");
+        let p: Vec<Value> = params
+            .parse()
+            .map_err(|e: jsonrpc_core::Error| bad(e.message))?;
+        let tracer = parse_tracer(p.get(1))?;
+        let hash = block_by_number_param(&st, p.first())?;
+        trace_block(&st, &ex, &hs, &hash, tracer)
+    });
+
+    let (st, ex, hs) = (storage.clone(), executor.clone(), historical.clone());
+    io_handler.add_sync_method("debug_traceBlockByHash", move |params: Params| {
+        rpc_request("debug_traceBlockByHash");
+        let p: Vec<Value> = params
+            .parse()
+            .map_err(|e: jsonrpc_core::Error| bad(e.message))?;
+        let tracer = parse_tracer(p.get(1))?;
+        let hash = crate::explorer_rpc::parse_hash_param(p.first(), "block hash")?;
+        trace_block(&st, &ex, &hs, &hash, tracer)
     });
 
     let (st, ex, hs) = (storage, executor, historical);

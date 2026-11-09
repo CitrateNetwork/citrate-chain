@@ -29,6 +29,7 @@ chain, the blocks reached by `selectedParent` from the applied tip.
 | `eth_getBlockReceipts` | implemented, tested | S3-3b moves receipts to the accepting block |
 | historical `eth_getBalance` / `eth_getTransactionCount` / `eth_getCode` / `eth_getStorageAt` / `eth_call` | implemented, tested | no |
 | `debug_traceTransaction`, `debug_traceCall` (`callTracer`, `prestateTracer`) | implemented, tested | S3-3b changes what is replayed, not the output |
+| `debug_traceBlockByNumber`, `debug_traceBlockByHash` (`callTracer`) | implemented, tested | S3-3b changes what is replayed, not the output |
 | `ots_getContractCreator` | implemented, tested | no |
 | `net_peerInfo` (extended: each peer's last-known head) | implemented, tested | no |
 
@@ -44,7 +45,7 @@ real RocksDB store. It does not mean runtime-proven on a live network.
 
 | Call | Units | Where it is charged |
 |---|---|---|
-| `debug_traceTransaction`, `debug_traceCall` | 100 | request middleware (`heavy_method_cost`) |
+| `debug_traceTransaction`, `debug_traceCall`, `debug_traceBlockByNumber`, `debug_traceBlockByHash` | 100 | request middleware (`heavy_method_cost`) |
 | `ots_getContractCreator` | 200 | request middleware |
 | historical point read (balance, nonce, code, slot below the head) | 20 | in the handler, only when the tag names a past block |
 | historical `eth_call` | 10 (as today) + 100 | in the handler |
@@ -349,6 +350,30 @@ This method runs the same simulation as `eth_call`, traced. The simulation runs 
 head, or on a verified historical state when the tag names a past block. `to` may be
 omitted, which simulates a create.
 
+## `debug_traceBlockByNumber(block, {tracer})` and `debug_traceBlockByHash(hash, {tracer})`
+
+These methods trace every transaction of one applied-chain block with one replay of the
+block, for bulk internal-transaction indexing (02 §3 `trace_block`). The output is geth's
+`[{txHash, result}]`, and each `result` is the frame `debug_traceTransaction` returns.
+
+- **Block parameter:** a number (hex or JSON), `latest` / `pending` (the applied tip) or
+  `earliest`; or a 32-byte hash for `ByHash`. The block must be on the applied chain.
+- **Data sources:** the block from `CF_BLOCKS`, checked against the canonical height
+  index; the parent's verified state from the undo records; `CF_RECEIPTS` for every
+  replayed transaction. A replay that diverges from a stored receipt is refused.
+- **Bounds:** one block's body, the 15 s trace deadline, and 100 budget units, the same
+  work as tracing the block's last transaction.
+- **Only `callTracer`.** `prestateTracer` is error `-32602` here, because it needs one
+  state snapshot per transaction. Trace one transaction for it.
+- A block without transactions (genesis included) returns `[]`. A block above the head,
+  an unknown hash, or a block off the applied chain is error `-32000`.
+
+```json
+→ {"method":"debug_traceBlockByNumber","params":["0x2",{"tracer":"callTracer"}]}
+← [{"txHash":"0x…21","result":{"type":"CALL","from":"0x…aa","to":"0x…bb","value":"0x5", …}},
+   {"txHash":"0x…22","result":{"type":"CALL", …,"calls":[{"type":"CREATE", …}]}}]
+```
+
 ## `ots_getContractCreator(address)`
 
 This method returns the transaction that created the code an address holds at the head,
@@ -419,8 +444,9 @@ parents the blue score runs ahead of the height.
 
 ## Not served here (follow-ups)
 
-- `trace_block`, `trace_filter` and the rest of the Otterscan `ots_*` set. The explorer
-  can index internal transactions block by block with `debug_traceTransaction`, or
-  with a `trace_block` built on `trace_rpc::replay_block`.
+- The Parity `trace_block` / `trace_filter` shapes and the rest of the Otterscan `ots_*`
+  set. The explorer indexes internal transactions block by block with
+  `debug_traceBlockByNumber`. `trace_filter` is a range scan with no natural bound, so
+  it belongs in the explorer's index, not on the node.
 - `eth_getProof` at a block.
 - `citrate_getDagBlock` (spec 06 §5.5).
