@@ -581,3 +581,92 @@ async fn pruned_node_validates_pruning_point_commitment() {
     assert_eq!(spec_pp(BOUNDARY), chain_id(150));
     assert_eq!(admit(&store, &gd, &right).await, Ok(()));
 }
+
+/// A sibling of the linear chain: same height and parent as `linear(h, pp)`,
+/// a different hash (`chain_id` with a branch tag).
+fn sibling(h: u64, parent: Hash, pp: Hash, tag: u8) -> Block {
+    let mut id = [0u8; 32];
+    id[0] = 0x5B;
+    id[1] = tag;
+    id[2..10].copy_from_slice(&h.to_be_bytes());
+    BlockBuilder::new()
+        .hash(Hash::new(id))
+        .parent(parent)
+        .height(h)
+        .blue_score(h)
+        .blue_work(blue_work_for_score(h))
+        .pruning_point(pp)
+        .build_unhashed()
+}
+
+/// The chain store a node keeps beside its DAG store (here: the linear
+/// chain's headers, which the node stored when it admitted them).
+struct ChainHeaders(HashMap<Hash, citrate_consensus::types::BlockHeader>);
+
+impl citrate_consensus::ghostdag::AncestryHeaders for ChainHeaders {
+    fn header(&self, hash: &Hash) -> Option<citrate_consensus::types::BlockHeader> {
+        self.0.get(hash).cloned()
+    }
+}
+
+/// G11 + CV-7a: a node whose DAG store is pruned at its tip's pruning point
+/// must still admit a block it is required to admit: a late or side-branch
+/// boundary block below its tip, inside the undo window. Such a block's
+/// pruning point lies up to `PRUNING_DEPTH` below the block itself, so below
+/// the node's DAG prune floor; the walk to it must read the selected-chain
+/// headers the node keeps in its chain store, and a header found nowhere still
+/// fails closed. An unpruned node admits the same block, so without this the
+/// pruned node diverges from it.
+#[tokio::test]
+async fn pruned_node_validates_a_late_boundary_block_below_its_tip() {
+    const TOP: u64 = SPEC_PRUNING_DEPTH + 520; // pp(TOP) = 500
+    const LATE: u64 = SPEC_PRUNING_DEPTH + 450; // a boundary 70 below TOP: pp = 450
+    assert_eq!(spec_pp_height(TOP), 500);
+    assert_eq!(spec_pp_height(LATE), 450);
+
+    // Every block of the linear chain, as the node's chain store holds them.
+    let headers: HashMap<Hash, citrate_consensus::types::BlockHeader> = (0..=TOP)
+        .map(|h| (chain_id(h), linear(h, spec_pp(h)).header))
+        .collect();
+
+    let store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+    let gd = GhostDag::new(GhostDagParams::default(), store.clone())
+        .with_ancestry_headers(Arc::new(ChainHeaders(headers)));
+    build_linear(&store, &gd, TOP).await;
+    // The node prunes its DAG store at its tip's pruning point (G11 floor).
+    store.update_pruning_point(spec_pp(TOP)).await.expect("pp");
+    assert!(store.prune().await.expect("prune") > 0);
+    assert!(
+        !store.has_block(&chain_id(450)).await,
+        "450 is below the floor"
+    );
+
+    // A sibling at LATE on the chain block LATE-1 (a late block, or the first
+    // block of a branch forked 71 deep). Its pruning point is the chain block
+    // at 450, which the DAG store dropped.
+    let late = sibling(LATE, chain_id(LATE - 1), spec_pp(LATE), 1);
+    assert_eq!(
+        admit(&store, &gd, &late).await,
+        Ok(()),
+        "a pruned node admits a late boundary block inside the undo window"
+    );
+    // Still validated: the wrong value is refused.
+    let wrong = sibling(LATE, chain_id(LATE - 1), chain_id(400), 2);
+    assert!(admit(&store, &gd, &wrong).await.is_err());
+
+    // Without the chain-store headers the walk cannot reach 450: it fails
+    // closed rather than guessing.
+    let bare_store = Arc::new(DagStore::with_permissive_vrf_for_testing());
+    let bare = GhostDag::new(GhostDagParams::default(), bare_store.clone());
+    build_linear(&bare_store, &bare, TOP).await;
+    bare_store
+        .update_pruning_point(spec_pp(TOP))
+        .await
+        .expect("pp");
+    assert!(bare_store.prune().await.expect("prune") > 0);
+    let late = sibling(LATE, chain_id(LATE - 1), spec_pp(LATE), 3);
+    assert!(
+        admit(&bare_store, &bare, &late).await.is_err(),
+        "no header source: fail closed"
+    );
+}

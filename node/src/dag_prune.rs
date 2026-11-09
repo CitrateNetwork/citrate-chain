@@ -351,6 +351,34 @@ mod tests {
         assert_eq!(pruning_point_height(67_441, 10_000), Some(57_441));
     }
 
+    /// Spec 06 G11: "a node MUST NOT prune at or above pruning_point(applied
+    /// tip)". The DAG prune point is a checkpoint height (so the tip's own
+    /// committed pruning point stays in the DAG store) and never above the
+    /// tip's G11 pruning point, and the retained range still covers `retain`.
+    #[test]
+    fn prune_floor_never_rises_above_the_tips_g11_pruning_point() {
+        use citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
+        use citrate_consensus::ghostdag::pruning_point_height as g11_pp_height;
+        for retain in [MIN_RETAIN_BLOCKS, MIN_RETAIN_BLOCKS + 37, 25_000] {
+            for applied in (0..=40_000u64).step_by(7) {
+                let Some(p) = pruning_point_height(applied, retain) else {
+                    continue;
+                };
+                assert_eq!(
+                    p % CHECKPOINT_INTERVAL,
+                    0,
+                    "prune point {p} (applied {applied}, retain {retain}) is a checkpoint height"
+                );
+                assert!(
+                    p <= g11_pp_height(applied),
+                    "prune point {p} above the tip's pruning point {} (applied {applied})",
+                    g11_pp_height(applied)
+                );
+                assert!(applied - p >= retain, "retains at least {retain}");
+            }
+        }
+    }
+
     /// An operator typo must never be able to prune inside the revertible-reorg
     /// window (MAX_REORG_DEPTH = 10,000). A too-small request is clamped UP.
     #[test]
