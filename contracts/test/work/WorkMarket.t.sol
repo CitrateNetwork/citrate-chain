@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {WorkMarket} from "../../src/work/WorkMarket.sol";
 import {IWorkMarket} from "../../src/work/IVerifier.sol";
 import {Governable} from "../../src/lib/Governable.sol";
+import {InitialAdmin} from "../../src/lib/InitialAdmin.sol";
 import {WorkMarketTestBase, ReenteringWorker} from "./WorkMarketTestBase.sol";
 
 /// @notice 0.6.0 planset 06 §2.1 rules, one test (or more) per rule.
@@ -572,6 +573,28 @@ contract WorkMarketTest is WorkMarketTestBase {
         new WorkMarket(governance, guardian, vs);
         vm.expectRevert(Governable.Governable_ZeroAddress.selector);
         new WorkMarket(address(0), guardian, new address[](0));
+    }
+
+    /// PBA-L2-002: a salted deploy runs the constructor from the CREATE2 factory, so no admin seat
+    /// may be the factory (or zero) at construction.
+    function test_constructor_guardian_goes_through_initial_admin_check() public {
+        address factory = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+        vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
+        new WorkMarket(governance, factory, new address[](0));
+        vm.expectRevert(InitialAdmin.InitialAdmin_Zero.selector);
+        new WorkMarket(governance, address(0), new address[](0));
+    }
+
+    function test_setGuardian_refuses_factory_but_may_clear() public {
+        vm.startPrank(governance);
+        vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
+        market.setGuardian(0x4e59b44847b379578588920cA78FbF26c0B4956C);
+        market.setGuardian(address(0));
+        vm.stopPrank();
+        assertEq(market.guardian(), address(0));
+        vm.prank(guardian);
+        vm.expectRevert(WorkMarket.NotGuardianOrGovernance.selector);
+        market.setNewOffersPaused(true);
     }
 
     // ── fuzz (10k runs, gate G-CON) ────────────────────────────────

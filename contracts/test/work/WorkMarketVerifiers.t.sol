@@ -35,7 +35,7 @@ contract WorkMarketVerifiersTest is Test {
         address[] memory vs = new address[](2);
         vs[0] = address(flV);
         vs[1] = address(taskV);
-        market = new WorkMarket(governance, address(0), vs);
+        market = new WorkMarket(governance, makeAddr("guardian"), vs);
         vm.deal(poster, 100 ether);
         vm.deal(worker, 10 ether);
         vm.deal(flCoord, 10 ether);
