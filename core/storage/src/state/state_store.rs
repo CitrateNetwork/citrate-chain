@@ -513,9 +513,26 @@ impl StateStore {
     /// Stage `record`, whatever its size: one RocksDB value. At the r1007
     /// acceptance gas cap a record is bounded at about 2 MB (spec 06 §4.2);
     /// a value of that size needs no chunking.
+    ///
+    /// The record is written in canonical order (accounts by address, slots
+    /// by address then key, models and jobs by id), so its bytes are a function of the block and its
+    /// pre-state only, whichever path built it: the linear commit or a reorg
+    /// re-apply (spec 06 §8.1 I7). Each address and slot appears once in a
+    /// record, so the order carries no meaning.
     fn stage_undo_record(&self, batch: &mut rocksdb::WriteBatch, record: &BlockUndo) -> Result<()> {
         let key = reorg_undo_key(record.height);
-        let bytes = bincode::serialize(record)?;
+        let mut canonical = record.clone();
+        canonical.accounts.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        canonical
+            .storage
+            .sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.1.cmp(&b.1)));
+        if let Some(mj) = canonical.models_jobs.as_mut() {
+            mj.models
+                .sort_by(|a, b| a.0 .0.as_bytes().cmp(b.0 .0.as_bytes()));
+            mj.jobs
+                .sort_by(|a, b| a.0 .0.as_bytes().cmp(b.0 .0.as_bytes()));
+        }
+        let bytes = bincode::serialize(&canonical)?;
         self.db.batch_put_cf(batch, CF_METADATA, &key, &bytes)
     }
 
@@ -1055,11 +1072,13 @@ mod tests {
         assert_eq!(rec.hash, block_hash(2));
         assert_eq!(rec.parent, Some((block_hash(1), 1)));
         assert_eq!(rec.accounts, vec![(a, Some(acct(10))), (b, None)]);
+        // Canonical order (address, then key): the record is a function of
+        // the block and its pre-state, not of the write order (I7).
         assert_eq!(
             rec.storage,
             vec![
-                (a, b"k".to_vec(), Some(b"v1".to_vec())),
-                (a, b"j".to_vec(), None)
+                (a, b"j".to_vec(), None),
+                (a, b"k".to_vec(), Some(b"v1".to_vec()))
             ]
         );
         // A second write at the same tip extends the record with new keys only:
