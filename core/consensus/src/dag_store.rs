@@ -238,13 +238,19 @@ pub struct DagStore {
     /// r1007 G10: every stored non-genesis block by slot, with its proposer:
     /// the index that finds an equivocating pair when its second block is
     /// stored, and that the slot statistics read. Pruned with the blocks.
-    slot_index: Arc<RwLock<BTreeMap<u64, Vec<(PublicKey, Hash)>>>>,
+    slot_index: Arc<RwLock<SlotIndex>>,
 
     /// r1007 G10 / O8: equivocation evidence recorded so far, keyed by
     /// (proposer, slot), loaded from and written to the DAG metadata. Never
     /// pruned: it is what the slashing path needs after the blocks are gone.
-    equivocations: Arc<RwLock<BTreeMap<([u8; 32], u64), EquivocationEvidence>>>,
+    equivocations: Arc<RwLock<EquivocationRecords>>,
 }
+
+/// r1007 G10: stored non-genesis blocks by slot, each with its proposer.
+type SlotIndex = BTreeMap<u64, Vec<(PublicKey, Hash)>>;
+
+/// r1007 G10 / O8: equivocation evidence keyed by (proposer key, slot).
+type EquivocationRecords = BTreeMap<([u8; 32], u64), EquivocationEvidence>;
 
 /// G12: the tag stored with a persisted GhostdagData record: the first 8
 /// bytes of SHA3-256 over a domain label, the block hash and the encoded

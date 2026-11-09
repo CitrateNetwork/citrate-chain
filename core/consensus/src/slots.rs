@@ -31,10 +31,11 @@ pub const MAX_FUTURE_SLOT_DRIFT_SECS: u64 = 15;
 pub const MAX_FUTURE_SLOT_DRIFT_SLOTS: u64 = MAX_FUTURE_SLOT_DRIFT_SECS / SLOT_DURATION_SECS;
 
 const _: () = assert!(SLOT_DURATION_SECS > 0);
-const _: () = assert!(MAX_FUTURE_SLOT_DRIFT_SECS % SLOT_DURATION_SECS == 0);
+const _: () = assert!(MAX_FUTURE_SLOT_DRIFT_SECS.is_multiple_of(SLOT_DURATION_SECS));
 // The parent-relative timestamp bound must be a whole number of slots, so the
 // producer's clamp to it lands on a slot boundary.
-const _: () = assert!(crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS % SLOT_DURATION_SECS == 0);
+const _: () =
+    assert!(crate::hardening::MAX_BLOCK_TIMESTAMP_ADVANCE_SECS.is_multiple_of(SLOT_DURATION_SECS));
 
 /// The slot of a block stamped `timestamp` on a chain whose genesis is stamped
 /// `genesis_timestamp`. `None` for a timestamp before genesis (no slot).
