@@ -118,7 +118,7 @@ contract WorkMarketVerifiersTest is Test {
         bytes32 leaf = _leaf(id, worker, 1);
         bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(worker);
-        market.postPayout{value: bondNow}(id, leaf, 1);
+        market.postPayout{value: bondNow}(id, leaf, 1, 0);
         assertEq(market.getOffer(id).digest, RESULT);
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, worker, 1, 0, 0, new bytes32[](0));
@@ -133,12 +133,12 @@ contract WorkMarketVerifiersTest is Test {
         bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(worker);
         vm.expectRevert(WorkMarket.NotAccepted.selector);
-        market.postPayout{value: bondNow}(id, leaf, 1);
+        market.postPayout{value: bondNow}(id, leaf, 1, 0);
         vm.warp(block.timestamp + REVIEW);
         leaf = _leaf(id, worker, 1);
         bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(worker);
-        market.postPayout{value: bondNow}(id, leaf, 1);
+        market.postPayout{value: bondNow}(id, leaf, 1, 0);
         assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.PayoutPosted));
     }
 
@@ -259,7 +259,7 @@ contract WorkMarketVerifiersTest is Test {
         bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(flCoord);
         vm.expectRevert(WorkMarket.NotAccepted.selector);
-        market.postPayout{value: bondNow}(id, leaf, 3);
+        market.postPayout{value: bondNow}(id, leaf, 3, 0);
 
         vm.roll(block.number + 21);
         frl.finalize(roundId);
@@ -270,7 +270,7 @@ contract WorkMarketVerifiersTest is Test {
         leaf = _leaf(id, worker, 3);
         bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(flCoord);
-        market.postPayout{value: bondNow}(id, leaf, 3);
+        market.postPayout{value: bondNow}(id, leaf, 3, 0);
         assertEq(market.getOffer(id).digest, frl.recordDigest(roundId));
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, worker, 3, 0, 0, new bytes32[](0));

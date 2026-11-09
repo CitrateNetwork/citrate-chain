@@ -134,9 +134,16 @@ abstract contract WorkMarketTestBase is Test {
         verifier.setAccepted(id, DIGEST);
     }
 
+    /// Posts an arbitrary root at depth 0 (tests that never open a leaf).
     function _post(uint256 id, bytes32 root, uint64 units) internal {
         vm.prank(coordinator);
-        market.postPayout{value: CBOND}(id, root, units);
+        market.postPayout{value: CBOND}(id, root, units, 0);
+    }
+
+    /// Posts the tree over `leaves` (length 2^depth) at its depth.
+    function _postTree(uint256 id, bytes32[] memory leaves, uint64 units) internal {
+        vm.prank(coordinator);
+        market.postPayout{value: CBOND}(id, _rootOf(leaves), units, uint8(_depthFor(leaves.length)));
     }
 
     // ── payout tree (mirrors WorkMarket's leaf/node rules) ─────────
@@ -240,7 +247,7 @@ abstract contract WorkMarketTestBase is Test {
         _join(id, w3);
         _accept(id);
         (leaves,) = _leaves(id, _entries3(), _noOverride(), 2);
-        _post(id, _rootOf(leaves), 6);
+        _postTree(id, leaves, 6);
     }
 
     function _settle(uint256 id, bytes32[] memory leaves, uint256 index, Entry memory e, uint64 cum) internal {

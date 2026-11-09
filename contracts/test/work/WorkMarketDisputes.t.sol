@@ -30,7 +30,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         e[0] = Entry(w1, 2);
         e[1] = Entry(w3, 1);
         (leaves,) = _leaves(id, e, _noOverride(), 1);
-        _post(id, _rootOf(leaves), 3);
+        _postTree(id, leaves, 3);
     }
 
     function _missingEvidence(
@@ -80,7 +80,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         vm.prank(w2);
         market.dispute(id, ev);
         (bytes32[] memory l3,) = _leaves(id, _entries3(), _noOverride(), 2);
-        _post(id, _rootOf(l3), 6);
+        _postTree(id, l3, 6);
         vm.warp(block.timestamp + WINDOW);
         _settle(id, l3, 1, _entries3()[1], 2);
         assertEq(market.balanceOf(w2), CBOND / 2 + 3 * PRICE);
@@ -94,7 +94,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         Entry[] memory e = new Entry[](1);
         e[0] = Entry(w2, 1);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1); // [w2, pad]
-        _post(id, _rootOf(leaves), 1);
+        _postTree(id, leaves, 1);
         WorkMarket.LeafOpening memory none;
         bytes memory ev = _missingEvidence(id, w1, market.ABSENT_BEFORE_FIRST(), none, _opening(leaves, 0, e[0], 0));
         vm.prank(w1);
@@ -111,7 +111,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         Entry[] memory e = new Entry[](1);
         e[0] = Entry(w1, 1);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
-        _post(id, _rootOf(leaves), 1);
+        _postTree(id, leaves, 1);
         bytes memory ev =
             _missingEvidence(id, w3, market.ABSENT_AFTER_LAST(), _opening(leaves, 0, e[0], 0), _padding(leaves, 1));
         vm.prank(w3);
@@ -127,7 +127,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         f[0] = Entry(w1, 1);
         f[1] = Entry(w2, 1);
         (bytes32[] memory l2,) = _leaves(id2, f, _noOverride(), 1);
-        _post(id2, _rootOf(l2), 2);
+        _postTree(id2, l2, 2);
         WorkMarket.LeafOpening memory none;
         bytes memory ev2 = _missingEvidence(id2, w3, market.ABSENT_AFTER_LAST(), _opening(l2, 1, f[1], 1), none);
         vm.prank(w3);
@@ -140,7 +140,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         _join(id, w1);
         _accept(id);
         bytes32[] memory leaves = new bytes32[](2); // all padding
-        _post(id, _rootOf(leaves), 1);
+        _postTree(id, leaves, 1);
         WorkMarket.LeafOpening memory none;
         bytes memory ev = _missingEvidence(id, w1, market.ABSENT_EMPTY(), none, _padding(leaves, 0));
         vm.prank(w1);
@@ -230,7 +230,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         e[0] = Entry(w2, 1);
         e[1] = Entry(w1, 1); // descending
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
-        _post(id, _rootOf(leaves), 2);
+        _postTree(id, leaves, 2);
         bytes memory ev =
             _ev(market.DISPUTE_ORDER(), abi.encode(_opening(leaves, 0, e[0], 0), _opening(leaves, 1, e[1], 1)));
         vm.prank(stranger);
@@ -253,7 +253,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         cums[0] = 0;
         cums[1] = 0; // both claim units [0,4): tree pays 8 against a posted 4
         (bytes32[] memory leaves,) = _leaves(id, e, cums, 1);
-        _post(id, _rootOf(leaves), 4);
+        _postTree(id, leaves, 4);
         bytes memory ev =
             _ev(market.DISPUTE_ORDER(), abi.encode(_opening(leaves, 0, e[0], 0), _opening(leaves, 1, e[1], 0)));
         vm.prank(w2);
@@ -285,7 +285,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         uint64[] memory cums = new uint64[](1);
         cums[0] = 3;
         (bytes32[] memory leaves,) = _leaves(id, e, cums, 1);
-        _post(id, _rootOf(leaves), 4);
+        _postTree(id, leaves, 4);
         bytes memory ev = _ev(market.DISPUTE_FIRST_LEAF(), abi.encode(_opening(leaves, 0, e[0], 3)));
         vm.prank(w1);
         market.dispute(id, ev);
@@ -326,7 +326,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         Entry[] memory e = new Entry[](1);
         e[0] = Entry(coordinator, 1);
         (leaves,) = _leaves(id, e, _noOverride(), 0);
-        _post(id, _rootOf(leaves), 1);
+        _postTree(id, leaves, 1);
     }
 
     function _subjective(uint16 reason) internal pure returns (bytes memory) {

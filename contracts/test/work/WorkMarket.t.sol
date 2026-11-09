@@ -208,14 +208,14 @@ contract WorkMarketTest is WorkMarketTestBase {
         vm.deal(stranger, 10 ether);
         vm.prank(stranger);
         vm.expectRevert(WorkMarket.NotCoordinator.selector);
-        market.postPayout{value: CBOND}(id, keccak256("r"), 1);
+        market.postPayout{value: CBOND}(id, keccak256("r"), 1, 0);
     }
 
     function test_postPayout_reverts_unless_verifier_accepted() public {
         uint256 id = _openFl();
         vm.prank(coordinator);
         vm.expectRevert(WorkMarket.NotAccepted.selector);
-        market.postPayout{value: CBOND}(id, keccak256("r"), 1);
+        market.postPayout{value: CBOND}(id, keccak256("r"), 1, 0);
     }
 
     function test_postPayout_binds_digest_into_root() public {
@@ -236,9 +236,9 @@ contract WorkMarketTest is WorkMarketTestBase {
         _accept(id);
         vm.startPrank(coordinator);
         vm.expectRevert(WorkMarket.BadUnits.selector);
-        market.postPayout{value: CBOND}(id, keccak256("r"), 11);
+        market.postPayout{value: CBOND}(id, keccak256("r"), 11, 0);
         vm.expectRevert(WorkMarket.BadUnits.selector);
-        market.postPayout{value: CBOND}(id, keccak256("r"), 0);
+        market.postPayout{value: CBOND}(id, keccak256("r"), 0, 0);
         vm.stopPrank();
     }
 
@@ -247,9 +247,9 @@ contract WorkMarketTest is WorkMarketTestBase {
         _accept(id);
         vm.startPrank(coordinator);
         vm.expectRevert(WorkMarket.WrongBond.selector);
-        market.postPayout{value: CBOND - 1}(id, keccak256("r"), 1);
+        market.postPayout{value: CBOND - 1}(id, keccak256("r"), 1, 0);
         vm.expectRevert(WorkMarket.BadRoot.selector);
-        market.postPayout{value: CBOND}(id, bytes32(0), 1);
+        market.postPayout{value: CBOND}(id, bytes32(0), 1, 0);
         vm.stopPrank();
     }
 
@@ -259,7 +259,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         vm.warp(block.timestamp + 7 days + 1);
         vm.prank(coordinator);
         vm.expectRevert(WorkMarket.PastDeadline.selector);
-        market.postPayout{value: CBOND}(id, keccak256("r"), 1);
+        market.postPayout{value: CBOND}(id, keccak256("r"), 1, 0);
     }
 
     function test_postPayout_task_must_be_one_unit() public {
@@ -267,7 +267,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         _accept(id);
         vm.prank(coordinator);
         vm.expectRevert(WorkMarket.BadUnits.selector);
-        market.postPayout{value: CBOND}(id, keccak256("r"), 2);
+        market.postPayout{value: CBOND}(id, keccak256("r"), 2, 0);
     }
 
     function test_verifier_denied_after_open_does_not_block_payout() public {
@@ -326,7 +326,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         e[0] = Entry(w1, 1);
         e[1] = Entry(stranger, 1);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
-        _post(id, _rootOf(leaves), 2);
+        _postTree(id, leaves, 2);
         vm.warp(block.timestamp + WINDOW);
         vm.expectRevert(WorkMarket.NotJoined.selector);
         _settle(id, leaves, 1, e[1], 1);
@@ -341,7 +341,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         e[0] = Entry(w1, 3);
         e[1] = Entry(w2, 3);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
-        _post(id, _rootOf(leaves), 4); // tree pays 6, posted 4
+        _postTree(id, leaves, 4); // tree pays 6, posted 4
         vm.warp(block.timestamp + WINDOW);
         _settle(id, leaves, 0, e[0], 0);
         vm.expectRevert(WorkMarket.ExceedsPayout.selector);
@@ -359,7 +359,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         e[0] = Entry(w1, 3);
         e[1] = Entry(w2, 3);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
-        _post(id, _rootOf(leaves), 4);
+        _postTree(id, leaves, 4);
         vm.warp(block.timestamp + WINDOW);
         vm.expectRevert(WorkMarket.ExceedsPayout.selector);
         _settle(id, leaves, 1, e[1], 3);
@@ -376,7 +376,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         Entry[] memory e = new Entry[](1);
         e[0] = Entry(w1, 2);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 0);
-        _post(id, _rootOf(leaves), 2);
+        _postTree(id, leaves, 2);
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, w1, 2, 0, 0, new bytes32[](0));
         assertEq(market.balanceOf(w1), 2 * PRICE + 0.5 ether);
@@ -501,7 +501,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         Entry[] memory e = new Entry[](1);
         e[0] = Entry(address(rw), 3);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 0);
-        _post(id, _rootOf(leaves), 3);
+        _postTree(id, leaves, 3);
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, address(rw), 3, 0, 0, new bytes32[](0));
         uint256 marketBefore = address(market).balance;
@@ -634,7 +634,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         e[0] = Entry(w1, u1);
         e[1] = Entry(w2, u2);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
-        _post(id, _rootOf(leaves), u1 + u2);
+        _postTree(id, leaves, u1 + u2);
         vm.warp(uint256(market.getOffer(id).deadline) + WINDOW);
         _settle(id, leaves, 0, e[0], 0);
         vm.prank(poster);

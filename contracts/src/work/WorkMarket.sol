@@ -55,6 +55,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @notice How long the coordinator (or anyone holding the tree) has to answer an inclusion
     ///         challenge by opening the challenged worker's leaf.
     uint32 public constant CHALLENGE_RESPONSE_WINDOW = 24 hours;
+    uint32 public constant POST_ANSWER_DISPUTE_WINDOW = 24 hours;
     /// @notice After `deadline + disputeWindow + RESERVE_CLAIM_PERIOD`, the poster may take back
     ///         what a posted root reserved for workers who never settled (owner 2026-11-09, Q3).
     uint64 public constant RESERVE_CLAIM_PERIOD = 180 days;
@@ -137,6 +138,16 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         bool reserveSwept; // the poster took back the unsettled reserve after the claim period
         uint32 payoutEpoch; // bumps whenever a posted root is withdrawn; scopes challenges
         uint32 openChallenges; // inclusion challenges awaiting an answer under the live root
+        uint8 payoutDepth;
+        uint64 answerGraceUntil;
+    }
+
+    struct IndexChallenge {
+        uint32 epoch;
+        bool open;
+        bool answered;
+        address challenger;
+        uint64 answerBy;
     }
 
     struct Challenge {
@@ -264,6 +275,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     error AnswerTooEarly();
     error BadAnswer();
     error ReserveGone();
+    error BadDepth();
 
     // ── construction ────────────────────────────────────────────────
 
@@ -393,7 +405,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///         before the deadline, carrying exactly the offer's coordinator bond.
     /// @param root  the payout tree's root over sorted, prefix-summed leaves (see contract notes)
     /// @param units the total units the tree pays (`<= maxUnits`; exactly 1 for TASK)
-    function postPayout(uint256 id, bytes32 root, uint64 units) external payable {
+    function postPayout(uint256 id, bytes32 root, uint64 units, uint8 /* depth: red, not stored yet */) external payable {
         Offer storage o = _offer(id);
         if (msg.sender != o.coordinator) revert NotCoordinator();
         if (o.state != State.Open && o.state != State.Running) revert WrongState();
@@ -665,6 +677,23 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
     function challengeOf(uint256 id, address worker) external view returns (Challenge memory) {
         return _challenges[id][worker];
+    }
+
+    // red: index challenges not implemented yet
+    function challengeIndex(uint256, uint32) external pure {
+        revert WrongState();
+    }
+
+    function answerIndexChallenge(uint256, LeafOpening calldata) external pure {
+        revert WrongState();
+    }
+
+    function resolveIndexChallenge(uint256, uint32) external pure {
+        revert WrongState();
+    }
+
+    function indexChallengeOf(uint256, uint32) external pure returns (IndexChallenge memory c) {
+        return c;
     }
 
     // ── reserve sweep (V60-GEN-Q3) ──────────────────────────────────

@@ -25,7 +25,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         e = _entries3();
         (leaves,) = _leaves(id, e, _noOverride(), 2);
         leaves[1] = keccak256("garbage leaf, no preimage");
-        _post(id, _rootOf(leaves), 6);
+        _postTree(id, leaves, 6);
     }
 
     // ── Q11: challenge-response ────────────────────────────────────
@@ -183,7 +183,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         _accept(id);
         vm.prank(coordinator);
         vm.expectRevert(WorkMarket.WrongBond.selector);
-        market.postPayout(id, keccak256("r"), 1);
+        market.postPayout(id, keccak256("r"), 1, 0);
     }
 
     function test_constructor_refuses_zero_default_bond() public {

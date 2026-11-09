@@ -20,18 +20,41 @@ contract WorkMarketHandler is Test {
     address public coordinator = vm.addr(COORD_KEY);
 
     uint32 internal constant WINDOW = 24 hours;
+    uint8 internal constant DEPTH = 2; // maxWorkers 4: four slots
+
+    /// One slot of the posted tree as the coordinator built it. `idx` is the index hashed into
+    /// the leaf (differs from the slot for an out-of-range leaf); `garbage` has no preimage.
+    struct Slot {
+        address worker;
+        uint64 units;
+        uint64 cum;
+        uint32 idx;
+        bool garbage;
+    }
+
+    struct Range {
+        uint64 lo;
+        uint64 hi;
+    }
 
     uint256[] public ids;
     mapping(uint256 => uint128) public priceAtOpen;
     mapping(uint256 => bytes32[]) internal leavesOf;
-    mapping(uint256 => uint64[]) internal unitsOf; // per actor index in the posted tree
+    mapping(uint256 => Slot[4]) internal slotsOf;
+    /// The honest watcher of a malformed tree (the worker the tree cheats) and the slots it has seen.
+    mapping(uint256 => address) internal watcherOf;
+    mapping(uint256 => bool[4]) internal revealedOf;
     mapping(uint256 => mapping(address => uint256)) public settleCount;
+    mapping(bytes32 => Range[]) internal settledRanges; // keccak(id, payoutEpoch)
 
     // ghost flags: any true is an invariant violation
     bool public postedWithoutAcceptance;
     bool public refundTooEarly;
     bool public pauseBlockedExit;
     bool public settledWhileChallenged;
+    bool public overlapSettled;
+    bool public malformedRootPaid;
+    mapping(uint256 => bool) internal malformedLive;
     uint256 public challengesRaised;
     uint256 public challengesResolved;
 
@@ -39,6 +62,7 @@ contract WorkMarketHandler is Test {
     uint256 public opens;
     uint256 public opensTriedUnpaused;
     uint256 public posts;
+    uint256 public maliciousPosts;
     uint256 public settles;
 
     constructor(WorkMarket m, SwitchVerifier v, address gov, address guard) {
@@ -63,6 +87,34 @@ contract WorkMarketHandler is Test {
 
     function _id(uint256 seed) internal view returns (uint256) {
         return ids[seed % ids.length];
+    }
+
+    // ── tree helpers ───────────────────────────────────────────────
+
+    function _node(bytes32 l, bytes32 r) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(bytes1(0x01), l, r));
+    }
+
+    function _path(bytes32[] memory leaves, uint256 slot) internal pure returns (bytes32[] memory path) {
+        path = new bytes32[](2);
+        path[0] = leaves[slot ^ 1];
+        path[1] = slot < 2 ? _node(leaves[2], leaves[3]) : _node(leaves[0], leaves[1]);
+    }
+
+    /// The opening of `slot` as an honest holder of the tree would present it.
+    function _openingAt(uint256 id, uint256 slot) internal view returns (WorkMarket.LeafOpening memory l) {
+        Slot memory s = slotsOf[id][slot];
+        l = WorkMarket.LeafOpening({
+            index: uint32(slot), worker: s.worker, units: s.units, cumBefore: s.cum, path: _path(leavesOf[id], slot)
+        });
+    }
+
+    function _clearTree(uint256 id) internal {
+        delete leavesOf[id];
+        delete slotsOf[id];
+        delete watcherOf[id];
+        delete revealedOf[id];
+        delete malformedLive[id];
     }
 
     // ── actions ────────────────────────────────────────────────────
@@ -99,10 +151,11 @@ contract WorkMarketHandler is Test {
         } catch {}
     }
 
+    /// actorSeed % 5 == 4 joins the coordinator (a TASK's selected worker must have joined).
     function join(uint256 seed, uint256 actorSeed) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        address a = actors[actorSeed % 4];
+        address a = actorSeed % 5 == 4 ? coordinator : actors[actorSeed % 4];
         uint128 bond = market.getOffer(id).joinBond;
         bytes32[] memory none;
         vm.prank(a);
@@ -114,109 +167,145 @@ contract WorkMarketHandler is Test {
         verifier.setAccepted(_id(seed), keccak256(abi.encode("digest", seed)));
     }
 
-    /// Posts a well-formed tree over the joined actors, splitting `units` among them.
-    function postPayout(uint256 seed, uint64 units, bool acceptFirst) external {
+    /// Posts a payout tree. mode % 4: 0 a well-formed tree over the joined actors (published to
+    /// everyone); 1 honest `a` and sybil `b` claim the same range across a garbage separator;
+    /// 2 the sybil leaf sits at slot 1 hashed with out-of-range index 5; 3 the same overlap across
+    /// a padding slot. In modes 1-3 the coordinator publishes nothing, so the cheated worker `a`
+    /// (the watcher) holds only its own leaf and challenges every other index at once.
+    function postPayout(uint256 seed, uint64 units, bool acceptFirst, uint8 mode) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         if (acceptFirst) verifier.setAccepted(id, keccak256(abi.encode("digest", id)));
         WorkMarket.Offer memory o = market.getOffer(id);
         if (o.maxUnits == 0) return;
         units = uint64(bound(units, 1, o.maxUnits));
-        if (o.kind == IWorkMarket.Kind.TASK) units = 1;
+        mode = mode % 4;
+
+        Slot[4] memory slots;
+        uint64 total;
+        if (o.kind == IWorkMarket.Kind.TASK) {
+            mode = 0;
+            slots[0] = Slot(coordinator, 1, 0, 0, false);
+            total = 1;
+        } else {
+            (address a, address b) = (address(0), address(0));
+            for (uint256 i = 0; i < 4; i++) {
+                if (!market.joined(id, actors[i])) continue;
+                if (a == address(0)) a = actors[i];
+                else b = actors[i];
+            }
+            if (b == address(0)) mode = 0;
+            if (mode == 0) {
+                uint64 left = units;
+                uint256 n;
+                for (uint256 i = 0; i < 4 && left > 0; i++) {
+                    if (!market.joined(id, actors[i])) continue;
+                    uint64 u = left / 2 == 0 ? left : left / 2;
+                    slots[n] = Slot(actors[i], u, total, uint32(n), false);
+                    total += u;
+                    left -= u;
+                    n++;
+                }
+                if (total == 0) total = units;
+            } else {
+                // claim twice the units when the budget allows, so both overlapping leaves fit
+                total = uint256(units) * 2 <= o.maxUnits ? units * 2 : units;
+                slots[0] = Slot(a, units, 0, 0, false);
+                if (mode == 1) {
+                    slots[1].garbage = true;
+                    slots[2] = Slot(b, units, 0, 2, false);
+                } else if (mode == 2) {
+                    slots[1] = Slot(b, units, 0, 5, false);
+                } else {
+                    slots[2] = Slot(b, units, 0, 2, false);
+                }
+            }
+        }
 
         bytes32[] memory leaves = new bytes32[](4);
-        uint64[] memory per = new uint64[](4);
-        uint64 left = units;
-        uint64 cum;
-        uint256 n;
-        for (uint256 i = 0; i < 4 && left > 0; i++) {
-            if (!market.joined(id, actors[i])) continue;
-            uint64 u = (o.kind == IWorkMarket.Kind.TASK) ? 1 : (left / 2 == 0 ? left : left / 2);
-            per[i] = u;
-            leaves[n] = market.leafHash(uint32(n), market.leafPayload(id, actors[i], u, cum));
-            cum += u;
-            left -= u;
-            n++;
+        for (uint256 s = 0; s < 4; s++) {
+            if (slots[s].garbage) leaves[s] = keccak256(abi.encode("garbage", id, s));
+            else if (slots[s].worker != address(0)) {
+                leaves[s] = market.leafHash(slots[s].idx, market.leafPayload(id, slots[s].worker, slots[s].units, slots[s].cum));
+            }
         }
-        bytes32 root = keccak256(
-            abi.encodePacked(
-                bytes1(0x01),
-                keccak256(abi.encodePacked(bytes1(0x01), leaves[0], leaves[1])),
-                keccak256(abi.encodePacked(bytes1(0x01), leaves[2], leaves[3]))
-            )
-        );
+        bytes32 root = _node(_node(leaves[0], leaves[1]), _node(leaves[2], leaves[3]));
         (bool ok,) = verifier.accepted(id, o.bindRef);
         vm.prank(coordinator);
-        try market.postPayout{value: o.coordinatorBond}(id, root, cum == 0 ? units : cum) {
+        try market.postPayout{value: o.coordinatorBond}(id, root, total, DEPTH) {
             if (!ok) postedWithoutAcceptance = true;
             posts++;
+            _clearTree(id);
             leavesOf[id] = leaves;
-            unitsOf[id] = per;
+            for (uint256 s = 0; s < 4; s++) {
+                slotsOf[id][s] = slots[s];
+            }
+            if (mode == 0) {
+                revealedOf[id] = [true, true, true, true];
+            } else {
+                maliciousPosts++;
+                malformedLive[id] = true;
+                address w = slots[0].worker;
+                watcherOf[id] = w;
+                revealedOf[id][0] = true;
+                for (uint32 s = 1; s < 4; s++) {
+                    vm.prank(w);
+                    try market.challengeIndex(id, s) {
+                        challengesRaised++;
+                    } catch {}
+                }
+            }
         } catch {}
     }
 
-    function settle(uint256 seed, uint256 actorSeed, bool jumpPastWindow) external {
+    /// The watcher disputes as soon as two leaves it has seen prove a bad order.
+    function _watch(uint256 id) internal {
+        address w = watcherOf[id];
+        if (w == address(0)) return;
+        bool[4] memory seen = revealedOf[id];
+        for (uint256 i = 0; i < 4; i++) {
+            for (uint256 j = i + 1; j < 4; j++) {
+                if (!seen[i] || !seen[j]) continue;
+                bytes memory ev = abi.encode(uint8(3), abi.encode(_openingAt(id, i), _openingAt(id, j)));
+                vm.prank(w);
+                try market.dispute(id, ev) {
+                    _clearTree(id);
+                    return;
+                } catch {}
+            }
+        }
+    }
+
+    function settle(uint256 seed, uint256 slotSeed, bool jumpPastWindow) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         bytes32[] memory leaves = leavesOf[id];
         if (leaves.length == 0) return;
         WorkMarket.Offer memory o = market.getOffer(id);
         uint256 opensAt = uint256(o.payoutPostedAt) + o.disputeWindow;
+        if (o.answerGraceUntil > opensAt) opensAt = o.answerGraceUntil;
         if (jumpPastWindow && o.payoutPostedAt != 0 && block.timestamp < opensAt) vm.warp(opensAt);
-        uint64[] memory per = unitsOf[id];
-        // the first actor at or after the seed that has a leaf
-        uint256 target = 4;
         for (uint256 k = 0; k < 4; k++) {
-            if (per[(actorSeed % 4 + k) % 4] != 0) {
-                target = (actorSeed % 4 + k) % 4;
-                break;
-            }
+            uint256 slot = (slotSeed + k) % 4;
+            Slot memory s = slotsOf[id][slot];
+            if (s.worker == address(0)) continue;
+            uint32 openBefore = o.openChallenges;
+            try market.settle(id, s.worker, s.units, s.cum, s.idx, _path(leaves, slot)) {
+                if (openBefore != 0) settledWhileChallenged = true;
+                settleCount[id][s.worker] += 1;
+                settles++;
+                if (malformedLive[id]) malformedRootPaid = true;
+                bytes32 key = keccak256(abi.encode(id, o.payoutEpoch));
+                Range[] storage rs = settledRanges[key];
+                uint64 lo = s.cum;
+                uint64 hi = s.cum + s.units;
+                for (uint256 r = 0; r < rs.length; r++) {
+                    if (lo < rs[r].hi && rs[r].lo < hi) overlapSettled = true;
+                }
+                rs.push(Range(lo, hi));
+            } catch {}
+            return;
         }
-        if (target == 4) return;
-        uint256 n;
-        uint64 cum;
-        for (uint256 i = 0; i < 4; i++) {
-            if (per[i] == 0) continue;
-            if (i == target) {
-                bytes32[] memory path = new bytes32[](2);
-                path[0] = leaves[n ^ 1];
-                path[1] = n < 2
-                    ? keccak256(abi.encodePacked(bytes1(0x01), leaves[2], leaves[3]))
-                    : keccak256(abi.encodePacked(bytes1(0x01), leaves[0], leaves[1]));
-                uint32 openBefore = market.getOffer(id).openChallenges;
-                try market.settle(id, actors[i], per[i], cum, uint32(n), path) {
-                    if (openBefore != 0) settledWhileChallenged = true;
-                    settleCount[id][actors[i]] += 1;
-                    settles++;
-                } catch {}
-                return;
-            }
-            cum += per[i];
-            n++;
-        }
-    }
-
-    /// Opens the actor's leaf (or returns an empty opening if it has none) from the stored tree.
-    function _openingFor(uint256 id, uint256 target) internal view returns (WorkMarket.LeafOpening memory l, bool has) {
-        bytes32[] memory leaves = leavesOf[id];
-        uint64[] memory per = unitsOf[id];
-        if (leaves.length == 0 || per[target] == 0) return (l, false);
-        uint256 n;
-        uint64 cum;
-        for (uint256 i = 0; i < target; i++) {
-            if (per[i] == 0) continue;
-            cum += per[i];
-            n++;
-        }
-        bytes32[] memory path = new bytes32[](2);
-        path[0] = leaves[n ^ 1];
-        path[1] = n < 2
-            ? keccak256(abi.encodePacked(bytes1(0x01), leaves[2], leaves[3]))
-            : keccak256(abi.encodePacked(bytes1(0x01), leaves[0], leaves[1]));
-        l = WorkMarket.LeafOpening({
-            index: uint32(n), worker: actors[target], units: per[target], cumBefore: cum, path: path
-        });
-        return (l, true);
     }
 
     /// The challenger (the worker itself) presents 1..3 coordinator-signed receipts.
@@ -242,14 +331,22 @@ contract WorkMarketHandler is Test {
         } catch {}
     }
 
-    /// An honest coordinator answers whenever the leaf covers the claim.
+    /// The coordinator answers a worker challenge whenever the worker's leaf opens.
     function answer(uint256 seed, uint256 actorSeed) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        (WorkMarket.LeafOpening memory l, bool has) = _openingFor(id, actorSeed % 4);
-        if (!has) return;
-        vm.prank(coordinator);
-        try market.answerChallenge(id, l) {} catch {}
+        if (leavesOf[id].length == 0) return;
+        address w = actors[actorSeed % 4];
+        for (uint256 slot = 0; slot < 4; slot++) {
+            Slot memory s = slotsOf[id][slot];
+            if (s.worker != w || s.garbage || s.idx != slot) continue;
+            vm.prank(coordinator);
+            try market.answerChallenge(id, _openingAt(id, slot)) {
+                revealedOf[id][slot] = true;
+                _watch(id);
+            } catch {}
+            return;
+        }
     }
 
     function resolve(uint256 seed, uint256 actorSeed, bool jump) external {
@@ -260,8 +357,45 @@ contract WorkMarketHandler is Test {
         if (jump && c.open && block.timestamp <= c.answerBy) vm.warp(uint256(c.answerBy) + 1);
         try market.resolveChallenge(id, w) {
             challengesResolved++;
-            delete leavesOf[id];
-            delete unitsOf[id];
+            _clearTree(id);
+        } catch {}
+    }
+
+    /// Any joined actor (or the poster) challenges one index of the live tree.
+    function challengeIdx(uint256 seed, uint256 actorSeed, uint8 slot) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        address a = actorSeed % 5 == 4 ? poster : actors[actorSeed % 4];
+        vm.prank(a);
+        try market.challengeIndex(id, uint32(slot % 5)) {
+            challengesRaised++;
+        } catch {}
+    }
+
+    /// The coordinator answers an index challenge whenever the slot opens (real or padding).
+    function answerIdx(uint256 seed, uint8 slot) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        if (leavesOf[id].length == 0) return;
+        uint256 sl = slot % 4;
+        Slot memory s = slotsOf[id][sl];
+        if (s.garbage || (s.worker != address(0) && s.idx != sl)) return;
+        vm.prank(coordinator);
+        try market.answerIndexChallenge(id, _openingAt(id, sl)) {
+            revealedOf[id][sl] = true;
+            _watch(id);
+        } catch {}
+    }
+
+    function resolveIdx(uint256 seed, uint8 slot, bool jump) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        uint32 sl = uint32(slot % 4);
+        WorkMarket.IndexChallenge memory c = market.indexChallengeOf(id, sl);
+        if (jump && c.open && block.timestamp <= c.answerBy) vm.warp(uint256(c.answerBy) + 1);
+        try market.resolveIndexChallenge(id, sl) {
+            challengesResolved++;
+            _clearTree(id);
         } catch {}
     }
 
@@ -419,15 +553,38 @@ contract WorkMarketInvariantTest is Test {
         assertFalse(handler.settledWhileChallenged());
     }
 
-    /// Q11: open challenges never outnumber the joined workers of an offer.
+    /// Q11: open challenges never outnumber the joined workers plus the tree's slots.
     /// forge-config: default.invariant.runs = 256
     /// forge-config: default.invariant.depth = 200
     /// forge-config: default.invariant.fail-on-revert = false
     function invariant_open_challenges_bounded() public view {
         for (uint256 i = 0; i < handler.idsLength(); i++) {
             WorkMarket.Offer memory o = market.getOffer(handler.ids(i));
-            assertLe(o.openChallenges, o.workers);
+            assertLe(o.openChallenges, uint256(o.workers) + (uint256(1) << o.payoutDepth));
         }
+    }
+
+    /// Tree integrity: a posted root never pays out more units than it posted.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_settled_units_le_payout_units() public view {
+        for (uint256 i = 0; i < handler.idsLength(); i++) {
+            WorkMarket.Offer memory o = market.getOffer(handler.ids(i));
+            assertLe(o.settledUnits, o.payoutUnits);
+        }
+    }
+
+    /// Tree integrity: no two leaves settled under one root claim overlapping unit ranges, even
+    /// when the coordinator posts malformed trees (sybil overlap behind a garbage leaf, an
+    /// out-of-range index, or a padding separator), given a watcher that challenges the slots it
+    /// was not shown and disputes as soon as an answer reveals a bad pair.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_settled_leaves_never_overlap() public view {
+        assertFalse(handler.overlapSettled());
+        assertFalse(handler.malformedRootPaid());
     }
 
     /// 06 §7.7: pause never stops anyone pulling what they are owed.
