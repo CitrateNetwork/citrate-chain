@@ -2381,3 +2381,91 @@ async fn reorg_round_trip_equals_fresh_apply() {
     assert_eq!(r.nonce(sender(1)), 0, "B's sender is untouched");
     assert_eq!(r.nonce(sender(0)), f.nonce(sender(0)));
 }
+
+// ---------------------------------------------------------------------------
+// Mempool nonce window under mergeset execution (lead decision 2026-11-09).
+// The 16-ahead window counts from the sender's highest INCLUDED nonce on the
+// applied chain (contiguous from its committed nonce), not from the committed
+// nonce alone, which lags inclusion by one block under spec 06 D6.
+// ---------------------------------------------------------------------------
+
+/// The Rule 6 pattern that the committed-nonce window refused (64 signers at
+/// about 4.7 tx/s each, so about 10 new txs per sender per block): every
+/// submission is admitted while earlier ones wait in an included,
+/// not-yet-accepted block, and all of them execute.
+#[tokio::test]
+async fn high_rate_sender_is_not_refused_while_its_txs_await_acceptance() {
+    let fleet = Fleet::new(FleetSpec::new(1)).await;
+    let a = &fleet.nodes[0];
+    const PER_BLOCK: u64 = 10;
+    const SLOTS: u64 = 6;
+    for slot in 0..SLOTS {
+        for k in 0..PER_BLOCK {
+            let n = slot * PER_BLOCK + k;
+            let tx = transfer(0, n, recipient(0), VALUE, GAS_PRICE);
+            if let Err(e) = a.mempool.add_transaction(tx, TxClass::Standard).await {
+                panic!(
+                    "slot {slot}: nonce {n} refused (committed {}): {e:?}",
+                    a.nonce(sender(0))
+                );
+            }
+        }
+        let blk = a.produce().await;
+        assert_eq!(
+            blk.transactions.len() as u64,
+            PER_BLOCK,
+            "slot {slot}: the block includes the sender's next ten"
+        );
+    }
+    for _ in 0..2 {
+        a.produce().await;
+    }
+    assert_eq!(
+        a.nonce(sender(0)),
+        SLOTS * PER_BLOCK,
+        "every tx executed once"
+    );
+}
+
+/// The window keeps its anti-spam bound (at most 16 beyond what the applied
+/// chain includes) and follows a reorg: when the block that included a
+/// sender's txs leaves the applied chain, the window falls back to the
+/// committed nonce.
+#[tokio::test]
+async fn nonce_window_is_bounded_by_the_included_run_and_follows_reorgs() {
+    let fleet = Fleet::new(FleetSpec::new(2)).await;
+    let (a, b) = (&fleet.nodes[0], &fleet.nodes[1]);
+    let submit = |n: u64| async move {
+        a.mempool
+            .add_transaction(
+                transfer(0, n, recipient(0), VALUE, GAS_PRICE),
+                TxClass::Standard,
+            )
+            .await
+    };
+    for n in 0..10 {
+        submit(n).await.expect("within the committed window");
+    }
+    let a1 = a.produce().await;
+    assert_eq!(a1.transactions.len(), 10);
+    assert_eq!(a.nonce(sender(0)), 0, "included, not yet accepted");
+    // Included run 0..=9: the window is 10..=26.
+    assert!(
+        submit(27).await.is_err(),
+        "17 beyond the included run is refused"
+    );
+    submit(20).await.expect("within 16 of the included run");
+    // B never saw a1 and outgrows it; A reorgs and a1 leaves its chain.
+    let b1 = b.produce().await;
+    let b2 = b.produce().await;
+    a.receive(&b1).await;
+    a.receive(&b2).await;
+    assert_eq!(a.tip().await.0, b2.header.block_hash, "A reorged onto B");
+    assert_eq!(a.nonce(sender(0)), 0);
+    // Nothing of sender 0 is included on the applied chain now.
+    assert!(
+        submit(18).await.is_err(),
+        "the window is the committed nonce again: 18 is 18 ahead of 0"
+    );
+    submit(16).await.expect("16 ahead of the committed nonce");
+}

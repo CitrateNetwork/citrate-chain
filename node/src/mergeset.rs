@@ -183,3 +183,62 @@ impl RecentChain {
         Ok(out.into_iter().map(|(h, x)| (h, *x.as_bytes())).collect())
     }
 }
+
+#[cfg(test)]
+mod included_window_tests {
+    use super::*;
+    use citrate_consensus::types::{BlockBuilder, PublicKey, Transaction};
+    use citrate_storage::pruning::PruningConfig;
+    use std::sync::Arc;
+
+    fn tx(from: u8, nonce: u64) -> Transaction {
+        let mut h = [0u8; 32];
+        h[0] = from;
+        h[1..9].copy_from_slice(&nonce.to_be_bytes());
+        Transaction {
+            hash: Hash::new(h),
+            nonce,
+            from: PublicKey::new([from; 32]),
+            ..Default::default()
+        }
+    }
+
+    /// The reader counts only the run contiguous from the committed nonce in
+    /// the applied tip's own list: a block holding gap nonces (a dishonest
+    /// producer can include any) never widens a sender's window.
+    #[test]
+    fn included_run_is_contiguous_from_the_committed_nonce() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let reader = included_nonce_reader(storage.clone());
+        let me = PublicKey::new([7; 32]);
+        assert_eq!(reader(&me, 5), 5, "no applied tip: the committed nonce");
+        let tip = BlockBuilder::new()
+            .hash(Hash::new([0xA7; 32]))
+            .height(4)
+            .transactions(vec![tx(7, 5), tx(7, 6), tx(7, 7), tx(7, 40), tx(8, 0)])
+            .build_unhashed();
+        storage.blocks.put_block(&tip).expect("put");
+        storage
+            .blocks
+            .put_applied_tip(&tip.header.block_hash, 4)
+            .expect("tip");
+        assert_eq!(
+            reader(&me, 5),
+            8,
+            "5, 6, 7 included: next is 8; 40 is gap junk"
+        );
+        assert_eq!(reader(&me, 6), 8, "the run starts at the committed nonce");
+        assert_eq!(
+            reader(&me, 9),
+            9,
+            "an included run below the committed nonce is ignored"
+        );
+        assert_eq!(
+            reader(&PublicKey::new([9; 32]), 3),
+            3,
+            "another sender is untouched"
+        );
+    }
+}
