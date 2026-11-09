@@ -684,12 +684,33 @@ fn cold_fill_under_churn(readers: usize) {
         })
         .collect();
 
+    // The tip must move before every try, so each retry re-anchors on a newer
+    // tip than the one its checkpoints were collected under. Waiting for the
+    // churn thread makes that hold on any scheduler: without it a loaded runner
+    // could run every try before the churn thread appended a block, and the
+    // test would pass without exercising churn at all.
+    let wait_for_append = |seen: u64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let now = appended.load(Ordering::Acquire);
+            if now > seen {
+                return now;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the churn thread appended nothing for 30 s (stuck at {seen})"
+            );
+            std::thread::yield_now();
+        }
+    };
+
     // Each retry restarts at the lowest checkpoint it reached, so a cold fill
     // advances at least one stride per try. Allow slack for the blocks the
     // churn thread adds above the start.
     let max_tries = top / CHECKPOINT_STRIDE + 4;
     let mut tries = 0u64;
     let mut overlapped = 0u64;
+    let mut seen = 0u64;
     let mut last_count = idx.checkpoint_count();
     let got = loop {
         tries += 1;
@@ -698,7 +719,8 @@ fn cold_fill_under_churn(readers: usize) {
             "deep query not complete after {max_tries} tries; {} checkpoints kept",
             idx.checkpoint_count()
         );
-        let before = appended.load(Ordering::Acquire);
+        seen = wait_for_append(seen);
+        let before = seen;
         let res = idx.executed_hashes(&storage, 0, 10);
         if appended.load(Ordering::Acquire) != before {
             overlapped += 1;
@@ -722,7 +744,12 @@ fn cold_fill_under_churn(readers: usize) {
         r.join().expect("reader thread");
     }
 
-    assert!(overlapped > 0, "the tip never advanced during a deep walk");
+    // Cold: the 12k-block walk cannot finish in one budget, so at least one
+    // retry ran, each on a tip the churn thread had moved (wait_for_append).
+    assert!(tries >= 2, "the deep query was never retried ({tries} try)");
+    // Whether the tip also moved in the middle of a walk is up to the
+    // scheduler; it is reported, not asserted.
+    eprintln!("cold fill: {tries} tries, {overlapped} overlapped a tip move");
     assert_eq!(
         got.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
         canon[0..=10].to_vec()

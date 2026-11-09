@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   selfcheck:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: packages/chain-config

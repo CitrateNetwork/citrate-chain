@@ -40,9 +40,14 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
 
+# Runner image pinned to ubuntu-24.04 in every chain workflow (not ubuntu-latest):
+# ubuntu-latest became 26.04 (seen from 2026-11-07), whose newer GCC/libstdc++ headers no
+# longer declare uint64_t for the vendored RocksDB 8.10 C++ in librocksdb-sys 0.16
+# ("rocksdb/db/blob/blob_file_meta.h: 'uint64_t' has not been declared"). A consensus chain's CI should build on an image
+# it names, not one that moves under it; 26.04 readiness (rocksdb bump) is tracked separately.
 jobs:
   core-workspace:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -75,7 +80,7 @@ jobs:
         run: cargo test --workspace --quiet --locked
 
   verifier-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -131,7 +136,7 @@ jobs:
   # and fuzz.yml only runs on a schedule. Two targets once stopped compiling
   # against current APIs unnoticed; this makes that a PR failure.
   fuzz-targets-compile:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -163,7 +168,7 @@ jobs:
   # vendor/wasm/BUILD_PINS, and fails if a native-only dependency (tokio/mio,
   # reqwest, wallet-core `native`) enters the wasm build.
   wallet-sdk-wasm:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -187,7 +192,7 @@ jobs:
         run: scripts/ci/wallet_sdk_wasm_gate.sh --require-pack
 
   standalone-benchmarks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -213,7 +218,7 @@ jobs:
   # workspaces (root Cargo.toml `exclude`), so core-workspace never runs them.
   # The tripwire step fails if any other excluded crate is left without a job.
   commd-workspaces:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
