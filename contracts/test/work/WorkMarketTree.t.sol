@@ -308,11 +308,16 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
     }
 
     function test_index_challenge_after_withdrawn_root_starts_fresh() public {
-        (uint256 id,) = _postedA1();
+        (uint256 id, bytes32[] memory leaves) = _postedA1();
+        vm.prank(w1);
+        market.challengeIndex(id, 2);
+        market.answerIndexChallenge(id, _real(leaves, 2, w3, 2, 0)); // slot 2 answered under root 1
         vm.prank(w1);
         market.challengeIndex(id, 1);
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         market.resolveIndexChallenge(id, 1);
+        assertEq(market.getOffer(id).payoutDepth, 0); // cleared with the root
+
         (bytes32[] memory l3,) = _leaves(id, _entries3(), _noOverride(), 2);
         _postTree(id, l3, 6);
         assertEq(market.indexChallengeOf(id, 1).open, false);
@@ -320,5 +325,96 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         market.challengeIndex(id, 1);
         market.answerIndexChallenge(id, _real(l3, 1, w2, 3, 2));
         assertTrue(market.indexChallengeOf(id, 1).answered);
+        // a slot answered under the withdrawn root can be challenged again under the new one
+        vm.prank(w1);
+        market.challengeIndex(id, 2);
+        assertTrue(market.indexChallengeOf(id, 2).open);
+    }
+
+    // ── guards the mutation pass asked for ─────────────────────────
+
+    function test_order_needs_two_distinct_slots() public {
+        (uint256 id, bytes32[] memory leaves) = _postedFl3();
+        WorkMarket.LeafOpening memory a = _real(leaves, 1, w2, 3, 2);
+        bytes memory ev = _order(a, a);
+        vm.prank(w1);
+        vm.expectRevert(WorkMarket.DisputeNotProven.selector);
+        market.dispute(id, ev);
+    }
+
+    function test_order_non_adjacent_abutting_ranges_are_fine() public {
+        uint256 id = _open3();
+        leavesBuf = new bytes32[](4); // [w1 (0,2), w2 (2,0), w3 (2,1), pad]: a zero-unit leaf between
+        leavesBuf[0] = market.leafHash(0, market.leafPayload(id, w1, 2, 0));
+        leavesBuf[1] = market.leafHash(1, market.leafPayload(id, w2, 0, 2));
+        leavesBuf[2] = market.leafHash(2, market.leafPayload(id, w3, 1, 2));
+        _postTree(id, leavesBuf, 3);
+        bytes memory ev = _order(_real(leavesBuf, 0, w1, 2, 0), _real(leavesBuf, 2, w3, 1, 2));
+        vm.prank(w1);
+        vm.expectRevert(WorkMarket.DisputeNotProven.selector);
+        market.dispute(id, ev);
+    }
+
+    function test_order_neighbours_with_a_gap_are_disputable() public {
+        uint256 id = _open3();
+        leavesBuf = new bytes32[](2); // [w1 (0,1), w2 (3,1)]
+        leavesBuf[0] = market.leafHash(0, market.leafPayload(id, w1, 1, 0));
+        leavesBuf[1] = market.leafHash(1, market.leafPayload(id, w2, 1, 3));
+        _postTree(id, leavesBuf, 4);
+        bytes memory ev = _order(_real(leavesBuf, 0, w1, 1, 0), _real(leavesBuf, 1, w2, 1, 3));
+        vm.prank(w3);
+        market.dispute(id, ev);
+        assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.Running));
+    }
+
+    /// A slot whose value is an internal node over two leaves hides those leaves one level below
+    /// the posted depth. The depth rule keeps them from settling (and from opening as evidence).
+    function test_leaves_nested_below_the_posted_depth_do_not_open() public {
+        uint256 id = _open3();
+        bytes32 la = market.leafHash(0, market.leafPayload(id, w1, 2, 0));
+        bytes32 lb = market.leafHash(1, market.leafPayload(id, w3, 2, 0));
+        leavesBuf = new bytes32[](4); // slot 0 = node(la, lb), posted at depth 2
+        leavesBuf[0] = _node(la, lb);
+        _postTree(id, leavesBuf, 2);
+        vm.warp(block.timestamp + WINDOW);
+        bytes32[] memory p2 = _proof(leavesBuf, 0);
+        bytes32[] memory p3 = new bytes32[](3);
+        p3[0] = lb;
+        p3[1] = p2[0];
+        p3[2] = p2[1];
+        vm.expectRevert(WorkMarket.BadProof.selector);
+        market.settle(id, w1, 2, 0, 0, p3);
+        p3[0] = la;
+        vm.expectRevert(WorkMarket.BadProof.selector);
+        market.settle(id, w3, 2, 0, 1, p3);
+    }
+
+    /// Posted near the deadline, a late answer keeps the offer open past deadline + window: the
+    /// refund and the coordinator bond wait until the post-answer window ends.
+    function test_late_answer_holds_refund_and_coordinator_bond() public {
+        uint256 id = _open3();
+        uint64 deadline = market.getOffer(id).deadline;
+        vm.warp(deadline);
+        leavesBuf = new bytes32[](4);
+        leavesBuf[0] = market.leafHash(0, market.leafPayload(id, w1, 2, 0));
+        leavesBuf[2] = market.leafHash(2, market.leafPayload(id, w3, 2, 0));
+        _postTree(id, leavesBuf, 2);
+        uint256 windowEnd = uint256(deadline) + WINDOW;
+        vm.warp(windowEnd - 1);
+        vm.prank(w1);
+        market.challengeIndex(id, 2);
+        vm.warp(windowEnd + 1 hours);
+        market.answerIndexChallenge(id, _real(leavesBuf, 2, w3, 2, 0));
+        vm.prank(poster);
+        vm.expectRevert(WorkMarket.TooEarly.selector);
+        market.refund(id);
+        vm.prank(coordinator);
+        vm.expectRevert(WorkMarket.NothingToClaim.selector);
+        market.claimBond(id);
+        // the revealed overlap is still disputable, and the bond is still there to slash
+        bytes memory ev = _order(_real(leavesBuf, 0, w1, 2, 0), _real(leavesBuf, 2, w3, 2, 0));
+        vm.prank(w1);
+        market.dispute(id, ev);
+        assertEq(market.balanceOf(w1), CBOND / 2);
     }
 }
