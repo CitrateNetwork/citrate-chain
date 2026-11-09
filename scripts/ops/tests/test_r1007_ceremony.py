@@ -68,7 +68,8 @@ def fake_binary(tmp: Path, *, params: str | None = None, genesis: str | None = N
         "r1007_genesis": SRC["r1007_genesis"],
     }
     b = tmp / f"citrate-{abs(hash((params, genesis, fingerprint)))}"
-    b.write_text("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(m) + "\nEOF\n")
+    # Like the real node: log lines on stdout first, then the pretty-printed manifest.
+    b.write_text("#!/bin/sh\necho '  2026-11-09T15:00:33Z INFO citrate_storage: RocksDB opened'\ncat <<'EOF'\n" + json.dumps(m, indent=2) + "\nEOF\n")
     b.chmod(0o755)
     return b
 
@@ -154,6 +155,8 @@ class RenderAndCheck(unittest.TestCase):
         env = C.parse_env((self.rdir / "citrate-prod-2" / "citrate-node.env").read_text())
         self.assertEqual(env["CITRATE_DAG_PRUNE_RETAIN"], str(SRC["params"]["pruning_depth"]))
         self.assertEqual(env["CITRATE_VALIDATOR_REGISTRY"].lower(), SRC["validator_registry"])
+        unit = (self.rdir / "citrate-prod-2" / "citrate-node.service").read_text()
+        self.assertIn("KillSignal=SIGINT", unit)  # the node ignores SIGTERM (rehearsal 2026-11-09)
         b = C.parse_toml((self.rdir / "citrate-boot-1" / "node.sync.toml").read_text())
         self.assertFalse(b["mining"]["enabled"])
         self.assertEqual(b["mining"]["coinbase"], "0" * 40)
