@@ -87,4 +87,4 @@ cargo test -p citrate-execution --test storage_cow_cost -- --nocapture
 ```
 
 The devnet arm is as in the CV-14 note; fund the throwaway signers in batches
-of 16 (the mempool refuses a nonce more than 16 ahead, PBA-L1a-001).
+of 16 (the mempool refuses a nonce more than 16 ahead of the sender's committed nonce).
