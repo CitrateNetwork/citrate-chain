@@ -225,7 +225,7 @@ mod tests {
         for t in [0u64, 1, 2, 3, 5, 7, 60] {
             let p = production_period_secs(t);
             assert!(p >= SLOT_DURATION_SECS && p >= t);
-            assert_eq!(p % SLOT_DURATION_SECS, 0);
+            assert!(p.is_multiple_of(SLOT_DURATION_SECS));
             assert!(p < t.max(1) + SLOT_DURATION_SECS);
         }
     }

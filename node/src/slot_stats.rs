@@ -295,7 +295,7 @@ pub fn spawn(storage: Arc<StorageManager>, dag: Arc<DagStore>) {
                 Err(e) => warn!("slot-stats: applied tip unreadable: {e}"),
             }
             ticks = ticks.saturating_add(1);
-            if ticks % SLOT_STATS_WINDOW_SLOTS != 0 {
+            if !ticks.is_multiple_of(SLOT_STATS_WINDOW_SLOTS) {
                 continue;
             }
             let Some(origin) = dag.slot_origin() else {
