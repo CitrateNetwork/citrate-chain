@@ -670,6 +670,16 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         module.initiateRecovery(kernel, cd, b, sigs);
     }
 
+    /// A fixed call gas (min == max) is a valid commitment.
+    function test_initiate_acceptsEqualMinAndMaxCallGas() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "fixed-cgl");
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.minCallGasLimit = b.maxCallGasLimit;
+        module.initiateRecovery(kernel, cd, b, bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b)));
+        assertEq(module.pendingBounds(kernel).minCallGasLimit, b.maxCallGasLimit);
+    }
+
     /// The bounds are part of what the quorum signs: submitting looser bounds than were signed fails.
     function test_initiate_rejectsBoundsTheQuorumDidNotSign() public {
         _install(kernel);
@@ -767,11 +777,22 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         assertTrue(module.isInitialized(kernel));
     }
 
+    /// Contract code of the designator's length that is not a 7702 designator is not an EOA.
+    function test_install_refuses23ByteContractCodeAsEoa() public {
+        address[] memory g = _threeGuardians();
+        for (uint256 i = 0; i < 3; i++) {
+            vm.etch(g[i], abi.encodePacked(hex"ef0200", address(0x7702)));
+        }
+        vm.prank(kernel);
+        vm.expectRevert(GuardianRecoveryModuleV2.NoEoaGuardian.selector);
+        module.onInstall(_installBytes(2, g));
+    }
+
     // ── the module holds no value ───────────────────────────────────
 
     function test_moduleRefusesValue() public {
         bytes4 err = bytes4(keccak256("ValueNotAccepted()"));
-        vm.deal(kernel, 4);
+        vm.deal(kernel, 5);
         vm.startPrank(kernel);
         vm.expectRevert(err);
         module.preCheck{value: 1}(address(0), 0, "");
@@ -780,6 +801,8 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         vm.expectRevert(err);
         module.onInstall{value: 1}(_installBytes(2, _threeGuardians()));
         module.onInstall(_installBytes(2, _threeGuardians()));
+        vm.expectRevert(err);
+        module.validateUserOp{value: 1}(_op("", ""), OP_HASH);
         vm.expectRevert(err);
         module.onUninstall{value: 1}("");
         vm.stopPrank();

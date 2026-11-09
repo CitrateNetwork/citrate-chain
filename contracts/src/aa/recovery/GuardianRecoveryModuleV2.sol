@@ -346,6 +346,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         override
         returns (uint256)
     {
+        if (msg.value != 0) revert ValueNotAccepted();
         RecoveryConfig storage cfg = _config[msg.sender];
         if (cfg.count == 0) return SIG_VALIDATION_FAILED_UINT;
 
