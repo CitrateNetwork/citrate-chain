@@ -42,6 +42,11 @@ import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///         The module has **no owner, admin or governance role and no constructor parameters**:
 ///         it is a per-account plug-in, and the delay is a constant. It holds no value.
 ///         Citrate is never a guardian; nothing in the module gives the deployer any role.
+/// @notice The V1 read this module needs (contracts/src/aa/recovery/GuardianRecoveryModule.sol).
+interface IGuardianRecoveryModuleV1 {
+    function isInitialized(address smartAccount) external view returns (bool);
+}
+
 contract GuardianRecoveryModuleV2 is IValidator, IHook {
     using ECDSA for bytes32;
     using MessageHashUtils for bytes32;
@@ -78,6 +83,8 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
     error RecoveryActionNotAllowed();
     error InvalidGuardianSignatures();
     error NoPendingRecovery();
+    error V1HasNoCode();
+    error V1StillInstalled(address smartAccount);
 
     // ── events ──────────────────────────────────────────────────────
 
@@ -106,11 +113,20 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         uint64 nonce; // the nonce the guardians signed
     }
 
+    /// @notice The genesis V1 module. V2 refuses to work for an account while V1 is initialized
+    ///         for it (owner Q19, 2026-11-09): V1 has no delay.
+    IGuardianRecoveryModuleV1 public immutable v1;
+
     mapping(address smartAccount => RecoveryConfig) internal _config;
     mapping(address smartAccount => PendingRecovery) internal _pending;
     /// @notice Next nonce a guardian quorum must sign for `account`. Never reset (survives
     ///         uninstall and reinstall), so a signature set can never be replayed.
     mapping(address smartAccount => uint64) public recoveryNonce;
+
+    /// @param v1_ the genesis GuardianRecoveryModule (V1) address (GEN-PARAM)
+    constructor(IGuardianRecoveryModuleV1 v1_) {
+        v1 = v1_;
+    }
 
     // ── install lifecycle ───────────────────────────────────────────
 

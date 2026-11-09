@@ -16,7 +16,8 @@ import {
 } from "@kernel/types/Constants.sol";
 import {IEntryPoint as IKernelEntryPoint} from "@kernel/interfaces/IEntryPoint.sol";
 
-import {GuardianRecoveryModuleV2} from "../../src/aa/recovery/GuardianRecoveryModuleV2.sol";
+import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/recovery/GuardianRecoveryModuleV2.sol";
+import {GuardianRecoveryModule} from "../../src/aa/recovery/GuardianRecoveryModule.sol";
 import {CitrateWallet} from "../../src/aa/wallet/CitrateWallet.sol";
 import {CitrateWalletFactory} from "../../src/aa/factory/CitrateWalletFactory.sol";
 import {CitratePaymaster} from "../../src/aa/paymaster/CitratePaymaster.sol";
@@ -117,7 +118,7 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
     event RecoveryExecuted(address indexed account, uint64 indexed nonce, bytes32 callDataHash);
 
     function setUp() public {
-        module = new GuardianRecoveryModuleV2();
+        module = new GuardianRecoveryModuleV2(IGuardianRecoveryModuleV1(address(new GuardianRecoveryModule())));
         vm.warp(1_700_000_000);
     }
 
@@ -403,6 +404,75 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         assertEq(ea, uint48(block.timestamp) + DELAY);
     }
 
+    // ── owner Q19 (2026-11-09): V2 never works alongside V1 ─────────
+
+    function _installV1(address k) internal {
+        vm.prank(k);
+        GuardianRecoveryModule(address(module.v1())).onInstall(_installBytes(2, _threeGuardians()));
+    }
+
+    function test_constructor_rejectsV1WithoutCode() public {
+        vm.expectRevert(GuardianRecoveryModuleV2.V1HasNoCode.selector);
+        new GuardianRecoveryModuleV2(IGuardianRecoveryModuleV1(address(0xBEEF)));
+    }
+
+    function test_install_refusedWhileV1Installed() public {
+        _installV1(kernel);
+        vm.prank(kernel);
+        vm.expectRevert(abi.encodeWithSelector(GuardianRecoveryModuleV2.V1StillInstalled.selector, kernel));
+        module.onInstall(_installBytes(2, _threeGuardians()));
+    }
+
+    function test_install_allowedAfterV1Uninstalled() public {
+        _installV1(kernel);
+        vm.prank(kernel);
+        GuardianRecoveryModule(address(module.v1())).onUninstall("");
+        _install(kernel);
+        assertTrue(module.isInitialized(kernel));
+    }
+
+    /// Reverse order: V1 installed after V2. V2 cannot block V1's install, so it refuses to act.
+    function test_initiate_refusedWhileV1InstalledAfterV2() public {
+        _install(kernel);
+        _installV1(kernel);
+        bytes memory cd = _rotateCallData(kernel, "k1");
+        bytes memory sigs = _quorum(kernel, cd);
+        vm.expectRevert(abi.encodeWithSelector(GuardianRecoveryModuleV2.V1StillInstalled.selector, kernel));
+        module.initiateRecovery(kernel, cd, sigs);
+    }
+
+    function test_validate_failsWhileV1InstalledAfterV2() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "k1");
+        _initiate(kernel, cd);
+        _installV1(kernel);
+        assertEq(_validate(kernel, cd), SIG_VALIDATION_FAILED_UINT);
+        (, uint48 ea,) = module.pendingRecovery(kernel);
+        assertGt(ea, 0, "not consumed while refused");
+    }
+
+    // ── owner Q20 (2026-11-09): the execution-op signer is an EOA guardian ──
+
+    function test_validate_rejects1271ExecutionSigner() public {
+        V2SmartWalletGuardian sw = new V2SmartWalletGuardian(vm.addr(PK_OTHER));
+        address[] memory g = new address[](3);
+        g[0] = vm.addr(PK_A);
+        g[1] = vm.addr(PK_B);
+        g[2] = address(sw);
+        vm.prank(kernel);
+        module.onInstall(_installBytes(2, g));
+        bytes memory cd = _rotateCallData(kernel, "k1");
+        _initiate(kernel, cd);
+        // the smart-wallet guardian's owner signs the raw execution digest (the 1271 convention)
+        bytes memory raw = _sign(PK_OTHER, keccak256(abi.encodePacked(OP_HASH, kernel)));
+        vm.prank(kernel);
+        assertEq(module.validateUserOp(_op(cd, raw), OP_HASH), SIG_VALIDATION_FAILED_UINT, "1271 signer refused");
+        // an EOA guardian still executes
+        vm.prank(kernel);
+        uint256 vd = module.validateUserOp(_op(cd, _execSig(PK_A, OP_HASH, kernel)), OP_HASH);
+        assertEq(vd & 1, 0);
+    }
+
     // ── phase 2: validate ───────────────────────────────────────────
 
     function test_validate_returnsValidAfterEqualToExecuteAfter() public {
@@ -563,7 +633,7 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
         CitrateWallet impl = new CitrateWallet(IKernelEntryPoint(address(entryPoint)));
         ecdsaValidator = new CitrateECDSAValidator();
         newValidator = new CitrateECDSAValidator();
-        module = new GuardianRecoveryModuleV2();
+        module = new GuardianRecoveryModuleV2(IGuardianRecoveryModuleV1(address(new GuardianRecoveryModule())));
         factory = new CitrateWalletFactory(address(impl), vm.addr(IDENTITY_PK), address(0xA11CE));
         CitratePaymaster pm = new CitratePaymaster(
             IEntryPoint(address(entryPoint)),
@@ -835,7 +905,7 @@ contract GuardianRecoveryModuleV2InvariantTest is Test {
 
     function setUp() public {
         vm.warp(1_700_000_000);
-        module = new GuardianRecoveryModuleV2();
+        module = new GuardianRecoveryModuleV2(IGuardianRecoveryModuleV1(address(new GuardianRecoveryModule())));
         handler = new GuardianV2Handler(module);
         targetContract(address(handler));
     }
