@@ -301,6 +301,45 @@ pub fn gate_outbound(
     Vec::new()
 }
 
+/// The checkpoint configuration the node runs (main.rs). The interval and the
+/// committee size are consensus constants (spec 06 §1.2: `CHECKPOINT_INTERVAL`,
+/// `CHECKPOINT_COMMITTEE_SIZE`): a `[checkpoint]` file value that differs is
+/// ignored with a warning, since nodes that disagree on either derive different
+/// committees. Chain id, genesis and vote depth are the node's; the legacy
+/// `quorum_threshold` is carried for reference only (finalization uses the
+/// stake quorum).
+pub fn node_checkpoint_config(
+    file: &crate::config::CheckpointNodeConfig,
+    chain_id: u64,
+    genesis_hash: Hash,
+) -> citrate_consensus::checkpoint::CheckpointConfig {
+    use citrate_consensus::checkpoint::{
+        CheckpointConfig, CHECKPOINT_COMMITTEE_SIZE, CHECKPOINT_INTERVAL,
+    };
+    if file.interval != CHECKPOINT_INTERVAL {
+        warn!(
+            "[checkpoint] interval = {} ignored: r1007 checkpoints are every {} heights \
+             (consensus constant, aligned with the pruning point)",
+            file.interval, CHECKPOINT_INTERVAL
+        );
+    }
+    if file.committee_size != CHECKPOINT_COMMITTEE_SIZE {
+        warn!(
+            "[checkpoint] committee_size = {} ignored: checkpoint committees have {} seats \
+             (consensus constant; nodes that disagree on it derive different committees)",
+            file.committee_size, CHECKPOINT_COMMITTEE_SIZE
+        );
+    }
+    CheckpointConfig {
+        interval: CHECKPOINT_INTERVAL,
+        committee_size: CHECKPOINT_COMMITTEE_SIZE,
+        quorum_threshold: file.quorum_threshold,
+        chain_id,
+        genesis_hash,
+        vote_depth: file.vote_depth,
+    }
+}
+
 /// The finality gadget the node runs (main.rs), over `manager`. Committee sources:
 ///
 /// - `registry_selector`: the shared epoch-snapshot proposer selector (filled by
@@ -822,10 +861,14 @@ mod tests {
             ..crate::config::CheckpointNodeConfig::default()
         };
         let a = node_checkpoint_config(&team, 40204, h(1));
-        let b = node_checkpoint_config(&crate::config::CheckpointNodeConfig::default(), 40204, h(1));
+        let b =
+            node_checkpoint_config(&crate::config::CheckpointNodeConfig::default(), 40204, h(1));
         assert_eq!(CHECKPOINT_COMMITTEE_SIZE, 100);
         assert_eq!(a.committee_size, CHECKPOINT_COMMITTEE_SIZE);
-        assert_eq!(a.committee_size, b.committee_size, "one committee size fleet-wide");
+        assert_eq!(
+            a.committee_size, b.committee_size,
+            "one committee size fleet-wide"
+        );
         assert_eq!(a.interval, CHECKPOINT_INTERVAL);
         assert_eq!(
             (a.chain_id, a.genesis_hash, a.vote_depth),

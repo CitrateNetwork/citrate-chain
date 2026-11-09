@@ -2231,25 +2231,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
     let checkpoint_manager = {
-        use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+        use citrate_consensus::checkpoint::CheckpointManager;
         // Stage 0 checkpoint finality: build the consensus CheckpointConfig from the
         // node's `[checkpoint]` config instead of `default()`, and bind `chain_id`
         // to the node's chain config (NOT a hardcoded 40204) so a devnet (e.g. 1337)
         // signs/verifies vote messages for its own chain. `quorum_threshold` is
         // carried through for reference, but finalization derives the effective
         // quorum `floor(2n/3)+1` from the actual committee size (see checkpoint.rs).
-        // r1007 (spec 06 §1.2, §7): the checkpoint interval is the compiled
-        // consensus constant, aligned with the G11 pruning point; a different
-        // `[checkpoint] interval` is ignored with a warning. Votes bind the
-        // genesis this node loaded (r1006 and r1007 share chain id 40204).
-        let interval = citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
-        if config.checkpoint.interval != interval {
-            warn!(
-                "[checkpoint] interval = {} ignored: r1007 checkpoints are every {} heights \
-                 (consensus constant, aligned with the pruning point)",
-                config.checkpoint.interval, interval
-            );
-        }
+        // r1007 (spec 06 §1.2, §7): the checkpoint interval and the committee
+        // size are compiled consensus constants (the interval is aligned with
+        // the G11 pruning point; a per-node committee size would let nodes
+        // derive different committees); differing `[checkpoint]` values are
+        // ignored with a warning. Votes bind the genesis this node loaded
+        // (r1006 and r1007 share chain id 40204).
         let genesis_hash = match storage.blocks.get_block_by_height(0) {
             Ok(Some(g)) => g,
             other => {
@@ -2261,14 +2255,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 citrate_consensus::types::Hash::default()
             }
         };
-        let cp_config = CheckpointConfig {
-            interval,
-            committee_size: config.checkpoint.committee_size,
-            quorum_threshold: config.checkpoint.quorum_threshold,
-            chain_id: config.chain.chain_id,
+        let cp_config = finality_driver::node_checkpoint_config(
+            &config.checkpoint,
+            config.chain.chain_id,
             genesis_hash,
-            vote_depth: config.checkpoint.vote_depth,
-        };
+        );
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
         Arc::new(CheckpointManager::with_persistence(
             cp_config,

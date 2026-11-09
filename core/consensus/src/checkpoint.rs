@@ -235,6 +235,8 @@ pub struct CheckpointConfig {
     pub interval: u64,
 
     /// Committee size (number of validators selected for each checkpoint).
+    /// The node always runs [`CHECKPOINT_COMMITTEE_SIZE`]; other values are for
+    /// in-process tests.
     pub committee_size: usize,
 
     /// Legacy fixed quorum (minimum votes), kept for config compatibility.
@@ -272,6 +274,14 @@ pub const DEFAULT_VOTE_DEPTH: u64 = 3;
 /// intervals exist only for in-process tests.
 pub const CHECKPOINT_INTERVAL: u64 = 50;
 
+/// §1.2 `CHECKPOINT_COMMITTEE_SIZE` (spec 06; lead decision 2, 2026-11-09):
+/// seats in every checkpoint committee, a consensus constant like
+/// [`CHECKPOINT_INTERVAL`] (no per-node override): nodes that disagree on it
+/// derive different committees for the same checkpoint. While the eligible set
+/// is at most this size the committee is the whole set. Configurable sizes
+/// exist only for in-process tests.
+pub const CHECKPOINT_COMMITTEE_SIZE: usize = 100;
+
 /// §11.9 memory bound: at most this many checkpoints are pending at once. During
 /// a quorum stall the OLDEST pending checkpoint (and its voted markers) is
 /// evicted to admit a new one, so memory stays bounded however long the stall.
@@ -299,7 +309,7 @@ impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
             interval: CHECKPOINT_INTERVAL,
-            committee_size: 100,
+            committee_size: CHECKPOINT_COMMITTEE_SIZE,
             quorum_threshold: 67,
             chain_id: 40204,
             genesis_hash: Hash::default(),
@@ -681,7 +691,7 @@ pub const COMMITTEE_EPOCH_SEED_DOMAIN: &[u8] = b"CITRATE-COMMITTEE-EPOCH-V1";
 /// longer each finalize a different sibling. Binding the genesis keeps
 /// r1006 and r1007 (same chain id) on different draws. The seed is public in
 /// advance; while the eligible set fits the committee
-/// (the committee size) the committee is the whole set and the seed
+/// ([`CHECKPOINT_COMMITTEE_SIZE`]) the committee is the whole set and the seed
 /// only orders it, so it cannot be biased. A set larger than the committee
 /// needs an unbiasable per-epoch beacon first (spec 06 §12.2 R8).
 pub fn committee_epoch_seed(genesis_hash: &Hash, epoch: u64) -> Hash {
@@ -1893,7 +1903,10 @@ mod tests {
     #[test]
     fn committee_size_is_the_consensus_constant() {
         assert_eq!(CHECKPOINT_COMMITTEE_SIZE, 100);
-        assert_eq!(CheckpointConfig::default().committee_size, CHECKPOINT_COMMITTEE_SIZE);
+        assert_eq!(
+            CheckpointConfig::default().committee_size,
+            CHECKPOINT_COMMITTEE_SIZE
+        );
     }
 
     #[test]

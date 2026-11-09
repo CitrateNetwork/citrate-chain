@@ -118,7 +118,10 @@ pub struct CheckpointNodeConfig {
     #[serde(default = "default_checkpoint_interval")]
     pub interval: u64,
 
-    /// Committee size.
+    /// Committee size. Accepted for file compatibility and IGNORED: the node
+    /// runs the consensus constant `CHECKPOINT_COMMITTEE_SIZE` (a differing
+    /// value is logged at start-up), since nodes that disagree on it derive
+    /// different committees (`finality_driver::node_checkpoint_config`).
     #[serde(default = "default_committee_size")]
     pub committee_size: usize,
 
@@ -142,7 +145,7 @@ fn default_checkpoint_interval() -> u64 {
 }
 
 fn default_committee_size() -> usize {
-    100
+    citrate_consensus::checkpoint::CHECKPOINT_COMMITTEE_SIZE
 }
 
 fn default_quorum_threshold() -> usize {
