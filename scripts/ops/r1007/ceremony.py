@@ -214,13 +214,25 @@ def cmd_collect(a, fleet: Fleet, src: dict) -> int:
                 "--staker-password-file", str(keys / "staker.password")]
         if a.mint:
             args.append("--mint")
+        # The node logs to stdout as well, so the public identity is read from --out (0644,
+        # public parts only), never parsed out of the log stream.
         if fleet.transport == "local":
-            r = subprocess.run([a.binary, *args], capture_output=True, text=True, timeout=300)
+            out_f = Path(a.state) / "identity-pub" / f"{h['name']}.json"
+            out_f.parent.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run([a.binary, *args, "--out", str(out_f)], capture_output=True, text=True, timeout=300)
+            text = out_f.read_text() if r.returncode == 0 and out_f.exists() else ""
         else:
-            r = subprocess.run(["ssh", h["ssh"], "/usr/local/bin/citrate-node", *args], capture_output=True, text=True, timeout=300)
+            remote = "/var/lib/citrate/ceremony/identity.pub.json"
+            r = subprocess.run(["ssh", h["ssh"], "mkdir -p /var/lib/citrate/ceremony && /usr/local/bin/citrate-node "
+                                + " ".join(args) + f" --out {remote} >/dev/null 2>&1 && cat {remote}"],
+                               capture_output=True, text=True, timeout=300)
+            text = r.stdout
         if r.returncode != 0:
             raise Fail(f"{h['name']}: host-identity failed (rc {r.returncode})")
-        pub = json.loads(r.stdout)
+        try:
+            pub = json.loads(text)
+        except json.JSONDecodeError:
+            raise Fail(f"{h['name']}: host-identity wrote no public identity") from None
         if set(pub) != {"schema", "peer_id", "noise_pubkey", "proposer_pubkey", "vrf_pubkey", "staker_address", "coinbase_address"}:
             raise Fail(f"{h['name']}: host-identity printed something other than a public identity")
         if fleet.transport == "ssh":
@@ -314,7 +326,11 @@ def render_host(fleet: Fleet, h: dict, net: str, src: dict, ids: dict, stk: dict
         t = re.sub(r'^coinbase = "[0-9a-fA-F]{40}"$', f'# {h["role"]}: never mines; coinbase unused\ncoinbase = "{ZERO_COINBASE}"', t, flags=re.M)
         files["node.sync.toml"] = t
     files["citrate-node.env"] = G.render_env(prof)
-    files["citrate-node.service"] = G.render_unit(real(etc), real(data), real(binp))
+    # The node stops cleanly on SIGINT (tokio ctrl_c) and did not exit on SIGTERM on the
+    # 2026-11-09 rehearsal, so systemd's default stop would wait out its timeout and kill.
+    unit = G.render_unit(real(etc), real(data), real(binp))
+    unit = unit.replace("RestartSec=5s\n", "RestartSec=5s\nKillSignal=SIGINT\nTimeoutStopSec=90s\n", 1)
+    files["citrate-node.service"] = unit
     files["launch.json"] = json.dumps({"binary": binp, "config": f"{etc}/node.toml", "env_file": f"{etc}/citrate-node.env", "data_dir": data}, indent=2) + "\n"
     return files
 
@@ -469,6 +485,19 @@ def check_static(fleet: Fleet, net: str, src: dict, rdir: Path, ids: dict, stk: 
     return probs
 
 
+def manifest_json(stdout: str) -> dict | None:
+    """The JSON manifest `consensus --json` prints after the node's log lines: the text from
+    the first line that is exactly `{`."""
+    lines = stdout.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "{":
+            try:
+                return json.loads("\n".join(lines[i:]))
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
 def check_binary(fleet: Fleet, net: str, src: dict, rdir: Path, binary: Path) -> list[str]:
     """Run the binary's own `consensus --json` on every rendered config: the node must bind the
     r1007 genesis with exactly R1007_CHAIN_PARAMS, and every node must print one fingerprint."""
@@ -486,7 +515,10 @@ def check_binary(fleet: Fleet, net: str, src: dict, rdir: Path, binary: Path) ->
             if r.returncode != 0:
                 probs.append(f"{h['name']}/{f}: consensus --json failed: {r.stderr.strip()[-200:]}")
                 continue
-            m = json.loads(r.stdout)
+            m = manifest_json(r.stdout)
+            if m is None:
+                probs.append(f"{h['name']}/{f}: consensus --json printed no manifest")
+                continue
             if str(m.get("genesis_hash", "")).lower() != src[f"{net}_genesis"]:
                 probs.append(f"{h['name']}/{f}: the binary binds genesis {m.get('genesis_hash')}, not {src[f'{net}_genesis']}")
             if net == "r1007":

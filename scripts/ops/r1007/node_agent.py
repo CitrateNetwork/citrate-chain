@@ -101,11 +101,7 @@ class Host:
             p = int(self.pidfile.read_text().strip())
         except (OSError, ValueError):
             return None
-        try:
-            os.kill(p, 0)
-        except OSError:
-            return None
-        return p
+        return p if alive(p) else None
 
     def running(self) -> bool:
         if self.mode == "systemd":
@@ -134,11 +130,16 @@ class Host:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         log = open(self.state_dir / f"node-{gen}.log", "ab")
         data = self.p(spec["data_dir"])
+        wait_db_unlocked(data)
         proc = subprocess.Popen(
             [str(self.p(spec["binary"])), "--config", str(self.p(spec["config"]))],
             cwd=data, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
         )
         self.pidfile.write_text(str(proc.pid))
+        time.sleep(3)
+        if proc.poll() is not None:
+            self.pidfile.unlink(missing_ok=True)
+            raise RuntimeError(f"the node exited at start-up (rc {proc.returncode}); see node-{gen}.log")
 
     def stop(self) -> None:
         if self.mode == "systemd":
@@ -151,16 +152,22 @@ class Host:
         if p is None:
             self.pidfile.unlink(missing_ok=True)
             return
-        os.kill(p, signal.SIGTERM)
-        for _ in range(120):
+        # The node shuts down on SIGINT (tokio ctrl_c); on the 2026-11-09 rehearsal it did
+        # not exit on SIGTERM. SIGINT first, then SIGTERM, then SIGKILL.
+        for sig, secs in ((signal.SIGINT, 60), (signal.SIGTERM, 10), (signal.SIGKILL, 30)):
             try:
-                os.kill(p, 0)
+                os.kill(p, sig)
             except OSError:
                 break
-            time.sleep(0.25)
+            if wait_gone(p, secs):
+                break
         else:
-            os.kill(p, signal.SIGKILL)
+            raise Refused(f"node pid {p} did not exit after SIGKILL")
         self.pidfile.unlink(missing_ok=True)
+        gen = self.active()
+        if gen:
+            spec = json.loads((self.slot_etc(gen) / "launch.json").read_text())
+            wait_db_unlocked(self.p(spec["data_dir"]))
 
     # ---- rpc (loopback only) ---------------------------------------------
     def call(self, method: str, params: list) -> object:
@@ -174,6 +181,49 @@ class Host:
         if "error" in d:
             raise RuntimeError(f"{method}: {d['error']}")
         return d["result"]
+
+
+def alive(pid: int) -> bool:
+    """A running process (a zombie counts as gone: it holds no files)."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def wait_gone(pid: int, seconds: float) -> bool:
+    until = time.time() + seconds
+    while time.time() < until:
+        if not alive(pid):
+            return True
+        time.sleep(0.25)
+    return not alive(pid)
+
+
+def wait_db_unlocked(data: Path, seconds: float = 60) -> None:
+    """Wait until no process holds the data dir's RocksDB LOCK (fcntl), so a restart never
+    races the previous process's exit."""
+    import fcntl
+
+    lock = data / "LOCK"
+    if not lock.exists():
+        return
+    until = time.time() + seconds
+    while True:
+        try:
+            with open(lock, "r+") as f:
+                fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.lockf(f, fcntl.LOCK_UN)
+            return
+        except OSError:
+            if time.time() > until:
+                raise Refused(f"{lock} is still held by another process")
+            time.sleep(0.5)
 
 
 def sha(path: Path) -> str:
@@ -349,14 +399,31 @@ def cmd_head(h: Host, a) -> int:
 
 
 def cmd_miners(h: Host, a) -> int:
+    """Coinbases of the last N blocks of the selected chain AND of the blocks each one
+    merges (`mergeParentHashes`): in a GHOSTDAG DAG a producer's block is often merged
+    rather than selected, so the selected chain alone under-counts sealing."""
     head = int(str(h.call("eth_blockNumber", [])), 16)
     seen: dict[str, int] = {}
+    done: set[str] = set()
+
+    def count(blk: dict) -> None:
+        bh = str(blk.get("hash", "")).lower()
+        if bh in done:
+            return
+        done.add(bh)
+        m = str(blk.get("miner", "")).lower()
+        seen[m] = seen.get(m, 0) + 1
+
     for n in range(max(1, head - a.last + 1), head + 1):
         blk = h.call("eth_getBlockByNumber", [hex(n), False])
-        if blk:
-            m = str(blk.get("miner", "")).lower()  # type: ignore[union-attr]
-            seen[m] = seen.get(m, 0) + 1
-    return out({"head": head, "miners": seen})
+        if not blk:
+            continue
+        count(blk)  # type: ignore[arg-type]
+        for mh in blk.get("mergeParentHashes") or []:  # type: ignore[union-attr]
+            mb = h.call("eth_getBlockByHash", [mh, False])
+            if mb:
+                count(mb)  # type: ignore[arg-type]
+    return out({"head": head, "miners": seen, "blocks": len(done)})
 
 
 def cmd_rollback_target(h: Host, a) -> int:
