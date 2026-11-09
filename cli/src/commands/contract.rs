@@ -20,15 +20,15 @@ pub enum ContractCommands {
         contract: PathBuf,
 
         /// Constructor arguments (JSON)
-        #[arg(short, long)]
+        #[arg(long)]
         args: Option<String>,
 
         /// Account to deploy from
-        #[arg(short, long)]
+        #[arg(long)]
         account: Option<String>,
 
         /// Contract value in wei
-        #[arg(short, long, default_value = "0")]
+        #[arg(long, default_value = "0")]
         value: String,
     },
 
@@ -41,15 +41,15 @@ pub enum ContractCommands {
         method: String,
 
         /// Method arguments (JSON array)
-        #[arg(short, long)]
+        #[arg(long)]
         args: Option<String>,
 
         /// Account to call from
-        #[arg(short, long)]
+        #[arg(long)]
         account: Option<String>,
 
         /// Value to send in wei
-        #[arg(short, long, default_value = "0")]
+        #[arg(long, default_value = "0")]
         value: String,
     },
 
@@ -102,7 +102,7 @@ pub enum ContractCommands {
         contract: Option<String>,
 
         /// solc long version, e.g. v0.8.26+commit.8a97fa7a (read from the build-info if omitted)
-        #[arg(short, long)]
+        #[arg(long)]
         compiler: Option<String>,
 
         /// Single-file mode: optimizer enabled

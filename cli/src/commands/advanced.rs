@@ -53,7 +53,7 @@ pub enum AdvancedCommands {
         interval: u64,
 
         /// Number of updates to display (0 = infinite)
-        #[arg(short, long, default_value = "0")]
+        #[arg(long, default_value = "0")]
         count: usize,
 
         /// Include DAG metrics
@@ -72,7 +72,7 @@ pub enum AdvancedCommands {
         txs: usize,
 
         /// Concurrency level
-        #[arg(short, long, default_value = "10")]
+        #[arg(long, default_value = "10")]
         concurrency: usize,
 
         /// Transaction size in bytes
@@ -122,7 +122,7 @@ pub enum AdvancedCommands {
         model_id: Option<String>,
 
         /// Time range (24h, 7d, 30d)
-        #[arg(short, long, default_value = "24h")]
+        #[arg(long, default_value = "24h")]
         range: String,
 
         /// Export to CSV
