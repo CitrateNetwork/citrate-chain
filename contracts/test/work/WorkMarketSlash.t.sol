@@ -27,6 +27,9 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         market.revealDispute(id, ev, salt);
     }
 
+    /// A further worker `_underPosted` joins before posting (a sybil), if set.
+    address internal alsoJoins;
+
     /// Posts a correct 6-unit tree over w1..w3 posted as 9 units; returns the TOTAL evidence.
     function _underPosted(bool posterCoordinates) internal returns (uint256 id, bytes memory ev) {
         WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.FL_ROUND);
@@ -35,6 +38,7 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         _join(id, w1);
         _join(id, w2);
         _join(id, w3);
+        if (alsoJoins != address(0)) _join(id, alsoJoins);
         _accept(id);
         Entry[] memory e = _entries3();
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 2);
@@ -71,13 +75,47 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         assertEq(market.balanceOf(SINK), CBOND);
     }
 
-    function test_committed_dispute_pays_the_whole_bond_when_the_poster_coordinates() public {
+    /// Owner 2026-11-09 (Q4 revised): every slash splits half to the rewarded disputer, half to
+    /// the sink; the poster never receives any part, whoever coordinates.
+    function test_committed_dispute_against_a_coordinating_poster_splits_with_the_sink() public {
         (uint256 id, bytes memory ev) = _underPosted(true);
         bytes32 salt = _commit(id, w3, ev);
         _reveal(id, w3, ev, salt);
-        assertEq(market.balanceOf(w3), CBOND);
+        assertEq(market.balanceOf(w3), CBOND / 2);
         assertEq(market.balanceOf(poster), 0);
-        assertEq(market.balanceOf(SINK), 0);
+        assertEq(market.balanceOf(SINK), CBOND - CBOND / 2);
+    }
+
+    /// A coordinating poster pre-commits through a joined sybil worker and reveals first: the
+    /// colluding side recovers at most half of the slashed bond.
+    function test_sybil_precommit_by_a_coordinating_poster_recovers_at_most_half() public {
+        address sy = address(0x0A0A);
+        alsoJoins = sy;
+        (uint256 id, bytes memory ev) = _underPosted(true);
+        bytes32 sSalt = _commit(id, sy, ev); // right after posting
+        vm.warp(block.timestamp + 6 hours);
+        _commit(id, w3, ev);
+        vm.prank(sy);
+        market.revealDispute(id, ev, sSalt);
+        assertLe(market.balanceOf(sy) + market.balanceOf(poster), CBOND / 2, "colluders recover at most half");
+        assertEq(market.balanceOf(SINK), CBOND - CBOND / 2);
+    }
+
+    /// The poster coordinates through a second address and keeps a sybil worker: still at most
+    /// half comes back to the colluding side.
+    function test_second_address_coordinator_and_sybil_recover_at_most_half() public {
+        // `coordinator` stands for the poster's second address
+        address sy = address(0x0A0A);
+        alsoJoins = sy;
+        (uint256 id, bytes memory ev) = _underPosted(false);
+        bytes32 sSalt = _commit(id, sy, ev);
+        _reveal(id, sy, ev, sSalt);
+        assertLe(
+            market.balanceOf(sy) + market.balanceOf(poster) + market.balanceOf(coordinator),
+            CBOND / 2,
+            "colluders recover at most half"
+        );
+        assertEq(market.balanceOf(SINK), CBOND - CBOND / 2);
     }
 
     function test_direct_dispute_slash_goes_to_the_sink() public {
@@ -103,13 +141,13 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         assertEq(market.balanceOf(SINK), 2 * CBOND);
     }
 
-    function test_committed_worker_dispute_still_splits_with_the_poster() public {
+    function test_committed_worker_dispute_splits_with_the_sink_not_the_poster() public {
         (uint256 id, bytes memory ev) = _underPosted(false);
         bytes32 salt = _commit(id, w2, ev);
         _reveal(id, w2, ev, salt);
         assertEq(market.balanceOf(w2), CBOND / 2);
-        assertEq(market.balanceOf(poster), CBOND / 2);
-        assertEq(market.balanceOf(SINK), 0);
+        assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND - CBOND / 2);
     }
 
     function test_unanswered_poster_challenge_slash_goes_to_the_sink() public {

@@ -76,9 +76,10 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         bytes memory ev = _total(_opening(leaves, 0, _entries3()[0], 0), _none()); // w1 (0,2) > 1
         _commitReveal(id, w1, ev);
         assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.Running));
-        // a coordinating poster forfeits the whole bond to the disputer, not half to itself
-        assertEq(market.balanceOf(w1), CBOND);
+        // owner 2026-11-09 (Q4 revised): half to the disputer, half to the sink, none to the poster
+        assertEq(market.balanceOf(w1), CBOND / 2);
         assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND / 2);
     }
 
     function test_payout_units_above_tree_total_are_disputable() public {

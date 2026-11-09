@@ -100,7 +100,8 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         assertEq(o.payoutRoot, bytes32(0));
         assertEq(o.openChallenges, 0);
         assertEq(market.balanceOf(w1), CBOND / 2 + CHBOND);
-        assertEq(market.balanceOf(poster), CBOND / 2);
+        assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND / 2);
     }
 
     /// A late answer reveals the sybil leaf; the window stays open for disputes long enough to use it.

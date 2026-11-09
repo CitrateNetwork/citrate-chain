@@ -48,7 +48,8 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         assertEq(o.payoutRoot, bytes32(0));
         assertEq(o.openChallenges, 0);
         assertEq(market.balanceOf(w2), CBOND / 2 + CHBOND); // share plus its challenge bond back
-        assertEq(market.balanceOf(poster), CBOND / 2);
+        assertEq(market.balanceOf(poster), 0); // the poster never receives a slash (Q4 revised)
+        assertEq(market.balanceOf(SINK), CBOND / 2);
     }
 
     function test_answered_challenge_is_dismissed_and_settle_resumes() public {

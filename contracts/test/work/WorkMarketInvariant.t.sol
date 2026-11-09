@@ -21,15 +21,22 @@ contract WorkMarketHandler is Test {
     /// A poster that coordinates its own offers (FL only).
     uint256 internal constant PC_KEY = 0xBADC0DE;
     address public pc = vm.addr(PC_KEY);
+    /// The colluding side of a self-coordinated offer: the poster `pc`, a second address `pc2`
+    /// it may coordinate through, and a sybil worker `pcSy` it joins to every such offer.
+    uint256 internal constant PC2_KEY = 0xBADC0DF;
+    address public pc2 = vm.addr(PC2_KEY);
+    address public pcSy = address(0x5B11);
     mapping(uint256 => address) public posterOf;
     mapping(uint256 => address) public coordOf;
     mapping(uint256 => uint256) internal keyOf;
     // value accounting for the coordinating poster
-    uint256 public pcIn; // everything pc sent the market
-    uint256 public pcWithdrawn;
-    uint256 public pcDismissedEarned; // dismissed challenge bonds paid to pc as coordinator
+    uint256 public pcIn; // everything the colluding side sent the market
+    uint256 public pcWithdrawn; // everything the colluding side withdrew
+    uint256 public pcDismissedEarned; // dismissed challenge bonds paid to pc / pc2 as coordinator
     uint256 public reveals;
-    uint256 public pcLost; // coordinator bonds slashed by upheld disputes against pc's roots
+    /// The least the colluding side must have lost to upheld slashes of its roots: the sink's
+    /// half of each slashed bond (bond - bond * SLASH_DISPUTER_BPS / BPS).
+    uint256 public pcMinLoss;
 
     uint32 internal constant WINDOW = 24 hours;
     uint8 internal constant DEPTH = 2; // maxWorkers 4: four slots
@@ -88,6 +95,8 @@ contract WorkMarketHandler is Test {
         vm.deal(poster, type(uint128).max);
         vm.deal(coordinator, 1e30);
         vm.deal(pc, type(uint128).max);
+        vm.deal(pc2, 1e30);
+        vm.deal(pcSy, 1e24);
         for (uint256 i = 0; i < 4; i++) {
             vm.deal(actors[i], 1e24);
         }
@@ -141,9 +150,11 @@ contract WorkMarketHandler is Test {
     }
 
     function _noteUpheld(uint256 id, uint32 epoch, bool held, uint128 bond) internal {
-        if (coordOf[id] != pc || !held) return;
+        if (posterOf[id] != pc || !held) return;
         WorkMarket.Offer memory o = market.getOffer(id);
-        if (o.payoutEpoch != epoch && o.state == IWorkMarket.State.Running && !o.coordinatorBondHeld) pcLost += bond;
+        if (o.payoutEpoch != epoch && o.state == IWorkMarket.State.Running && !o.coordinatorBondHeld) {
+            pcMinLoss += bond - (uint256(bond) * 5000) / 10_000;
+        }
     }
 
     // ── actions ────────────────────────────────────────────────────
@@ -159,7 +170,8 @@ contract WorkMarketHandler is Test {
         if (cbond != 0) cbond = uint128(bound(cbond, market.minCoordinatorBond(), 1e19));
         bool pcMode = selfCoordinated && !task;
         address who = pcMode ? pc : poster;
-        address coord = pcMode ? pc : coordinator;
+        // a self-coordinated offer names pc itself or its second address pc2
+        address coord = pcMode ? (units % 2 == 0 ? pc : pc2) : coordinator;
         WorkMarket.OpenParams memory p = WorkMarket.OpenParams({
             kind: task ? IWorkMarket.Kind.TASK : IWorkMarket.Kind.FL_ROUND,
             verifier: address(verifier),
@@ -186,8 +198,15 @@ contract WorkMarketHandler is Test {
             priceAtOpen[id] = price;
             posterOf[id] = who;
             coordOf[id] = coord;
-            keyOf[id] = pcMode ? PC_KEY : COORD_KEY;
-            if (pcMode) pcIn += budget;
+            keyOf[id] = !pcMode ? COORD_KEY : (coord == pc ? PC_KEY : PC2_KEY);
+            if (pcMode) {
+                pcIn += budget;
+                bytes32[] memory none;
+                vm.prank(pcSy);
+                try market.join{value: joinBond}(id, 0, none) {
+                    pcIn += joinBond;
+                } catch {}
+            }
             opens++;
         } catch {}
     }
@@ -285,7 +304,7 @@ contract WorkMarketHandler is Test {
         uint128 chBond = market.challengeBondOf(id);
         vm.prank(coordOf[id]);
         try market.postPayout{value: o.coordinatorBond}(id, root, total, DEPTH) {
-            if (coordOf[id] == pc) pcIn += o.coordinatorBond;
+            if (posterOf[id] == pc) pcIn += o.coordinatorBond;
             if (!ok) postedWithoutAcceptance = true;
             posts++;
             _clearTree(id);
@@ -504,10 +523,33 @@ contract WorkMarketHandler is Test {
     function release(uint256 seed, uint256 actorSeed, uint8 slot) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        uint256 before = market.balanceOf(pc);
+        uint256 before = _colluders();
         try market.releaseChallengeBond(id, actors[actorSeed % 4]) {} catch {}
         try market.releaseIndexChallengeBond(id, uint32(slot % 4)) {} catch {}
-        if (coordOf[id] == pc) pcDismissedEarned += market.balanceOf(pc) - before;
+        if (posterOf[id] == pc) pcDismissedEarned += _colluders() - before;
+    }
+
+    function _colluders() internal view returns (uint256) {
+        return market.balanceOf(pc) + market.balanceOf(pc2) + market.balanceOf(pcSy);
+    }
+
+    function colluderBalances() external view returns (uint256) {
+        return _colluders();
+    }
+
+    /// The coordinating poster's sybil worker commits and reveals a dispute against the poster's
+    /// own root (TOTAL or ORDER over the stored tree), e.g. right after it was posted.
+    function sybilDispute(uint256 seed, uint8 slot) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        if (posterOf[id] != pc || leavesOf[id].length == 0) return;
+        uint256 i = slot % 4;
+        WorkMarket.LeafOpening memory next;
+        if (i + 1 < 4) next = _openingAt(id, i + 1);
+        bytes memory ev = slot % 2 == 0
+            ? abi.encode(uint8(6), abi.encode(_openingAt(id, i), next))
+            : abi.encode(uint8(3), abi.encode(_openingAt(id, i), next));
+        _commitReveal(id, pcSy, ev);
     }
 
     /// A joined actor commits to TOTAL or ORDER evidence over leaves it has seen, waits the
@@ -596,13 +638,15 @@ contract WorkMarketHandler is Test {
     }
 
     function withdraw(uint256 actorSeed, uint8 who) external {
-        uint8 k = who % 5;
+        uint8 k = who % 7;
         address a = k == 0 ? poster : (k == 1 ? coordinator : (k == 2 ? pc : actors[actorSeed % 4]));
         if (k == 4) a = market.slashSink();
+        if (k == 5) a = pc2;
+        if (k == 6) a = pcSy;
         uint256 bal = market.balanceOf(a);
         vm.prank(a);
         try market.withdraw() {
-            if (a == pc) pcWithdrawn += bal;
+            if (a == pc || a == pc2 || a == pcSy) pcWithdrawn += bal;
         } catch {
             if (bal != 0) pauseBlockedExit = true;
         }
@@ -647,7 +691,8 @@ contract WorkMarketInvariantTest is Test {
 
     function _pullTotal() internal view returns (uint256 t) {
         t = market.balanceOf(handler.poster()) + market.balanceOf(handler.coordinator())
-            + market.balanceOf(handler.pc()) + market.balanceOf(market.slashSink());
+            + market.balanceOf(handler.pc()) + market.balanceOf(market.slashSink()) + market.balanceOf(handler.pc2())
+            + market.balanceOf(handler.pcSy());
         for (uint256 i = 0; i < 4; i++) {
             t += market.balanceOf(handler.actorAt(i));
         }
@@ -768,15 +813,17 @@ contract WorkMarketInvariantTest is Test {
         assertFalse(handler.honestLeafBlocked());
     }
 
-    /// Slash rules: a poster that coordinates its own offers never ends with more than it put
-    /// in, apart from dismissed challenge bonds it earned as coordinator of a surviving root (the
-    /// documented withholding remainder). Upheld disputes against its roots pay it nothing.
+    /// Slash rules (owner 2026-11-09, Q4 revised): a poster that coordinates its own offers, in
+    /// its own name or through a second address, and keeps a sybil worker, never ends with more
+    /// than it put in, apart from dismissed challenge bonds earned as coordinator of a surviving
+    /// root (the documented withholding remainder), and loses at least the sink's half of every
+    /// bond slashed by an upheld dispute against its roots.
     /// forge-config: default.invariant.runs = 256
     /// forge-config: default.invariant.depth = 200
     /// forge-config: default.invariant.fail-on-revert = false
     function invariant_coordinating_poster_never_profits() public view {
         assertLe(
-            market.balanceOf(handler.pc()) + handler.pcWithdrawn() + handler.pcLost(),
+            handler.colluderBalances() + handler.pcWithdrawn() + handler.pcMinLoss(),
             handler.pcIn() + handler.pcDismissedEarned()
         );
     }

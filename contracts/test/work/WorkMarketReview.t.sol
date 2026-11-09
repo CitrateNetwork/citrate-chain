@@ -100,10 +100,11 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
 
         market.resolveIndexChallenge(id, 0);
         assertEq(market.balanceOf(w1), CBOND / 2 + CHBOND);
-        assertEq(market.balanceOf(poster), CBOND / 2);
+        assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND / 2);
         vm.prank(poster);
         market.refund(id);
-        assertEq(market.balanceOf(poster), CBOND / 2 + 3 * PRICE);
+        assertEq(market.balanceOf(poster), 3 * PRICE);
         assertEq(market.owedOn(id), 0);
     }
 
