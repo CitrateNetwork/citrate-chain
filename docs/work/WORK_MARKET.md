@@ -104,7 +104,7 @@ their addresses are known before the ceremony.
 | FLRoundVerifier | `frl_` | the genesis FederatedRoundLedger (CREATE2, already in the r1006 set) | immutable |
 | TaskVerifier | `reviewWindow_` | seconds, 1 h ≤ x ≤ 30 d | immutable; owner picks (proposal: 72 h) |
 | WorkMarket | `governance_` | the governance timelock | two-step transfer; may not be the CREATE2 factory (Governable) |
-| WorkMarket | `guardian_` | the guardian council 2-of-3 | not zero and not the CREATE2 factory (`InitialAdmin.check`, PBA-L2-002); governance may rotate or clear it later |
+| WorkMarket | `guardian_` | the guardian council 2-of-3 | not zero and not the CREATE2 factory (`InitialAdmin.check`); governance may rotate or clear it later |
 | WorkMarket | `initialVerifiers_` | `[FLRoundVerifier, TaskVerifier]` | the CREATE2-predicted addresses above; deploy order: FRL, the two verifiers, then WorkMarket |
 
 Fixed in code (not parameters): `MIN_DISPUTE_WINDOW` = 24 h, `MAX_WORKERS_CAP` = 1024,
