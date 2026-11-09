@@ -12,12 +12,28 @@ All notable changes in this PR are documented here. This follows a Keep‑a‑Ch
 - **Removed flags:** `--runtime-bytecode` and `--runtime-bytecode-file`. They only fed the node
   method; the explorer recompiles the source. Scripts passing them now fail at argument parsing.
 - `contract verify-get` (and `verify --get`) read the explorer's `getsourcecode`, not the node.
+- **Removed short flags that clashed (#448).** Several subcommand short flags reused the global
+  `-c` (`--config`), `-r` (`--rpc`) or `-v` (`--verbose`), or each other. Debug builds panicked
+  at startup; in release builds `contract deploy|call -a <account>` was read as the constructor
+  or method arguments. The long flags are unchanged; use them instead:
+  - `contract deploy`, `contract call`: `-a` (was both `--args` and `--account`) and `-v`
+    (`--value`) are gone. `-a` now fails at argument parsing.
+  - `contract verify`: `-c` (`--compiler`) is gone; `-c` is the global `--config`.
+  - `model deploy`: `-v` (`--version`) is gone; `-v` is the global `--verbose`.
+  - `advanced monitor` `-c` (`--count`), `advanced benchmark` `-c` (`--concurrency`) and
+    `advanced model-stats` `-r` (`--range`) are gone; `-c` and `-r` are the global flags.
+  - A unit test runs clap's `debug_assert` over the whole command tree, so a new clash fails CI.
 
 ### Added
 - `contract verify` flags `--api-key`, `--constructor-args`, `--creation-tx`, `--chain-id`
   (sends Etherscan v2 `chainid` only when given), `--watch`, `--poll-interval-ms`,
   `--watch-timeout-secs`; single-file `--runs`, `--evm-version`, `--library`.
 - `contract verify-status <guid>` (with `--chain-id`, `--watch`).
+
+### Fixed
+- `contract verify`: explorer answers that come back as `HTTP <status>` or as a non-envelope
+  body are scrubbed of the API key (raw and percent-encoded) before they reach an error message,
+  like transport errors already were (#445 review follow-up).
 
 ## v0.4.0 — 2026-04-22
 
