@@ -992,9 +992,11 @@ impl DeferredVerdict {
         }
     }
 
-    /// CV-5: this node cannot reconcile with a branch fork choice prefers (see
-    /// `deferred_for_round`). Refuse whatever the height gap: the branches can be
-    /// level while this node still cannot follow the preferred one.
+    /// CV-5: this node cannot reconcile with a branch fork choice prefers, or a
+    /// majority of the producers extends a branch it cannot admit (the split
+    /// guard; see `deferred_for_round`). Refuse whatever the height gap: the
+    /// branches can be level while this node still cannot follow the preferred
+    /// one (under G9 they stay level: one height per slot on each).
     fn refuse_if_unreconciled(&self, attested: u64, local_tip: u64) -> anyhow::Result<()> {
         if !self.cannot_reconcile {
             return Ok(());
@@ -1358,7 +1360,14 @@ impl ProduceCatchupGate {
                     self.deferred_refuse_max.as_secs()
                 );
             }
-            return DeferredVerdict::watermark(majority);
+            // r1007 G9 (#184): refuse whatever the height gap, as for a
+            // contender below. Under G9 a chain gains at most one height per
+            // slot, so a majority branch can stay within the refuse gap of this
+            // node's own tip while this node keeps sealing next to it.
+            return DeferredVerdict {
+                watermark: majority,
+                cannot_reconcile: true,
+            };
         }
         self.split_guard.store(false, Ordering::SeqCst);
         if let Some(c) = contender.filter(|c| c.preferred) {
