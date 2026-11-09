@@ -129,6 +129,8 @@ pub struct ExecutionContext {
     pub gas_limit: u64,
     pub gas_used: u64,
     pub gas_price: u64,
+    /// The transaction's value (r1007 T2: a deployment carries it).
+    pub value: u128,
     pub origin: Address,
     pub logs: Vec<Log>,
     pub output: Vec<u8>,
@@ -161,6 +163,7 @@ impl ExecutionContext {
             gas_limit: tx.gas_limit,
             gas_used: 0,
             gas_price: tx.gas_price,
+            value: tx.value,
             origin: crate::address_utils::normalize_address(&tx.from),
             logs: Vec::new(),
             output: Vec::new(),
@@ -3413,6 +3416,14 @@ impl Executor {
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
         context.use_gas(self.gas_schedule.create)?;
+        // r1007 T2 (spec 06 §3.12): under supply hardening the deployment's
+        // value moves to the created contract. Below the activation (r1006
+        // history) it is checked against the balance and never transferred.
+        let value = if crate::supply_hardening::supply_hardening_active(context.block_number) {
+            U256::from(context.value)
+        } else {
+            U256::zero()
+        };
 
         // Execute deployment bytecode using revm (battle-tested EVM)
         // Revm will calculate the correct CREATE address and create the account
@@ -3422,7 +3433,7 @@ impl Executor {
             self.state_db.clone(),
             from,
             code,
-            U256::zero(), // No value transfer during deployment
+            value,
             gas_remaining,
             U256::from(context.gas_price),
             self.chain_id,
@@ -3431,9 +3442,9 @@ impl Executor {
             self.get_block_context(),
             Some(context.writes_handle.clone()),
             Some(context.journal.clone()),
-            // Deployments carry no value on this path (see the U256::zero()
-            // above), but constructor code can still CALL out with value, so
-            // the same height gate applies.
+            // Constructor code can CALL out with value, and from supply
+            // hardening the deployment carries its own value, so the same
+            // height gate applies.
             crate::executor::value_semantics_at(context.block_number),
         );
 
@@ -3564,11 +3575,19 @@ impl Executor {
         // with contract code about what lives at those addresses. Gated on
         // the hardening activation (40204 pins it at genesis on the reroll)
         // so pre-activation history replays unchanged.
+        //
+        // r1007 T1 (spec 06 §3.12): under supply hardening a call to an account
+        // without code runs in REVM like any other call, so its value moves and
+        // it pays EVM gas. Below the activation (r1006 history) nothing runs and
+        // no value moves, unchanged.
         let code_len = match &code_opt {
             Some(code) => Some(code.len()),
             None if crate::activation::pba_hardening_active(context.block_number)
                 && crate::revm_adapter::is_revm_precompile_at(&to, context.block_number) =>
             {
+                Some(0)
+            }
+            None if crate::supply_hardening::supply_hardening_active(context.block_number) => {
                 Some(0)
             }
             None => None,

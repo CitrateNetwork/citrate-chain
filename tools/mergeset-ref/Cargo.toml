@@ -26,3 +26,7 @@ serde = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# production_differential.rs: the production executor and the chain's reward
+# rule, compared against the reference (test-only; the library never uses them).
+citrate-economics = { path = "../../core/economics" }
+tokio = { workspace = true }

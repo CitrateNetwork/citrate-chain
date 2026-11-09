@@ -6,14 +6,17 @@
 //! RULES (each one is what a node must do; a divergence means one side breaks
 //! one of them):
 //!   * E1 call: a base charge of [`CALL_BASE_GAS`] comes first (a gas limit
-//!     below it fails the tx). If the recipient has code, or is a standard
-//!     precompile (0x01..=0x09) with PBA hardening active, REVM runs the call
-//!     with `gas_limit - CALL_BASE_GAS`. A recipient without code runs nothing
-//!     and moves no value: the tx succeeds with the base charge only.
+//!     below it fails the tx). REVM runs the call with
+//!     `gas_limit - CALL_BASE_GAS` if the recipient has code, or is a standard
+//!     precompile (0x01..=0x09) with PBA hardening active, or, under supply
+//!     hardening (spec 06 §3.12 T1, the r1007 rule), always. Otherwise (r1006
+//!     history) a recipient without code runs nothing and moves no value: the
+//!     tx succeeds with the base charge only.
 //!   * E2 deployment: a base charge of [`CREATE_BASE_GAS`], then REVM CREATE
-//!     with `gas_limit - CREATE_BASE_GAS` and value 0 (a deployment's value is
-//!     not transferred). The created account's code is the runtime REVM
-//!     returned, byte for byte.
+//!     with `gas_limit - CREATE_BASE_GAS`, carrying the tx value under supply
+//!     hardening (§3.12 T2) and value 0 below it (the value is checked, not
+//!     transferred). The created account's code is the runtime REVM returned,
+//!     byte for byte.
 //!   * E3 outcome: REVM success charges `base + REVM gas used`; anything else
 //!     (revert, halt, REVM refusing the tx) fails it: the full gas limit is
 //!     charged, the nonce moves, nothing else changes and no log is kept.
@@ -112,6 +115,7 @@ pub enum Kind {
     },
     Create {
         init: Vec<u8>,
+        value: U256,
     },
 }
 
@@ -249,10 +253,10 @@ pub fn run(
                         tx.data = Bytes::from(data.clone());
                         tx.value = ru(*value);
                     }
-                    Kind::Create { init } => {
+                    Kind::Create { init, value } => {
                         tx.transact_to = TransactTo::Create;
                         tx.data = Bytes::from(init.clone());
-                        tx.value = RU256::ZERO;
+                        tx.value = ru(*value);
                     }
                 }
                 tx.gas_limit = gas_limit;

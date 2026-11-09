@@ -380,10 +380,17 @@ impl State {
                 tx.hash, cfg.evm.value_transfer_height
             )));
         }
+        // §3.12 T1/T2: the r1007 rules, under supply hardening.
+        let r1007 = cfg.executed_basis_at(height);
         let (kind, base) = match tx.to {
             None => (
                 Kind::Create {
                     init: tx.data.clone(),
+                    value: if r1007 {
+                        U256::from(tx.value)
+                    } else {
+                        U256::zero()
+                    },
                 },
                 CREATE_BASE_GAS,
             ),
@@ -407,7 +414,8 @@ impl State {
                     None => citrate_consensus::hardening::PbaHardening::off(),
                 };
                 let runs = self.accounts.get(&to).is_some_and(|a| a.code.is_some())
-                    || (is_standard_precompile(&to) && pba.active_at(height));
+                    || (is_standard_precompile(&to) && pba.active_at(height))
+                    || r1007;
                 if !runs {
                     // E1: no code, nothing runs, no value moves.
                     return Ok((tx.gas_limit >= CALL_BASE_GAS)
