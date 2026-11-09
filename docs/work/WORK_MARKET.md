@@ -2,7 +2,7 @@
 created: 2026-11-08T22:00:00Z
 branch: feat/v060-genesis-workmarket
 author: Larry Klosowski + Claude Opus 5.5 (MAC lane, V60-GEN)
-status: draft (ceremony-genesis candidate; not deployed; internal audit GEN-AUDIT pending)
+status: draft (ceremony-genesis candidate; owner decisions of 2026-11-09 applied; not deployed; internal audit GEN-AUDIT pending)
 spec: citrate-federation .agentile/planset/2026-11-07-v060/06_CONTRACTS.md §2-§4, §6-§8
 ---
 
@@ -32,12 +32,13 @@ Sources: `contracts/src/work/{IVerifier,WorkMarket,FLRoundVerifier,TaskVerifier}
 
 ## Where the code chose, and why (spec deltas for review)
 
-Each is also an owner or reviewer question in the sprint file
-(`citrate-federation/.agentile/sprints/active/2026-11-08-V60-S0-contracts-genesis.md`).
+The owner approved all of them on 2026-11-09 (V60-GEN Q1-Q11; record in
+`citrate-federation/.agentile/sprints/active/2026-11-08-V60-S0-contracts-genesis.md` and 06).
 
 1. **`open` takes a struct** (`OpenParams`) instead of 14 flat arguments, and gains
    `coordinatorBond` and `disputeAdmin`. 06 §2 stores both in the offer and §2.2 relies on them,
-   but `open` had no argument for either.
+   but `open` had no argument for either. A `coordinatorBond` of 0 takes the protocol default,
+   `defaultCoordinatorBond`, a constructor parameter above zero (Q1).
 2. **Payout tree.** `postPayout(id, root, units)` takes the leaves root; the contract stores
    `payoutRoot = keccak256(abi.encode(PAYOUT_TAG, digest, root))` (06 §2.1 "root binds digest").
    Leaves carry an index and a running prefix sum: `payload = keccak256(abi.encode(LEAF_TAG,
@@ -59,11 +60,15 @@ Each is also an owner or reviewer question in the sprint file
    Receipt digest: `keccak256(abi.encode(RECEIPT_TAG, chainid, market, offerId, worker, leaseId,
    deltaHash, true))`, EIP-191-signed by the coordinator (EIP-1271 for contract coordinators).
    The coordinator software (citrate-compute-pool) must sign this exact digest.
-5. **Known limit, objective disputes:** a leaf whose payload is not a valid
-   `(worker, units, cumBefore)` preimage cannot be opened, so it can hide one absent worker from a
-   `MISSING_LEAF` proof. A challenge-response variant (the coordinator must prove inclusion
-   within a response window) closes this, at the cost of another window. This is a reviewer
-   question.
+5. **Inclusion challenge (Q11).** A leaf whose payload is not a valid `(worker, units,
+   cumBefore)` preimage cannot be opened, so it could hide an absent worker from a
+   `MISSING_LEAF` proof. `challengeInclusion(id, receipts)`: inside the window a joined worker or
+   the poster presents coordinator-signed receipts for one joined worker. `answerChallenge(id,
+   leaf)`: anyone, until `answerBy` (+24 h, `CHALLENGE_RESPONSE_WINDOW`), opens that worker's leaf
+   with at least the receipted units. Otherwise `resolveChallenge(id, worker)` upholds it like an
+   objective dispute (`DISPUTE_UNANSWERED_CHALLENGE`). Settle, the coordinator bond and the
+   poster's refund wait while a challenge is open. A worker is re-challenged under the same root
+   only with more receipts than were last answered, so a spurious challenge costs one answer.
 6. **Subjective disputes (TASK, poster only, one per posted payout):** the offer goes to
    Disputed and settle stops. Group tasks: the dispute admin upholds (root withdrawn, worker's
    bond **returned**, offer Running) or rejects (payout stands). Open tasks: no admin, so the
@@ -71,15 +76,14 @@ Each is also an owner or reviewer question in the sprint file
 7. **Refund after a posted root** returns `budget − payoutUnits × price`, not `budget − paid`.
    06 §2.1 allows `budget − paid` after `deadline + disputeWindow`, but a root posted near the
    deadline only opens for settling at about the same time, so `budget − paid` would let the
-   poster take what the root owes unsettled workers (RT-11). The reserve stays settleable with
-   no time limit; whether it should return to the poster after a claim period is an owner
-   question.
+   poster take what the root owes unsettled workers (RT-11). The reserve stays settleable until
+   the poster calls `sweepReserve(id)`, allowed after `deadline + disputeWindow + 180 days`
+   (`RESERVE_CLAIM_PERIOD`, Q3); settling stops after the sweep.
 8. **Expired** = the deadline passed with no live root (none can be posted any more); the
    poster may refund at once. 06 §7.5 allows refund before `deadline + window` only when Expired.
 9. **Join bonds are never slashed** (06 §2 says "refunded on settle or expiry"). They are
    released on settle, when the offer is Closed or Expired, or after `deadline + disputeWindow`.
-   06 §2.1 `refund` mentions "unreleased bonds" going to the poster. The code does not do that,
-   pending the owner's answer.
+   Owner 2026-11-09 (Q5): join bonds always go back to the worker; 06 §2.1 is corrected.
 10. **The verifier is fixed at `open`.** De-allowlisting it later blocks new offers only, so
     governance cannot freeze a live offer's payout.
 11. **`claimBond(id)`** is new: it releases the caller's join bond and, for the coordinator, the
@@ -102,13 +106,15 @@ their addresses are known before the ceremony.
 | Contract | Parameter | Value class | Notes |
 |---|---|---|---|
 | FLRoundVerifier | `frl_` | the genesis FederatedRoundLedger (CREATE2, already in the r1006 set) | immutable |
-| TaskVerifier | `reviewWindow_` | seconds, 1 h ≤ x ≤ 30 d | immutable; owner picks (proposal: 72 h) |
+| TaskVerifier | `reviewWindow_` | **72 h** (owner 2026-11-09, Q7); the contract bounds it to 1 h–30 d | immutable |
 | WorkMarket | `governance_` | the governance timelock | two-step transfer; may not be the CREATE2 factory (Governable) |
 | WorkMarket | `guardian_` | the guardian council 2-of-3 | not zero and not the CREATE2 factory (`InitialAdmin.check`); governance may rotate or clear it later |
+| WorkMarket | `defaultCoordinatorBond_` | SALT wei, above zero (Q1) | immutable; the amount is a genesis-spec value tied to the tokenomics decision |
 | WorkMarket | `initialVerifiers_` | `[FLRoundVerifier, TaskVerifier]` | the CREATE2-predicted addresses above; deploy order: FRL, the two verifiers, then WorkMarket |
 
 Fixed in code (not parameters): `MIN_DISPUTE_WINDOW` = 24 h, `MAX_WORKERS_CAP` = 1024,
-`SLASH_DISPUTER_BPS` = 5000, `MAX_RECEIPTS_PER_DISPUTE` = 256. Native SALT only; the market
+`SLASH_DISPUTER_BPS` = 5000 (Q4), `MAX_RECEIPTS_PER_DISPUTE` = 256,
+`CHALLENGE_RESPONSE_WINDOW` = 24 h, `RESERVE_CLAIM_PERIOD` = 180 days. Native SALT only; the market
 refuses plain transfers (no `receive`).
 
 The genesis-spec test (GEN-PARAMS red test) is still to write: the block-0 code hash of each

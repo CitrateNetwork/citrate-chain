@@ -356,7 +356,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         o.maxWorkers = p.maxWorkers;
         o.joinBond = p.joinBond;
         o.coordinator = p.coordinator;
-        o.coordinatorBond = p.coordinatorBond;
+        o.coordinatorBond = p.coordinatorBond == 0 ? defaultCoordinatorBond : p.coordinatorBond;
         o.disputeAdmin = p.disputeAdmin;
 
         emit OfferOpened(id, p.kind, msg.sender, p.groupHash, p.pricePerUnit, budget, p.deadline, p.requirementsCid);
@@ -602,19 +602,65 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///         the root answer for that worker within `CHALLENGE_RESPONSE_WINDOW`. A worker may be
     ///         challenged again under the same root only with more receipts than were last answered.
     function challengeInclusion(uint256 id, Receipt[] calldata receipts) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted) revert WrongState();
+        if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
+        if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
+        if (receipts.length == 0 || receipts.length > MAX_RECEIPTS_PER_DISPUTE) revert BadEvidence();
+        address w = receipts[0].worker;
+        if (w == address(0) || !_slots[id][w].joined) revert BadEvidence();
+        bytes32 prevLease = bytes32(0);
+        for (uint256 i = 0; i < receipts.length; i++) {
+            Receipt calldata r = receipts[i];
+            if (r.worker != w || (i > 0 && r.leaseId <= prevLease)) revert BadEvidence();
+            if (!_receiptValid(id, o, r)) revert BadEvidence();
+            prevLease = r.leaseId;
+        }
+        Challenge storage c = _challenges[id][w];
+        uint64 claimed = uint64(receipts.length);
+        if (c.epoch != o.payoutEpoch) {
+            c.epoch = o.payoutEpoch;
+            c.open = false;
+            c.answeredUnits = 0;
+        }
+        if (c.open) revert ChallengeOpen();
+        if (claimed <= c.answeredUnits) revert BadEvidence();
+        uint64 answerBy = uint64(block.timestamp) + CHALLENGE_RESPONSE_WINDOW;
+        c.open = true;
+        c.challenger = msg.sender;
+        c.claimedUnits = claimed;
+        c.answerBy = answerBy;
+        o.openChallenges += 1;
+        emit InclusionChallenged(id, w, msg.sender, claimed, answerBy);
     }
 
     /// @notice Answer an open challenge by opening the worker's leaf with at least the claimed
     ///         units. Anyone may answer (the proof is objective); only until `answerBy`.
     function answerChallenge(uint256 id, LeafOpening calldata leaf) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted && o.state != State.Disputed) revert WrongState();
+        Challenge storage c = _challenges[id][leaf.worker];
+        if (leaf.worker == address(0) || !c.open || c.epoch != o.payoutEpoch) revert NoOpenChallenge();
+        if (block.timestamp > c.answerBy) revert AnswerTooLate();
+        if (leaf.units < c.claimedUnits || !_opens(id, o, leaf)) revert BadAnswer();
+        c.open = false;
+        c.answeredUnits = c.claimedUnits;
+        o.openChallenges -= 1;
+        emit ChallengeAnswered(id, leaf.worker, leaf.units);
     }
 
     /// @notice After `answerBy`, an unanswered challenge is upheld: the root is withdrawn, the
     ///         coordinator bond slashed (to the challenger and the poster) and the offer runs again.
     function resolveChallenge(uint256 id, address worker) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted && o.state != State.Disputed) revert WrongState();
+        Challenge storage c = _challenges[id][worker];
+        if (!c.open || c.epoch != o.payoutEpoch) revert NoOpenChallenge();
+        if (block.timestamp <= c.answerBy) revert AnswerTooEarly();
+        c.open = false;
+        address challenger = c.challenger;
+        emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
+        _upholdObjective(id, o, challenger);
     }
 
     function challengeOf(uint256 id, address worker) external view returns (Challenge memory) {
@@ -626,7 +672,15 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @notice After the poster's refund and `deadline + disputeWindow + RESERVE_CLAIM_PERIOD`,
     ///         return what the posted root reserved for workers who never settled. Settling stops.
     function sweepReserve(uint256 id) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (msg.sender != o.poster) revert NotPoster();
+        if (o.state != State.Closed || o.payoutRoot == bytes32(0) || o.reserveSwept) revert WrongState();
+        if (block.timestamp < uint256(o.deadline) + o.disputeWindow + RESERVE_CLAIM_PERIOD) revert TooEarly();
+        uint128 amount = uint128(uint256(o.payoutUnits) * o.pricePerUnit) - o.paid;
+        o.reserveSwept = true;
+        o.refunded += amount;
+        balanceOf[o.poster] += amount;
+        emit ReserveSwept(id, amount);
     }
 
     // ── withdraw ────────────────────────────────────────────────────
