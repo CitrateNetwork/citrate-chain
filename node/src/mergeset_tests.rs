@@ -1954,7 +1954,13 @@ async fn reference_executor_matches_production_on_adversarial_dags() {
         tip_height: 0,
         divergence: None,
     };
-    for seed in 31..=33u64 {
+    // CITRATE_NODE_DIFF_SEEDS widens the run (default 3 seeds; each is a
+    // 4-node fleet, about 20 s).
+    let seeds: u64 = std::env::var("CITRATE_NODE_DIFF_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    for seed in 31..31 + seeds {
         let mut spec = FleetSpec::new(4);
         spec.senders = 7;
         spec.k = 1;
