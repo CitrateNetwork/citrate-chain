@@ -3480,4 +3480,56 @@ mod tests {
             }
         }
     }
+
+    /// Spec 06 §3.10 (D11, as amended 2026-11-09): marking a block
+    /// disqualified marks every held block whose selected chain passes
+    /// through it; a block admitted later on a marked selected parent
+    /// inherits the mark; fork choice uses the first unmarked block on each
+    /// tip's selected chain; the mark is persisted with the DAG store.
+    #[tokio::test]
+    async fn disqualify_propagates_to_selected_parent_descendants() {
+        fn id(n: u8) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0] = n;
+            b[31] = 0xD5;
+            b
+        }
+        let kv = Arc::new(MemKv::default());
+        let store = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("persistent store"),
+        );
+        let gd = GhostDag::new(GhostDagParams::default(), store.clone());
+        let g = create_test_block_with_parents(id(1), Hash::default(), vec![], 0);
+        store.store_block(g.clone()).await.expect("store");
+        gd.add_block(&g).await.expect("genesis");
+        let mut chain = vec![g.hash()];
+        for n in 2..=4u8 {
+            let b = sealed(&gd, id(n), vec![*chain.last().expect("tip")]).await;
+            store.store_block(b.clone()).await.expect("store");
+            gd.add_block(&b).await.expect("admit");
+            chain.push(b.hash());
+        }
+        let (b1, x, y) = (chain[1], chain[2], chain[3]);
+        assert_eq!(gd.select_tip().await.expect("head"), y);
+        gd.disqualify(&x).await;
+        assert!(gd.is_disqualified(&x));
+        assert!(gd.is_disqualified(&y), "a held descendant is marked with it");
+        assert!(!gd.is_disqualified(&b1));
+        assert_eq!(
+            gd.select_tip().await.expect("head"),
+            b1,
+            "the first unmarked block on the tip's selected chain"
+        );
+        let z = sealed(&gd, id(5), vec![y]).await;
+        store.store_block(z.clone()).await.expect("store");
+        gd.add_block(&z).await.expect("a child of a marked block is still a DAG block");
+        assert!(gd.is_disqualified(&z.hash()), "inherited at admission");
+        let reopened = DagStore::persistent_with_strict_vrf(kv, false).expect("reopen");
+        assert!(reopened.is_disqualified(&x) && reopened.is_disqualified(&z.hash()));
+        assert!(!reopened.is_disqualified(&b1));
+        let s = sealed(&gd, id(6), vec![b1]).await;
+        store.store_block(s.clone()).await.expect("store");
+        gd.add_block(&s).await.expect("sibling");
+        assert_eq!(gd.select_tip().await.expect("head"), s.hash(), "a valid sibling wins");
+    }
 }

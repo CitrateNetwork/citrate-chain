@@ -2009,3 +2009,137 @@ async fn reference_executor_matches_production_on_adversarial_dags() {
     assert!(total.skipped_gas > 0, "no ACCEPT-budget skip: {total:?}");
     assert!(total.max_mergeset >= 8, "no deep mergeset: {total:?}");
 }
+
+// ---------------------------------------------------------------------------
+// S3-3b: disqualified from chain (spec 06 §3.10, D11).
+// ---------------------------------------------------------------------------
+
+/// `b` re-sealed by producer `i` after `edit`: hash recomputed, signature
+/// remade. A block whose own commitments lie, or one built on such a block,
+/// as a dishonest producer would send it.
+fn resealed(b: &Block, i: u8, edit: impl FnOnce(&mut Block)) -> Block {
+    let mut x = b.clone();
+    edit(&mut x);
+    x.header.block_hash = x.compute_hash();
+    x.signature = citrate_consensus::crypto::sign_block(&x.header.block_hash, &signing_key(i));
+    x
+}
+
+fn with_wrong_state_root(b: &Block, i: u8) -> Block {
+    resealed(b, i, |x| x.state_root = Hash::new([0xBA; 32]))
+}
+
+/// A chain block whose state root is wrong is admitted to the DAG (admission
+/// never executes) and is disqualified when the applied chain reaches it:
+/// the mark is persisted, the node stays on its last valid chain block and
+/// keeps sealing on it, and the bad block is still a DAG block. The next
+/// block merges it, and the transactions it carries are executed.
+#[tokio::test]
+async fn wrong_state_root_disqualifies_from_chain_not_from_dag() {
+    let fleet = Fleet::new(FleetSpec::new(2)).await;
+    let (a, b) = (&fleet.nodes[0], &fleet.nodes[1]);
+    let t = transfer(0, 0, recipient(0), VALUE, GAS_PRICE);
+    assert!(a.submit(&t).await);
+    let a1 = a.produce().await;
+    b.receive(&a1).await;
+    let u = transfer(1, 0, recipient(1), VALUE, GAS_PRICE);
+    assert!(a.submit(&u).await);
+    let a2 = a.produce().await;
+    assert!(a2.transactions.iter().any(|x| x.hash == u.hash));
+    let x = with_wrong_state_root(&a2, 0);
+    let xh = x.header.block_hash;
+    assert!(b.offer(&x).await, "admission never executes: x is admitted");
+    assert_eq!(b.tip().await.0, a1.header.block_hash, "x is never applied");
+    assert!(b.ghostdag.is_disqualified(&xh), "x is disqualified from chain");
+    assert!(
+        b.storage.blocks.get_block(&xh).expect("read").is_some(),
+        "x stays a DAG block"
+    );
+    // Persisted: a reload of the DAG store sees the mark.
+    let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(
+        b.storage.db.clone(),
+    ));
+    let reloaded = DagStore::persistent_with_strict_vrf(kv, true).expect("reload");
+    assert!(reloaded.is_disqualified(&xh), "the mark survives a restart");
+    // B keeps sealing on its applied tip, merges x, and runs x's own tx.
+    let m = b.produce().await;
+    assert_eq!(m.header.selected_parent_hash, a1.header.block_hash);
+    assert!(
+        m.header.merge_parent_hashes.contains(&xh),
+        "x can still be merged"
+    );
+    assert_eq!(b.tip().await.0, m.header.block_hash);
+    let n = b.produce().await;
+    let j = b.receipt_json(&u.hash).expect("x's tx is executed once x is merged");
+    assert_eq!(
+        j["acceptance"]["including_block_hash"],
+        serde_json::to_value(xh).expect("j"),
+        "included by x, accepted by m's chain child"
+    );
+    assert_eq!(j["block_hash"], serde_json::to_value(n.header.block_hash).expect("j"));
+    assert!(!b.ghostdag.is_disqualified(&m.header.block_hash));
+}
+
+/// Fork choice never names a disqualified block: a lone disqualified tip
+/// yields its last valid selected-chain ancestor (no reorg attempt that can
+/// only fail), and with a valid sibling the sibling wins and is applied.
+#[tokio::test]
+async fn disqualified_tip_is_skipped_by_fork_choice() {
+    let fleet = Fleet::new(FleetSpec::new(3)).await;
+    let (a, b, c) = (&fleet.nodes[0], &fleet.nodes[1], &fleet.nodes[2]);
+    let a1 = a.produce().await;
+    b.receive(&a1).await;
+    c.receive(&a1).await;
+    let x = with_wrong_state_root(&a.produce().await, 0);
+    b.receive(&x).await;
+    assert_eq!(
+        b.ghostdag.select_tip().await.expect("a head"),
+        a1.header.block_hash,
+        "a lone disqualified tip yields its last valid ancestor"
+    );
+    let c2 = c.produce().await;
+    assert_eq!(c2.header.selected_parent_hash, a1.header.block_hash);
+    b.receive(&c2).await;
+    assert_eq!(
+        b.ghostdag.select_tip().await.expect("a head"),
+        c2.header.block_hash,
+        "the valid sibling wins"
+    );
+    assert_eq!(b.tip().await.0, c2.header.block_hash, "and is applied");
+}
+
+/// A block whose selected parent is disqualified is disqualified too: it is
+/// admitted (a DAG block) and inherits the mark, and fork choice and the
+/// producer stay on the last valid chain block.
+#[tokio::test]
+async fn child_of_disqualified_sp_is_disqualified() {
+    let fleet = Fleet::new(FleetSpec::new(2)).await;
+    let (a, b) = (&fleet.nodes[0], &fleet.nodes[1]);
+    let a1 = a.produce().await;
+    b.receive(&a1).await;
+    let a2 = a.produce().await;
+    let x = with_wrong_state_root(&a2, 0);
+    let a3 = a.produce().await;
+    assert_eq!(a3.header.selected_parent_hash, a2.header.block_hash);
+    let y = resealed(&a3, 0, |y| y.header.selected_parent_hash = x.header.block_hash);
+    // After the mark.
+    b.receive(&x).await;
+    assert!(b.ghostdag.is_disqualified(&x.header.block_hash));
+    assert!(b.offer(&y).await, "y is admitted");
+    assert!(
+        b.ghostdag.is_disqualified(&y.header.block_hash),
+        "y inherits the mark at admission"
+    );
+    assert_eq!(b.tip().await.0, a1.header.block_hash);
+    // Fork choice never returns to the marked branch, and B seals on a1.
+    assert_eq!(
+        b.ghostdag.select_tip().await.expect("a head"),
+        a1.header.block_hash
+    );
+    let m = b.produce().await;
+    assert_eq!(m.header.selected_parent_hash, a1.header.block_hash);
+    // Propagation to descendants held BEFORE the mark is covered by the
+    // consensus test `disqualify_propagates_to_selected_parent_descendants`
+    // (admission applies on receipt here, so x is always marked before y can
+    // be admitted).
+}
