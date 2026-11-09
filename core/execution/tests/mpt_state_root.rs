@@ -300,16 +300,27 @@ fn root_is_pure_function_of_state() {
     assert_eq!(a.isolated_clone().calculate_state_root(), root_a);
 }
 
-/// The legacy root is untouched below the activation (no MPT rule at height 0:
-/// genesis is never re-judged), and the two rules give different roots.
+/// r1007 genesis rule (lead decision 2026-11-09): activation 0 covers block 0
+/// itself, so the genesis post-state is rooted under the MPT rule like every
+/// later block. (Until 3e5db765 height 0 kept the legacy root; that is now
+/// only so for an activation above 0, see `mpt_state_root::active_at`.)
 #[test]
-fn genesis_post_state_keeps_the_legacy_root() {
+fn activation_0_roots_block_0_under_the_mpt_rule() {
     let a = db();
     a.accounts.set_balance(addr(1), U256::from(10));
-    let mpt_root = a.calculate_state_root_at(1);
-    let legacy = a.calculate_state_root_at(0);
-    assert_ne!(mpt_root, legacy);
-    assert_eq!(a.calculate_state_root_at(1), a.reference_state_root());
+    a.set_storage(addr(2), slot(1), value(0, 9));
+    let at_0 = a.calculate_state_root_at(0);
+    assert_eq!(at_0, a.calculate_state_root_at(1), "one rule at 0 and 1");
+    assert_eq!(
+        at_0,
+        a.reference_state_root(),
+        "block 0: the standard MPT root"
+    );
+    a.set_root_height(0);
+    assert!(
+        a.mpt_rule_active(),
+        "the post-state of block 0 is under the rule"
+    );
 }
 
 /// The `eth_getProof` accessor: the account proof verifies against the state

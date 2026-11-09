@@ -233,10 +233,14 @@ mod tests {
         assert!(resolve(None, Some("soon"), None).is_err());
     }
 
+    /// r1007 genesis rule (lead decision 2026-11-09): activation 0 includes
+    /// block 0. A later activation never re-judges genesis.
     #[test]
-    fn genesis_is_never_rejudged_and_the_boundary_is_inclusive() {
+    fn activation_0_includes_genesis_and_the_boundary_is_inclusive() {
+        assert!(!active_at(None, 0));
         assert!(!active_at(None, 1));
-        assert!(!active_at(Some(0), 0));
+        assert!(active_at(Some(0), 0));
+        assert!(!active_at(Some(10), 0));
         assert!(active_at(Some(0), 1));
         assert!(!active_at(Some(10), 9));
         assert!(active_at(Some(10), 10));

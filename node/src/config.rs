@@ -1262,6 +1262,41 @@ mod tests {
         assert_eq!(cfg.chain.mpt_state_root_height, Some(0));
     }
 
+    /// r1007 genesis rule (CV-14, lead decision 2026-11-09): activation 0 roots
+    /// block 0 itself under the MPT rule, so the rule must be published before
+    /// a genesis is BUILT, not only before start_node hydrates. Every function
+    /// in main.rs that builds a genesis publishes it first (through
+    /// `publish_mpt_rule_for_genesis_build`, which resolves it for the genesis
+    /// the build is meant to produce).
+    #[test]
+    fn every_genesis_build_publishes_the_mpt_rule_first() {
+        let main = include_str!("main.rs");
+        let mut builds = 0;
+        for needle in [
+            "initialize_genesis_state(",
+            "initialize_genesis_state_with_profile(",
+        ] {
+            for (at, _) in main.match_indices(needle) {
+                // Skip the `use` line and the helper's own definition.
+                let line_start = main[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line = &main[line_start..at];
+                if line.trim_start().starts_with("use ") || line.contains("fn ") {
+                    continue;
+                }
+                let fn_start = main[..at].rfind("fn ").expect("inside a function");
+                let before = &main[fn_start..at];
+                assert!(
+                    before.contains("publish_mpt_rule_for_genesis_build(")
+                        || before.contains("citrate_execution::mpt_state_root::init_for_genesis("),
+                    "the genesis build at byte {at} of main.rs does not publish the MPT \
+                         state root rule first"
+                );
+                builds += 1;
+            }
+        }
+        assert!(builds >= 4, "found {builds} genesis builds in main.rs");
+    }
+
     /// The canonical VRF encoding height is published in start_node before
     /// the DAG store (which captures it through its selector) is built, from
     /// one publication path. Release profiles leave it to the release pin;
