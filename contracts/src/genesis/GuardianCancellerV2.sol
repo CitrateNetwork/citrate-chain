@@ -32,11 +32,15 @@ interface IProviderRegistryGuardianSeat {
 ///         plus one extra non-cancellable form, because under V60-GEN-Q9 the GUARDIAN council
 ///         is both ProviderRegistry's block-0 guardian and this canceller's guardian, and could
 ///         otherwise cancel governance's rotation of the registry seat away from itself:
-///           removal      providerRegistry.setGuardian(next)      (next != the registry's current guardian)
-///         Everything below about v1 holds for v2 unchanged: an operation is outside the veto
-///         only if every call in it is one of the management forms and at least one is a removal;
-///         any other call in the same operation keeps it cancellable, and a rotation to the
-///         registry's current guardian changes nothing and stays cancellable.
+///           rotation     providerRegistry.setGuardian(next)      (next != the registry's current guardian)
+///         An operation is outside the veto when it is a v1 guardian removal (unchanged, below),
+///         or when it is the rotation alone, or the rotation together only with v1 removal forms
+///         of this canceller's own path. A CANCELLER_ROLE grant counts as a replacement only
+///         alongside a removal of this canceller's path (revoke, renounce or this.setGuardian),
+///         exactly as in v1; next to a rotation alone it is an ordinary call. So the rotation
+///         mixed with any other call (an unrelated call, or a grant without a canceller-path
+///         removal) stays cancellable, and a rotation to the registry's current guardian changes
+///         nothing and stays cancellable.
 ///
 /// v1 notes:
 /// @notice C2 D5, owner decision 2026-10-19 (fed#331). This contract, not the guardian itself,
@@ -62,6 +66,14 @@ interface IProviderRegistryGuardianSeat {
 ///
 ///         Holds no value and no other role; nothing here can schedule or execute.
 contract GuardianCancellerV2 {
+    /// How a single call relates to the guardian paths.
+    enum CallKind {
+        Other, // anything else: keeps the operation cancellable
+        Replacement, // grantRole(CANCELLER_ROLE, anyone but this): counts only beside a CancellerRemoval
+        CancellerRemoval, // revoke / renounce CANCELLER_ROLE of this, or this.setGuardian(new guardian)
+        RegistryRotation // providerRegistry.setGuardian(new guardian)
+    }
+
     bytes32 public constant CANCELLER_ROLE = keccak256("CANCELLER_ROLE");
     bytes4 internal constant GRANT_ROLE = bytes4(keccak256("grantRole(bytes32,address)"));
     bytes4 internal constant REVOKE_ROLE = bytes4(keccak256("revokeRole(bytes32,address)"));
@@ -109,8 +121,10 @@ contract GuardianCancellerV2 {
     function cancel(address target, uint256 value, bytes calldata data, bytes32 predecessor, bytes32 salt) external {
         if (msg.sender != guardian) revert NotGuardian();
         bytes32 id = IGovernanceTimelockV2(governanceTimelock).hashOperation(target, value, data, predecessor, salt);
-        (bool management, bool removal) = _classify(target, value, data);
-        if (management && removal) revert GuardianRemovalNotCancellable(id);
+        CallKind k = _classify(target, value, data);
+        if (k == CallKind.CancellerRemoval || k == CallKind.RegistryRotation) {
+            revert GuardianRemovalNotCancellable(id);
+        }
         _cancel(id);
     }
 
@@ -138,13 +152,19 @@ contract GuardianCancellerV2 {
         uint256 n = targets.length;
         if (n != values.length || n != payloads.length) revert LengthMismatch();
         if (n == 0) revert EmptyOperation();
-        bool anyRemoval = false;
+        bool cancellerRemoval = false;
+        bool rotation = false;
+        bool replacement = false;
         for (uint256 i = 0; i < n; i++) {
-            (bool management, bool removal) = _classify(targets[i], values[i], payloads[i]);
-            if (!management) return false;
-            anyRemoval = anyRemoval || removal;
+            CallKind k = _classify(targets[i], values[i], payloads[i]);
+            if (k == CallKind.Other) return false;
+            if (k == CallKind.CancellerRemoval) cancellerRemoval = true;
+            else if (k == CallKind.RegistryRotation) rotation = true;
+            else replacement = true;
         }
-        return anyRemoval;
+        // v1: a replacement grant is part of a removal only beside a canceller-path removal.
+        if (replacement && !cancellerRemoval) return false;
+        return cancellerRemoval || rotation;
     }
 
     function _cancel(bytes32 id) internal {
@@ -161,44 +181,39 @@ contract GuardianCancellerV2 {
         guardian = guardian_;
     }
 
-    /// @return management the call is one of the guardian-removal / -replacement forms
-    /// @return removal    the call removes the current guardian path (revoke / renounce / setGuardian)
-    function _classify(address target, uint256 value, bytes calldata data)
-        internal
-        view
-        returns (bool management, bool removal)
-    {
-        if (value != 0 || data.length < 4) return (false, false);
+    /// @return the kind of guardian-path change the call is (see `CallKind`)
+    function _classify(address target, uint256 value, bytes calldata data) internal view returns (CallKind) {
+        if (value != 0 || data.length < 4) return CallKind.Other;
         bytes4 sel = bytes4(data[:4]);
         if (target == governanceTimelock) {
-            if (data.length != 68) return (false, false);
-            if (sel != GRANT_ROLE && sel != REVOKE_ROLE && sel != RENOUNCE_ROLE) return (false, false);
+            if (data.length != 68) return CallKind.Other;
+            if (sel != GRANT_ROLE && sel != REVOKE_ROLE && sel != RENOUNCE_ROLE) return CallKind.Other;
             (bytes32 role, uint256 account) = abi.decode(data[4:], (bytes32, uint256));
-            if (role != CANCELLER_ROLE || account > type(uint160).max) return (false, false);
+            if (role != CANCELLER_ROLE || account > type(uint160).max) return CallKind.Other;
             // Re-granting this canceller restores the guardian path: never part of a removal.
             if (sel == GRANT_ROLE) {
-                return account == uint256(uint160(address(this))) ? (false, false) : (true, false);
+                return account == uint256(uint160(address(this))) ? CallKind.Other : CallKind.Replacement;
             }
-            return account == uint256(uint160(address(this))) ? (true, true) : (false, false);
+            return account == uint256(uint160(address(this))) ? CallKind.CancellerRemoval : CallKind.Other;
         }
         if (target == providerRegistry && sel == this.setGuardian.selector && data.length == 36) {
             // ProviderRegistry.setGuardian(address) has the same selector as this.setGuardian.
             uint256 next = abi.decode(data[4:], (uint256));
             // A rotation to the registry's current guardian changes nothing: not a removal.
-            if (next > type(uint160).max) return (false, false);
+            if (next > type(uint160).max) return CallKind.Other;
             if (next == uint256(uint160(IProviderRegistryGuardianSeat(providerRegistry).guardian()))) {
-                return (false, false);
+                return CallKind.Other;
             }
-            return (true, true);
+            return CallKind.RegistryRotation;
         }
         if (target == address(this) && sel == this.setGuardian.selector && data.length == 36) {
             uint256 account = abi.decode(data[4:], (uint256));
             // setGuardian(current guardian) changes nothing, so it is not a removal; a batch
             // that sets another guardian and then the current one back contains this call and
             // so stays cancellable too.
-            if (account > type(uint160).max || account == uint256(uint160(guardian))) return (false, false);
-            return (true, true);
+            if (account > type(uint160).max || account == uint256(uint160(guardian))) return CallKind.Other;
+            return CallKind.CancellerRemoval;
         }
-        return (false, false);
+        return CallKind.Other;
     }
 }

@@ -212,9 +212,12 @@ Decided and implemented:
     is v1 plus one non-cancellable form: `providerRegistry.setGuardian(next)` with value 0, canonical calldata and
     `next` not the registry's current guardian, where `providerRegistry` is an immutable constructor argument (the
     block-0 ProviderRegistry, deployed before the canceller).
-  - The rest of v1's rule is kept. An operation is outside the veto only if every call in it is a management form and
-    at least one is a removal, so the rotation mixed with any other call stays cancellable, and a rotation to the
-    current guardian changes nothing and stays cancellable.
+  - The rest of v1's rule is kept. An operation is outside the veto only if it is a v1 guardian removal, the rotation
+    alone, or the rotation together only with v1 removal forms of the canceller's own path (revoke or renounce its
+    `CANCELLER_ROLE`, `GuardianCancellerV2.setGuardian`). As in v1, a `CANCELLER_ROLE` grant counts as a replacement
+    only beside one of those canceller-path removals. So the rotation mixed with any other call stays cancellable,
+    including a grant with no canceller-path removal, and a rotation to the current guardian changes nothing and stays
+    cancellable.
   - v2 has its own CREATE2 salt, `Salts.salt("Genesis.GuardianCancellerV2")`, and its own init code (v2 creation code +
     `abi.encode(governanceTimelock, guardian, providerRegistry)`). The ceremony genesis uses v2 in place of v1. r1006
     and r1007 keep v1 unchanged at `Salts.salt("Genesis.GuardianCanceller")`, so the genesis scripts' check of the

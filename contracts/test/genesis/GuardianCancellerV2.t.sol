@@ -215,6 +215,36 @@ contract GuardianCancellerV2Test is Test {
         assertEq(c.providerRegistry(), address(registry));
     }
 
+    /// One of eight call forms, built against canceller `self` (its own path) on timelock `tl`.
+    function _form(uint256 f, address self, address currentGuardian) internal view returns (address t, bytes memory p) {
+        f = f % 8;
+        if (f == 0) return (address(tl), abi.encodeCall(tl.revokeRole, (canceller, self)));
+        if (f == 1) return (address(tl), abi.encodeCall(tl.renounceRole, (canceller, self)));
+        if (f == 2) return (address(tl), abi.encodeCall(tl.grantRole, (canceller, address(0xE111))));
+        if (f == 3) return (address(tl), abi.encodeCall(tl.grantRole, (canceller, self)));
+        if (f == 4) return (self, abi.encodeCall(c.setGuardian, (address(0xBEEF))));
+        if (f == 5) return (self, abi.encodeCall(c.setGuardian, (currentGuardian)));
+        if (f == 6) return (address(tl), abi.encodeCall(tl.updateDelay, (0)));
+        return (address(tl), abi.encodeCall(tl.revokeRole, (canceller, address(0xE222))));
+    }
+
+    /// v2 decides exactly as v1 on every operation that does not touch the registry seat.
+    /// forge-config: default.fuzz.runs = 10000
+    function testFuzz_v2_matches_v1_without_a_rotation(uint256 seed, uint8 len) public {
+        GuardianCanceller v1 = new GuardianCanceller(address(tl), council);
+        uint256 n = bound(len, 1, 4);
+        address[] memory t1 = new address[](n);
+        bytes[] memory p1 = new bytes[](n);
+        address[] memory t2 = new address[](n);
+        bytes[] memory p2 = new bytes[](n);
+        for (uint256 i = 0; i < n; i++) {
+            uint256 f = uint256(keccak256(abi.encode(seed, i)));
+            (t1[i], p1[i]) = _form(f, address(v1), council);
+            (t2[i], p2[i]) = _form(f, address(c), council);
+        }
+        assertEq(c.isGuardianRemoval(t2, new uint256[](n), p2), v1.isGuardianRemoval(t1, new uint256[](n), p1));
+    }
+
     // ── genesis placement ──────────────────────────────────────────
 
     /// v2 has its own salt and init code, so its CREATE2 address can never collide with, or move,
