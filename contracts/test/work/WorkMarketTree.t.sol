@@ -90,8 +90,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         vm.expectRevert(WorkMarket.ChallengeOpen.selector);
         _settle(id, leaves, 2, Entry(w3, 2), 0);
 
-        vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW());
-        vm.expectRevert(WorkMarket.AnswerTooEarly.selector);
+        vm.expectRevert(WorkMarket.AnswerTooEarly.selector); // answerBy is inclusive
         market.resolveIndexChallenge(id, 1);
         vm.warp(block.timestamp + 1);
         vm.prank(stranger);
@@ -163,8 +162,10 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         vm.prank(w1);
         market.challengeIndex(id, 1);
         WorkMarket.LeafOpening memory l = _real(leaves, 1, w3, 2, 0);
-        l.index = 5;
-        vm.expectRevert(WorkMarket.BadAnswer.selector);
+        vm.expectRevert(WorkMarket.BadAnswer.selector); // slot 1 holds no index-1 leaf
+        market.answerIndexChallenge(id, l);
+        l.index = 5; // the index the leaf was hashed with names no slot
+        vm.expectRevert(WorkMarket.NoOpenChallenge.selector);
         market.answerIndexChallenge(id, l);
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         market.resolveIndexChallenge(id, 1);

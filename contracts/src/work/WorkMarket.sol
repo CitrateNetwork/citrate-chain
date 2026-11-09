@@ -29,7 +29,13 @@ import {IVerifier, IWorkMarket} from "./IVerifier.sol";
 ///      The sort makes absence provable (two neighbours bracket the missing worker); the prefix
 ///      sum makes over-allocation provable (two neighbours whose ranges do not abut) and lets
 ///      `settle` check `cumBefore + units <= payoutUnits` leaf by leaf. A tree that breaks either
-///      rule is a coordinator fault anyone can prove inside the window (DISPUTE_ORDER/FIRST_LEAF).
+///      rule is a coordinator fault anyone can prove inside the window (DISPUTE_ORDER/FIRST_LEAF):
+///      the order proof takes any two openable leaves `i < j`, not only neighbours.
+///
+///      The tree depth is fixed when the root is posted (`payoutDepth`, at most what `maxWorkers`
+///      needs) and every opening, in `settle` and in disputes alike, must carry a path of exactly
+///      that length and an index below `2^payoutDepth`. A leaf that settles therefore always opens
+///      in a dispute too.
 ///
 ///      Inclusion challenge (owner 2026-11-09, V60-GEN-Q11): a leaf whose payload has no valid
 ///      preimage cannot be opened, so it could hide one absent worker from a MISSING_LEAF proof.
@@ -38,6 +44,13 @@ import {IVerifier, IWorkMarket} from "./IVerifier.sol";
 ///      answer by opening that worker's leaf with at least the receipted units before
 ///      `answerBy`; if nobody does, the challenge is upheld like any objective dispute. Settling
 ///      and the coordinator's bond wait while a challenge is open.
+///
+///      Index challenge: the same, for one tree index instead of one worker. The answer opens the
+///      slot as a real leaf or as padding (the zero leaf); a slot that opens as neither (a leaf with
+///      no preimage) is upheld when the answer time runs out. So every slot can be forced open,
+///      and with the any-pair order proof no two leaves can claim overlapping unit ranges unseen.
+///      An answer keeps disputes open for `POST_ANSWER_DISPUTE_WINDOW` after it, so a leaf opened
+///      late in the window can still be disputed; settling waits for that too.
 contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     // ── constants ───────────────────────────────────────────────────
 
@@ -49,12 +62,13 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint16 internal constant BPS = 10_000;
     /// @notice Bounds the receipts one LOW_UNITS dispute may carry (calldata and gas).
     uint256 public constant MAX_RECEIPTS_PER_DISPUTE = 256;
-    uint256 internal constant MAX_TREE_DEPTH = 32;
     /// @notice Subjective (TASK) dispute reason codes start here; lower codes name objective kinds.
     uint16 public constant SUBJECTIVE_REASON_MIN = 256;
     /// @notice How long the coordinator (or anyone holding the tree) has to answer an inclusion
     ///         challenge by opening the challenged worker's leaf.
     uint32 public constant CHALLENGE_RESPONSE_WINDOW = 24 hours;
+    /// @notice After a challenge is answered, disputes stay open at least this long, so the leaf
+    ///         the answer opened can be used in an objective dispute.
     uint32 public constant POST_ANSWER_DISPUTE_WINDOW = 24 hours;
     /// @notice After `deadline + disputeWindow + RESERVE_CLAIM_PERIOD`, the poster may take back
     ///         what a posted root reserved for workers who never settled (owner 2026-11-09, Q3).
@@ -137,17 +151,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         bool subjectiveDisputeUsed; // one subjective dispute per posted payout
         bool reserveSwept; // the poster took back the unsettled reserve after the claim period
         uint32 payoutEpoch; // bumps whenever a posted root is withdrawn; scopes challenges
-        uint32 openChallenges; // inclusion challenges awaiting an answer under the live root
-        uint8 payoutDepth;
-        uint64 answerGraceUntil;
-    }
-
-    struct IndexChallenge {
-        uint32 epoch;
-        bool open;
-        bool answered;
-        address challenger;
-        uint64 answerBy;
+        uint32 openChallenges; // inclusion and index challenges awaiting an answer under the live root
+        uint8 payoutDepth; // the posted tree's depth: every opening carries exactly this many siblings
+        uint64 answerGraceUntil; // disputes stay open until at least this time (set by answers)
     }
 
     struct Challenge {
@@ -156,6 +162,14 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         address challenger;
         uint64 claimedUnits; // distinct receipted leases
         uint64 answeredUnits; // highest claim already answered under this epoch
+        uint64 answerBy;
+    }
+
+    struct IndexChallenge {
+        uint32 epoch; // payoutEpoch it was raised under
+        bool open;
+        bool answered; // a slot answered under this epoch cannot be challenged again
+        address challenger;
         uint64 answerBy;
     }
 
@@ -197,6 +211,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @notice Pull balances (payouts, refunds, released and slashed bonds).
     mapping(address => uint256) public balanceOf;
     mapping(uint256 => mapping(address => Challenge)) internal _challenges;
+    mapping(uint256 => mapping(uint32 => IndexChallenge)) internal _indexChallenges;
 
     // ── events ──────────────────────────────────────────────────────
 
@@ -228,6 +243,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     );
     event ChallengeAnswered(uint256 indexed id, address indexed worker, uint64 leafUnits);
     event ReserveSwept(uint256 indexed id, uint128 amount);
+    event IndexChallenged(uint256 indexed id, uint32 indexed index, address indexed challenger, uint64 answerBy);
+    event IndexChallengeAnswered(uint256 indexed id, uint32 indexed index, address worker);
 
     // ── errors ──────────────────────────────────────────────────────
 
@@ -405,7 +422,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///         before the deadline, carrying exactly the offer's coordinator bond.
     /// @param root  the payout tree's root over sorted, prefix-summed leaves (see contract notes)
     /// @param units the total units the tree pays (`<= maxUnits`; exactly 1 for TASK)
-    function postPayout(uint256 id, bytes32 root, uint64 units, uint8 /* depth: red, not stored yet */) external payable {
+    /// @param depth the tree's depth (`2^depth` slots), at most what `maxWorkers` needs; every
+    ///        opening of this tree must carry exactly `depth` siblings
+    function postPayout(uint256 id, bytes32 root, uint64 units, uint8 depth) external payable {
         Offer storage o = _offer(id);
         if (msg.sender != o.coordinator) revert NotCoordinator();
         if (o.state != State.Open && o.state != State.Running) revert WrongState();
@@ -414,6 +433,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (root == bytes32(0)) revert BadRoot();
         if (units == 0 || units > o.maxUnits) revert BadUnits();
         if (o.kind == Kind.TASK && units != 1) revert BadUnits();
+        if (depth > _depthFor(o.maxWorkers)) revert BadDepth();
 
         (bool ok, bytes32 digest) = IVerifier(o.verifier).accepted(id, o.bindRef);
         if (!ok || digest == bytes32(0)) revert NotAccepted();
@@ -423,6 +443,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         o.payoutRoot = keccak256(abi.encode(PAYOUT_TAG, digest, root));
         o.payoutPostedAt = uint64(block.timestamp);
         o.payoutUnits = units;
+        o.payoutDepth = depth;
+        o.answerGraceUntil = 0;
         o.settledUnits = 0;
         o.coordinatorBondHeld = true;
         o.subjectiveDisputeUsed = false;
@@ -437,12 +459,12 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///        DISPUTE_SUBJECTIVE  body = abi.encode(uint16 reason)                      TASK, poster only
     ///        DISPUTE_MISSING_LEAF body = abi.encode(Receipt, uint8 mode, LeafOpening lo, LeafOpening hi)
     ///        DISPUTE_LOW_UNITS   body = abi.encode(LeafOpening leaf, Receipt[] receipts)
-    ///        DISPUTE_ORDER       body = abi.encode(LeafOpening a, LeafOpening b)       b.index == a.index + 1
+    ///        DISPUTE_ORDER       body = abi.encode(LeafOpening a, LeafOpening b)       a.index < b.index
     ///        DISPUTE_FIRST_LEAF  body = abi.encode(LeafOpening first)                  index 0
     function dispute(uint256 id, bytes calldata evidence) external nonReentrant {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
-        if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
+        if (block.timestamp >= _disputeEnd(o)) revert WindowClosed();
         if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
 
         (uint8 tag, bytes memory body) = abi.decode(evidence, (uint8, bytes));
@@ -501,15 +523,16 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted && o.state != State.Closed) revert WrongState();
         if (o.payoutRoot == bytes32(0)) revert WrongState();
-        if (block.timestamp < uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowOpen();
+        if (block.timestamp < _disputeEnd(o)) revert WindowOpen();
         if (o.openChallenges != 0) revert ChallengeOpen();
         if (o.reserveSwept) revert ReserveGone();
         WorkerSlot storage s = _slots[id][worker];
         if (!s.joined) revert NotJoined();
         if (s.settled) revert AlreadySettled();
         if (units == 0) revert BadUnits();
-        if (proof.length > MAX_TREE_DEPTH) revert BadProof();
-        if (!_verifyLeaf(o.leavesRoot, index, leafPayload(id, worker, units, cumBefore), proof)) revert BadProof();
+        // The same opening rule as disputes (depth and index range): a leaf that settles can be
+        // used as evidence against the tree.
+        if (!_opens(id, o, LeafOpening(index, worker, units, cumBefore, proof))) revert BadProof();
         if (uint256(cumBefore) + units > o.payoutUnits) revert ExceedsPayout();
         if (uint256(o.settledUnits) + units > o.payoutUnits) revert ExceedsPayout();
 
@@ -551,7 +574,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
             amount = o.budget - o.paid;
             finalState = State.Expired;
         } else if (o.state == State.PayoutPosted) {
-            if (block.timestamp < afterWindow) revert TooEarly();
+            if (block.timestamp < afterWindow || block.timestamp < _disputeEnd(o)) revert TooEarly();
             if (o.openChallenges != 0) revert ChallengeOpen();
             amount = o.budget - uint128(uint256(o.payoutUnits) * o.pricePerUnit);
             finalState = State.Closed;
@@ -595,8 +618,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
         if (
             msg.sender == o.coordinator && o.coordinatorBondHeld && o.payoutRoot != bytes32(0) && o.openChallenges == 0
-                && (o.state == State.PayoutPosted || o.state == State.Closed)
-                && block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow
+                && (o.state == State.PayoutPosted || o.state == State.Closed) && block.timestamp >= _disputeEnd(o)
         ) {
             o.coordinatorBondHeld = false;
             total += o.coordinatorBond;
@@ -658,6 +680,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         c.open = false;
         c.answeredUnits = c.claimedUnits;
         o.openChallenges -= 1;
+        _extendForAnswer(o);
         emit ChallengeAnswered(id, leaf.worker, leaf.units);
     }
 
@@ -679,21 +702,62 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         return _challenges[id][worker];
     }
 
-    // red: index challenges not implemented yet
-    function challengeIndex(uint256, uint32) external pure {
-        revert WrongState();
+    /// @notice Inside the dispute window, a joined worker or the poster makes the root answer for
+    ///         tree slot `index` (`< 2^payoutDepth`) within `CHALLENGE_RESPONSE_WINDOW`. A slot
+    ///         answered under the live root cannot be challenged again.
+    function challengeIndex(uint256 id, uint32 index) external nonReentrant {
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted) revert WrongState();
+        if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
+        if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
+        if (uint256(index) >> o.payoutDepth != 0) revert BadEvidence();
+        IndexChallenge storage c = _indexChallenges[id][index];
+        if (c.epoch != o.payoutEpoch) {
+            c.epoch = o.payoutEpoch;
+            c.open = false;
+            c.answered = false;
+        }
+        if (c.open) revert ChallengeOpen();
+        if (c.answered) revert BadEvidence();
+        uint64 answerBy = uint64(block.timestamp) + CHALLENGE_RESPONSE_WINDOW;
+        c.open = true;
+        c.challenger = msg.sender;
+        c.answerBy = answerBy;
+        o.openChallenges += 1;
+        emit IndexChallenged(id, index, msg.sender, answerBy);
     }
 
-    function answerIndexChallenge(uint256, LeafOpening calldata) external pure {
-        revert WrongState();
+    /// @notice Answer an open index challenge by opening slot `leaf.index` as a real leaf or as
+    ///         padding (`leaf.worker == 0`). Anyone may answer; only until `answerBy`.
+    function answerIndexChallenge(uint256 id, LeafOpening calldata leaf) external nonReentrant {
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted && o.state != State.Disputed) revert WrongState();
+        IndexChallenge storage c = _indexChallenges[id][leaf.index];
+        if (!c.open || c.epoch != o.payoutEpoch) revert NoOpenChallenge();
+        if (block.timestamp > c.answerBy) revert AnswerTooLate();
+        if (!_opens(id, o, leaf)) revert BadAnswer();
+        c.open = false;
+        c.answered = true;
+        o.openChallenges -= 1;
+        _extendForAnswer(o);
+        emit IndexChallengeAnswered(id, leaf.index, leaf.worker);
     }
 
-    function resolveIndexChallenge(uint256, uint32) external pure {
-        revert WrongState();
+    /// @notice After `answerBy`, an unanswered index challenge is upheld like an objective dispute.
+    function resolveIndexChallenge(uint256 id, uint32 index) external nonReentrant {
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted && o.state != State.Disputed) revert WrongState();
+        IndexChallenge storage c = _indexChallenges[id][index];
+        if (!c.open || c.epoch != o.payoutEpoch) revert NoOpenChallenge();
+        if (block.timestamp <= c.answerBy) revert AnswerTooEarly();
+        c.open = false;
+        address challenger = c.challenger;
+        emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
+        _upholdObjective(id, o, challenger);
     }
 
-    function indexChallengeOf(uint256, uint32) external pure returns (IndexChallenge memory c) {
-        return c;
+    function indexChallengeOf(uint256 id, uint32 index) external view returns (IndexChallenge memory) {
+        return _indexChallenges[id][index];
     }
 
     // ── reserve sweep (V60-GEN-Q3) ──────────────────────────────────
@@ -791,6 +855,25 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         o.settledUnits = 0;
         o.payoutEpoch += 1;
         o.openChallenges = 0;
+        o.payoutDepth = 0;
+        o.answerGraceUntil = 0;
+    }
+
+    /// Disputes close at the end of the posted root's window, or `POST_ANSWER_DISPUTE_WINDOW` after
+    /// the latest challenge answer, whichever is later. Settling and the coordinator bond wait for it.
+    function _disputeEnd(Offer storage o) internal view returns (uint256 end) {
+        end = uint256(o.payoutPostedAt) + o.disputeWindow;
+        if (o.answerGraceUntil > end) end = o.answerGraceUntil;
+    }
+
+    function _extendForAnswer(Offer storage o) internal {
+        uint64 until = uint64(block.timestamp) + POST_ANSWER_DISPUTE_WINDOW;
+        if (until > o.answerGraceUntil) o.answerGraceUntil = until;
+    }
+
+    /// Smallest depth whose `2^depth` slots hold `maxWorkers` leaves (`maxWorkers <= 1024`).
+    function _depthFor(uint32 maxWorkers) internal pure returns (uint8 d) {
+        while ((uint256(1) << d) < maxWorkers) d++;
     }
 
     function _releaseCoordinatorBond(uint256 id, Offer storage o) internal {
@@ -816,18 +899,11 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         o.state = State.Running;
     }
 
-    function _verifyLeaf(bytes32 root, uint32 index, bytes32 payload, bytes32[] memory path)
-        internal
-        pure
-        returns (bool)
-    {
-        return _rootFrom(leafHash(index, payload), index, path) == root;
-    }
-
     /// Opens a leaf (real or padding) against the posted root and returns false if it does not open.
+    /// The path must have exactly the posted depth and the index must name one of its slots.
     function _opens(uint256 id, Offer storage o, LeafOpening memory l) internal view returns (bool) {
-        if (l.path.length > MAX_TREE_DEPTH) return false;
-        if (l.path.length < 32 && uint256(l.index) >> l.path.length != 0) return false;
+        if (l.path.length != o.payoutDepth) return false;
+        if (uint256(l.index) >> o.payoutDepth != 0) return false;
         bytes32 leaf =
             l.worker == address(0) ? bytes32(0) : leafHash(l.index, leafPayload(id, l.worker, l.units, l.cumBefore));
         return _rootFrom(leaf, l.index, l.path) == o.leavesRoot;
@@ -859,8 +935,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
         if (mode == ABSENT_BETWEEN) {
             return lo.worker != address(0) && hi.worker != address(0) && hi.index == uint256(lo.index) + 1
-                && lo.path.length == hi.path.length && lo.worker < w && w < hi.worker && _opens(id, o, lo)
-                && _opens(id, o, hi);
+                && lo.worker < w && w < hi.worker && _opens(id, o, lo) && _opens(id, o, hi);
         }
         if (mode == ABSENT_BEFORE_FIRST) {
             return hi.index == 0 && hi.worker != address(0) && w < hi.worker && _opens(id, o, hi);
@@ -868,10 +943,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (mode == ABSENT_AFTER_LAST) {
             if (lo.worker == address(0) || !(lo.worker < w) || !_opens(id, o, lo)) return false;
             // lo is the last real leaf: it is the tree's last slot, or the next slot is padding.
-            bool lastSlot = lo.path.length < 32 && uint256(lo.index) + 1 == (uint256(1) << lo.path.length);
+            bool lastSlot = uint256(lo.index) + 1 == (uint256(1) << o.payoutDepth);
             if (lastSlot) return true;
-            return hi.worker == address(0) && hi.index == uint256(lo.index) + 1 && hi.path.length == lo.path.length
-                && _opens(id, o, hi);
+            return hi.worker == address(0) && hi.index == uint256(lo.index) + 1 && _opens(id, o, hi);
         }
         if (mode == ABSENT_EMPTY) {
             return hi.index == 0 && hi.worker == address(0) && _opens(id, o, hi);
@@ -895,15 +969,19 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         return true;
     }
 
-    /// Two neighbouring leaves break the tree rules: padding before a real leaf, workers not
-    /// strictly ascending, or prefix sums that do not abut.
+    /// Two openable leaves `a.index < b.index` (any two, not only neighbours) break the tree
+    /// rules: padding before a real leaf, workers not strictly ascending, or overlapping ranges
+    /// (`a.cumBefore + a.units > b.cumBefore`). Neighbours must also abut exactly.
     function _provesBadOrder(uint256 id, Offer storage o, bytes memory body) internal view returns (bool) {
         (LeafOpening memory a, LeafOpening memory b) = abi.decode(body, (LeafOpening, LeafOpening));
-        if (b.index != uint256(a.index) + 1 || a.path.length != b.path.length) return false;
+        if (a.index >= b.index) return false;
         if (!_opens(id, o, a) || !_opens(id, o, b)) return false;
         if (b.worker == address(0)) return false; // real-then-padding or padding-then-padding is fine
         if (a.worker == address(0)) return true; // padding before a real leaf
-        return a.worker >= b.worker || uint256(a.cumBefore) + a.units != b.cumBefore;
+        if (a.worker >= b.worker) return true;
+        uint256 aEnd = uint256(a.cumBefore) + a.units;
+        if (b.index == uint256(a.index) + 1) return aEnd != b.cumBefore;
+        return aEnd > b.cumBefore;
     }
 
     /// The first real leaf must start the prefix sum at zero.

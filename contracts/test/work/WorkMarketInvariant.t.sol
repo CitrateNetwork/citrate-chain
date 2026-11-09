@@ -224,9 +224,12 @@ contract WorkMarketHandler is Test {
 
         bytes32[] memory leaves = new bytes32[](4);
         for (uint256 s = 0; s < 4; s++) {
-            if (slots[s].garbage) leaves[s] = keccak256(abi.encode("garbage", id, s));
-            else if (slots[s].worker != address(0)) {
-                leaves[s] = market.leafHash(slots[s].idx, market.leafPayload(id, slots[s].worker, slots[s].units, slots[s].cum));
+            if (slots[s].garbage) {
+                leaves[s] = keccak256(abi.encode("garbage", id, s));
+            } else if (slots[s].worker != address(0)) {
+                leaves[s] = market.leafHash(
+                    slots[s].idx, market.leafPayload(id, slots[s].worker, slots[s].units, slots[s].cum)
+                );
             }
         }
         bytes32 root = _node(_node(leaves[0], leaves[1]), _node(leaves[2], leaves[3]));

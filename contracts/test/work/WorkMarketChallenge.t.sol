@@ -72,6 +72,10 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         vm.expectRevert(WorkMarket.NoOpenChallenge.selector);
         market.resolveChallenge(id, w2);
 
+        // the opened leaf stays disputable for POST_ANSWER_DISPUTE_WINDOW after the answer
+        vm.expectRevert(WorkMarket.WindowOpen.selector);
+        _settle(id, leaves, 0, e[0], 0);
+        vm.warp(block.timestamp + market.POST_ANSWER_DISPUTE_WINDOW());
         _settle(id, leaves, 0, e[0], 0);
         assertEq(market.balanceOf(w1), 2 * PRICE);
         vm.prank(coordinator);
