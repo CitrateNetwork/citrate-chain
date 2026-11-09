@@ -37,7 +37,7 @@
 // harness makes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use citrate_consensus::crypto::Ed25519SigningKey;
@@ -201,6 +201,11 @@ struct Node {
     /// Simulated monotonic time (one slot = [`SLOT`]), for every clock the
     /// recovery and pull paths read.
     clock: std::time::Instant,
+    /// How far this node's wall clock (the producer's slot clock and the
+    /// attested head's clock) runs ahead of the harness's simulated time, in
+    /// ms (negative: behind). 0 unless a test skews it
+    /// ([`Fleet::set_clock_skew`]); a restarted process starts at 0.
+    skew_ms: Arc<AtomicI64>,
     rotate_idx: u64,
     split_gate: sync_peer::SplitPullGate,
     /// Blocks this process has relayed (the gossip seen-cache).
@@ -412,6 +417,7 @@ impl Node {
         // r1007 G9: the producers below stamp the harness's simulated time, so
         // the deferred-evidence check judges header timestamps against it too
         // (before G9 the producer stamped the real clock).
+        let skew_ms = Arc::new(AtomicI64::new(0));
         let sim_wall: crate::producer::SlotClock = {
             let base_ms = genesis
                 .header
@@ -419,7 +425,12 @@ impl Node {
                 .saturating_add(citrate_consensus::slots::SLOT_DURATION_SECS)
                 .saturating_mul(1_000);
             let sim = clock_ms.clone();
-            Arc::new(move || base_ms.saturating_add(sim.load(Ordering::Relaxed)))
+            let skew = skew_ms.clone();
+            Arc::new(move || {
+                base_ms
+                    .saturating_add(sim.load(Ordering::Relaxed))
+                    .saturating_add_signed(skew.load(Ordering::Relaxed))
+            })
         };
         let attested = AttestedNetworkHead::new().with_wall_clock_for_test(sim_wall.clone());
         let initial_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -490,6 +501,7 @@ impl Node {
             initial_sync,
             started_slot: slot_no,
             clock,
+            skew_ms,
             rotate_idx: 0,
             split_gate: sync_peer::SplitPullGate::new(),
             relayed: HashSet::new(),
@@ -958,6 +970,14 @@ impl Fleet {
             }
             self.pump().await;
         }
+        self.end_slot().await;
+        produced
+    }
+
+    /// The end of a slot: each running node runs its sync tick, then its
+    /// drain.
+    async fn end_slot(&mut self) {
+        let n = self.nodes.len();
         let running: Vec<usize> = (0..n).filter(|i| !self.down.contains(i)).collect();
         for i in running.iter().copied() {
             let linked: Vec<usize> = (0..n).filter(|&j| self.up(i, j) && self.up(j, i)).collect();
@@ -971,7 +991,137 @@ impl Fleet {
         for i in running {
             self.nodes[i].app.drive_drain().await;
         }
+    }
+
+    /// Node `i`'s wall clock runs `ms` ahead of the harness's time (negative:
+    /// behind), as an unsynchronized host's would: its producer's slot clock
+    /// and its attested-head clock read the skewed time.
+    pub(crate) fn set_clock_skew(&mut self, i: usize, ms: i64) {
+        self.nodes[i].skew_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// One slot in real-time order. `rounds` lists `(producer, at_ms)`: the
+    /// producer's round fires when the harness's time is the slot boundary
+    /// plus `at_ms` (negative: before the boundary). A producer with a clock
+    /// skewed +200 ms ([`Self::set_clock_skew`]) fires at `at_ms = -200`, when
+    /// its own clock reads the boundary; a round that fires early within
+    /// `SLOT_TICK_EARLY_ALLOWANCE_MS` has a negative `at_ms` and no skew.
+    ///
+    /// Rounds fire in `at_ms` order (ties in list order). The blocks of the
+    /// rounds that fire at one instant are gossiped and every running node
+    /// drains before the next instant's rounds fire: the network delay is
+    /// shorter than the gap between them, and a node drains continuously.
+    /// Then each running node runs its sync tick and drain, as in
+    /// [`Self::slot`]. With every `at_ms` equal this is [`Self::slot`].
+    pub(crate) async fn slot_timed(&mut self, rounds: &[(usize, i64)]) -> Vec<(usize, Block)> {
+        self.slot_no += 1;
+        let slot_ms = u64::try_from(SLOT.as_millis()).expect("ms");
+        let boundary_ms = self.slot_no * slot_ms;
+        let now = self.now();
+        for node in &mut self.nodes {
+            node.clock = now;
+        }
+        if self.sybils_active {
+            self.sybil_gossip().await;
+        }
+        let n = self.nodes.len();
+        let mut order: Vec<(usize, i64)> = rounds.to_vec();
+        order.sort_by_key(|&(_, at)| at);
+        let mut produced = Vec::new();
+        let mut k = 0;
+        while k < order.len() {
+            let at = order[k].1;
+            self.clock_ms
+                .store(boundary_ms.saturating_add_signed(at), Ordering::Relaxed);
+            let mut sealed = Vec::new();
+            while k < order.len() && order[k].1 == at {
+                let i = order[k].0;
+                k += 1;
+                if self.quiet.contains(&i) || self.down.contains(&i) {
+                    continue;
+                }
+                let Ok(h) = self.nodes[i].producer.produce_block().await else {
+                    continue;
+                };
+                let b = self.nodes[i]
+                    .storage
+                    .blocks
+                    .get_block(&h)
+                    .expect("read produced")
+                    .expect("produced stored");
+                sealed.push((i, b));
+            }
+            for (i, b) in &sealed {
+                for j in (0..n).filter(|j| j != i) {
+                    let _ = self
+                        .peer(*i, j)
+                        .send(NetworkMessage::NewBlock { block: b.clone() })
+                        .await;
+                }
+                self.pump().await;
+            }
+            for i in (0..n).filter(|i| !self.down.contains(i)) {
+                self.nodes[i].app.drive_drain().await;
+            }
+            produced.extend(sealed);
+        }
+        self.clock_ms.store(
+            boundary_ms.max(self.clock_ms.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        self.end_slot().await;
         produced
+    }
+
+    /// Of the blocks node `i` has accepted (its applied tip and that tip's
+    /// past, genesis excluded), how many each of the fleet's producers
+    /// sealed, by producer index. Every block in that past is accepted, so
+    /// this is each producer's share of the accepted slots.
+    pub(crate) async fn accepted_by_producer(&self, i: usize) -> Vec<usize> {
+        let mut counts = vec![0usize; self.nodes.len()];
+        let mut seen = self.past(i).await;
+        seen.insert(self.nodes[i].app.applied_tip().await.hash);
+        for h in seen {
+            let Some(b) = self.nodes[i].storage.blocks.get_block(&h).expect("read") else {
+                continue;
+            };
+            if b.header.height == 0 {
+                continue;
+            }
+            if let Some(p) =
+                (0..self.nodes.len()).find(|&p| b.header.proposer_pubkey.as_bytes() == &proposer(p))
+            {
+                counts[p] += 1;
+            }
+        }
+        counts
+    }
+
+    /// Of node `i`'s selected chain (genesis excluded), how many chain blocks
+    /// each producer sealed, by producer index. On this branch the block
+    /// reward settles per applied chain block to its proposer's staker, so
+    /// this is each producer's share of the rewards; under spec §3.8 (the
+    /// emission split among a chain block's blue mergeset) the reward share
+    /// follows [`Self::accepted_by_producer`] instead.
+    pub(crate) async fn chain_by_producer(&self, i: usize) -> Vec<usize> {
+        let mut counts = vec![0usize; self.nodes.len()];
+        for (height, h) in self.chain(i).await {
+            if height == 0 {
+                continue;
+            }
+            let b = self.nodes[i]
+                .storage
+                .blocks
+                .get_block(&h)
+                .expect("read")
+                .expect("chain block stored");
+            if let Some(p) =
+                (0..self.nodes.len()).find(|&p| b.header.proposer_pubkey.as_bytes() == &proposer(p))
+            {
+                counts[p] += 1;
+            }
+        }
+        counts
     }
 
     /// The selected chain from node `i`'s applied tip: height -> hash.
@@ -1935,6 +2085,130 @@ mod tests {
             r.is_ok(),
             "producer 1 must still seal slot 7 (on slot 6's blocks): {r:?}"
         );
+    }
+
+    /// Same-slot fairness (spec 06 G13.4, acceptance A1/A2): slots per run.
+    const FAIR_SLOTS: usize = 60;
+    /// Same-slot fairness: producers in the fleet.
+    const FAIR_N: usize = 3;
+    /// Same-slot fairness: how far a producer's share of the accepted blocks
+    /// may sit from 1/FAIR_N. Every producer seals every slot when the rule
+    /// holds, so the only slack is the harness's first slot (no producer
+    /// seals in it: 59 blocks over 60 slots even for a lone producer) and the
+    /// last slot's siblings, not merged yet: at most two blocks a producer.
+    const FAIR_SLOT_TOLERANCE: f64 = 0.05;
+    /// Same-slot fairness: slots of a run in which a producer may have no
+    /// accepted block (the first and the last, see FAIR_SLOT_TOLERANCE).
+    const FAIR_SLOT_SLACK: usize = 2;
+    /// Same-slot fairness: the largest share of selected-chain blocks (the
+    /// reward-bearing blocks on this branch) one producer may hold. Which
+    /// sibling becomes the chain block is decided by Key (blue_work, then the
+    /// slot-bound VRF output), a 1/FAIR_N draw per slot when the siblings
+    /// merge the same past: Binomial(60, 1/3) exceeds 30 with probability
+    /// about 0.3%. The keys are fixed, so the run is deterministic.
+    const FAIR_CHAIN_MAX_SHARE: f64 = 0.5;
+
+    /// Runs FAIR_SLOTS slots of FAIR_N producers with the given rounds per
+    /// slot, then returns, for every node, the accepted blocks per producer
+    /// and the chain blocks per producer.
+    async fn fairness_run(
+        skew: &[(usize, i64)],
+        rounds: &[(usize, i64)],
+    ) -> Vec<(Vec<usize>, Vec<usize>)> {
+        let mut fleet = Fleet::new(FAIR_N).await;
+        for &(i, ms) in skew {
+            fleet.set_clock_skew(i, ms);
+        }
+        for _ in 0..FAIR_SLOTS {
+            fleet.slot_timed(rounds).await;
+        }
+        let mut out = Vec::new();
+        for i in 0..FAIR_N {
+            out.push((
+                fleet.accepted_by_producer(i).await,
+                fleet.chain_by_producer(i).await,
+            ));
+        }
+        println!("SAMESLOT skew={skew:?} rounds={rounds:?}: (accepted, chain) per node {out:?}");
+        out
+    }
+
+    /// Acceptance A1: on every node, every producer's share of the accepted
+    /// blocks is 1/FAIR_N within FAIR_SLOT_TOLERANCE, and every producer has a
+    /// block accepted in all but FAIR_SLOT_SLACK slots.
+    fn assert_fair_slot_share(run: &[(Vec<usize>, Vec<usize>)], what: &str) {
+        for (node, (accepted, _)) in run.iter().enumerate() {
+            let total: usize = accepted.iter().sum();
+            for (p, &c) in accepted.iter().enumerate() {
+                let share = c as f64 / total.max(1) as f64;
+                assert!(
+                    (share - 1.0 / FAIR_N as f64).abs() <= FAIR_SLOT_TOLERANCE
+                        && c + FAIR_SLOT_SLACK >= FAIR_SLOTS,
+                    "{what}: node {node} accepted {accepted:?} over {FAIR_SLOTS} slots; \
+                     producer {p} has {c} ({share:.3}), fair is one per slot (1/{FAIR_N})"
+                );
+            }
+        }
+    }
+
+    /// Acceptance A2 (reward proxy): on every node, no producer holds more
+    /// than FAIR_CHAIN_MAX_SHARE of the selected-chain blocks.
+    fn assert_fair_chain_share(run: &[(Vec<usize>, Vec<usize>)], what: &str) {
+        for (node, (_, chain)) in run.iter().enumerate() {
+            let total: usize = chain.iter().sum();
+            for (p, &c) in chain.iter().enumerate() {
+                let share = c as f64 / total.max(1) as f64;
+                assert!(
+                    share <= FAIR_CHAIN_MAX_SHARE,
+                    "{what}: node {node} chain blocks {chain:?}; producer {p} holds {c} \
+                     ({share:.3}), at most {FAIR_CHAIN_MAX_SHARE} allowed"
+                );
+            }
+        }
+    }
+
+    /// Control for the same-slot fairness tests: with synchronized clocks
+    /// every producer seals every slot (on the earlier slots' blocks) and the
+    /// next slot merges the siblings, so the accepted blocks split evenly.
+    /// Passes today; the skewed variants below must match it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_slot_share_is_fair_with_synchronized_clocks() {
+        let run = fairness_run(&[], &[(0, 0), (1, 0), (2, 0)]).await;
+        assert_fair_slot_share(&run, "synchronized clocks");
+        assert_fair_chain_share(&run, "synchronized clocks");
+    }
+
+    /// Same-slot fairness A1 (spec 06 G13), OPEN: a producer whose clock
+    /// runs 200 ms ahead fires its round 200 ms before the others, and its
+    /// block reaches them first. Each of them then skips the slot (G9: the
+    /// selected parent is in this slot), so the fast producer seals every
+    /// accepted block. Fixed when a producer seals its slot-s block on the
+    /// view of slots before s (G13 rules SF1 to SF4).
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "open (#184, spec 06 G13): a producer whose clock runs 200 ms ahead takes every slot"]
+    async fn same_slot_share_is_fair_with_a_fast_clock() {
+        let run = fairness_run(&[(0, 200)], &[(0, -200), (1, 0), (2, 0)]).await;
+        assert_fair_slot_share(&run, "producer 0 clock +200 ms");
+    }
+
+    /// Same-slot fairness A1, OPEN: the same, with synchronized clocks and a
+    /// round that fires 240 ms early, inside SLOT_TICK_EARLY_ALLOWANCE_MS
+    /// (250 ms), so it still stamps the coming slot.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "open (#184, spec 06 G13): a round inside the 250 ms early-tick allowance takes every slot"]
+    async fn same_slot_share_is_fair_with_an_early_round() {
+        let run = fairness_run(&[], &[(0, -240), (1, 0), (2, 0)]).await;
+        assert_fair_slot_share(&run, "producer 0 round 240 ms early");
+    }
+
+    /// Same-slot fairness A2 (reward proxy), OPEN: with a producer 200 ms
+    /// ahead, it holds every selected-chain block, so on this branch it
+    /// earns every block reward.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "open (#184, spec 06 G13): a producer whose clock runs 200 ms ahead earns every block reward"]
+    async fn same_slot_reward_share_is_fair_with_a_fast_clock() {
+        let run = fairness_run(&[(0, 200)], &[(0, -200), (1, 0), (2, 0)]).await;
+        assert_fair_chain_share(&run, "producer 0 clock +200 ms");
     }
 
     /// See `apply_cost_per_block_stays_within_budget`.
