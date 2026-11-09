@@ -81,6 +81,11 @@ contract OrgBudgets is Governable {
     event CeilingCleared(uint256 indexed orgId, address indexed member, Unit unit, Period period, uint64 effectiveAt);
     event GlobalMaxSet(Unit unit, Period period, uint128 amount);
     event GlobalMaxCleared(Unit unit, Period period);
+    /// A pending raise or removal was dropped before it landed (a newer write, or the org
+    /// was deactivated before it matured).
+    event PendingChangeCancelled(
+        uint256 indexed orgId, address indexed member, Unit unit, Period period, bool clears, uint128 amount
+    );
 
     error NotOrgHolder();
     error OrgNotActive();

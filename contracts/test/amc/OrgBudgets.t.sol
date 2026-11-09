@@ -308,6 +308,54 @@ contract OrgBudgetsTest is AmcTestBase {
         assertLe(eff, g);
         assertLe(eff, c);
     }
+
+    // ------------------------------------------------------------------ review P3 (2026-11-09)
+
+    /// A raise queued while the org was active does not land once the org is deactivated: the
+    /// in-effect value stays the lower one (fail closed).
+    function test_raiseQueuedWhileActiveDoesNotLandAfterDeactivation() public {
+        _set(holder, address(0), USD, DAY, 1_000_000);
+        _set(holder, address(0), USD, DAY, 9_000_000); // queued raise
+        vm.prank(sbtAdmin);
+        orgSbt.deactivate(orgId);
+        vm.warp(block.timestamp + RAISE);
+        (, uint128 amount) = _ceiling(address(0), USD, DAY);
+        assertEq(amount, 1_000_000, "a deactivated org keeps the lower ceiling");
+        (bool p,,,) = ob.pendingOf(orgId, address(0), USD, DAY);
+        assertFalse(p);
+    }
+
+    /// A queued removal is also a raise: it does not land after deactivation either.
+    function test_removalQueuedWhileActiveDoesNotLandAfterDeactivation() public {
+        _set(holder, address(0), USD, DAY, 1_000_000);
+        vm.prank(holder);
+        ob.clearCeiling(orgId, address(0), USD, DAY);
+        vm.prank(sbtAdmin);
+        orgSbt.deactivate(orgId);
+        vm.warp(block.timestamp + RAISE);
+        (bool set, uint128 amount) = _ceiling(address(0), USD, DAY);
+        assertTrue(set, "the ceiling stays");
+        assertEq(amount, 1_000_000);
+    }
+
+    function test_isOrgHolderIsFalseForUnknownOrg() public view {
+        assertFalse(ob.isOrgHolder(orgId + 12345, holder));
+        assertFalse(ob.isOrgHolder(orgId + 12345, address(0)));
+    }
+
+    function test_setCeilingOnUnknownOrgRevertsNotOrgHolder() public {
+        vm.prank(holder);
+        vm.expectRevert(OrgBudgets.NotOrgHolder.selector);
+        ob.setCeiling(orgId + 12345, address(0), USD, DAY, 1);
+    }
+
+    function test_cancelledPendingRaiseEmits() public {
+        _set(holder, address(0), USD, DAY, 1_000_000);
+        _set(holder, address(0), USD, DAY, 9_000_000); // queued raise
+        vm.expectEmit(true, true, false, true, address(ob));
+        emit OrgBudgets.PendingChangeCancelled(orgId, address(0), USD, DAY, false, 9_000_000);
+        _set(holder, address(0), USD, DAY, 500_000); // a new write cancels the raise
+    }
 }
 
 /// Random lowers, raises, clears, global-max changes and time; checked against a reference model.
