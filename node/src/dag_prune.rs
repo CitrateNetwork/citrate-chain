@@ -248,8 +248,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -399,8 +402,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -546,8 +552,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -657,8 +666,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -808,8 +820,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -899,8 +914,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -952,6 +970,8 @@ mod tests {
         merge.header.blue_score = N + 3;
         merge.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 3);
         merge.header.block_hash = merge.compute_hash();
+        // The score fields changed after `mk` sealed it: record the final hash.
+        crate::g11_test_seal::record(&merge);
         for blk in [&a, &b, &merge] {
             for (dag, gd) in [(&pruned_dag, &pruned), (&full_dag, &full)] {
                 dag.store_block(blk.clone()).await.expect("dag");
@@ -983,6 +1003,7 @@ mod tests {
         child.header.blue_score = N + 4;
         child.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 4);
         child.header.block_hash = child.compute_hash();
+        crate::g11_test_seal::record(&child);
         pruned_dag.store_block(child.clone()).await.expect("dag");
         pruned
             .add_block(&child)

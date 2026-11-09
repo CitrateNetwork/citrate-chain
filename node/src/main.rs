@@ -75,6 +75,8 @@ mod finality_adversarial_tests;
 mod finality_driver;
 mod finality_floor;
 mod finality_sync;
+#[cfg(test)]
+mod g11_test_seal;
 mod genesis;
 mod hardening_rejoin;
 mod host_identity;

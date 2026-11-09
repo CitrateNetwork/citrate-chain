@@ -1072,6 +1072,8 @@ mod tests {
             .blue_score(height)
             .blue_work(blue_work_for_score(height))
             .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            // G11: the committed pruning point (zero below 10,050).
+            .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
             .build_unhashed();
         b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
             PbaHardening::off(),
@@ -1080,6 +1082,7 @@ mod tests {
         );
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
+        crate::g11_test_seal::record(&b);
         b
     }
 
@@ -3003,6 +3006,7 @@ mod tests {
             b.header.vrf_reveal.output = Hash::new(out);
             b.header.block_hash = b.compute_hash();
             b.signature = crypto::sign_block(&b.header.block_hash, key);
+            crate::g11_test_seal::record(&b);
             let key_of_b = citrate_consensus::types::ForkChoiceKey::of_header(&b.header);
             if key_of_b != than && (key_of_b > than) == wins {
                 return b;
@@ -3827,6 +3831,7 @@ mod tests {
             .blue_score(score)
             .blue_work(blue_work_for_score(score))
             .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            .pruning_point(crate::g11_test_seal::pruning_point(height, sp_hash))
             .build_unhashed();
         b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
             PbaHardening::off(),
@@ -3835,6 +3840,7 @@ mod tests {
         );
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
+        crate::g11_test_seal::record(&b);
         Some(b)
     }
 
