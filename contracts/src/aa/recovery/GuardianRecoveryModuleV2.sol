@@ -28,7 +28,10 @@ import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///            execution op's verification gas, call gas, preVerificationGas, priority fee and max
 ///            fee, and set a minimum call gas, so the one guardian who later signs the execution op
 ///            can neither spend more of the account's deposit than the quorum approved nor starve
-///            the rotation of gas to burn the pending recovery.
+///            the rotation of gas to burn the pending recovery. The bounds also name the one
+///            paymaster the execution op may use (`address(0)`: none, `paymasterAndData` must be
+///            empty) and its minimum verification and postOp gas limits, because a reverting
+///            postOp undoes the rotation after validation has consumed the pending recovery.
 ///            The module checks the callData against the same allowlist as V1 (CHAIN-B-C032:
 ///            a single, zero-value self-`execute` whose inner call is `changeRootValidator`),
 ///            records the pending recovery with `executeAfter = now + 72 h` and bumps the nonce,
@@ -43,8 +46,23 @@ import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///            never reads the block timestamp (ERC-7562). The pending entry is consumed in
 ///            validation (the allowlisted callData cannot call back into this module); the approved
 ///            minimum call gas, which the EntryPoint guarantees to the call (AA95), is what keeps a
-///            starved execution from consuming it. Core/SDKs set `minCallGasLimit` from a gas
-///            estimate of the exact rotation callData, with margin.
+///            starved execution from consuming it.
+///
+///         Choosing the bounds (core/SDK):
+///         * `minCallGasLimit` must cover the whole rotation: Kernel `execute` plus
+///           `changeRootValidator`, including the new validator's `onInstall` (about 65k gas for
+///           the ECDSA validator in this repo's tests). Estimate the exact rotation callData and
+///           add margin; a minimum below the real cost lets one guardian run the op out of gas
+///           and consume the pending recovery, and the quorum must initiate again.
+///         * There is no absolute fee ceiling in the module. The quorum chooses the fee and gas
+///           caps; what one guardian can spend from the account's deposit is at most
+///           (maxVerificationGasLimit + maxCallGasLimit + maxPreVerificationGas) x maxFeePerGas,
+///           plus the EntryPoint's unused-gas penalty. Keep the caps close to the estimate.
+///         * Sponsorship: set `paymaster` to the sponsoring paymaster (the genesis
+///           CitratePaymaster has a recovery category) and the minimum paymaster gas limits from
+///           its postOp cost with margin; leave `paymaster == address(0)` for a self-funded
+///           recovery. Paymaster gas is paid by the paymaster, so there is no maximum here; the
+///           paymaster's own policy bounds it.
 ///
 ///         The account itself cancels (`cancelRecovery`, a normal UserOp signed by the current
 ///         root validator) at any time before execution; uninstalling the module also clears it.
@@ -140,8 +158,12 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         address[7] guardians;
     }
 
-    /// @notice Gas and fee bounds of the execution op, approved by the initiating quorum. All
-    ///         bounds are inclusive. `minCallGasLimit` is non-zero and at most `maxCallGasLimit`.
+    /// @notice Gas, fee and paymaster bounds of the execution op, approved by the initiating
+    ///         quorum. All bounds are inclusive. `minCallGasLimit` is non-zero and at most
+    ///         `maxCallGasLimit`. `paymaster == address(0)` means the op carries no paymaster (empty
+    ///         `paymasterAndData`); the two paymaster minimums must then be zero. Otherwise the op
+    ///         must name exactly `paymaster`, and its paymaster verification and postOp gas limits
+    ///         must be at least the minimums, and `minPaymasterPostOpGasLimit` is non-zero.
     struct ExecutionBounds {
         uint64 maxVerificationGasLimit;
         uint64 minCallGasLimit;
@@ -149,6 +171,9 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         uint64 maxPreVerificationGas;
         uint128 maxPriorityFeePerGas;
         uint128 maxFeePerGas;
+        address paymaster;
+        uint64 minPaymasterVerificationGasLimit;
+        uint64 minPaymasterPostOpGasLimit;
     }
 
     struct PendingRecovery {
@@ -306,6 +331,13 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
         if (bounds.minCallGasLimit == 0 || bounds.minCallGasLimit > bounds.maxCallGasLimit) {
             revert InvalidExecutionBounds();
         }
+        if (bounds.paymaster == address(0)) {
+            if (bounds.minPaymasterVerificationGasLimit != 0 || bounds.minPaymasterPostOpGasLimit != 0) {
+                revert InvalidExecutionBounds();
+            }
+        } else if (bounds.minPaymasterPostOpGasLimit == 0) {
+            revert InvalidExecutionBounds();
+        }
 
         uint64 nonce = recoveryNonce[account];
         bytes32 callDataHash = keccak256(callData);
@@ -390,17 +422,28 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
 
     // ── internals ───────────────────────────────────────────────────
 
-    /// True iff every gas and fee field of `op` is inside `b` (inclusive). `accountGasLimits` packs
-    /// verificationGasLimit (high 128) | callGasLimit (low 128); `gasFees` packs
-    /// maxPriorityFeePerGas (high 128) | maxFeePerGas (low 128). Paymaster gas limits are not
-    /// bounded here: a paymaster's own policy decides what it sponsors.
+    /// True iff every gas and fee field of `op` is inside `b` (inclusive) and its paymaster data
+    /// matches `b`. `accountGasLimits` packs verificationGasLimit (high 128) | callGasLimit (low
+    /// 128); `gasFees` packs maxPriorityFeePerGas (high 128) | maxFeePerGas (low 128).
+    /// `paymasterAndData` (EntryPoint v0.7) is paymaster (20) | paymasterVerificationGasLimit (16)
+    /// | paymasterPostOpGasLimit (16) | paymaster data. Calldata reads only (ERC-7562).
     function _withinBounds(PackedUserOperation calldata op, ExecutionBounds memory b) internal pure returns (bool) {
         uint256 limits = uint256(op.accountGasLimits);
         uint256 fees = uint256(op.gasFees);
         uint256 callGas = uint128(limits);
-        return (limits >> 128) <= b.maxVerificationGasLimit && callGas >= b.minCallGasLimit
-            && callGas <= b.maxCallGasLimit && op.preVerificationGas <= b.maxPreVerificationGas
-            && (fees >> 128) <= b.maxPriorityFeePerGas && uint128(fees) <= b.maxFeePerGas;
+        if (
+            (limits >> 128) > b.maxVerificationGasLimit || callGas < b.minCallGasLimit || callGas > b.maxCallGasLimit
+                || op.preVerificationGas > b.maxPreVerificationGas || (fees >> 128) > b.maxPriorityFeePerGas
+                || uint128(fees) > b.maxFeePerGas
+        ) return false;
+        bytes calldata pmd = op.paymasterAndData;
+        // No approved paymaster: the op must carry none (a reverting postOp would undo the
+        // rotation after validation consumed the pending recovery).
+        if (b.paymaster == address(0)) return pmd.length == 0;
+        if (pmd.length < 52) return false;
+        if (address(bytes20(pmd[0:20])) != b.paymaster) return false;
+        return uint128(bytes16(pmd[20:36])) >= b.minPaymasterVerificationGasLimit
+            && uint128(bytes16(pmd[36:52])) >= b.minPaymasterPostOpGasLimit;
     }
 
     /// True for an address with no code or with an EIP-7702 delegation designator

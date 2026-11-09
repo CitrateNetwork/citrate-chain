@@ -83,7 +83,10 @@ abstract contract GuardianV2Base is Test {
             maxCallGasLimit: B_MAX_CGL,
             maxPreVerificationGas: B_MAX_PVG,
             maxPriorityFeePerGas: B_MAX_PRIO,
-            maxFeePerGas: B_MAX_FEE
+            maxFeePerGas: B_MAX_FEE,
+            paymaster: address(0),
+            minPaymasterVerificationGasLimit: 0,
+            minPaymasterPostOpGasLimit: 0
         });
     }
 
@@ -712,6 +715,79 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         assertEq(module.pendingBounds(kernel).minCallGasLimit, b.maxCallGasLimit);
     }
 
+    function test_initiate_rejectsInconsistentPaymasterBounds() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "pm-bounds");
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.minPaymasterPostOpGasLimit = 1; // minimums without a paymaster
+        bytes memory sigs = bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b));
+        vm.expectRevert(GuardianRecoveryModuleV2.InvalidExecutionBounds.selector);
+        module.initiateRecovery(kernel, cd, b, sigs);
+        b = _bounds();
+        b.minPaymasterVerificationGasLimit = 1;
+        sigs = bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b));
+        vm.expectRevert(GuardianRecoveryModuleV2.InvalidExecutionBounds.selector);
+        module.initiateRecovery(kernel, cd, b, sigs);
+        b = _bounds();
+        b.paymaster = address(0xFA11); // a paymaster with no postOp minimum
+        sigs = bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b));
+        vm.expectRevert(GuardianRecoveryModuleV2.InvalidExecutionBounds.selector);
+        module.initiateRecovery(kernel, cd, b, sigs);
+        b.minPaymasterPostOpGasLimit = 1;
+        sigs = bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b));
+        module.initiateRecovery(kernel, cd, b, sigs);
+        assertEq(module.pendingBounds(kernel).paymaster, address(0xFA11));
+    }
+
+    /// With an approved paymaster, validation passes iff the op names exactly that paymaster with
+    /// paymaster gas limits at or above the approved minimums.
+    /// forge-config: default.fuzz.runs = 2000
+    function testFuzz_validate_paymasterData(
+        address pmOp,
+        uint128 pmVgl,
+        uint128 pmPost,
+        bool approvedPm,
+        bytes calldata tail
+    ) public {
+        address PM = address(0xFA11);
+        uint64 minV = 50_000;
+        uint64 minP = 40_000;
+        if (approvedPm) pmOp = PM;
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "fuzz-pm");
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.paymaster = PM;
+        b.minPaymasterVerificationGasLimit = minV;
+        b.minPaymasterPostOpGasLimit = minP;
+        uint48 ea = module.initiateRecovery(kernel, cd, b, bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b)));
+        PackedUserOperation memory op = _op(cd, _execSig(PK_C, OP_HASH, kernel));
+        op.paymasterAndData = abi.encodePacked(pmOp, pmVgl, pmPost, tail);
+        bool ok = pmOp == PM && pmVgl >= minV && pmPost >= minP;
+        vm.prank(kernel);
+        uint256 vd = module.validateUserOp(op, OP_HASH);
+        assertEq(vd == SIG_VALIDATION_FAILED_UINT, !ok);
+        (, uint48 left,) = module.pendingRecovery(kernel);
+        assertEq(left, ok ? 0 : ea);
+    }
+
+    function test_validate_approvedPaymasterRequiresPaymasterData() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "pm-short");
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.paymaster = address(0xFA11);
+        b.minPaymasterPostOpGasLimit = 1;
+        module.initiateRecovery(kernel, cd, b, bytes.concat(_sigOver(PK_A, cd, b), _sigOver(PK_B, cd, b)));
+        PackedUserOperation memory op = _op(cd, _execSig(PK_C, OP_HASH, kernel));
+        vm.prank(kernel);
+        assertEq(module.validateUserOp(op, OP_HASH), SIG_VALIDATION_FAILED_UINT, "empty");
+        op.paymasterAndData = abi.encodePacked(address(0xFA11), uint128(1), uint120(1));
+        vm.prank(kernel);
+        assertEq(module.validateUserOp(op, OP_HASH), SIG_VALIDATION_FAILED_UINT, "51 bytes");
+        op.paymasterAndData = abi.encodePacked(address(0xFA11), uint128(0), uint128(1));
+        vm.prank(kernel);
+        assertTrue(module.validateUserOp(op, OP_HASH) != SIG_VALIDATION_FAILED_UINT, "52 bytes at the minimums");
+    }
+
     /// The bounds are part of what the quorum signs: submitting looser bounds than were signed fails.
     function test_initiate_rejectsBoundsTheQuorumDidNotSign() public {
         _install(kernel);
@@ -1125,6 +1201,53 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
         (, uint48 left,) = module.pendingRecovery(wallet);
         assertEq(left, ea, "pending recovery kept");
         assertEq(_rootOwner(), vm.addr(OLD_OWNER_PK));
+    }
+
+    uint64 internal constant PM_MIN_VGL = 150_000;
+    uint64 internal constant PM_MIN_POSTOP = 100_000;
+
+    /// Initiate with bounds that approve the genesis CitratePaymaster.
+    function _initiateSponsored(bytes memory cd) internal returns (uint48) {
+        GuardianRecoveryModuleV2.ExecutionBounds memory b = _bounds();
+        b.paymaster = factory.paymaster();
+        b.minPaymasterVerificationGasLimit = PM_MIN_VGL;
+        b.minPaymasterPostOpGasLimit = PM_MIN_POSTOP;
+        bytes32 d = module.recoveryDigest(wallet, keccak256(cd), b, module.recoveryNonce(wallet));
+        bytes memory q = bytes.concat(_sign(PK_A, d.toEthSignedMessageHash()), _sign(PK_B, d.toEthSignedMessageHash()));
+        return module.initiateRecovery(wallet, cd, b, q);
+    }
+
+    /// A quorum-approved sponsorship by the genesis paymaster executes the rotation.
+    function test_recovery_sponsoredByTheApprovedPaymaster() public {
+        bytes memory cd = _rotationCallData();
+        vm.warp(_initiateSponsored(cd));
+        uint256 depBefore = entryPoint.balanceOf(wallet);
+        _handle(_sponsoredOp(cd, PM_MIN_VGL, PM_MIN_POSTOP));
+        assertEq(_rootOwner(), vm.addr(NEW_OWNER_PK));
+        assertEq(entryPoint.balanceOf(wallet), depBefore, "the paymaster paid");
+    }
+
+    /// With the genesis paymaster approved, a postOp or verification gas limit below the approved
+    /// minimum, another paymaster, or no paymaster is refused and the pending recovery is kept.
+    function test_recovery_approvedPaymasterBoundsAreEnforced() public {
+        bytes memory cd = _rotationCallData();
+        uint48 ea = _initiateSponsored(cd);
+        vm.warp(ea);
+        _expectSigError(_sponsoredOp(cd, PM_MIN_VGL, 1));
+        _expectSigError(_sponsoredOp(cd, PM_MIN_VGL, PM_MIN_POSTOP - 1));
+        _expectSigError(_sponsoredOp(cd, PM_MIN_VGL - 1, PM_MIN_POSTOP));
+        RevertingPostOpPaymaster gp = new RevertingPostOpPaymaster();
+        entryPoint.depositTo{value: 1 ether}(address(gp));
+        AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
+        op.paymasterAndData = abi.encodePacked(address(gp), uint128(PM_MIN_VGL), uint128(PM_MIN_POSTOP));
+        op.signature = _execSig(PK_C, entryPoint.getUserOpHash(op), wallet);
+        _expectSigError(op);
+        _expectSigError(_recoveryOp()); // self-funded, but the quorum chose sponsorship
+        (, uint48 left,) = module.pendingRecovery(wallet);
+        assertEq(left, ea, "pending recovery kept");
+        assertEq(_rootOwner(), vm.addr(OLD_OWNER_PK));
+        _handle(_sponsoredOp(cd, PM_MIN_VGL, PM_MIN_POSTOP));
+        assertEq(_rootOwner(), vm.addr(NEW_OWNER_PK));
     }
 
     /// A recovery op sponsored by the genesis CitratePaymaster (recovery category), signed by the
