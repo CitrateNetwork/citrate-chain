@@ -11,7 +11,8 @@ interface IOrganizationSBT {
 
 /// @title OrgBudgets: per-org spending ceilings as an accounting limit, never a payment
 /// @notice AMC 0.5.3 planset 06 section 4; ADR-2026-10-26 P-15. Spec:
-///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or block 0.
+///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or r1007: deployed in the
+///         ceremony genesis block 0 (0.6.0 owner answer 7), with OrganizationSBT (owner 2026-11-09).
 ///
 ///         No SALT moves here: no payable path, no token, no balance. Core's spend guard applies
 ///         min(member's local cap, effective org ceiling) per matching unit and period, using its
@@ -107,7 +108,7 @@ contract OrgBudgets is Governable {
         GlobalMax storage g = _globalMax[unit][period];
         if (g.set && amount > g.amount) revert AboveGlobalMax(g.amount);
         Slot storage s = _slots[orgId][member][unit][period];
-        (bool curSet, uint128 cur) = _materialize(s);
+        (bool curSet, uint128 cur) = _materialize(orgId, member, unit, period, s);
         uint64 effectiveAt;
         if (!curSet || amount <= cur) {
             s.set = true;
@@ -129,7 +130,7 @@ contract OrgBudgets is Governable {
         _onlyOrgHolder(orgId);
         if (!orgs.isActive(orgId)) revert OrgNotActive();
         Slot storage s = _slots[orgId][member][unit][period];
-        (bool curSet,) = _materialize(s);
+        (bool curSet,) = _materialize(orgId, member, unit, period, s);
         if (!curSet) revert NoCeiling();
         uint64 effectiveAt = uint64(block.timestamp) + RAISE_DELAY;
         s.pending = true;
@@ -159,7 +160,7 @@ contract OrgBudgets is Governable {
         view
         returns (bool set, uint128 amount)
     {
-        return _inEffect(_slots[orgId][member][unit][period]);
+        return _inEffect(orgId, _slots[orgId][member][unit][period]);
     }
 
     /// @notice What core applies for `member`: the minimum of the member's ceiling, the org
@@ -196,7 +197,7 @@ contract OrgBudgets is Governable {
         returns (bool pending, bool clears, uint128 amount, uint64 effectiveAt)
     {
         Slot storage s = _slots[orgId][member][unit][period];
-        if (!s.pending || block.timestamp >= s.pendingAt) return (false, false, 0, 0);
+        if (!s.pending || block.timestamp >= s.pendingAt || !_active(orgId)) return (false, false, 0, 0);
         return (true, s.pendingClear, s.pendingAmount, s.pendingAt);
     }
 
@@ -206,18 +207,30 @@ contract OrgBudgets is Governable {
     }
 
     /// @notice True when `who` holds the org's OrganizationSBT, the only budget authority.
+    ///         False for an unknown org id (OrganizationSBT.ownerOf reverts for one).
     function isOrgHolder(uint256 orgId, address who) public view returns (bool) {
-        return who != address(0) && who == orgs.ownerOf(orgId);
+        if (who == address(0)) return false;
+        try orgs.ownerOf(orgId) returns (address owner_) {
+            return who == owner_;
+        } catch {
+            return false;
+        }
     }
 
     // ------------------------------------------------------------------ internals
+
+    function _active(uint256 orgId) internal view returns (bool) {
+        return orgs.isActive(orgId);
+    }
 
     function _onlyOrgHolder(uint256 orgId) internal view {
         if (!isOrgHolder(orgId, msg.sender)) revert NotOrgHolder();
     }
 
-    function _inEffect(Slot storage s) internal view returns (bool, uint128) {
-        if (s.pending && block.timestamp >= s.pendingAt) {
+    /// A matured raise or removal lands only while the org is active. One queued while the org
+    /// was active never lands after it is deactivated: the lower value stays (fail closed).
+    function _inEffect(uint256 orgId, Slot storage s) internal view returns (bool, uint128) {
+        if (s.pending && block.timestamp >= s.pendingAt && _active(orgId)) {
             return s.pendingClear ? (false, uint128(0)) : (true, s.pendingAmount);
         }
         return (s.set, s.amount);
@@ -225,13 +238,18 @@ contract OrgBudgets is Governable {
 
     /// Fold a matured pending change into the slot and drop an unmatured one; returns the value
     /// in effect now. A new write therefore always cancels a raise that has not landed.
-    function _materialize(Slot storage s) internal returns (bool, uint128) {
-        (bool set, uint128 amount) = _inEffect(s);
+    function _materialize(uint256 orgId, address member, Unit unit, Period period, Slot storage s)
+        internal
+        returns (bool, uint128)
+    {
+        (bool set, uint128 amount) = _inEffect(orgId, s);
         if (s.pending) {
-            if (block.timestamp >= s.pendingAt) {
+            if (block.timestamp >= s.pendingAt && _active(orgId)) {
                 s.set = set;
                 s.amount = amount;
                 s.effectiveAt = s.pendingAt;
+            } else {
+                emit PendingChangeCancelled(orgId, member, unit, period, s.pendingClear, s.pendingAmount);
             }
             s.pending = false;
             s.pendingClear = false;

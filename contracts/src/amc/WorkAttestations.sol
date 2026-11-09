@@ -16,7 +16,8 @@ interface IAgentSBT {
 
 /// @title WorkAttestations: a member's signed claim that a unit of agent work happened
 /// @notice AMC 0.5.3 planset 06 section 5; ADR-2026-10-26 P-12, P-16. Spec:
-///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or block 0.
+///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or r1007: deployed in the
+///         ceremony genesis block 0 (0.6.0 owner answer 7), with AgentSBT (owner 2026-11-09).
 ///
 ///         An attestation is the MEMBER'S CLAIM, labelled so (RT-17), not a proof of quality.
 ///         `verifierBits` are the sidecar workflow verifiers' pass bits (D-22), filled by core

@@ -64,8 +64,14 @@ contract RegistryGuardian2of3 {
 
     constructor(IProviderRegistryGuardianActions registry_, address a, address b, address c) {
         if (address(registry_).code.length == 0) revert RegistryHasNoCode();
+        // check() reverts on zero or the CREATE2 factory; its return value is its input.
+        // slither-disable-next-line unused-return
         InitialAdmin.check(a);
+        // check() reverts on zero or the CREATE2 factory; its return value is its input.
+        // slither-disable-next-line unused-return
         InitialAdmin.check(b);
+        // check() reverts on zero or the CREATE2 factory; its return value is its input.
+        // slither-disable-next-line unused-return
         InitialAdmin.check(c);
         if (a == b || a == c || b == c) revert DuplicateOwner();
         registry = registry_;

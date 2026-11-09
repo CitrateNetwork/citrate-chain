@@ -297,6 +297,8 @@ contract ProviderRegistry is Governable {
     }
 
     function _setGuardian(address next) internal {
+        // check() reverts on zero or the CREATE2 factory; its return value is its input.
+        // slither-disable-next-line unused-return
         InitialAdmin.check(next); // nonzero, never the CREATE2 factory
         if (next == governance()) revert GuardianIsGovernance();
         emit GuardianSet(guardian, next);

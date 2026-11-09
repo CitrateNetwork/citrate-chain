@@ -3,7 +3,8 @@ pragma solidity ^0.8.26;
 
 /// @title UsageReceipts: opt-in daily commitment to a member's local usage log
 /// @notice AMC 0.5.3 planset 06 section 3; ADR-2026-10-26 P-7(d), P-12. Spec:
-///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or block 0.
+///         docs/amc/PROVIDER_GOVERNANCE_CONTRACTS.md. Not in r1006 or r1007: deployed in the
+///         ceremony genesis block 0 (0.6.0 owner answer 7).
 ///
 ///         Core writes a signed local record for every cloud call, with no prompt or reply
 ///         content. A member who opts in commits one Merkle root per closed UTC day, so they can
