@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub const MAGIC: &[u8; 8] = b"CITRPLAY";
 
 /// Format version of [`Recording`].
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// One block of the node's applied selected chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +95,10 @@ pub struct ReplayConfig {
     /// (`citrate_execution::storage_root_hardening`). Process-wide in the
     /// executor: `replay` refuses to run when the process value differs.
     pub storage_root_hardening_height: Option<u64>,
+    /// MPT state root activation (`citrate_execution::mpt_state_root`, CV-14).
+    /// Process-wide in the executor: `replay` refuses to run when the process
+    /// value differs. (Format 2 adds this field.)
+    pub mpt_state_root_height: Option<u64>,
     /// Genesis allocation: (address, big-endian U256 balance).
     pub genesis_alloc: Vec<([u8; 20], [u8; 32])>,
 }
@@ -110,6 +114,7 @@ impl ReplayConfig {
             supply_hardening_height: citrate_execution::supply_hardening::supply_hardening_height(),
             storage_root_hardening_height:
                 citrate_execution::storage_root_hardening::storage_root_hardening_height(),
+            mpt_state_root_height: citrate_execution::mpt_state_root::mpt_state_root_height(),
             genesis_alloc: Vec::new(),
         }
     }

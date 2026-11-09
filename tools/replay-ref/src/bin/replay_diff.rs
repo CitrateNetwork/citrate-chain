@@ -52,6 +52,7 @@ async fn main() -> ExitCode {
     citrate_execution::storage_root_hardening::set_storage_root_hardening_height(
         rec.config.storage_root_hardening_height,
     );
+    citrate_execution::mpt_state_root::set_mpt_state_root_height(rec.config.mpt_state_root_height);
     println!(
         "recording: {} (from {}; {} blocks; chain {}..={}; applied tip {} @ {})",
         path.display(),
@@ -64,7 +65,7 @@ async fn main() -> ExitCode {
     );
     println!(
         "config: chain id {}, validator activation {:?}, reward policy {}, hardening pba {:?} \
-         supply {:?} storage-root {:?}, {} genesis account(s)",
+         supply {:?} storage-root {:?} mpt-state-root {:?}, {} genesis account(s)",
         rec.config.chain_id,
         rec.config.validator_activation_height,
         if rec.config.reward_policy.is_some() {
@@ -75,6 +76,7 @@ async fn main() -> ExitCode {
         rec.config.pba_hardening_height,
         rec.config.supply_hardening_height,
         rec.config.storage_root_hardening_height,
+        rec.config.mpt_state_root_height,
         rec.config.genesis_alloc.len(),
     );
     match replay(&rec, mode.as_ref()).await {

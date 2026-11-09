@@ -88,6 +88,10 @@ pub enum Field {
     HeaderStateRoot,
     /// The reference root differs from the root the node committed.
     CommittedStateRoot,
+    /// The from-scratch root of the replayed state (`StateDB::reference_state_root_with`:
+    /// every account and slot re-encoded, no cache) differs from the incremental root
+    /// the same state was given (CV-14 (b)).
+    FromScratchStateRoot,
     /// The reference could not execute the block at all (the node did).
     Execution,
 }
@@ -100,6 +104,7 @@ impl fmt::Display for Field {
             Self::ChainLink => "chain link",
             Self::HeaderStateRoot => "state root (block header)",
             Self::CommittedStateRoot => "state root (committed by the node)",
+            Self::FromScratchStateRoot => "state root (from scratch vs incremental)",
             Self::Execution => "execution",
         })
     }
@@ -140,6 +145,8 @@ pub struct Report {
     /// Chain blocks with a committed root to compare (of `matched`).
     pub committed_compared: u64,
     pub tip_height: u64,
+    /// Chain blocks whose from-scratch root was computed and matched.
+    pub from_scratch_compared: u64,
     pub divergence: Option<Divergence>,
 }
 
@@ -154,6 +161,14 @@ pub async fn replay(rec: &Recording, mode: &dyn OrderingMode) -> Result<Report> 
             "storage-root hardening is {process_srh:?} in this process, the recording ran with \
              {:?}; set it first (replay-diff does)",
             cfg.storage_root_hardening_height
+        );
+    }
+    let process_mpt = citrate_execution::mpt_state_root::mpt_state_root_height();
+    if process_mpt != cfg.mpt_state_root_height {
+        bail!(
+            "the MPT state root is {process_mpt:?} in this process, the recording ran with \
+             {:?}; set it first (replay-diff does)",
+            cfg.mpt_state_root_height
         );
     }
     let exec = Executor::with_chain_id(Arc::new(StateDB::new()), cfg.chain_id);
@@ -195,6 +210,7 @@ pub async fn replay(rec: &Recording, mode: &dyn OrderingMode) -> Result<Report> 
         matched: 0,
         committed_compared: 0,
         tip_height: rec.chain.last().map(|e| e.height).unwrap_or(0),
+        from_scratch_compared: 0,
         divergence: None,
     };
     let dag = rec.index();
@@ -278,6 +294,28 @@ pub async fn replay(rec: &Recording, mode: &dyn OrderingMode) -> Result<Report> 
                 }
             }
         }
+        // CV-14 (b): the roots above are the executor's incremental roots (the
+        // node computes them the same way). The from-scratch reference of the
+        // same state must agree, and it is what the node's committed root is
+        // then judged against.
+        let root = match root {
+            Some(incremental) => {
+                let scratch = exec
+                    .state_db()
+                    .reference_state_root_with(cfg.storage_root_hardening_height, entry.height);
+                report.from_scratch_compared += 1;
+                if scratch != incremental {
+                    report.divergence = Some(diverge(
+                        Field::FromScratchStateRoot,
+                        full_hash(&scratch),
+                        full_hash(&incremental),
+                    ));
+                    return Ok(report);
+                }
+                Some(scratch)
+            }
+            None => None,
+        };
         if let (Some(root), Some(committed)) = (root, entry.committed_root) {
             report.committed_compared += 1;
             if root != committed {

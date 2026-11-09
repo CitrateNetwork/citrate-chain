@@ -8,7 +8,8 @@
 // reloads exactly what a node reloads.
 //
 // Data source: `StorageManager.state` (`StateStore::get_all_accounts`,
-// `StateStore::get_all_storage`, `StateStore::get_state_root`) and
+// `StateStore::get_all_storage`, `StateStore::get_state_root`, and under the
+// MPT state root `StateStore::trie_root_at` / `get_trie_node`) and
 // `StorageManager.blocks` (`BlockStore::get_applied_tip`).
 
 use citrate_execution::StateDB;
@@ -115,6 +116,7 @@ pub(crate) fn hydrate_state_db(storage: &StorageManager, state_db: &StateDB) -> 
         // The hydrated state is the post-state of the applied tip: root it under
         // that height's storage-root rule.
         state_db.set_root_height(tip_height);
+        reuse_persisted_trie(storage, state_db, tip_height);
         let memory_root = state_db.calculate_state_root();
         if tip_height > 0 && tip_hash != citrate_consensus::types::Hash::default() {
             let committed_root = storage
@@ -167,4 +169,38 @@ pub(crate) fn hydrate_state_db(storage: &StorageManager, state_db: &StateDB) -> 
         state_db.accounts.clear_dirty();
     }
     Ok(())
+}
+
+/// CV-14: under the MPT state root, reuse the trie nodes persisted for the
+/// applied tip instead of rebuilding the state trie from the hydrated state.
+/// `StateDB::reuse_persisted_trie` checks every node and every leaf against
+/// the hydrated state; on any difference nothing is installed and the root
+/// below is built from state as on a cold start (the same root either way:
+/// the node store is a cache). The committed-root check that follows is
+/// unchanged.
+fn reuse_persisted_trie(storage: &StorageManager, state_db: &StateDB, tip_height: u64) {
+    use citrate_execution::executor::StateStoreTrait;
+    if !citrate_execution::mpt_state_root::mpt_state_root_active(tip_height) {
+        return;
+    }
+    match storage.state.trie_root_at(tip_height) {
+        Ok(Some(root)) => {
+            let source = |h: &[u8; 32]| storage.state.get_trie_node(h).ok().flatten();
+            let started = std::time::Instant::now();
+            match state_db.reuse_persisted_trie(&root, &source) {
+                Ok(r) => info!(
+                    "State trie reused from the node store at height {tip_height}: {} account(s), \
+                     {} storage trie(s) checked in {:?} (no rebuild)",
+                    r.accounts,
+                    r.storage_tries,
+                    started.elapsed()
+                ),
+                Err(e) => warn!(
+                    "State trie at height {tip_height} not reused ({e}); rebuilding from state"
+                ),
+            }
+        }
+        Ok(None) => info!("No persisted state trie at height {tip_height}; rebuilding from state"),
+        Err(e) => warn!("Trie root record at height {tip_height} unreadable ({e}); rebuilding"),
+    }
 }

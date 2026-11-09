@@ -95,6 +95,44 @@ fn merge_model_job_undo(mut held: ModelJobUndo, more: &ModelJobUndo) -> ModelJob
     held
 }
 
+/// CV-14 trie-node store, in `CF_STATE` (no new column family, so an older
+/// binary still opens the database): `mpt_node:` + keccak256(RLP) -> RLP.
+const TRIE_NODE_PREFIX: &[u8] = b"mpt_node:";
+/// `mpt_root:` + big-endian height -> the state root of the applied block there.
+const TRIE_ROOT_PREFIX: &[u8] = b"mpt_root:";
+/// The highest height with a root record (so a rewrite at a lower height knows
+/// which records an abandoned longer branch left).
+const TRIE_ROOT_TIP_KEY: &[u8] = b"mpt_root_tip";
+
+/// Trie nodes unreachable from every root in the undo window are swept every
+/// this many heights (mark-and-sweep; see [`StateStore::prune_trie_nodes`]).
+pub const TRIE_PRUNE_INTERVAL: u64 = 1_000;
+
+fn trie_node_key(hash: &[u8; 32]) -> Vec<u8> {
+    let mut k = TRIE_NODE_PREFIX.to_vec();
+    k.extend_from_slice(hash);
+    k
+}
+
+fn trie_root_key(height: u64) -> Vec<u8> {
+    let mut k = TRIE_ROOT_PREFIX.to_vec();
+    k.extend_from_slice(&height.to_be_bytes());
+    k
+}
+
+/// What a trie-node prune kept and removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TriePruneStats {
+    /// Root records inside the window (the mark roots).
+    pub roots: usize,
+    /// Root records removed (below the window).
+    pub roots_removed: usize,
+    /// Nodes reachable from a root in the window (kept).
+    pub nodes_kept: usize,
+    /// Nodes removed (reachable from none).
+    pub nodes_removed: usize,
+}
+
 /// Whether height `h` is inside the kept window at tip height `tip`.
 fn in_undo_window(h: u64, tip: u64) -> bool {
     h <= tip && h > tip.saturating_sub(REORG_UNDO_DEPTH)
@@ -344,6 +382,69 @@ impl StateStoreTrait for StateStore {
     /// C1-R: the receipt index on its own, as one fsync'd batch. The commit paths
     /// stage it inside their state batch instead; this override keeps the
     /// standalone trait method honest for any caller of the default fallback.
+    fn get_trie_node(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.db.get_cf(CF_STATE, &trie_node_key(hash))
+    }
+
+    /// One batch: the nodes, the root record for `height`, and the removal of
+    /// the records an abandoned longer branch left above it. Every
+    /// [`TRIE_PRUNE_INTERVAL`] heights, a prune over the undo window
+    /// ([`REORG_UNDO_DEPTH`], = retention) follows.
+    fn put_trie_nodes(
+        &self,
+        height: u64,
+        root: &Hash,
+        nodes: &[([u8; 32], Vec<u8>)],
+    ) -> Result<()> {
+        let mut batch = self.db.batch();
+        for (hash, rlp) in nodes {
+            self.db
+                .batch_put_cf(&mut batch, CF_STATE, &trie_node_key(hash), rlp)?;
+        }
+        let prev_tip = self
+            .db
+            .get_cf(CF_STATE, TRIE_ROOT_TIP_KEY)?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes);
+        if let Some(prev) = prev_tip.filter(|p| *p > height) {
+            // An abandoned branch reached `prev`: its records above `height`
+            // no longer name canonical roots.
+            let span = prev.saturating_sub(height).min(REORG_UNDO_DEPTH);
+            for h in (prev.saturating_sub(span).saturating_add(1)..=prev).filter(|h| *h > height) {
+                self.db
+                    .batch_delete_cf(&mut batch, CF_STATE, &trie_root_key(h))?;
+            }
+        }
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_STATE,
+            &trie_root_key(height),
+            root.as_bytes(),
+        )?;
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_STATE,
+            TRIE_ROOT_TIP_KEY,
+            &height.to_be_bytes(),
+        )?;
+        self.db.write_batch(batch)?;
+        if height > 0 && height.is_multiple_of(TRIE_PRUNE_INTERVAL) {
+            let stats = self.prune_trie_nodes(height, REORG_UNDO_DEPTH)?;
+            info!(
+                "trie nodes pruned at height {height}: {} root(s) in the window, {} node(s) kept, {} removed",
+                stats.roots, stats.nodes_kept, stats.nodes_removed
+            );
+        }
+        Ok(())
+    }
+
+    fn trie_root_at(&self, height: u64) -> Result<Option<Hash>> {
+        Ok(self
+            .db
+            .get_cf(CF_STATE, &trie_root_key(height))?
+            .and_then(|b| Hash::try_from_bytes(&b)))
+    }
+
     fn put_receipt_index(&self, index: &ReceiptIndexBatch) -> Result<()> {
         if index.is_empty() {
             return Ok(());
@@ -417,6 +518,103 @@ impl StateStoreTrait for StateStore {
 }
 
 impl StateStore {
+    /// Mark-and-sweep the trie-node store: keep every node reachable from the
+    /// root recorded at a height in (`tip` - `window`, `tip`] (account tries,
+    /// and the storage tries their leaves name), delete every other node and
+    /// the root records below the window. Production runs it with
+    /// `window` = [`REORG_UNDO_DEPTH`] (CV-7a: undo window = retention).
+    ///
+    /// A node the next state needs is never removed: the current trie is
+    /// reachable from the tip's own record. A missing node anywhere only costs
+    /// a restart its trie reuse (it rebuilds from state).
+    pub fn prune_trie_nodes(&self, tip: u64, window: u64) -> Result<TriePruneStats> {
+        use citrate_execution::state::mpt;
+        use std::collections::HashSet;
+        let floor = tip.saturating_sub(window);
+        let mut stats = TriePruneStats::default();
+        let mut roots: Vec<[u8; 32]> = Vec::new();
+        let mut stale_records: Vec<Vec<u8>> = Vec::new();
+        self.db
+            .for_each_prefix_key_cf(CF_STATE, TRIE_ROOT_PREFIX, |key| {
+                let h = key
+                    .strip_prefix(TRIE_ROOT_PREFIX)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map(u64::from_be_bytes);
+                match h {
+                    Some(h) if h > floor && h <= tip => {}
+                    _ => stale_records.push(key.to_vec()),
+                }
+                Ok(())
+            })?;
+        for h in floor.saturating_add(1)..=tip {
+            if let Some(r) = self.trie_root_at(h)? {
+                roots.push(*r.as_bytes());
+            }
+        }
+        stats.roots = roots.len();
+        // Mark. Account-trie leaves name a storage root to descend into.
+        let mut marked: HashSet<[u8; 32]> = HashSet::new();
+        let mut stack: Vec<([u8; 32], bool)> = roots.iter().map(|r| (*r, true)).collect();
+        while let Some((hash, account_trie)) = stack.pop() {
+            if hash == mpt::EMPTY_ROOT || !marked.insert(hash) {
+                continue;
+            }
+            let Some(rlp) = self.get_trie_node(&hash)? else {
+                continue;
+            };
+            let Ok((children, leaf_values)) = mpt::node_refs_and_leaf_values(&rlp) else {
+                continue;
+            };
+            stack.extend(children.into_iter().map(|c| (c, account_trie)));
+            if account_trie {
+                for v in leaf_values {
+                    if let Some(sr) =
+                        citrate_execution::state::mpt_state::account_leaf_storage_root(&v)
+                    {
+                        stack.push((sr, false));
+                    }
+                }
+            }
+        }
+        // Sweep.
+        let mut batch = self.db.batch();
+        self.db
+            .for_each_prefix_key_cf(CF_STATE, TRIE_NODE_PREFIX, |key| {
+                let keep = key
+                    .strip_prefix(TRIE_NODE_PREFIX)
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .is_some_and(|h| marked.contains(&h));
+                if keep {
+                    stats.nodes_kept = stats.nodes_kept.saturating_add(1);
+                } else {
+                    stats.nodes_removed = stats.nodes_removed.saturating_add(1);
+                    self.db.batch_delete_cf(&mut batch, CF_STATE, key)?;
+                }
+                Ok(())
+            })?;
+        for key in &stale_records {
+            self.db.batch_delete_cf(&mut batch, CF_STATE, key)?;
+        }
+        stats.roots_removed = stale_records.len();
+        self.db.write_batch(batch)?;
+        Ok(stats)
+    }
+
+    /// Trie nodes stored, and their total RLP bytes (storage overhead).
+    pub fn trie_node_usage(&self) -> Result<(usize, u64)> {
+        let mut n: usize = 0;
+        let mut bytes: u64 = 0;
+        for (_, v) in self
+            .db
+            .prefix_iter_cf(CF_STATE, TRIE_NODE_PREFIX)?
+            .take_while(|(k, _)| k.starts_with(TRIE_NODE_PREFIX))
+        {
+            n = n.saturating_add(1);
+            bytes = bytes.saturating_add(v.len() as u64);
+        }
+        Ok((n, bytes))
+    }
+
     /// Stage the applied-tip pointer and the canonical height index for it into
     /// `batch` (same key + layout as `BlockStore::put_applied_tip`). The returned
     /// guard must be held until `batch` is committed: staging reads the index it

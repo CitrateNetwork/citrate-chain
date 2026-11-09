@@ -43,6 +43,8 @@ pub struct FingerprintInputs<'a> {
     pub supply_hardening_height: Option<u64>,
     /// Appended to the pre-image only when set (chain#392).
     pub storage_root_hardening_height: Option<u64>,
+    /// Appended to the pre-image only when set (CV-14, the MPT state root).
+    pub mpt_state_root_height: Option<u64>,
     pub value_transfer_activation_height: u64,
     pub create_nonce_fix_activation_height: u64,
     pub merge_depth_activation_height: u64,
@@ -126,6 +128,10 @@ pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
         Some(h) => format!("{preimage}storage_root_hardening_height={h}\n"),
         None => preimage,
     };
+    let preimage = match i.mpt_state_root_height {
+        Some(h) => format!("{preimage}mpt_state_root_height={h}\n"),
+        None => preimage,
+    };
     match i.genesis_binding {
         None => preimage,
         Some(b) => format!(
@@ -196,6 +202,10 @@ pub struct ConsensusManifest {
     /// (`citrate_execution::storage_root_hardening`); `None` = not activated.
     /// Part of the fingerprint only when set.
     pub storage_root_hardening_height: Option<u64>,
+    /// Standard incremental MPT state root height
+    /// (`citrate_execution::mpt_state_root`, CV-14); `None` = not activated.
+    /// Part of the fingerprint only when set.
+    pub mpt_state_root_height: Option<u64>,
     /// Execution/consensus rules that switch on by height, as this process
     /// resolved them (compiled default or devnet env override). A node whose
     /// env overrides one of these computes different roots, so they are in the
@@ -333,6 +343,7 @@ impl ConsensusManifest {
             citrate_execution::executor::create_nonce_fix_activation_height();
         let merge_depth_activation_height =
             citrate_consensus::ghostdag::merge_depth_activation_height();
+        let mpt_state_root_height = citrate_execution::mpt_state_root::mpt_state_root_height();
         let fingerprint = fingerprint_of(&FingerprintInputs {
             git_sha,
             feat_halo2_verifier,
@@ -344,6 +355,7 @@ impl ConsensusManifest {
             vrf_canonical_encoding_height,
             supply_hardening_height,
             storage_root_hardening_height,
+            mpt_state_root_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -367,6 +379,7 @@ impl ConsensusManifest {
             vrf_canonical_encoding_height,
             supply_hardening_height,
             storage_root_hardening_height,
+            mpt_state_root_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -435,6 +448,7 @@ impl ConsensusManifest {
             vrf_canonical_encoding_height: self.vrf_canonical_encoding_height,
             supply_hardening_height: self.supply_hardening_height,
             storage_root_hardening_height: self.storage_root_hardening_height,
+            mpt_state_root_height: self.mpt_state_root_height,
             value_transfer_activation_height: self.value_transfer_activation_height,
             create_nonce_fix_activation_height: self.create_nonce_fix_activation_height,
             merge_depth_activation_height: self.merge_depth_activation_height,
@@ -501,6 +515,12 @@ impl ConsensusManifest {
             self.storage_root_hardening_height
                 .map(|h| format!("hardened from height {h}"))
                 .unwrap_or_else(|| "not activated".to_string())
+        );
+        println!(
+            "  state root (MPT)   {}",
+            self.mpt_state_root_height
+                .map(|h| format!("standard MPT from height {h}"))
+                .unwrap_or_else(|| "not activated (legacy root)".to_string())
         );
         println!(
             "  value transfer     from height {}",
@@ -656,6 +676,7 @@ mod tests {
             vrf_canonical_encoding_height: None,
             supply_hardening_height: None,
             storage_root_hardening_height: None,
+            mpt_state_root_height: None,
             value_transfer_activation_height: 1,
             create_nonce_fix_activation_height: 2,
             merge_depth_activation_height: 3,
@@ -794,6 +815,13 @@ mod tests {
                 },
             ),
             (
+                "MPT state root height",
+                FingerprintInputs {
+                    mpt_state_root_height: Some(5),
+                    ..base
+                },
+            ),
+            (
                 "value transfer",
                 FingerprintInputs {
                     value_transfer_activation_height: 9,
@@ -857,6 +885,7 @@ mod tests {
                 vrf_canonical_encoding_height: m.vrf_canonical_encoding_height,
                 supply_hardening_height: m.supply_hardening_height,
                 storage_root_hardening_height: m.storage_root_hardening_height,
+                mpt_state_root_height: m.mpt_state_root_height,
                 value_transfer_activation_height: m.value_transfer_activation_height,
                 create_nonce_fix_activation_height: m.create_nonce_fix_activation_height,
                 merge_depth_activation_height: m.merge_depth_activation_height,

@@ -220,18 +220,23 @@ pub struct GenesisActivations {
     /// one height (`citrate_execution::supply_hardening`, resolved through its
     /// `pin_for_genesis`).
     pub supply_hardening: Option<u64>,
+    /// The standard, incremental MPT state root (`citrate_execution::mpt_state_root`,
+    /// ADR-2026-11-03 CV-14 (a)+(b)): an r1007 genesis rule. It changes every root
+    /// value, so a running chain never gets it; r1006 keeps it unset.
+    pub mpt_state_root: Option<u64>,
 }
 
 impl GenesisActivations {
     /// Every rule, by name, with its height, in a fixed order (for logs and the
     /// consensus fingerprint).
-    pub fn entries(&self) -> [(&'static str, Option<u64>); 5] {
+    pub fn entries(&self) -> [(&'static str, Option<u64>); 6] {
         [
             ("pba_hardening", self.pba_hardening),
             ("exact_create_code", self.exact_create_code),
             ("vrf_canonical_encoding", self.vrf_canonical_encoding),
             ("storage_root_hardening", self.storage_root_hardening),
             ("supply_hardening", self.supply_hardening),
+            ("mpt_state_root", self.mpt_state_root),
         ]
     }
 
@@ -243,18 +248,24 @@ impl GenesisActivations {
         "vrf_canonical_encoding",
         "storage_root_hardening",
         "supply_hardening",
+        "mpt_state_root",
     ];
 }
 
 /// r1006's rules: the owner's decision (2026-10-26) is EVERY new hardening rule active
 /// from the first block after genesis. ONE place: changing a rule's schedule for r1006 is
 /// a one-line change here (and moves the consensus fingerprint).
+///
+/// `mpt_state_root` is the exception: it is a genesis rule for r1007 (CV-14, owner
+/// 2026-11-07) and would change every root of the running r1006 chain, so r1006 keeps
+/// it unset.
 pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
     pba_hardening: Some(0),
     exact_create_code: Some(0),
     vrf_canonical_encoding: Some(0),
     storage_root_hardening: Some(0),
     supply_hardening: Some(0),
+    mpt_state_root: None,
 };
 
 /// Per-genesis activations compiled into this release, keyed by (chain id, block-0 hash),
@@ -1023,10 +1034,16 @@ mod tests {
         );
         assert!(RELEASE_GENESIS.contains(&(40204, R1006_GENESIS)));
         for (name, h) in R1006_ACTIVATIONS.entries() {
+            // CV-14 (owner 2026-11-07): the MPT state root is an r1007 genesis rule and
+            // would move every r1006 root, so it is the one rule r1006 leaves unset.
+            let want = if name == "mpt_state_root" {
+                None
+            } else {
+                Some(0)
+            };
             assert_eq!(
-                h,
-                Some(0),
-                "{name}: the owner set every new rule to 0 on r1006"
+                h, want,
+                "{name}: the owner set every new rule to 0 on r1006 (except the r1007 genesis rule)"
             );
         }
         let names: Vec<&str> = R1006_ACTIVATIONS.entries().iter().map(|e| e.0).collect();
@@ -1037,7 +1054,8 @@ mod tests {
                 "exact_create_code",
                 "vrf_canonical_encoding",
                 "storage_root_hardening",
-                "supply_hardening"
+                "supply_hardening",
+                "mpt_state_root"
             ]
         );
         for w in GenesisActivations::WIRED {
@@ -1059,7 +1077,12 @@ mod tests {
             assert_eq!(rules_for_genesis(40204, g), None, "{}", hex::encode(g));
         }
         let r = rules_for_genesis(40204, &R1006_GENESIS).expect("r1006 has rules");
-        assert!(r.entries().iter().all(|(_, h)| *h == Some(0)), "{r:?}");
+        assert!(
+            r.entries()
+                .iter()
+                .all(|(n, h)| *h == Some(0) || (*n == "mpt_state_root" && h.is_none())),
+            "{r:?}"
+        );
         assert_eq!(
             rules_for_genesis(40204, &[0x42; 32]),
             None,
