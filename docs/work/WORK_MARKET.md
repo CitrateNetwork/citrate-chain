@@ -2,7 +2,7 @@
 created: 2026-11-08T22:00:00Z
 branch: feat/v060-genesis-workmarket
 author: Larry Klosowski + Claude Opus 5.5 (MAC lane, V60-GEN)
-status: draft (ceremony-genesis candidate; owner decisions of 2026-11-09 and the #451 review fixes applied; not deployed; internal audit GEN-AUDIT pending)
+status: draft (ceremony-genesis candidate; owner decisions of 2026-11-09 and the #451 review fixes (rounds 1 and 2) applied; not deployed; internal audit GEN-AUDIT pending)
 spec: citrate-federation .agentile/planset/2026-11-07-v060/06_CONTRACTS.md §2-§4, §6-§8
 ---
 
@@ -34,8 +34,11 @@ Sources: `contracts/src/work/{IVerifier,WorkMarket,FLRoundVerifier,TaskVerifier}
 
 The owner approved all of them on 2026-11-09 (V60-GEN Q1-Q11; record in
 `citrate-federation/.agentile/sprints/active/2026-11-08-V60-S0-contracts-genesis.md` and 06).
-Items marked "#451 review" (and the changes they make to points 2-6 and 13) come from the
-independent review of chain #451 and are not yet owner-approved; they do not change any owner
+Items marked "#451 review" (round 1: the depth argument, index challenges, the post-answer
+window, commit-reveal disputes; and the changes they make to points 2-6 and 13) and
+"#451 review 2" (round 2: the tree-total dispute, committed-only dispute rewards, the
+time-based reveal delay, challenge bonds, the coordinating-poster slash rule) come from the
+independent reviews of chain #451 and are not yet owner-approved; they do not change any owner
 answer.
 
 1. **`open` takes a struct** (`OpenParams`) instead of 14 flat arguments, and gains
@@ -52,9 +55,13 @@ answer.
    opening, in `settle` and in disputes alike, must carry exactly `payoutDepth` siblings and an
    index below `2^payoutDepth`, so a leaf that settles always opens as dispute evidence. The index makes the spec's
    sorted-tree non-inclusion proof possible. The prefix sum lets `settle` check
-   `cumBefore + units <= payoutUnits` per leaf, and makes over-allocation provable on chain.
-   Without it, a root whose leaves sum to more than the posted units pays the first settlers
-   and leaves the rest unpaid, with nothing to dispute.
+   `cumBefore + units <= payoutUnits` per leaf. **The tree total must equal `payoutUnits`**
+   (#451 review 2): the last real leaf must end exactly at `payoutUnits`. The contract never
+   sees the leaves at `postPayout`, so this is enforced by dispute (`DISPUTE_TOTAL`, point 4):
+   a root whose leaves sum past the posted units (which would pay the first settlers and leave
+   a later worker unable to settle) or short of them (which would let the poster refund work the
+   tree pays for) is a provable coordinator fault. Undisputed, `settle` still never pays past
+   `payoutUnits`.
 3. **`settle` takes `cumBefore` and `index`** for the same reason, and verifies them with the
    same opening rule as disputes (depth and index range).
 4. **Objective disputes** (upheld automatically): `MISSING_LEAF` (coordinator-signed receipt
@@ -63,10 +70,16 @@ answer.
    abut, or padding before a real leaf; `ORDER` takes **any two** openable leaves `i < j`, not
    only neighbours, and is proven by `worker_i >= worker_j` or `cumBefore_i + units_i > cumBefore_j`,
    or padding at `i` before a real leaf at `j`; neighbours must still abut exactly),
-   `FIRST_LEAF` (prefix sum not starting at zero). An
-   upheld dispute withdraws the root, slashes the coordinator bond (`SLASH_DISPUTER_BPS` = 50 %
-   to a disputer who is not the poster, the rest to the poster), and returns the offer to Running
-   so a new root can be posted before the deadline.
+   `FIRST_LEAF` (prefix sum not starting at zero), `TOTAL` (#451 review 2: any openable real
+   leaf with `cumBefore + units > payoutUnits`; or the last real leaf, shown by being the tree's
+   last slot or by padding opening in the next slot, ending below `payoutUnits`; or padding at
+   slot 0, an empty tree posted with units). An upheld dispute withdraws the root, slashes the
+   coordinator bond and returns the offer to Running so a new root can be posted before the
+   deadline. The slash (#451 review 2): a revealed commitment (point 5c) or an unanswered
+   challenge pays `SLASH_DISPUTER_BPS` = 50 % to a disputer who is not the poster and the rest to
+   the poster; a direct `dispute()` call pays it all to the poster. When the poster is also the
+   coordinator, a disputer other than the poster takes the whole bond, so a coordinating poster
+   never takes back half of its own slashed bond.
    Receipt digest: `keccak256(abi.encode(RECEIPT_TAG, chainid, market, offerId, worker, leaseId,
    deltaHash, true))`, EIP-191-signed by the coordinator (EIP-1271 for contract coordinators).
    The coordinator software (citrate-compute-pool) must sign this exact digest.
@@ -94,14 +107,30 @@ answer.
    coordinator opens at the last moment can still be used in a dispute. Challenges themselves
    can only be raised inside the original window, so the extension is bounded: at most
    `CHALLENGE_RESPONSE_WINDOW + POST_ANSWER_DISPUTE_WINDOW` (48 h) past the window end.
-5c. **Committed disputes (#451 review).** Dispute evidence is objective, so a copier who sees a
-   `dispute` transaction before it lands could submit the same evidence first and take the
-   disputer's 50 % share (or half of a poster's 100 %). `commitDispute(id, c)` with
+5c. **Committed disputes (#451 review; rewards and delay #451 review 2).** Dispute evidence is
+   objective, so a copier who sees a dispute transaction before it lands could submit the same
+   evidence first. `commitDispute(id, c)` with
    `c = disputeCommitment(id, payoutEpoch, msg.sender, evidence, salt)`, then
-   `revealDispute(id, evidence, salt)` from the next block on, inside the dispute window, binds
-   the reward to the committer. `dispute` remains for direct use. Challenges have no such step:
-   the first challenger of a worker or a slot is the one paid if it goes unanswered, and a
-   worker challenge reveals that worker's receipts.
+   `revealDispute(id, evidence, salt)` at least `DISPUTE_REVEAL_DELAY` (60 s) later, inside the
+   dispute window, binds the reward to the committer. The delay is measured in block time, not
+   `block.number`: on the BlockDAG, merged parallel blocks can repeat or lower the header
+   height. `dispute()` stays callable, so a fault can always be proven at once, but it earns no
+   disputer share (the poster takes the whole slash), so copying a reveal into `dispute()`
+   earns nothing. The poster's own 100 % needs no commitment. What remains: a copier who
+   commits after seeing a reveal can only win if that reveal stays unincluded for the whole
+   delay; the contract cannot tell which of two hidden commitments came first.
+5d. **Challenge bonds (#451 review 2).** `challengeInclusion` and `challengeIndex` take
+   `challengeBondOf(id)` = `CHALLENGE_BOND_BPS` (10 %) of the coordinator bond, rounded up.
+   Upheld (unanswered): returned to the challenger with its slash share. Answered: paid to the
+   answerer. Left open by a root an unrelated dispute withdrew: returned when that worker or
+   slot is challenged again, or by `reclaimChallengeBond` / `reclaimIndexChallengeBond`
+   (anyone may call; the bond goes to the challenger). Chosen over re-posting after the deadline
+   because a bond prices the spam (the late-challenge griefing of point 14 costs the griefer the
+   bond per challenge the coordinator answers) without adding a post-deadline state in which the
+   poster's refund would have to wait; the remaining risk, a coordinator that fails to answer in
+   24 h, is the same liveness the workers already rely on for the coordinator to post at all.
+   The bond also means a coordinator that withholds the tree earns the bonds of the challenges
+   it answers; workers should prefer coordinators that publish the tree.
 6. **Subjective disputes (TASK, poster only, one per posted payout):** the offer goes to
    Disputed and settle stops. Group tasks (which must name a dispute admin): the dispute admin
    upholds (root withdrawn, worker's bond **returned**, offer Running) or rejects (payout stands).
@@ -140,13 +169,20 @@ answer.
       is reached and so keep honest workers out; joined accounts may also raise challenges. A
       poster who expects that sets a join bond (returned to the worker in every case, Q5) or an
       `allowlistRoot`.
+    - *Poster as coordinator (#451 review 2).* `open` does not forbid `coordinator == poster`:
+      the poster could name a second address it controls, so a ban would only hide the case.
+      After `DISPUTE_TOTAL` a coordinating poster cannot under-post units or over-sum the tree
+      unpunished, and it forfeits the whole bond to the disputer. It can still, like any
+      coordinator, never post a root and refund after the deadline: the coordinator's liveness
+      is trusted, and the bond prices only bad roots. Workers choose offers by coordinator.
     - *Late-challenge liveness.* A challenge raised just before the window ends delays settling,
       the coordinator bond and the refund by up to `CHALLENGE_RESPONSE_WINDOW`, and an answer
       adds up to `POST_ANSWER_DISPUTE_WINDOW` more (48 h worst case). Any joined worker or the
       poster can challenge every slot (`2^payoutDepth`, at most 1024) and every joined worker, so
       the coordinator may have to answer that many times to keep its bond. That cost is the price
       of making every leaf provable; a coordinator that publishes the full tree to its workers
-      leaves them nothing to challenge.
+      leaves them nothing to challenge. Each challenge carries a bond (point 5d), so spam the
+      coordinator answers costs the challenger.
 
 ## GEN-PARAMS (constructor parameters for the ceremony genesis spec)
 
@@ -165,7 +201,8 @@ their addresses are known before the ceremony.
 
 Fixed in code (not parameters): `MIN_DISPUTE_WINDOW` = 24 h, `MAX_WORKERS_CAP` = 1024,
 `SLASH_DISPUTER_BPS` = 5000 (Q4), `MAX_RECEIPTS_PER_DISPUTE` = 256,
-`CHALLENGE_RESPONSE_WINDOW` = 24 h, `POST_ANSWER_DISPUTE_WINDOW` = 24 h, `RESERVE_CLAIM_PERIOD` = 180 days.
+`CHALLENGE_RESPONSE_WINDOW` = 24 h, `POST_ANSWER_DISPUTE_WINDOW` = 24 h, `RESERVE_CLAIM_PERIOD` = 180 days,
+`DISPUTE_REVEAL_DELAY` = 60 s, `CHALLENGE_BOND_BPS` = 1000 (10 % of the coordinator bond).
 The payout tree depth is per payout, bounded by `maxWorkers` (at most 10 for 1024 workers). Native SALT only; the market
 refuses plain transfers (no `receive`).
 

@@ -1109,7 +1109,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         return aEnd > b.cumBefore;
     }
 
-    /// The leaves do not sum to exactly `payoutUnits` (owner of the decision: #451 review 2):
+    /// The leaves do not sum to exactly `payoutUnits` (#451 review 2):
     /// - `leaf` is an openable real leaf ending past `payoutUnits` (`cumBefore + units >
     ///   payoutUnits`): the tree pays more than it posted, so some worker cannot settle; or
     /// - `leaf` is the last real leaf (the tree's last slot, or `next` opens as padding right after
