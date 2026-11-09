@@ -198,6 +198,77 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         vm.warp(block.timestamp + market.POST_ANSWER_DISPUTE_WINDOW());
         market.releaseChallengeBond(id, w2);
         assertEq(market.balanceOf(coordinator), CHBOND);
+        vm.expectRevert(WorkMarket.NothingToClaim.selector); // paid once
+        market.releaseChallengeBond(id, w2);
+    }
+
+    /// An answered challenge's root has not survived while another challenge is still open past
+    /// the window; if that one is upheld, the answered challenger is refunded instead.
+    function test_dismissed_bond_waits_for_open_challenges_too() public {
+        (uint256 id, bytes32[] memory leaves) = _postedFl3();
+        uint256 windowEnd = uint256(market.getOffer(id).payoutPostedAt) + WINDOW;
+        vm.prank(w1);
+        market.challengeIndex{value: CHBOND}(id, 3);
+        market.answerIndexChallenge(id, _padding(leaves, 3)); // grace ends before the window does
+        vm.warp(windowEnd - 1);
+        vm.prank(w2);
+        market.challengeIndex{value: CHBOND}(id, 0);
+        vm.warp(windowEnd + 1); // past the dispute end, but slot 0 is still challenged
+        vm.expectRevert(WorkMarket.NothingToClaim.selector);
+        market.releaseIndexChallengeBond(id, 3);
+        vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW());
+        market.resolveIndexChallenge(id, 0); // nobody answered slot 0: root withdrawn
+        market.releaseIndexChallengeBond(id, 3);
+        assertEq(market.balanceOf(w1), CHBOND, "refunded: the root it was dismissed under is gone");
+        assertEq(market.balanceOf(coordinator), 0);
+    }
+
+    function test_upheld_challenges_pay_their_bond_once() public {
+        uint256 id = _openFl();
+        _join(id, w1);
+        _join(id, w2);
+        _accept(id);
+        bytes32[] memory leaves = new bytes32[](2);
+        leaves[0] = keccak256("no preimage");
+        _postTree(id, leaves, 1);
+        vm.prank(w1);
+        market.challengeIndex{value: CHBOND}(id, 0);
+        vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
+        market.resolveIndexChallenge(id, 0);
+        vm.expectRevert(WorkMarket.NothingToClaim.selector);
+        market.releaseIndexChallengeBond(id, 0);
+
+        bytes32[] memory l2 = new bytes32[](2);
+        l2[0] = keccak256("still no preimage");
+        _postTree(id, l2, 1);
+        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
+        rs[0] = _receipt(id, w2, bytes32(uint256(1)));
+        vm.prank(w1);
+        market.challengeInclusion{value: CHBOND}(id, rs);
+        vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
+        market.resolveChallenge(id, w2);
+        vm.expectRevert(WorkMarket.NothingToClaim.selector);
+        market.releaseChallengeBond(id, w2);
+        assertEq(market.owedOn(id), BUDGET);
+    }
+
+    /// A same-root re-challenge with more receipts than the answered leaf pays proves the root
+    /// faulty, so the earlier, dismissed challenger is refunded at once.
+    function test_same_root_rechallenge_refunds_the_dismissed_challenger() public {
+        (uint256 id, bytes32[] memory leaves) = _postedFl3(); // w2's leaf pays 3
+        WorkMarket.Receipt[] memory one = new WorkMarket.Receipt[](1);
+        one[0] = _receipt(id, w2, bytes32(uint256(1)));
+        vm.prank(w1);
+        market.challengeInclusion{value: CHBOND}(id, one);
+        market.answerChallenge(id, _opening(leaves, 1, _entries3()[1], 2));
+        WorkMarket.Receipt[] memory four = new WorkMarket.Receipt[](4);
+        for (uint256 i = 0; i < 4; i++) {
+            four[i] = _receipt(id, w2, bytes32(i + 1));
+        }
+        vm.prank(w2);
+        market.challengeInclusion{value: CHBOND}(id, four);
+        assertEq(market.balanceOf(w1), CHBOND);
+        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND);
     }
 
     // ── commit deadline ────────────────────────────────────────────
