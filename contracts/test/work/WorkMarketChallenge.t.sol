@@ -34,7 +34,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         (uint256 id,,) = _postedWithGarbage();
         WorkMarket.Receipt[] memory rs = _receipts(id, w2, 1);
         vm.prank(w2);
-        market.challengeInclusion(id, rs);
+        market.challengeInclusion{value: CHBOND}(id, rs);
         assertEq(market.getOffer(id).openChallenges, 1);
 
         vm.expectRevert(WorkMarket.AnswerTooEarly.selector);
@@ -56,7 +56,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         Entry[] memory e = _entries3();
         WorkMarket.Receipt[] memory rs = _receipts(id, w2, 3);
         vm.prank(w2);
-        market.challengeInclusion(id, rs);
+        market.challengeInclusion{value: CHBOND}(id, rs);
 
         vm.warp(block.timestamp + WINDOW);
         vm.expectRevert(WorkMarket.ChallengeOpen.selector);
@@ -87,7 +87,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         Entry[] memory e = _entries3();
         WorkMarket.Receipt[] memory rs = _receipts(id, w3, 2); // w3's leaf pays 1
         vm.prank(w3);
-        market.challengeInclusion(id, rs);
+        market.challengeInclusion{value: CHBOND}(id, rs);
         WorkMarket.LeafOpening memory l = _opening(leaves, 2, e[2], 5);
         vm.expectRevert(WorkMarket.BadAnswer.selector);
         market.answerChallenge(id, l);
@@ -101,7 +101,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         Entry[] memory e = _entries3();
         WorkMarket.Receipt[] memory rs = _receipts(id, w2, 1);
         vm.prank(w2);
-        market.challengeInclusion(id, rs);
+        market.challengeInclusion{value: CHBOND}(id, rs);
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         WorkMarket.LeafOpening memory l = _opening(leaves, 1, e[1], 2);
         vm.expectRevert(WorkMarket.AnswerTooLate.selector);
@@ -113,18 +113,18 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         Entry[] memory e = _entries3();
         WorkMarket.Receipt[] memory one = _receipts(id, w2, 1);
         vm.prank(w2);
-        market.challengeInclusion(id, one);
+        market.challengeInclusion{value: CHBOND}(id, one);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.ChallengeOpen.selector);
-        market.challengeInclusion(id, one);
+        market.challengeInclusion{value: CHBOND}(id, one);
         WorkMarket.LeafOpening memory l = _opening(leaves, 1, e[1], 2);
         market.answerChallenge(id, l);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector); // same claim again: griefing
-        market.challengeInclusion(id, one);
+        market.challengeInclusion{value: CHBOND}(id, one);
         WorkMarket.Receipt[] memory four = _receipts(id, w2, 4); // leaf pays 3: a real claim
         vm.prank(w2);
-        market.challengeInclusion(id, four);
+        market.challengeInclusion{value: CHBOND}(id, four);
         assertEq(market.getOffer(id).openChallenges, 1);
     }
 
@@ -133,31 +133,31 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         WorkMarket.Receipt[] memory rs = _receipts(id, w2, 1);
         vm.prank(stranger);
         vm.expectRevert(WorkMarket.NotDisputer.selector);
-        market.challengeInclusion(id, rs);
+        market.challengeInclusion{value: CHBOND}(id, rs);
 
         WorkMarket.Receipt[] memory none = new WorkMarket.Receipt[](0);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector);
-        market.challengeInclusion(id, none);
+        market.challengeInclusion{value: CHBOND}(id, none);
 
         WorkMarket.Receipt[] memory bad = _receipts(id, w2, 1);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xBEEF, keccak256("x"));
         bad[0].signature = abi.encodePacked(r, s, v);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector);
-        market.challengeInclusion(id, bad);
+        market.challengeInclusion{value: CHBOND}(id, bad);
 
         WorkMarket.Receipt[] memory dup = new WorkMarket.Receipt[](2);
         dup[0] = _receipt(id, w2, bytes32(uint256(1)));
         dup[1] = _receipt(id, w2, bytes32(uint256(1)));
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector);
-        market.challengeInclusion(id, dup);
+        market.challengeInclusion{value: CHBOND}(id, dup);
 
         vm.warp(block.timestamp + WINDOW);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.WindowClosed.selector);
-        market.challengeInclusion(id, rs);
+        market.challengeInclusion{value: CHBOND}(id, rs);
     }
 
     function test_refund_waits_for_open_challenge() public {
@@ -165,7 +165,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         WorkMarket.Receipt[] memory rs2 = _receipts(id2, w2, 1);
         vm.warp(uint256(market.getOffer(id2).payoutPostedAt) + WINDOW - 1);
         vm.prank(w2);
-        market.challengeInclusion(id2, rs2);
+        market.challengeInclusion{value: CHBOND}(id2, rs2);
         vm.warp(uint256(market.getOffer(id2).deadline) + WINDOW);
         vm.prank(poster);
         vm.expectRevert(WorkMarket.ChallengeOpen.selector);

@@ -44,6 +44,8 @@ contract WorkMarketHandler is Test {
     /// The honest watcher of a malformed tree (the worker the tree cheats) and the slots it has seen.
     mapping(uint256 => address) internal watcherOf;
     mapping(uint256 => bool[4]) internal revealedOf;
+    /// Slots whose leaf is an honest worker's real claim (receipted work the tree must pay).
+    mapping(uint256 => bool[4]) internal honestOf;
     mapping(uint256 => mapping(address => uint256)) public settleCount;
     mapping(bytes32 => Range[]) internal settledRanges; // keccak(id, payoutEpoch)
 
@@ -54,6 +56,7 @@ contract WorkMarketHandler is Test {
     bool public settledWhileChallenged;
     bool public overlapSettled;
     bool public malformedRootPaid;
+    bool public honestLeafBlocked;
     mapping(uint256 => bool) internal malformedLive;
     uint256 public challengesRaised;
     uint256 public challengesResolved;
@@ -114,6 +117,7 @@ contract WorkMarketHandler is Test {
         delete slotsOf[id];
         delete watcherOf[id];
         delete revealedOf[id];
+        delete honestOf[id];
         delete malformedLive[id];
     }
 
@@ -172,6 +176,9 @@ contract WorkMarketHandler is Test {
     /// 2 the sybil leaf sits at slot 1 hashed with out-of-range index 5; 3 the same overlap across
     /// a padding slot. In modes 1-3 the coordinator publishes nothing, so the cheated worker `a`
     /// (the watcher) holds only its own leaf and challenges every other index at once.
+    /// Mode 4: the sybil `a` takes `units` at 0 and honest `b` gets 1 unit at `units`, posted
+    /// `units` (the leaves sum past payoutUnits). Mode 5: a well-formed tree over `a` (1 unit)
+    /// and `b` (`units`), under-posted by one. In modes 4-5 the watcher is `b`, holding its leaf.
     function postPayout(uint256 seed, uint64 units, bool acceptFirst, uint8 mode) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
@@ -179,7 +186,7 @@ contract WorkMarketHandler is Test {
         WorkMarket.Offer memory o = market.getOffer(id);
         if (o.maxUnits == 0) return;
         units = uint64(bound(units, 1, o.maxUnits));
-        mode = mode % 4;
+        mode = mode % 6;
 
         Slot[4] memory slots;
         uint64 total;
@@ -207,6 +214,10 @@ contract WorkMarketHandler is Test {
                     n++;
                 }
                 if (total == 0) total = units;
+            } else if (mode >= 4) {
+                total = units;
+                slots[0] = Slot(a, mode == 4 ? units : 1, 0, 0, false);
+                slots[1] = Slot(b, mode == 4 ? 1 : units, mode == 4 ? units : 1, 1, false);
             } else {
                 // claim twice the units when the budget allows, so both overlapping leaves fit
                 total = uint256(units) * 2 <= o.maxUnits ? units * 2 : units;
@@ -234,6 +245,7 @@ contract WorkMarketHandler is Test {
         }
         bytes32 root = _node(_node(leaves[0], leaves[1]), _node(leaves[2], leaves[3]));
         (bool ok,) = verifier.accepted(id, o.bindRef);
+        uint128 chBond = market.challengeBondOf(id);
         vm.prank(coordinator);
         try market.postPayout{value: o.coordinatorBond}(id, root, total, DEPTH) {
             if (!ok) postedWithoutAcceptance = true;
@@ -245,15 +257,30 @@ contract WorkMarketHandler is Test {
             }
             if (mode == 0) {
                 revealedOf[id] = [true, true, true, true];
+                for (uint256 s = 0; s < 4; s++) {
+                    honestOf[id][s] = slots[s].worker != address(0);
+                }
+            } else if (mode >= 4) {
+                maliciousPosts++;
+                malformedLive[id] = true;
+                watcherOf[id] = slots[1].worker;
+                revealedOf[id][1] = true;
+                honestOf[id][1] = true;
+                if (mode == 5) {
+                    revealedOf[id][0] = true;
+                    honestOf[id][0] = true;
+                }
+                _watch(id);
             } else {
                 maliciousPosts++;
                 malformedLive[id] = true;
                 address w = slots[0].worker;
                 watcherOf[id] = w;
                 revealedOf[id][0] = true;
+                honestOf[id][0] = true;
                 for (uint32 s = 1; s < 4; s++) {
                     vm.prank(w);
-                    try market.challengeIndex(id, s) {
+                    try market.challengeIndex{value: chBond}(id, s) {
                         challengesRaised++;
                     } catch {}
                 }
@@ -261,11 +288,23 @@ contract WorkMarketHandler is Test {
         } catch {}
     }
 
-    /// The watcher disputes as soon as two leaves it has seen prove a bad order.
+    /// The watcher disputes as soon as a leaf it has seen breaks the posted total, or two leaves
+    /// it has seen prove a bad order.
     function _watch(uint256 id) internal {
         address w = watcherOf[id];
         if (w == address(0)) return;
         bool[4] memory seen = revealedOf[id];
+        for (uint256 i = 0; i < 4; i++) {
+            if (!seen[i] || slotsOf[id][i].worker == address(0)) continue;
+            WorkMarket.LeafOpening memory next;
+            if (i + 1 < 4) next = _openingAt(id, i + 1);
+            bytes memory tev = abi.encode(uint8(6), abi.encode(_openingAt(id, i), next));
+            vm.prank(w);
+            try market.dispute(id, tev) {
+                _clearTree(id);
+                return;
+            } catch {}
+        }
         for (uint256 i = 0; i < 4; i++) {
             for (uint256 j = i + 1; j < 4; j++) {
                 if (!seen[i] || !seen[j]) continue;
@@ -306,7 +345,14 @@ contract WorkMarketHandler is Test {
                     if (lo < rs[r].hi && rs[r].lo < hi) overlapSettled = true;
                 }
                 rs.push(Range(lo, hi));
-            } catch {}
+            } catch (bytes memory err) {
+                // an honest leaf of a live, undisputed root must always settle once it may
+                bytes4 sel = bytes4(err);
+                if (
+                    honestOf[id][slot]
+                        && (sel == WorkMarket.ExceedsPayout.selector || sel == WorkMarket.BadProof.selector)
+                ) honestLeafBlocked = true;
+            }
             return;
         }
     }
@@ -328,8 +374,9 @@ contract WorkMarketHandler is Test {
                 worker: w, leaseId: lease, deltaHash: delta, signature: abi.encodePacked(r, s_, v)
             });
         }
+        uint128 chBond = market.challengeBondOf(id);
         vm.prank(w);
-        try market.challengeInclusion(id, rs) {
+        try market.challengeInclusion{value: chBond}(id, rs) {
             challengesRaised++;
         } catch {}
     }
@@ -369,8 +416,9 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         address a = actorSeed % 5 == 4 ? poster : actors[actorSeed % 4];
+        uint128 chBond = market.challengeBondOf(id);
         vm.prank(a);
-        try market.challengeIndex(id, uint32(slot % 5)) {
+        try market.challengeIndex{value: chBond}(id, uint32(slot % 5)) {
             challengesRaised++;
         } catch {}
     }
@@ -400,6 +448,14 @@ contract WorkMarketHandler is Test {
             challengesResolved++;
             _clearTree(id);
         } catch {}
+    }
+
+    /// Challengers take back bonds of challenges a withdrawn root left open.
+    function reclaim(uint256 seed, uint256 actorSeed, uint8 slot) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        try market.reclaimChallengeBond(id, actors[actorSeed % 4]) {} catch {}
+        try market.reclaimIndexChallengeBond(id, uint32(slot % 4)) {} catch {}
     }
 
     function disputeOrder(uint256 seed) external {
@@ -588,6 +644,16 @@ contract WorkMarketInvariantTest is Test {
     function invariant_settled_leaves_never_overlap() public view {
         assertFalse(handler.overlapSettled());
         assertFalse(handler.malformedRootPaid());
+    }
+
+    /// Tree totals: an honest worker's leaf in a live root always settles (never ExceedsPayout or
+    /// BadProof), including when the coordinator posts leaves summing past payoutUnits or
+    /// under-posts payoutUnits, given a watcher that disputes with the leaf it holds.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_honest_leaf_always_settles() public view {
+        assertFalse(handler.honestLeafBlocked());
     }
 
     /// 06 §7.7: pause never stops anyone pulling what they are owed.

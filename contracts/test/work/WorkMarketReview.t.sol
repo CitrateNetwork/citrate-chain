@@ -72,17 +72,17 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         Entry[] memory e = _entries3(); // w2's leaf pays 3
         WorkMarket.Receipt[] memory one = _receipts(id, w2, 1);
         vm.prank(w2);
-        market.challengeInclusion(id, one);
+        market.challengeInclusion{value: CHBOND}(id, one);
         market.answerChallenge(id, _opening(leaves, 1, e[1], 2));
         assertEq(market.challengeOf(id, w2).answeredUnits, 3);
         WorkMarket.Receipt[] memory two = _receipts(id, w2, 2);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector);
-        market.challengeInclusion(id, two);
+        market.challengeInclusion{value: CHBOND}(id, two);
         WorkMarket.Receipt[] memory three = _receipts(id, w2, 3);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector);
-        market.challengeInclusion(id, three);
+        market.challengeInclusion{value: CHBOND}(id, three);
     }
 
     // ── slash share survives a refund or an upheld subjective dispute
@@ -90,7 +90,7 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
     function test_refund_of_disputed_task_waits_for_open_challenge_and_pays_challenger() public {
         (uint256 id,) = _postedTask(false);
         vm.prank(w1);
-        market.challengeIndex(id, 0);
+        market.challengeIndex{value: CHBOND}(id, 0);
         vm.prank(poster);
         market.dispute(id, _subjective());
         vm.warp(uint256(market.getOffer(id).deadline) + WINDOW);
@@ -111,7 +111,7 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         (uint256 id,) = _postedTask(true);
         WorkMarket.Receipt[] memory rs = _receipts(id, w1, 1);
         vm.prank(w1);
-        market.challengeInclusion(id, rs);
+        market.challengeInclusion{value: CHBOND}(id, rs);
         vm.prank(poster);
         market.dispute(id, _subjective());
         vm.prank(admin);

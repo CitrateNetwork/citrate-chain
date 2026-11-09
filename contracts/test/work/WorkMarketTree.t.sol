@@ -78,7 +78,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
     function test_A1_garbage_index_challenge_unanswered_is_upheld() public {
         (uint256 id, bytes32[] memory leaves) = _postedA1();
         vm.prank(w1);
-        market.challengeIndex(id, 1);
+        market.challengeIndex{value: CHBOND}(id, 1);
         assertEq(market.getOffer(id).openChallenges, 1);
 
         // the garbage slot opens neither as padding nor as any real leaf
@@ -109,7 +109,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         uint256 windowEnd = uint256(market.getOffer(id).payoutPostedAt) + WINDOW;
         vm.warp(windowEnd - 1);
         vm.prank(w1);
-        market.challengeIndex(id, 2);
+        market.challengeIndex{value: CHBOND}(id, 2);
         vm.warp(windowEnd + market.CHALLENGE_RESPONSE_WINDOW() - 1);
         vm.prank(coordinator);
         market.answerIndexChallenge(id, _real(leaves, 2, w3, 2, 0));
@@ -132,7 +132,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         uint256 windowEnd = uint256(market.getOffer(id).payoutPostedAt) + WINDOW;
         vm.warp(windowEnd - 1);
         vm.prank(w1);
-        market.challengeIndex(id, 3);
+        market.challengeIndex{value: CHBOND}(id, 3);
         vm.warp(windowEnd + 10);
         market.answerIndexChallenge(id, _padding(leaves, 3));
         uint256 graceEnd = windowEnd + 10 + market.POST_ANSWER_DISPUTE_WINDOW();
@@ -160,7 +160,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
     function test_A2_out_of_range_slot_is_challengeable() public {
         (uint256 id, bytes32[] memory leaves) = _postedA2();
         vm.prank(w1);
-        market.challengeIndex(id, 1);
+        market.challengeIndex{value: CHBOND}(id, 1);
         WorkMarket.LeafOpening memory l = _real(leaves, 1, w3, 2, 0);
         vm.expectRevert(WorkMarket.BadAnswer.selector); // slot 1 holds no index-1 leaf
         market.answerIndexChallenge(id, l);
@@ -209,7 +209,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
     function test_openings_of_the_wrong_depth_do_not_count_in_disputes() public {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
         vm.prank(w1);
-        market.challengeIndex(id, 0);
+        market.challengeIndex{value: CHBOND}(id, 0);
         WorkMarket.LeafOpening memory l = _real(leaves, 0, w1, 2, 0);
         bytes32[] memory longer = new bytes32[](3);
         longer[0] = l.path[0];
@@ -272,16 +272,16 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
         vm.prank(stranger);
         vm.expectRevert(WorkMarket.NotDisputer.selector);
-        market.challengeIndex(id, 0);
+        market.challengeIndex{value: CHBOND}(id, 0);
         vm.prank(w1);
         vm.expectRevert(WorkMarket.BadEvidence.selector); // 2^depth = 4 slots
-        market.challengeIndex(id, 4);
+        market.challengeIndex{value: CHBOND}(id, 4);
 
         vm.prank(poster);
-        market.challengeIndex(id, 1);
+        market.challengeIndex{value: CHBOND}(id, 1);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.ChallengeOpen.selector);
-        market.challengeIndex(id, 1);
+        market.challengeIndex{value: CHBOND}(id, 1);
         // an answer names its slot by index: an unchallenged slot is no answer, and the
         // challenged slot must open as what it holds (w2's leaf, not padding)
         vm.expectRevert(WorkMarket.NoOpenChallenge.selector);
@@ -291,12 +291,12 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         market.answerIndexChallenge(id, _real(leaves, 1, w2, 3, 2));
         vm.prank(w3);
         vm.expectRevert(WorkMarket.BadEvidence.selector); // answered under this root: done
-        market.challengeIndex(id, 1);
+        market.challengeIndex{value: CHBOND}(id, 1);
         vm.expectRevert(WorkMarket.NoOpenChallenge.selector);
         market.resolveIndexChallenge(id, 1);
 
         vm.prank(w3);
-        market.challengeIndex(id, 3);
+        market.challengeIndex{value: CHBOND}(id, 3);
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         vm.expectRevert(WorkMarket.AnswerTooLate.selector);
         market.answerIndexChallenge(id, _padding(leaves, 3));
@@ -304,16 +304,16 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         vm.warp(uint256(market.getOffer(id).payoutPostedAt) + WINDOW);
         vm.prank(w1);
         vm.expectRevert(WorkMarket.WindowClosed.selector);
-        market.challengeIndex(id, 0);
+        market.challengeIndex{value: CHBOND}(id, 0);
     }
 
     function test_index_challenge_after_withdrawn_root_starts_fresh() public {
         (uint256 id, bytes32[] memory leaves) = _postedA1();
         vm.prank(w1);
-        market.challengeIndex(id, 2);
+        market.challengeIndex{value: CHBOND}(id, 2);
         market.answerIndexChallenge(id, _real(leaves, 2, w3, 2, 0)); // slot 2 answered under root 1
         vm.prank(w1);
-        market.challengeIndex(id, 1);
+        market.challengeIndex{value: CHBOND}(id, 1);
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         market.resolveIndexChallenge(id, 1);
         assertEq(market.getOffer(id).payoutDepth, 0); // cleared with the root
@@ -322,12 +322,12 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         _postTree(id, l3, 6);
         assertEq(market.indexChallengeOf(id, 1).open, false);
         vm.prank(w1);
-        market.challengeIndex(id, 1);
+        market.challengeIndex{value: CHBOND}(id, 1);
         market.answerIndexChallenge(id, _real(l3, 1, w2, 3, 2));
         assertTrue(market.indexChallengeOf(id, 1).answered);
         // a slot answered under the withdrawn root can be challenged again under the new one
         vm.prank(w1);
-        market.challengeIndex(id, 2);
+        market.challengeIndex{value: CHBOND}(id, 2);
         assertTrue(market.indexChallengeOf(id, 2).open);
     }
 
@@ -402,7 +402,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         uint256 windowEnd = uint256(deadline) + WINDOW;
         vm.warp(windowEnd - 1);
         vm.prank(w1);
-        market.challengeIndex(id, 2);
+        market.challengeIndex{value: CHBOND}(id, 2);
         vm.warp(windowEnd + 1 hours);
         market.answerIndexChallenge(id, _real(leavesBuf, 2, w3, 2, 0));
         vm.prank(poster);

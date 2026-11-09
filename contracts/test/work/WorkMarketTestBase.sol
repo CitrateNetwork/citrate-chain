@@ -63,6 +63,8 @@ abstract contract WorkMarketTestBase is Test {
     uint128 internal constant BUDGET = 10 ether;
     uint32 internal constant WINDOW = 24 hours;
     uint128 internal constant CBOND = 2 ether;
+    /// Challenge bond for CBOND offers: CHALLENGE_BOND_BPS (10 %) of the coordinator bond.
+    uint128 internal constant CHBOND = 0.2 ether;
     bytes32 internal constant BIND = keccak256("bind");
     bytes32 internal constant DIGEST = keccak256("digest");
 

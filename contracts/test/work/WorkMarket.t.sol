@@ -332,7 +332,9 @@ contract WorkMarketTest is WorkMarketTestBase {
         _settle(id, leaves, 1, e[1], 1);
     }
 
-    function test_settle_leaf_beyond_posted_units_reverts() public {
+    /// A root whose leaves pay more than it posted is malformed and disputable (DISPUTE_TOTAL,
+    /// WorkMarketTotals). Undisputed, settle still never pays past the posted units.
+    function test_settle_never_pays_past_posted_units() public {
         uint256 id = _openFl();
         _join(id, w1);
         _join(id, w2);
@@ -341,7 +343,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         e[0] = Entry(w1, 3);
         e[1] = Entry(w2, 3);
         (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
-        _postTree(id, leaves, 4); // tree pays 6, posted 4
+        _postTree(id, leaves, 4); // malformed: tree pays 6, posted 4 (disputable)
         vm.warp(block.timestamp + WINDOW);
         _settle(id, leaves, 0, e[0], 0);
         vm.expectRevert(WorkMarket.ExceedsPayout.selector);

@@ -86,6 +86,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint8 public constant DISPUTE_FIRST_LEAF = 4;
     /// Reason code emitted when an inclusion challenge went unanswered.
     uint8 public constant DISPUTE_UNANSWERED_CHALLENGE = 5;
+    uint8 public constant DISPUTE_TOTAL = 6;
+    uint16 public constant CHALLENGE_BOND_BPS = 1000;
+    uint32 public constant DISPUTE_REVEAL_DELAY = 60;
 
     /// Non-inclusion modes for DISPUTE_MISSING_LEAF.
     uint8 public constant ABSENT_BETWEEN = 0;
@@ -155,6 +158,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint8 payoutDepth; // the posted tree's depth: every opening carries exactly this many siblings
         uint64 answerGraceUntil; // disputes stay open until at least this time (set by answers)
         uint32 resultEpoch; // bumps when a subjective dispute is upheld (TaskVerifier scopes results to it)
+        uint128 challengeBondsHeld;
     }
 
     struct Challenge {
@@ -685,7 +689,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///         coordinator-signed, strictly ascending lease ids, all for one joined worker) and makes
     ///         the root answer for that worker within `CHALLENGE_RESPONSE_WINDOW`. A worker may be
     ///         challenged again under the same root only with more receipts than the answered leaf pays.
-    function challengeInclusion(uint256 id, Receipt[] calldata receipts) external nonReentrant {
+    function challengeInclusion(uint256 id, Receipt[] calldata receipts) external payable nonReentrant {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
         if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
@@ -760,7 +764,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @notice Inside the dispute window, a joined worker or the poster makes the root answer for
     ///         tree slot `index` (`< 2^payoutDepth`) within `CHALLENGE_RESPONSE_WINDOW`. A slot
     ///         answered under the live root cannot be challenged again.
-    function challengeIndex(uint256 id, uint32 index) external nonReentrant {
+    function challengeIndex(uint256 id, uint32 index) external payable nonReentrant {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
         if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
@@ -809,6 +813,20 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         address challenger = c.challenger;
         emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
         _upholdObjective(id, o, challenger);
+    }
+
+    function challengeBondOf(uint256 id) public view returns (uint128) {
+        uint256 cb = _offers[id].coordinatorBond;
+        return uint128((cb * CHALLENGE_BOND_BPS + BPS - 1) / BPS);
+    }
+
+    // red: challenge bonds not refunded yet
+    function reclaimChallengeBond(uint256, address) external pure {
+        revert NothingToClaim();
+    }
+
+    function reclaimIndexChallengeBond(uint256, uint32) external pure {
+        revert NothingToClaim();
     }
 
     function indexChallengeOf(uint256 id, uint32 index) external view returns (IndexChallenge memory) {
