@@ -1005,6 +1005,66 @@ mod tests {
         storage.blocks.has_block(&b.header.block_hash).unwrap() && dag_has
     }
 
+    /// Admission with the node's applicator wired (execute-on-receive).
+    fn harness_with_applicator() -> (
+        BlockAdmission,
+        Arc<CanonicalApplicator>,
+        Arc<StorageManager>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let exec = Arc::new(citrate_execution::Executor::new(Arc::new(
+            citrate_execution::StateDB::new(),
+        )));
+        let app = Arc::new(
+            CanonicalApplicator::new(exec, storage.clone()).with_fork_choice(ghostdag.clone()),
+        );
+        let adm = BlockAdmission::new(storage.clone(), dag, ghostdag, Some(app.clone()));
+        (adm, app, storage, dir)
+    }
+
+    /// RED (r1007 devnet, cand-236247b6 K1/R3/P1/P2, 2026-11-08): block
+    /// execution ran inside admission, i.e. on the single P2P message loop,
+    /// once per admitted block (and once per block of a 32-block `Blocks`
+    /// answer), waiting for the state-advance lock the producer and the
+    /// periodic drain hold while THEY execute. At an apply cost of ~1.2 s per
+    /// block one handler ran past the 60 s stall watchdog: NewBlock was shed
+    /// (`inbound queue full`, 18-183 per run) and the node killed itself
+    /// (`STALLED`, up to 25 per run), then could not reseal or catch up.
+    ///
+    /// Admission stores; it must never wait for, or do, execution. The drain
+    /// task applies (it is woken, so nothing waits for its 1 s tick).
+    #[tokio::test]
+    async fn admit_never_waits_for_the_state_advance_lock() {
+        let (adm, app, storage, _d) = harness_with_applicator();
+        let g = root();
+        adm.admit(&g).await;
+        let b1 = mk(1, g.header.block_hash, 1, [0x61; 32]);
+
+        // The producer (or the drain) is executing a block: it holds the lock.
+        let lock = app.advance_lock();
+        let held = lock.lock().await;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), adm.admit(&b1)).await;
+        assert_eq!(
+            out.expect(
+                "admission waited on the state-advance lock: execution runs on the P2P \
+                 message loop, so one slow apply stalls every inbound message"
+            ),
+            AdmitOutcome::Admitted {
+                completed_partial: false
+            }
+        );
+        assert!(
+            storage.blocks.has_block(&b1.header.block_hash).unwrap(),
+            "the block is stored for the drain to apply"
+        );
+        drop(held);
+    }
+
     #[tokio::test]
     async fn admits_a_fresh_block_into_both_stores() {
         let (adm, storage, dag, _d) = harness();
