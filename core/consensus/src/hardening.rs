@@ -203,7 +203,7 @@ pub const R1006_GENESIS: [u8; 32] =
 /// allocation, the genesis block encoding or the root rule moves it, on purpose; the
 /// integration of the r1007 consensus lanes re-pins it there (docs/consensus/R1007_GENESIS.md).
 pub const R1007_GENESIS: [u8; 32] =
-    hex32("4e0465e0015f5bd712c4e8b9267d7fd831b4d1b488f83f2f86ca115820eaad29");
+    hex32("d245a960a616896a2b80f9aa8e92417b44a4fb451640efdb9c75dda5abc1ba7f");
 
 /// Activation heights compiled into this release for ONE genesis, keyed by its block-0
 /// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin
@@ -286,11 +286,11 @@ pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
 ///
 /// * `mpt_state_root: Some(0)`: CV-14 (a)+(b), owner 2026-11-07. Activation 0 includes
 ///   block 0 itself (lead decision 2026-11-09, docs/consensus/STATE_ROOT_MPT.md §1).
-/// * `supply_hardening` and `exact_create_code` at 0 (from block 1, as on r1006):
-///   PENDING OWNER confirmation of the mergeset lane's recommendation (no deployment
-///   bonus for a failed deployment, a deployment's `value` transferred, created code
-///   stored exactly, not zero-padded). The alternative, `None`, keeps the legacy
-///   behaviour on r1007 and needs a fork to remove before mainnet.
+/// * `supply_hardening` and `exact_create_code` at 0: owner decision 2026-11-09 (the
+///   mergeset lane's recommendation). Block 0 carries no transactions, so they govern
+///   every executed transaction: no deployment bonus for a failed deployment, a
+///   deployment's `value` is transferred, and created code is stored exactly, not
+///   zero-padded.
 /// * `pba_hardening`, `vrf_canonical_encoding`, `storage_root_hardening` at 0, as r1006.
 pub const R1007_ACTIVATIONS: GenesisActivations = GenesisActivations {
     pba_hardening: Some(0),

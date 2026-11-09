@@ -2,7 +2,7 @@
 created: 2026-11-09
 branch: r1007/s3-6-genesis
 author: Claude Opus 5.5 (lane S3-6 GENESIS WIRING) for Larry Klosowski
-status: draft for second-reviewer review (Matr0xshka, kurtatwork); block-0 hash is a candidate until the r1007 consensus lanes are integrated
+status: draft for second-reviewer review (Matr0xshka, kurtatwork); owner parameters decided 2026-11-09; block-0 hash is a candidate until the r1007 consensus lanes are integrated
 adr: ADR-2026-11-03-chain-convergence-r1007 CV-2, CV-7a, CV-8, CV-12, CV-13, CV-14
 planset: 2026-11-03-r1007-v060 05 S3-6, 06 §1.2
 ---
@@ -11,7 +11,8 @@ planset: 2026-11-03-r1007-v060 05 S3-6, 06 §1.2
 
 r1007 is the new-genesis rehearsal of chain 40204 (ADR Q-1). It runs every r1007
 consensus rule from block 0 (CV-2). This page lists every parameter the r1007 profile
-fixes, where each one comes from, and which ones are still **PENDING OWNER**. It also
+fixes, where each one comes from, and its status. The owner decided every pending
+parameter on 2026-11-09; none is still pending. It also
 gives the plan for re-issuing grants after genesis.
 
 Code:
@@ -30,11 +31,11 @@ Code:
 | Contract set | **the r1006 block-0 state, byte for byte**: every account of `GenesisConfig::r1006()` except the r1006 note | owner: r1007 keeps today's contract set; the 0.6.0 contracts go in the later ceremony genesis |
 | Validator set | the 7 r1006 producers, the same registry state, the same stakes | Q-3 ("fresh genesis from the same validator set") |
 | Source files | `core/economics/assets/r1006/alloc.json` (sha256 `ac969bda…43db`) and `validators.json` (sha256 `26f14840…d0ca`), read in place, not copied (Rule 9) | `GenesisConfig::r1007()` |
-| Genesis note | its own text at `0x000000000000000000000000000000C17A7E1007`, replacing r1006's note at `…C17A7E1006` | **PENDING OWNER** (wording) |
+| Genesis note | "Citrate r1007: rehearsal genesis for chain 40204" at `0x000000000000000000000000000000C17A7E1007`, replacing r1006's note at `…C17A7E1006` | Decided (owner 2026-11-09) |
 | State root of block 0 | standard MPT root (CV-14), with activation 0 covering block 0 itself | STATE_ROOT_MPT.md §1 |
 | Genesis header | the shared canonical genesis block (`create_canonical_genesis_block`, version 1, timestamp `CANONICAL_GENESIS_TIMESTAMP` = 1,767,225,600 = 2026-01-01T00:00:00Z) | unchanged from r1006 |
 | Supply split | unchanged: mining pool = 1T SALT − pre-allocations (the note holds no balance) | `GenesisConfig::r1006` |
-| Block-0 hash | `0x4e0465e0015f5bd712c4e8b9267d7fd831b4d1b488f83f2f86ca115820eaad29` | **candidate**, see §2 |
+| Block-0 hash | `0xd245a960a616896a2b80f9aa8e92417b44a4fb451640efdb9c75dda5abc1ba7f` | **candidate**, see §2 |
 
 **Every block-0 address is unchanged from r1006.** That includes `CitrateMemberSBT`
 `0x8831…060d`, `MembershipStakeVault` `0xd663…555e` and `ValidatorRegistry` `0xf511…31cd`,
@@ -58,10 +59,10 @@ this repo):
 | citrate-prod-6 | `0xcece36ef…70d0b8` | `0x78fc4dee8c40be8786c6b4e98482fdaa60435542` | 32,000 | 100 |
 | citrate-prod-7 | `0x15d1f3c5…befc40` | `0xbb7316ece2325e76cc66a61a01a1f307e67fd89c` | 32,000 | 100 |
 
-Producer keys stay on their hosts. Same validator set means the same keys sign r1007
-blocks. If the owner wants fresh producer keys for r1007 (D-K3, planset S4-1), the
-validators file must be refilled (`scripts/genesis/r1006/fill_producers.py`) and the hash
-re-pinned. **PENDING OWNER** if that is wanted.
+Producer keys stay on their hosts. **Decided (owner 2026-11-09): r1007 uses the same
+producer keys as r1006**, so the validators file is r1006's and nothing is refilled. (Fresh
+keys, D-K3, would mean refilling it with `scripts/genesis/r1006/fill_producers.py` and
+re-pinning the hash; that is for the ceremony genesis, not r1007.)
 
 ## 2. The block-0 hash: how it is computed and when it moves
 
@@ -105,7 +106,8 @@ Status key:
 - **Recorded**: compiled in `R1007_CHAIN_PARAMS` and bound into the consensus
   fingerprint. The constant it must equal lives on another lane's branch, and the
   integration binds it (§5).
-- **PENDING OWNER**: implemented behind the entry, but awaiting the owner's word.
+- **Decided 2026-11-09**: was PENDING OWNER in the first draft; the owner approved the
+  value on 2026-11-09.
 
 ### 3.1 Genesis-keyed activations (`R1007_ACTIVATIONS`)
 
@@ -115,12 +117,12 @@ Status key:
 | `pba_hardening` | `Some(0)` | r1006 schedule (owner 2026-10-26) carried over | Decided |
 | `vrf_canonical_encoding` | `Some(0)` | as r1006 | Decided |
 | `storage_root_hardening` | `Some(0)` | as r1006 | Decided |
-| `supply_hardening` | `Some(0)` (effective from block 1) | mergeset lane recommendation: no 1 SALT deployment bonus for a *failed* deployment, and a deployment's `value` is transferred, not only checked | **PENDING OWNER** |
-| `exact_create_code` | `Some(0)` (effective from block 1) | mergeset lane recommendation: contract-created code is stored exactly, not zero-padded (REVM's analysed form) | **PENDING OWNER** |
+| `supply_hardening` | `Some(0)`: on at block 0 (block 0 has no transactions, so it governs every executed tx) | mergeset lane recommendation: no 1 SALT deployment bonus for a *failed* deployment, and a deployment's `value` is transferred, not only checked | Decided 2026-11-09 |
+| `exact_create_code` | `Some(0)`: on at block 0 | mergeset lane recommendation: contract-created code is stored exactly, not zero-padded (REVM's analysed form) | Decided 2026-11-09 |
 
-For the two pending rules, `None` would keep the legacy behaviours on r1007. Removing
-them later needs a fork, which the soft-fork rule (06 §11) does not allow after the
-audit freeze. The recommendation is `Some(0)`.
+The owner took the recommendation for both on 2026-11-09. `None` would have kept the
+legacy behaviours on r1007, and removing them later needs a fork, which the soft-fork rule
+(06 §11) does not allow after the audit freeze.
 
 Checkpoint finality voting is on from genesis on the finality lane
 (`CHECKPOINT_VOTING_FROM_GENESIS = true`, `r1007/s3-finality-voting-v2`), and enforcement
@@ -132,7 +134,7 @@ stays off (CV-8). That lane keys enforcement by `(chain id, genesis)` in
 
 | Parameter | Value | Source | Where it is enforced | Status |
 |---|---|---|---|---|
-| `slot_duration_secs` | 1 | 06 §1.2, owner question O2 (1 s = r1006's live cadence, vs 2 s or 5 s); time-slots lane `SLOT_DURATION_SECS = 1` | fingerprint; bind to `slots::SLOT_DURATION_SECS` at integration | **PENDING OWNER** (O2) |
+| `slot_duration_secs` | 1 | 06 §1.2, owner question O2 (1 s = r1006's live cadence, vs 2 s or 5 s); time-slots lane `SLOT_DURATION_SECS = 1` | fingerprint; bind to `slots::SLOT_DURATION_SECS` at integration | Decided 2026-11-09 (O2: 1 s) |
 | slot origin | genesis timestamp 1,767,225,600 | time-slots lane: `DagStore::set_slot_origin(genesis header)` | the genesis header | Decided (shared genesis block) |
 | `max_future_drift_secs` | 15 | 06 G9 / reviewer R12; time-slots lane `MAX_FUTURE_SLOT_DRIFT_SECS = 15` (120 s hold horizon in v2) | fingerprint; bind at integration | Recorded (review R12) |
 | `pruning_depth` | 10,000 chain blocks | 06 §1.2 D12; `dag_prune::MIN_RETAIN_BLOCKS` = `DEFAULT_RETAIN_BLOCKS` | test `r1007_undo_window_is_the_compiled_retention` | Decided (CV-7a, owner O7) |
@@ -143,8 +145,8 @@ stays off (CV-8). That lane keys enforcement by `(chain id, genesis)` in
 | `checkpoint_interval` | 50 | 06 §1.2; finality lane `CHECKPOINT_INTERVAL = 50` | node start-up refuses another `[checkpoint] interval` on r1007 | Decided |
 | `committee_size` | 100 (with 7 producers, all 7 are the committee) | finality lane `CHECKPOINT_COMMITTEE_SIZE = 100` | node start-up refuses another `[checkpoint] committee_size` on r1007 | Decided (reviewer R8 open on count vs stake) |
 | `checkpoint_vote_depth` | 3 | `checkpoint::DEFAULT_VOTE_DEPTH` | node start-up refuses another `[checkpoint] vote_depth` on r1007 | Decided |
-| `include_gas_limit` | 30,000,000 | 06 D9; `producer::PRODUCER_BLOCK_GAS_LIMIT`; mergeset lane `INCLUDE_GAS_LIMIT` | test | **PENDING OWNER** (O5, provisional until S1-2) |
-| `accept_gas_limit` | 60,000,000 | 06 D9; mergeset lane `ACCEPT_GAS_LIMIT` | fingerprint; bind at integration | **PENDING OWNER** (O5) |
+| `include_gas_limit` | 30,000,000 | 06 D9; `producer::PRODUCER_BLOCK_GAS_LIMIT`; mergeset lane `INCLUDE_GAS_LIMIT` | test | Decided 2026-11-09 (O5: 30M) |
+| `accept_gas_limit` | 60,000,000 | 06 D9; mergeset lane `ACCEPT_GAS_LIMIT` | fingerprint; bind at integration | Decided 2026-11-09 (O5: 60M) |
 | `validator_activation_height` | 1,000 (start of epoch 1; above S(1) = 800) | `R1006_VALIDATOR_ACTIVATION_HEIGHT` | the compiled registry binding (§3.3) | Decided |
 
 The parameter rendering is appended to the genesis binding of the consensus fingerprint
@@ -185,15 +187,28 @@ No step below may run before the owner's S4 go. Every step names its tool.
 | G2 | Treasury signer reset to the new generation: signer `/health` reports `genesis` = `R1007_GENESIS`, so its ledger key `<genesis>/<orderId>` starts empty | identity#43 signer (genesis pin); core-membership#80 client (`CITRATE_GENESIS_HASH`) | the client refuses to POST unless `/health` echoes the pin (#80) |
 | G3 | Fund the grantor `MEMBERSHIP_GRANTOR` `0x57b06e5d…ba2a` from the treasury (32,000 SALT per member to re-grant, plus gas). It holds no balance in block 0 | a treasury transfer (GOVERNANCE or treasury key, 1Password item names only) | **[OWNER]** money movement |
 | G4 | Set `CITRATE_GENESIS_HASH` = `R1007_GENESIS` on core-membership (Vercel, server-side), then `vercel --prod` | core-membership#80 deploy order | until set, every grant is refused, with nothing sent (`genesis_unpinned`) |
-| G5 | Re-issue: one full reconcile sweep. `sweepRerollReissues` returns each `granted`/`active`/`renewed` order whose SBT is absent and whose sub is unbound (`isRerollPhantom`) to `paid`; the stranded-order loop then re-grants it through the triple-proof, single-writer and KYC path (mint the SBT, then `vault.grant(member, 32000e18, tokenId)`) | core-membership#70 (`fix/reroll-reissue`, OPEN; moved to 0.5.3) | needs #70 merged first. Each re-issue is audited `grant.reissue` and gets no dunning, SLA refund or welcome email. The member's wallet must be on record (the identity → members bridge) |
-| G5′ | Fallback if #70 is not merged: per member with an active order and on-chain SBT = 0, call `mintMember(member, keccak256(sub), now, now+1y)` and then `grant(member, 32000e18, tokenId)` with `--value 32000e18` through the droplet signer | the droplet `/_ops/treasury/grant` (3-argument grant, SBT first). This is the 2026-09-20 manual procedure | the app's `staging-grant.mjs` still uses the stale 2-argument grant and must not be used |
-| G6 | Verify: for every re-granted member, `SBT.balanceOf = 1` and `vault.attributedStake = 32,000e18` on r1007, and the explorer shows the grant txs | `eth_call` read-only | the success gate for S4-3 / g5-apps |
+| G5 | Re-issue: one full reconcile sweep. `sweepRerollReissues` returns each `granted`/`active`/`renewed` order whose SBT is absent and whose sub is unbound (`isRerollPhantom`) to `paid`; the stranded-order loop then re-grants it through the triple-proof, single-writer and KYC path (mint the SBT, then `vault.grant(member, 32000e18, tokenId)`) | core-membership#70 (`fix/reroll-reissue`, OPEN; moved to 0.5.3) | needs #70 merged first, **and #70 changed for the term (below)**: as written it opens a fresh one-year term. Each re-issue is audited `grant.reissue` and gets no dunning, SLA refund or welcome email. The member's wallet must be on record (the identity → members bridge) |
+| G5′ | Fallback if #70 is not merged: per member with an active order and on-chain SBT = 0, call `mintMember(member, keccak256(sub), now, <remaining-term end>)` and then `grant(member, 32000e18, tokenId)` with `--value 32000e18` through the droplet signer | the droplet `/_ops/treasury/grant` (3-argument grant, SBT first). This is the 2026-09-20 manual procedure, with the term end changed | the app's `staging-grant.mjs` still uses the stale 2-argument grant and must not be used |
+| G6 | Verify: for every re-granted member, `SBT.balanceOf = 1`, `vault.attributedStake = 32,000e18` and the SBT expiry = the member's r1006 term end on r1007, and the explorer shows the grant txs | `eth_call` read-only | the success gate for S4-3 / g5-apps |
 | G7 | Re-deploy the post-genesis contracts that r1006 had outside block 0 (forwarder/relayer, Radar, the 32 unpinned deploys), and re-run `setPaymaster`. **Their addresses move**: they are nonce-CREATE from post-genesis deployers. Re-pin every consumer after an `eth_getCode` check | the per-app deploy scripts listed on fed#331; the stale-pin scan (every repo's default branch) | the drift rule (memory `reroll-membership-contracts-drift`) applies here, not to the block-0 SBT and vault |
 
-Decisions the owner still has to make for the grants:
-- the re-grant term: a fresh year from the re-grant date (#70's behaviour) versus the
-  remaining r1006 term;
-- whether r1006-only grantees with no paid order get anything.
+### 4.1 The re-grant term (owner decision 2026-11-09)
+
+A re-issued grant carries the **remaining r1006 term**, not a fresh year:
+- The SBT is minted with `start = now` and `expiry` = the member's r1006 term end. The
+  term end comes from the order's `expires_at` in core-membership (the member's paid
+  coverage), which is the same end the r1006 SBT was minted with.
+- An order whose `expires_at` is past is not re-issued. That is #70's existing "coverage
+  remains" guard.
+- An order with a NULL `expires_at` has no recorded end in the database. Its end is read
+  from that member's r1006 SBT (`expiry` of `tokenIdForSub(subHash)`) on the final r1006
+  snapshot, **before r1006 is retired (S4-5)**. If neither source has an end, the order is
+  left for an operator and not granted.
+- Change needed in core-membership#70: re-issue grants pass the order's remaining term to
+  the mint, instead of `now + 1 year`. Add a test that a re-issued order's SBT expiry
+  equals the order's `expires_at`. This lands before G5 runs.
+
+Still open for the owner: whether r1006-only grantees with no paid order get anything.
 
 ## 5. Integration checklist (for the step that combines the r1007 lanes)
 
@@ -203,11 +218,18 @@ Decisions the owner still has to make for the grants:
    `checkpoint_enforcement_pinned(chain_id)`, which voting-v2 removes or changes, so it
    needs a hand fix.
 2. `genesis_committee_set`: add the `R1007_GENESIS` arm (§3.3).
-3. Bind the recorded parameters to their constants with a test in the owning crate:
-   - `slots::SLOT_DURATION_SECS == R1007_CHAIN_PARAMS.slot_duration_secs`, and the same
-     for `MAX_FUTURE_SLOT_DRIFT_SECS`;
-   - `acceptance::INCLUDE_GAS_LIMIT` and `ACCEPT_GAS_LIMIT`;
-   - `checkpoint::CHECKPOINT_INTERVAL` and `CHECKPOINT_COMMITTEE_SIZE`.
+3. Bind the lane constants to `R1007_CHAIN_PARAMS`. The constants do not exist on this
+   branch, so the binding test can only compile after the merges in step 1:
+   - `slots::SLOT_DURATION_SECS` (time-slots-v2), and `MAX_FUTURE_SLOT_DRIFT_SECS`;
+   - `acceptance::INCLUDE_GAS_LIMIT` and `ACCEPT_GAS_LIMIT` (mergeset-execution);
+   - `checkpoint::CHECKPOINT_INTERVAL` and `CHECKPOINT_COMMITTEE_SIZE` (finality-fixes).
+
+   The test is `r1007_chain_params_bind_the_lane_constants` in
+   `core/consensus/tests/r1007_chain_params.rs`, one `assert_eq!` per constant. On
+   2026-11-09 the lane branches carry exactly the compiled values (1, 15, 30M, 60M, 50,
+   100). The constants that exist here are bound already: `GhostDagParams::default()`,
+   `MERGE_PARENT_MAX_DEPTH`, `CheckpointConfig::default()`, `DEFAULT_VOTE_DEPTH`,
+   `producer::PRODUCER_BLOCK_GAS_LIMIT`, the undo-window and retention constants.
 4. Re-run `cargo run -p citrate-economics --example r1007_genesis_hash`, re-pin
    `R1007_GENESIS`, and run `cargo test --workspace`.
 5. Every genesis builder publishes the MPT rule first:

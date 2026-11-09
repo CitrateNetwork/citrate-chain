@@ -2,7 +2,7 @@
 //!
 //! Owner decisions (ADR-2026-11-03 Q-1, Q-3; 2026-11-03 and 2026-11-07):
 //! * r1007 is a new-genesis **rehearsal** of chain 40204 (not the ceremony genesis);
-//! * from the **same validator set**, with **today's contract set**: block 0 holds
+//! * from the **same validator set** and the same producer keys (owner 2026-11-09), with **today's contract set**: block 0 holds
 //!   exactly the r1006 block-0 state (`assets/r1006/alloc.json` and
 //!   `assets/r1006/validators.json`, read in place: one source of truth, Rule 9), so
 //!   every block-0 contract address, the membership SBT and vault included, is the
@@ -31,10 +31,9 @@ pub const GENESIS_NOTE_ADDRESS: Address = Address([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xC1, 0x7A, 0x7E, 0x10, 0x07,
 ]);
 
-/// The r1007 block-0 message. It is part of the genesis state, so it is part of the
-/// genesis hash. PENDING OWNER: the wording (docs/consensus/R1007_GENESIS.md).
-pub const GENESIS_NOTE: &str =
-    "Citrate r1007. The orchard is replanted from the same seed: the same contracts at block zero, the same keepers at the gate. Tend the orchard; share the harvest.";
+/// The r1007 block-0 message (owner decision 2026-11-09). It is part of the genesis state,
+/// so it is part of the genesis hash.
+pub const GENESIS_NOTE: &str = "Citrate r1007: rehearsal genesis for chain 40204";
 
 /// Whether `cfg` is the r1007 genesis: it carries the r1007 note account. Used by the
 /// shared genesis function to require the MPT rule for this profile.

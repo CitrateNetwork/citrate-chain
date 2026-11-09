@@ -23,7 +23,7 @@ use crate::hardening::R1007_GENESIS;
 /// The block-0 chain parameters of one genesis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenesisChainParams {
-    /// `SLOT_DURATION` (06 §1.2, G9). PENDING OWNER O2: 1 s is r1006's live cadence.
+    /// `SLOT_DURATION` (06 §1.2, G9). 1 s: owner decision 2026-11-09 (O2).
     pub slot_duration_secs: u64,
     /// Ingress future-drift bound for a block's slot (06 G9, reviewer R12).
     pub max_future_drift_secs: u64,
@@ -43,9 +43,9 @@ pub struct GenesisChainParams {
     pub committee_size: usize,
     /// Checkpoint vote depth `D` (votes only for a block buried this deep).
     pub checkpoint_vote_depth: u64,
-    /// `INCLUDE_GAS_LIMIT` per block (06 D9). PENDING OWNER O5: provisional until S1-2.
+    /// `INCLUDE_GAS_LIMIT` per block (06 D9). 30M: owner decision 2026-11-09 (O5).
     pub include_gas_limit: u64,
-    /// `ACCEPT_GAS_LIMIT` per accepting block (06 D9). PENDING OWNER O5.
+    /// `ACCEPT_GAS_LIMIT` per accepting block (06 D9). 60M: owner decision 2026-11-09 (O5).
     pub accept_gas_limit: u64,
     /// Height from which the stake-gated producer set is enforced (start of epoch 1).
     pub validator_activation_height: u64,
@@ -86,7 +86,8 @@ impl GenesisChainParams {
     }
 }
 
-/// r1007's block-0 parameters (planset 06 §1.2, ADR CV-7a/CV-8; owner 2026-11-07).
+/// r1007's block-0 parameters (planset 06 §1.2, ADR CV-7a/CV-8; owner 2026-11-07 and
+/// 2026-11-09).
 pub const R1007_CHAIN_PARAMS: GenesisChainParams = GenesisChainParams {
     slot_duration_secs: 1,
     max_future_drift_secs: 15,
