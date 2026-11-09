@@ -74,6 +74,48 @@
         "type": "string",
         "pattern": "^0x[0-9a-fA-F]{40}$"
       }
+    },
+    "genesisHash": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{64}$",
+      "description": "Block-0 hash of the network generation this book describes (eth_getBlockByNumber(0x0).hash). Readers compare it with the chain they talk to before trusting any address."
+    },
+    "source": {
+      "type": "object",
+      "description": "The books this file is generated from (path relative to the citrate-chain repo root, sha256 of the file bytes, and the deployer / timestamp each records).",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "regenerator": { "type": ["string", "null"] },
+          "deployer": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+          "deployedAt": { "type": "string", "format": "date-time" },
+          "contracts": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "CitrateMemberSBT": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$",
+      "description": "Top-level pin of contracts.CitrateMemberSBT (same address)."
+    },
+    "MembershipStakeVault": {
+      "type": "string",
+      "pattern": "^0x[0-9a-fA-F]{40}$",
+      "description": "Top-level pin of contracts.MembershipStakeVault (same address)."
+    },
+    "governance": {
+      "type": "object",
+      "description": "GOVERNANCE and GUARDIAN timelock addresses (each also a contracts entry). Archived books may also carry descriptive fields (type, threshold, minDelaySeconds) that were true for their own network only.",
+      "required": ["GOVERNANCE", "GUARDIAN"],
+      "properties": {
+        "GOVERNANCE": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
+        "GUARDIAN": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" }
+      },
+      "additionalProperties": { "type": ["string", "integer"] }
     }
   }
 }
