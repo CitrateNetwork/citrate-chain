@@ -2,7 +2,7 @@
 created: 2026-11-08T22:00:00Z
 branch: feat/v060-genesis-workmarket
 author: Larry Klosowski + Claude Opus 5.5 (MAC lane, V60-GEN)
-status: draft (ceremony-genesis candidate; owner decisions of 2026-11-09 and the #451 review fixes (rounds 1-3) applied; not deployed; internal audit GEN-AUDIT pending)
+status: draft (ceremony-genesis candidate; owner decisions of 2026-11-09 (incl. the Q4 revision) and the #451 review fixes (rounds 1-4) applied; not deployed; internal audit GEN-AUDIT pending)
 spec: citrate-federation .agentile/planset/2026-11-07-v060/06_CONTRACTS.md §2-§4, §6-§8
 ---
 
@@ -40,8 +40,12 @@ window, commit-reveal disputes; and the changes they make to points 2-6 and 13) 
 time-based reveal delay, challenge bonds, the coordinating-poster slash rule) and
 "#451 review 3" (round 3: the slash sink, held challenge bonds paid to the coordinator, the
 commit deadline, the minimum coordinator bond) come from the independent reviews of chain #451
-and are not yet owner-approved. Round 3 changes Q4 where the poster's share is concerned (see
-point 4); every other owner answer stands.
+and are not yet owner-approved. **Q4 is revised by the owner (2026-11-09, owner-approved, after
+#451 review 4):** every slashed coordinator bond on an upheld objective dispute or unanswered
+challenge goes `SLASH_DISPUTER_BPS` (50 %) to the rewarded disputer and 50 % to `slashSink` (the
+governance treasury); the poster never receives any part of a slash and still gets its unspent
+budget refunded as before; an uncommitted `dispute()`, or a disputer who is the poster, sends
+100 % to the sink (point 4). Every other owner answer stands.
 
 1. **`open` takes a struct** (`OpenParams`) instead of 14 flat arguments, and gains
    `coordinatorBond` and `disputeAdmin`. 06 §2 stores both in the offer and §2.2 relies on them,
@@ -77,17 +81,19 @@ point 4); every other owner answer stands.
    last slot or by padding opening in the next slot, ending below `payoutUnits`; or padding at
    slot 0, an empty tree posted with units). An upheld dispute withdraws the root, slashes the
    coordinator bond and returns the offer to Running so a new root can be posted before the
-   deadline. The slash (#451 reviews 2 and 3): the poster never takes back a slash it could have
-   brought about itself, since its coordinator may be a second address of its own.
-   - A direct `dispute()` call, or any dispute or challenge by the poster (committed or not):
-     the whole bond goes to `slashSink`, a constructor-set immutable (the governance treasury,
-     GEN-PARAMS). So a poster that coordinates through a second address and disputes its own
-     root recovers nothing; nor does a copier who lands a revealed dispute through `dispute()`.
+   deadline. The slash (owner 2026-11-09, Q4 revised, owner-approved): the poster never receives
+   any part of a slash, since its coordinator, and any worker, may be an address of its own.
    - A revealed commitment (point 5c) or an unanswered challenge, by someone other than the
-     poster: the whole bond to the disputer when the poster is the coordinator; otherwise
-     `SLASH_DISPUTER_BPS` = 50 % to the disputer and the rest to the poster (Q4).
-   This replaces Q4's "the poster disputes and takes 100 %": that path is exactly how a poster
-   with a second-address coordinator would undo its own slash. Every upholding path
+     poster: `SLASH_DISPUTER_BPS` = 50 % to that disputer, the rest to `slashSink`, a
+     constructor-set immutable (the governance treasury, GEN-PARAMS).
+   - A direct `dispute()` call, or any dispute or challenge by the poster (committed or not):
+     the whole bond to `slashSink`. So a copier who lands a revealed dispute through
+     `dispute()` earns nothing, and a poster that disputes its own root recovers nothing.
+   A colluding side (the poster, a coordinator that is the poster or its second address, and
+   sybil workers it joins) therefore recovers at most half of any slashed bond, however it
+   arranges the dispute (#451 review 4: a sybil pre-commitment, or a second-address
+   coordinator plus a sybil, used to recover all of it through the old whole-bond and
+   poster-half rules). The poster still gets its unspent budget back (points 7, 8). Every upholding path
    (`dispute`, `revealDispute`, `resolveChallenge`, `resolveIndexChallenge`) goes through this
    one rule; the subjective path never slashes (the worker's bond is returned, point 6).
    Receipt digest: `keccak256(abi.encode(RECEIPT_TAG, chainid, market, offerId, worker, leaseId,
@@ -143,8 +149,9 @@ point 4); every other owner answer stands.
    a coordinator no longer profits from a root that turns out bad, and a finder who forced the
    opening that exposed it loses nothing). The coordinator, not whoever answered, is paid, so a
    challenger that answers its own challenge (or answers from a second address) to delay
-   settling by up to 48 h pays its bond for the delay; that was chosen over only documenting the
-   48 h bound because it costs nothing in honest use (honest challengers are answered by the
+   settling by up to 48 h pays its bond for the delay, unless the challenger is the coordinator
+   itself (then the bond comes back to it: point 14, X2); that was chosen over only documenting
+   the 48 h bound because it costs nothing in honest use (honest challengers are answered by the
    coordinator anyway). `releaseChallengeBond` / `releaseIndexChallengeBond` (anyone may call)
    pay a held bond to whichever party it belongs to; raising a challenge on the same slot or
    worker under a new root also refunds a stale one. Chosen over re-posting after the deadline
@@ -196,12 +203,12 @@ point 4); every other owner answer stands.
       is reached and so keep honest workers out; joined accounts may also raise challenges. A
       poster who expects that sets a join bond (returned to the worker in every case, Q5) or an
       `allowlistRoot`.
-    - *Poster as coordinator (#451 reviews 2, 3).* `open` does not forbid `coordinator == poster`:
+    - *Poster as coordinator (#451 reviews 2-4).* `open` does not forbid `coordinator == poster`:
       the poster could name a second address it controls, so a ban would only hide the case.
       After `DISPUTE_TOTAL` a coordinating poster cannot under-post units or over-sum the tree
-      unpunished: a committed dispute pays its whole bond to the disputer, and its own dispute
-      sends the bond to `slashSink`, so it recovers nothing whether it coordinates in its own
-      name or through a second address. It can still, like any
+      unpunished: at least half of its slashed bond goes to `slashSink` whatever dispute is used,
+      and none of it to the poster, whether it coordinates in its own name or through a second
+      address, with or without sybil workers. It can still, like any
       coordinator, never post a root and refund after the deadline: the coordinator's liveness
       is trusted, and the bond prices only bad roots. Workers choose offers by coordinator.
     - *Late-challenge liveness.* A challenge raised just before the window ends delays settling,
@@ -212,6 +219,19 @@ point 4); every other owner answer stands.
       of making every leaf provable; a coordinator that publishes the full tree to its workers
       leaves them nothing to challenge. Each challenge carries a bond (point 5d), so spam the
       coordinator answers costs the challenger.
+    - *Coordinator self-delay (#451 review 4, X2).* A coordinator that also joined as a worker
+      may challenge its own root and answer itself: the held bond comes back to it as the
+      coordinator once the root survives, so it can delay settling at no cost. The delay is
+      bounded the same way (challenges only inside the window, so at most 48 h past it), the
+      workers are still paid in full afterwards, and nothing else is gained.
+    - *Held bonds on a Disputed group TASK (#451 review 4, X5).* While a subjective dispute
+      holds the offer in Disputed, a held challenge bond cannot be released: the root has not
+      survived. It is released once the dispute admin rules (upheld: the root is withdrawn and
+      the challenger is refunded; rejected: the root survives at the window end and the bond is
+      paid out as usual) or the poster refunds the offer (the root is withdrawn).
+    - *Challenge cost is visible before joining.* The poster sets `coordinatorBond` at `open` (at
+      least `minCoordinatorBond`), and the challenge bond is 10 % of it, so a worker knows what a
+      challenge will cost on an offer before it joins (`challengeBondOf(id)`).
 
 ## GEN-PARAMS (constructor parameters for the ceremony genesis spec)
 
@@ -231,7 +251,7 @@ their addresses are known before the ceremony.
 | WorkMarket | `initialVerifiers_` | `[FLRoundVerifier, TaskVerifier]` | the CREATE2-predicted addresses above; deploy order: FRL, the two verifiers, then WorkMarket |
 
 Fixed in code (not parameters): `MIN_DISPUTE_WINDOW` = 24 h, `MAX_WORKERS_CAP` = 1024,
-`SLASH_DISPUTER_BPS` = 5000 (Q4), `MAX_RECEIPTS_PER_DISPUTE` = 256,
+`SLASH_DISPUTER_BPS` = 5000 (Q4, revised by the owner 2026-11-09: the rest goes to `slashSink`), `MAX_RECEIPTS_PER_DISPUTE` = 256,
 `CHALLENGE_RESPONSE_WINDOW` = 24 h, `POST_ANSWER_DISPUTE_WINDOW` = 24 h, `RESERVE_CLAIM_PERIOD` = 180 days,
 `DISPUTE_REVEAL_DELAY` = 60 s, `CHALLENGE_BOND_BPS` = 1000 (10 % of the coordinator bond).
 The payout tree depth is per payout, bounded by `maxWorkers` (at most 10 for 1024 workers). Native SALT only; the market
