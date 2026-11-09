@@ -17,8 +17,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// hash -> (height, selected parent, committed pruning point)
-fn sealed() -> &'static Mutex<HashMap<Hash, (u64, Hash, Hash)>> {
-    static SEALED: OnceLock<Mutex<HashMap<Hash, (u64, Hash, Hash)>>> = OnceLock::new();
+type Sealed = Mutex<HashMap<Hash, (u64, Hash, Hash)>>;
+
+fn sealed() -> &'static Sealed {
+    static SEALED: OnceLock<Sealed> = OnceLock::new();
     SEALED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
