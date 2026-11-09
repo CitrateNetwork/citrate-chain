@@ -98,7 +98,7 @@ self_test() {
     function proposeListing(bytes32 id, uint8 kind, bytes32 h, bytes32 p) external;/' "$tmp/contracts/src/amc/RegistryGuardian2of3.sol"
   scan_guardian_actions "$tmp/contracts/src/amc/RegistryGuardian2of3.sol" >/dev/null || { echo "self-test: A4 missed an added action"; rc=1; }
 
-  rm -r "$tmp"
+  rm -r "${tmp:?}"
   [ "$rc" -eq 0 ] && echo "amc tripwire self-test: A1 A2 A3 A4 detect their class"
   return "$rc"
 }
