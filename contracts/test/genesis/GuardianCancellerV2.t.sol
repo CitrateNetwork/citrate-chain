@@ -153,6 +153,44 @@ contract GuardianCancellerV2Test is Test {
         assertFalse(tl.isOperation(id));
     }
 
+    /// Review round 2, P3-1 (A1): a CANCELLER_ROLE grant is a replacement only alongside a
+    /// removal of this canceller's own path (as in v1); next to a registry rotation alone it is
+    /// an ordinary call, so the batch stays cancellable. Both orders.
+    function test_rotation_with_a_canceller_grant_stays_cancellable() public {
+        address evil = makeAddr("evil-canceller");
+        for (uint256 k = 0; k < 2; k++) {
+            address[] memory t = new address[](2);
+            bytes[] memory p = new bytes[](2);
+            t[k] = address(registry);
+            p[k] = _rotation();
+            t[1 - k] = address(tl);
+            p[1 - k] = abi.encodeCall(tl.grantRole, (canceller, evil));
+            bytes32 salt = keccak256(abi.encode("a1", k));
+            assertFalse(c.isGuardianRemoval(t, new uint256[](2), p));
+            bytes32 id = _scheduleBatch(t, p, salt);
+            vm.prank(council);
+            c.cancelBatch(t, new uint256[](2), p, bytes32(0), salt);
+            assertFalse(tl.isOperation(id));
+        }
+    }
+
+    /// The v1 replacement (revoke this canceller + grant a successor) keeps its v1 status when it
+    /// rides with the registry rotation: every call is a guardian-path change.
+    function test_rotation_with_a_v1_canceller_replacement_is_not_cancellable() public {
+        address[] memory t = new address[](3);
+        bytes[] memory p = new bytes[](3);
+        t[0] = address(registry);
+        p[0] = _rotation();
+        t[1] = address(tl);
+        p[1] = abi.encodeCall(tl.revokeRole, (canceller, address(c)));
+        t[2] = address(tl);
+        p[2] = abi.encodeCall(tl.grantRole, (canceller, makeAddr("successor-canceller")));
+        bytes32 id = _scheduleBatch(t, p, keccak256("replace"));
+        vm.prank(council);
+        _refused(id);
+        c.cancelBatch(t, new uint256[](3), p, bytes32(0), keccak256("replace"));
+    }
+
     // ── v1 behaviour is kept ───────────────────────────────────────
 
     function test_v1_guardian_removal_still_not_cancellable() public {
