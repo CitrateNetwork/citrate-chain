@@ -98,17 +98,28 @@ fn genesis_hash(storage: &StorageManager) -> Result<Option<String>, jsonrpc_core
 ///   reads) is above the applied tip (`BlockStore::get_applied_tip`).
 /// - `synced`: neither.
 ///
-/// `highestSeen` is `null` when no sync signal is wired.
+/// `highestSeen` is `null` when no sync signal is wired. `appliedBlueScore`
+/// is the applied tip's `header.blue_score` (CF_HEADERS), `null` when unknown.
 pub fn sync_state_json(
     storage: &StorageManager,
     highest_seen: Option<u64>,
 ) -> Result<Value, jsonrpc_core::Error> {
-    let applied = storage
+    let tip = storage
         .blocks
         .get_applied_tip()
-        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?
-        .map(|(_, h)| h)
-        .unwrap_or(0);
+        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?;
+    let applied = tip.as_ref().map(|(_, h)| *h).unwrap_or(0);
+    // CV-3: the applied tip's header-committed GHOSTDAG blue score (the unit of
+    // `net_peerInfo[].headBlueScore`). Source: CF_HEADERS[applied tip hash];
+    // `null` when no tip is recorded or its header is not stored.
+    let applied_blue_score = match tip {
+        Some((hash, _)) => storage
+            .blocks
+            .get_header(&hash)
+            .map_err(|e| internal_error(format!("applied tip header lookup failed: {e}")))?
+            .map(|h| h.blue_score),
+        None => None,
+    };
     let hex_hash = |h: &citrate_consensus::types::Hash| format!("0x{}", hex::encode(h.as_bytes()));
     let wedge = citrate_storage::chain::wedge::read(&storage.db)
         .map_err(|e| internal_error(format!("dead-branch marker unreadable: {e}")))?;
@@ -118,6 +129,7 @@ pub fn sync_state_json(
             "reason": w.reason,
             "forkDepth": w.fork_depth(),
             "appliedHeight": applied,
+            "appliedBlueScore": applied_blue_score,
             "highestSeen": highest_seen,
             "deadTip": { "hash": hex_hash(&w.dead_tip), "height": w.dead_tip_height },
             "forkPoint": { "hash": hex_hash(&w.fork_point), "height": w.fork_height },
@@ -139,6 +151,7 @@ pub fn sync_state_json(
         "reason": reason,
         "forkDepth": Value::Null,
         "appliedHeight": applied,
+        "appliedBlueScore": applied_blue_score,
         "highestSeen": highest_seen,
     }))
 }

@@ -63,6 +63,17 @@ impl NetworkApi {
     /// They are ADVERTISED, not proven held (`sync_peer.rs` invariant I4), so
     /// `headSource` is `"advertised"`. Before the handshake completes
     /// (`Connecting` / `Handshaking`) no head is known and both are `null`.
+    ///
+    /// Units (CV-3, one blue-score unit): `headHeight` is the block height
+    /// (`header.height`, `heightUnit: "header.height"`), the unit of
+    /// `eth_blockNumber` and `citrate_nodeIdentity.syncState.appliedHeight`.
+    /// `headBlueScore` is the GHOSTDAG blue score of the same head block
+    /// (`header.blue_score`, header-committed and validated at admission;
+    /// `blueScoreUnit: "ghostdag.blue_score"`), the unit of
+    /// `syncState.appliedBlueScore`. Data source: `PeerInfo.head_blue_score`,
+    /// set with the head by every gossiped block from the peer
+    /// (`PeerInfo::observe_gossiped_head`); Hello/HelloAck carry none, so it
+    /// is `null` (`headBlueScoreSource: null`) until gossip names it.
     pub async fn get_peer_info(&self) -> Result<Vec<serde_json::Value>, ApiError> {
         use citrate_network::peer::{Direction, PeerState};
         let mut out = Vec::new();
@@ -89,6 +100,16 @@ impl NetworkApi {
                 "headHash": head_known
                     .then(|| format!("0x{}", hex::encode(info.head_hash.as_bytes()))),
                 "headSource": "advertised",
+                "heightUnit": "header.height",
+                "headBlueScore": info
+                    .head_blue_score
+                    .filter(|_| head_known)
+                    .map(|b| format!("0x{b:x}")),
+                "headBlueScoreSource": info
+                    .head_blue_score
+                    .filter(|_| head_known)
+                    .map(|_| "gossip"),
+                "blueScoreUnit": "ghostdag.blue_score",
                 "lastSeenSecsAgo": info.last_seen.elapsed().as_secs(),
                 "connectedSecs": info.connected_at.elapsed().as_secs(),
                 "score": info.score,

@@ -120,13 +120,15 @@ This method tells a client what changed on the applied chain since it last saw
 ← {"removedChainBlockHashes":["0x…b3","0x…b2"],
    "commonAncestor":{"hash":"0x…a1","height":"0x1"},
    "addedChainBlocks":[{"hash":"0x…a2","height":"0x2"},{"hash":"0x…a3","height":"0x3"}],
+   "addedChainBlockHashes":["0x…a2","0x…a3"],
    "more":false,
    "appliedTip":{"hash":"0x…a3","height":"0x3"}}
 ```
 
 - `removedChainBlockHashes` runs from `fromHash` down, highest first. It is empty when
   `fromHash` is still on the chain.
-- `addedChainBlocks` is in ascending order. When `more` is `true`, call again from the
+- `addedChainBlocks` is in ascending order. `addedChainBlockHashes` lists the same
+  blocks as bare hashes, in the same order (Kaspa's name; the explorer reads it). When `more` is `true`, call again from the
   last added hash.
 - An unknown `fromHash` is error `-32602`. A `fromHash` more than 10,000 blocks off the
   chain is error `-32000`; resync from a chain block.
@@ -144,7 +146,7 @@ This method returns the chain block that executed a transaction (spec 06 §5.4).
 ```json
 ← {"transactionHash":"0x…","acceptingBlockHash":"0x…c2","acceptingHeight":"0x2",
    "inclusions":[{"blockHash":"0x…c2","dagHeight":"0x2","isSelectedChain":true,
-                  "outcome":"executed","status":"0x1"}],
+                  "color":"selected_parent","outcome":"executed","status":"0x1"}],
    "inclusionsComplete":false,"knownTransaction":true,
    "semantics":"including-chain-block"}
 ```
@@ -154,6 +156,10 @@ This method returns the chain block that executed a transaction (spec 06 §5.4).
 - **On this base:** a chain block executes its own transactions, so the accepting block
   is the including block (`semantics: "including-chain-block"`). Only the receipt's block
   is listed (`inclusionsComplete: false`).
+  - `color` and `outcome` use the spec 06 §5.4 words. An executed inclusion is a
+    selected-chain block: `color: "selected_parent"`, `outcome: "executed"`.
+  - A receipt whose block left the applied chain (a reorg) is `color: "unaccepted"`,
+    `outcome: "pending"`: no chain block has executed the transaction.
 - **After S3-3b:**
   - the next chain block executes a block's transactions, and `semantics` becomes
     `"accepting"`;
@@ -176,9 +182,11 @@ block-depth estimate (CV-8).
   - the compiled pins (`CHECKPOINT_VOTING_PINS`, `CHECKPOINT_ENFORCEMENT_PINS`).
 
 ```json
-← {"chainId":"0x9d0c","votingPinned":false,"enforcementPinned":false,"enforcement":false,
+← {"published":true,"voting":false,"mode":null,
+   "quorumRule":"vote count: Checkpoint::effective_quorum of the committee (not stake-weighted on this base)",
+   "chainId":"0x9d0c","votingPinned":false,"enforcementPinned":false,"enforcement":false,
    "finalizedSource":"height-handle",
-   "finalized":{"height":"0x0","hash":"0x…genesis"},
+   "finalized":{"height":"0x0","hash":"0x…genesis","blockHash":"0x…genesis"},
    "latestCertificate":{"height":"0x2","blockHash":"0x…","committeeSize":4,"voters":3,
      "quorum":3,"epoch":null,"stateRoot":null,"acceptedRoot":null,
      "votedStake":null,"totalStake":null,"quorumStake":null},
@@ -189,6 +197,16 @@ block-depth estimate (CV-8).
 ```
 
 The fields listed in `pendingFinalityLane` are `null` on this base.
+
+- **Keys shared with the finality lane and the explorer** (citrate-explorer#51,
+  `src/lib/citrate/r1007.ts`, gates every finality figure on `published`):
+  - `published` is `true`: this view is read from storage on every call, so one always
+    exists;
+  - `voting` is the compiled voting pin (`votingPinned`);
+  - `mode` is `"enforced"` when verified certificates feed the finalized tag, and
+    otherwise `null`, because this base cannot tell the lane's `legacy` from `observed`;
+  - `quorumRule` names the count rule this base's certificates use;
+  - `finalized.blockHash` repeats `finalized.hash` under the lane's name.
 
 - **Where they come from:** branch `r1007/s3-finality-voting` (fbe06ac6, unreviewed)
   adds the v2 vote message (epoch, state root, accepted root), the stake-weighted
@@ -368,11 +386,34 @@ an Ethereum one, so it is extended in place. The fields it already returned (`id
   `headSource` is `"advertised"`.
 - **Before the handshake completes** (`connecting`, `handshaking`), no head is known and
   both fields are `null`, not 0.
+- **Blue score** (`headBlueScore`): the GHOSTDAG blue score of the same head block,
+  `PeerInfo.head_blue_score`.
+  - Hello/HelloAck carry no blue score, so it is `null` (and `headBlueScoreSource` is
+    `null`) until a gossiped block from the peer raises the head. Then
+    `headBlueScoreSource` is `"gossip"`.
+  - Height, hash and blue score move together (`PeerInfo::observe_gossiped_head`), so
+    they always describe one block.
+
+### Units (CV-3: one blue score)
+
+| Field | Unit | Same unit as |
+|---|---|---|
+| `headHeight` (`heightUnit: "header.height"`) | block height, `header.height` | `eth_blockNumber`, `citrate_nodeIdentity.syncState.appliedHeight` and `highestSeen` |
+| `headBlueScore` (`blueScoreUnit: "ghostdag.blue_score"`) | GHOSTDAG blue score, `header.blue_score` (header-committed, validated at admission, CV-3) | `syncState.appliedBlueScore`, `citrate_getGhostdagData.blueScore` |
+
+Compare a peer's `headHeight` with this node's `appliedHeight`, and a peer's
+`headBlueScore` with `appliedBlueScore`. Never compare across the two units: with merge
+parents the blue score runs ahead of the height.
+
+`syncState.appliedBlueScore` is the applied tip's `header.blue_score` (`CF_HEADERS`), or
+`null` when no tip or header is stored.
 
 ```json
 → {"method":"net_peerInfo","params":[]}
 ← [{"id":"12D3…","addr":"10.0.0.1:30303","direction":"outbound","state":"connected",
     "headHeight":"0x4d2","headHash":"0xabab…","headSource":"advertised",
+    "heightUnit":"header.height","headBlueScore":"0x4d9","headBlueScoreSource":"gossip",
+    "blueScoreUnit":"ghostdag.blue_score",
     "lastSeenSecsAgo":2,"connectedSecs":3600,"score":0}]
 ```
 

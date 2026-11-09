@@ -302,6 +302,8 @@ pub fn ghostdag_data_json(
 ///   (highest first). Empty when `fromHash` is still on it.
 /// - `addedChainBlocks`: applied chain blocks above the common ancestor,
 ///   ascending, at most `limit` (`more: true` if there are more).
+/// - `addedChainBlockHashes`: the same blocks as bare hashes, same order
+///   (Kaspa's field name; the explorer's chain-change feed reads it).
 ///
 /// Data sources: `CF_HEADERS` (the selected-parent walk), the canonical height
 /// index and the applied tip. The walk from `fromHash` is bounded by
@@ -355,6 +357,7 @@ pub fn selected_chain_changes_json(
     }
     let common = (cursor, header.height);
     let mut added = Vec::new();
+    let mut added_hashes = Vec::new();
     let mut h = common.1.saturating_add(1);
     let last = common.1.saturating_add(limit).min(tip.1);
     while h <= last {
@@ -363,7 +366,10 @@ pub fn selected_chain_changes_json(
             .get_canonical_block_by_height(h)
             .map_err(internal)?
         {
-            Some(hash) => added.push(json!({ "hash": hx(&hash), "height": qty(h) })),
+            Some(hash) => {
+                added.push(json!({ "hash": hx(&hash), "height": qty(h) }));
+                added_hashes.push(hx(&hash));
+            }
             None => break,
         }
         h = h.saturating_add(1);
@@ -372,6 +378,7 @@ pub fn selected_chain_changes_json(
         "removedChainBlockHashes": removed,
         "commonAncestor": { "hash": hx(&common.0), "height": qty(common.1) },
         "addedChainBlocks": added,
+        "addedChainBlockHashes": added_hashes,
         "more": last < tip.1,
         "appliedTip": { "hash": hx(&tip.0), "height": qty(tip.1) },
     }))
@@ -391,6 +398,13 @@ pub fn selected_chain_changes_json(
 /// carries the tx, with colour and outcome). That index does not exist here,
 /// so `inclusions` holds only the block named by the receipt and
 /// `inclusionsComplete` is `false`.
+///
+/// Inclusion `color` / `outcome` use the spec 06 §5.4 vocabulary. On this
+/// base the including block is itself a selected-chain block when it executed
+/// the tx: `color: "selected_parent"` (a chain block, as the explorer renders
+/// it), `outcome: "executed"`. A receipt whose block left the applied chain
+/// (a reorg) is `color: "unaccepted"`, `outcome: "pending"`: no chain block
+/// has executed the tx.
 ///
 /// Data sources: the receipt store (`CF_RECEIPTS[tx_hash]`: block hash and
 /// number), the canonical height index (is that block on the applied chain),
@@ -427,7 +441,8 @@ pub fn accepting_block_json(
             "blockHash": hx(&r.block_hash),
             "dagHeight": dag_height,
             "isSelectedChain": accepted,
-            "outcome": if accepted { "executed" } else { "unaccepted" },
+            "color": if accepted { "selected_parent" } else { "unaccepted" },
+            "outcome": if accepted { "executed" } else { "pending" },
             "status": if r.status { "0x1" } else { "0x0" },
         }],
         "inclusionsComplete": false,
@@ -510,6 +525,15 @@ fn latest_certificate(
 ///   (`checkpoint_gadget::CHECKPOINT_VOTING_PINS`, `CHECKPOINT_ENFORCEMENT_PINS`);
 /// - `interval`: `CheckpointConfig::default().interval`, `voteDepth`:
 ///   `checkpoint::DEFAULT_VOTE_DEPTH`.
+///
+/// Key set shared with the finality lane's handler (`r1007/s3-finality-voting`
+/// `finality_status.rs`) and read by citrate-explorer#51: `published` is
+/// `true` (this view is read from storage on every call, so one always
+/// exists), `voting` is the compiled voting pin, `mode` is `"enforced"` when
+/// verified certificates feed the finalized tag and otherwise `null` (this
+/// base cannot tell the lane's `legacy` from `observed`), `quorumRule` names
+/// the count rule this base's certificates use (`Checkpoint::effective_quorum`),
+/// and `finalized.blockHash` repeats `finalized.hash` under the lane's name.
 pub fn finality_status_json(
     storage: &StorageManager,
     finalized: &FinalizedTagSource,
@@ -529,16 +553,24 @@ pub fn finality_status_json(
     };
     let cert = latest_certificate(storage)?;
     let config = citrate_consensus::checkpoint::CheckpointConfig::default();
+    let enforced = matches!(finalized, FinalizedTagSource::Verified(_));
+    let finalized_hex = finalized_hash.as_ref().map(hx);
     Ok(json!({
+        "published": true,
+        "voting": citrate_consensus::checkpoint_gadget::checkpoint_voting_pinned(chain_id),
+        "mode": if enforced { json!("enforced") } else { Value::Null },
+        "quorumRule": "vote count: Checkpoint::effective_quorum of the committee (not \
+                       stake-weighted on this base)",
         "chainId": qty(chain_id),
         "votingPinned": citrate_consensus::checkpoint_gadget::checkpoint_voting_pinned(chain_id),
         "enforcementPinned":
             citrate_consensus::checkpoint_gadget::checkpoint_enforcement_pinned(chain_id),
-        "enforcement": matches!(finalized, FinalizedTagSource::Verified(_)),
+        "enforcement": enforced,
         "finalizedSource": source,
         "finalized": {
             "height": qty(anchor.height),
-            "hash": finalized_hash.as_ref().map(hx),
+            "hash": finalized_hex,
+            "blockHash": finalized_hex,
         },
         "latestCertificate": cert.map(|cp| json!({
             "height": qty(cp.height),

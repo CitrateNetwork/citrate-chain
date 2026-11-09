@@ -64,6 +64,12 @@ pub struct PeerInfo {
     pub version: Option<ProtocolVersion>,
     pub head_height: u64,
     pub head_hash: Hash,
+    /// GHOSTDAG blue score (`header.blue_score`, CV-3) of the block named by
+    /// `head_hash`, when the node knows it. Hello/HelloAck carry no blue
+    /// score, so this is `None` from the handshake until a gossiped block
+    /// raises the head ([`PeerInfo::observe_gossiped_head`]). Like the head
+    /// itself it is advertised, not proven held.
+    pub head_blue_score: Option<u64>,
     pub connected_at: Instant,
     pub last_seen: Instant,
     pub messages_sent: u64,
@@ -90,6 +96,7 @@ impl PeerInfo {
             version: None,
             head_height: 0,
             head_hash: Hash::default(),
+            head_blue_score: None,
             connected_at: now,
             last_seen: now,
             messages_sent: 0,
@@ -99,6 +106,20 @@ impl PeerInfo {
             score: 0,
             send_drops: 0,
         }
+    }
+
+    /// A block gossiped by this peer proves it holds at least that block, so
+    /// a block above the known head raises the head: height, hash and blue
+    /// score together, so the three always describe one block. A block at or
+    /// below the head changes nothing. Returns whether the head moved.
+    pub fn observe_gossiped_head(&mut self, height: u64, hash: Hash, blue_score: u64) -> bool {
+        if height <= self.head_height {
+            return false;
+        }
+        self.head_height = height;
+        self.head_hash = hash;
+        self.head_blue_score = Some(blue_score);
+        true
     }
 
     pub fn update_last_seen(&mut self) {
