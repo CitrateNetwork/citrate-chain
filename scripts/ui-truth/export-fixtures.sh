@@ -172,8 +172,10 @@ call skills_registered      SkillRegistry    "totalSkills()(uint256)"
 call models_registered      ModelRegistry    "totalModels()(uint256)"
 
 # Governance.
-call governance_min_delay_s GOVERNANCE "minDelay()(uint256)"
-call guardian_min_delay_s   GUARDIAN   "minDelay()(uint256)"
+# r1006 GOVERNANCE / GUARDIAN are OZ TimelockControllers: the delay is getMinDelay(). (r1005's
+# MultisigTimelock2of3 named it minDelay(), which reverts on r1006.)
+call governance_min_delay_s GOVERNANCE "getMinDelay()(uint256)"
+call guardian_min_delay_s   GUARDIAN   "getMinDelay()(uint256)"
 
 HEAD_END=$(head_now)
 mkdir -p "$(dirname "$OUT")"
