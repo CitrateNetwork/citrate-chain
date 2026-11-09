@@ -710,12 +710,14 @@ fn heavy_methods_carry_a_method_budget_cost() {
         heavy_method_cost("ots_getContractCreator"),
         citrate_api::trace_rpc::CREATOR_LOOKUP_COST
     );
-    assert!(citrate_api::trace_rpc::TRACE_COST > 0);
-    assert!(citrate_api::historical_state::HISTORICAL_POINT_READ_COST > 0);
-    assert!(
-        citrate_api::historical_state::HISTORICAL_FULL_STATE_COST
-            > citrate_api::historical_state::HISTORICAL_POINT_READ_COST
-    );
+    const { assert!(citrate_api::trace_rpc::TRACE_COST > 0) };
+    const { assert!(citrate_api::historical_state::HISTORICAL_POINT_READ_COST > 0) };
+    const {
+        assert!(
+            citrate_api::historical_state::HISTORICAL_FULL_STATE_COST
+                > citrate_api::historical_state::HISTORICAL_POINT_READ_COST
+        )
+    };
 }
 
 // ── DAG fixture: 1, 2, 3, 5, 6 ───────────────────────────────────────────
