@@ -2222,10 +2222,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PIL-42's genesis DAG seed moved into `BlockAdmission::seed_genesis` (see
     // SYNC-S1 D2 below) so that every chain-store/DAG-store consistency concern
     // lives in one module under one set of rules.
-    let shared_ghostdag = Arc::new(GhostDag::new(
-        GhostDagParams::default(),
-        shared_dag_store.clone(),
-    ));
+    // G11: the pruning-point walk reads headers DAG pruning dropped from the
+    // chain store (a late or side-branch block inside the undo window).
+    let shared_ghostdag = Arc::new(
+        GhostDag::new(GhostDagParams::default(), shared_dag_store.clone())
+            .with_ancestry_headers(Arc::new(dag_prune::ChainStoreHeaders(storage.clone()))),
+    );
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
     let checkpoint_manager = {

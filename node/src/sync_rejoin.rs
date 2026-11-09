@@ -1732,7 +1732,12 @@ mod tests {
         let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
         let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag load"));
         dag.set_configured_genesis(g.header.block_hash);
-        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        // As main.rs wires it: the G11 walk reads pruned headers from the chain store.
+        let ghostdag = Arc::new(
+            GhostDag::new(GhostDagParams::default(), dag.clone()).with_ancestry_headers(Arc::new(
+                crate::dag_prune::ChainStoreHeaders(storage.clone()),
+            )),
+        );
         let executor = Arc::new(Executor::with_storage_and_chain_id(
             Arc::new(StateDB::new()),
             Some(storage.state.clone()),

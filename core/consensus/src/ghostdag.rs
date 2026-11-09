@@ -171,6 +171,22 @@ pub fn merge_depth_activation_height() -> u64 {
 const MAX_GHOSTDAG_CACHE_ENTRIES: usize = 65_536;
 
 /// GhostDAG consensus engine
+/// Where the G11 pruning-point walk reads a selected-chain header that the
+/// DAG store no longer holds (spec 06 §2 G11, CV-7a).
+///
+/// At a boundary height `h` the expected pruning point is the chain ancestor at
+/// `h - PRUNING_DEPTH`. For a block below the tip (a late block, or a side
+/// branch forked inside the undo window, both of which a node must admit) that
+/// ancestor lies below the DAG prune floor. The node's chain store keeps every
+/// admitted header beyond that floor, so the walk reads it there. A header is
+/// content-addressed by its hash, so its source cannot change the result: it
+/// only decides whether the walk can finish. A header found nowhere still
+/// fails closed (`MissingParent`).
+pub trait AncestryHeaders: Send + Sync {
+    /// The header of `hash`, if this source holds it.
+    fn header(&self, hash: &Hash) -> Option<BlockHeader>;
+}
+
 pub struct GhostDag {
     /// Consensus parameters
     params: GhostDagParams,
@@ -210,6 +226,10 @@ pub struct GhostDag {
     /// authoritative after a restart. The applicator's runtime deep-fork rebuild
     /// gates on this instead of a block-height heuristic. See `dag_hydrated_handle`.
     dag_hydrated: Arc<AtomicBool>,
+
+    /// Fallback header source for the G11 pruning-point walk (see
+    /// [`AncestryHeaders`]); `None` reads the DAG store only.
+    ancestry: Option<Arc<dyn AncestryHeaders>>,
 }
 
 /// One entry of `GhostDag::validated`.
@@ -290,7 +310,15 @@ impl GhostDag {
             tips: Arc::new(RwLock::new(HashSet::new())),
             keys: Arc::new(RwLock::new(HashMap::new())),
             dag_hydrated: Arc::new(AtomicBool::new(false)),
+            ancestry: None,
         }
+    }
+
+    /// G11: read selected-chain headers the DAG store has pruned from
+    /// `source` (the node's chain store) during the pruning-point walk.
+    pub fn with_ancestry_headers(mut self, source: Arc<dyn AncestryHeaders>) -> Self {
+        self.ancestry = Some(source);
+        self
     }
 
     /// Override the PBA-R2 hardening activation (tests / isolated devnets).
@@ -1086,10 +1114,13 @@ impl GhostDag {
     /// O(1) between boundaries: SP's committed value (validated when SP was
     /// admitted) is B's whenever `pp_h(SP) = pp_h(B)`. When the boundary moves
     /// (`(height − PRUNING_DEPTH)` a multiple of the interval), it walks SP's
-    /// selected chain down to `pp_h(B)`, `PRUNING_DEPTH − 1` header reads; a
-    /// node never prunes above the pruning point of its tip, so the walk stays
-    /// on retained headers. A header the walk needs and does not have fails
-    /// closed (`MissingParent`). The producer seals with the same function.
+    /// selected chain down to `pp_h(B)`, `PRUNING_DEPTH − 1` header reads. For a
+    /// block at or above the tip those headers are at or above the tip's
+    /// pruning point, which the node never prunes (G11 floor). For a block
+    /// below the tip (late, or on a branch inside the undo window) they reach
+    /// below the DAG prune floor and come from the [`AncestryHeaders`] source.
+    /// A header the walk needs and finds nowhere fails closed
+    /// (`MissingParent`). The producer seals with the same function.
     pub async fn expected_pruning_point(
         &self,
         selected_parent: &Hash,
@@ -1113,7 +1144,19 @@ impl GhostDag {
                     "selected chain of {selected_parent} does not reach pruning height {target}"
                 )));
             }
-            cur = self.header_of(&cur.selected_parent_hash).await?;
+            cur = self.chain_header_of(&cur.selected_parent_hash).await?;
+        }
+    }
+
+    /// A selected-chain header for the G11 walk: the DAG store, else the
+    /// [`AncestryHeaders`] source, else `MissingParent` (fail closed).
+    async fn chain_header_of(&self, hash: &Hash) -> Result<BlockHeader, GhostDagError> {
+        match self.header_of(hash).await {
+            Ok(h) => Ok(h),
+            Err(e) => match self.ancestry.as_ref().and_then(|a| a.header(hash)) {
+                Some(h) if h.block_hash == *hash => Ok(h),
+                _ => Err(e),
+            },
         }
     }
 

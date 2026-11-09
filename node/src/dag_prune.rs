@@ -91,15 +91,49 @@ pub fn configured_retain() -> Option<u64> {
 /// `prune()` removes blocks strictly BELOW the pruning point, so this returns
 /// the floor of the retained range. Pure function so the policy is unit-testable
 /// without a store.
+///
+/// Spec 06 G11: a node MUST NOT prune at or above `pruning_point(applied tip)`.
+/// The point is `applied - retain` rounded DOWN to a checkpoint height, so it
+/// is never above the tip's G11 pruning point (`retain >= PRUNING_DEPTH`) and
+/// the tip's committed pruning point block stays in the DAG store.
 pub fn pruning_point_height(applied_height: u64, retain: u64) -> Option<u64> {
     let retain = retain.max(MIN_RETAIN_BLOCKS);
-    let point = applied_height.checked_sub(retain)?;
+    let interval = citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
+    let unaligned = applied_height.checked_sub(retain)?;
+    let point = unaligned
+        .checked_div(interval)
+        .unwrap_or(0)
+        .saturating_mul(interval);
     // point == 0 would make `prune()` a no-op (nothing is below height 0) and
     // would also target genesis itself; skip until the chain is deep enough.
     if point == 0 {
         return None;
     }
     Some(point)
+}
+
+/// G11 (spec 06 §2): the chain store as the [`AncestryHeaders`] source of the
+/// pruning-point walk. DAG pruning drops blocks from the DAG store only; the
+/// chain store keeps their headers (`CF_HEADERS`), so a pruned node validates
+/// the pruning point of a late or side-branch block inside the undo window the
+/// same way an unpruned node does. Data source: `BlockStore::get_header`.
+///
+/// [`AncestryHeaders`]: citrate_consensus::ghostdag::AncestryHeaders
+pub struct ChainStoreHeaders(pub Arc<StorageManager>);
+
+impl citrate_consensus::ghostdag::AncestryHeaders for ChainStoreHeaders {
+    fn header(
+        &self,
+        hash: &citrate_consensus::types::Hash,
+    ) -> Option<citrate_consensus::types::BlockHeader> {
+        match self.0.blocks.get_header(hash) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("dag-prune: chain-store header {hash} unreadable for the G11 walk: {e}");
+                None
+            }
+        }
+    }
 }
 
 /// The height below which DAG pruning has dropped blocks from `dag_store`
@@ -348,7 +382,8 @@ mod tests {
     #[test]
     fn prunes_below_the_retained_window() {
         assert_eq!(pruning_point_height(11_000, 10_000), Some(1_000));
-        assert_eq!(pruning_point_height(67_441, 10_000), Some(57_441));
+        // G11: rounded down to a checkpoint height (57,441 -> 57,400).
+        assert_eq!(pruning_point_height(67_441, 10_000), Some(57_400));
     }
 
     /// Spec 06 G11: "a node MUST NOT prune at or above pruning_point(applied
