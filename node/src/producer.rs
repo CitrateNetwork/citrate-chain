@@ -9117,6 +9117,55 @@ mod tests {
             assert!(split_guard_on(&b), "the split guard is not raised");
         }
 
+        /// r1007 G9 (#184): the same majority branch, built the way G9 builds
+        /// it. All four producers seal in every slot at the slot boundary, so
+        /// each slot has four sibling blocks on the same selected parent; the
+        /// next slot's blocks select one of them and merge the other three.
+        /// The merged siblings are nobody's selected parent, so each is a
+        /// one-block "branch" of its own, and their proposers looked like
+        /// proposers on two branches (counted on none). The branch then showed
+        /// one proposer instead of four and B sealed solo after the cap.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_concurrent_siblings_of_one_branch_count_their_proposers() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut tip = Hash::new([0xA9; 32]);
+            let mut height = start.1 + 10;
+            let mut losers: Vec<Hash> = Vec::new();
+            let mut sealed = Vec::new();
+            for step in 0..=18u64 {
+                let t = step * 10;
+                height += 1;
+                let mut slot_blocks = Vec::new();
+                for i in 1..=4u8 {
+                    let mut x = signed(&templates, i, height, tip, t);
+                    x.header.merge_parent_hashes = losers.clone();
+                    x.header.block_hash = x.compute_hash();
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    slot_blocks.push(x);
+                }
+                hear(&mut b, &slot_blocks).await;
+                // The next slot selects one sibling and merges the rest.
+                tip = slot_blocks[0].header.block_hash;
+                losers = slot_blocks[1..].iter().map(|x| x.header.block_hash).collect();
+                if b.producer.produce_block().await.is_ok() {
+                    sealed.push(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                sealed,
+                Vec::<u64>::new(),
+                "B sealed on its own tip while 4 of 7 producers extend a branch it cannot \
+                 admit, sealing concurrently as G9 has them"
+            );
+            assert_eq!(applied(&b), start, "B extended a solo branch");
+            assert!(split_guard_on(&b), "the split guard is not raised");
+        }
+
         /// The guard is bounded by the evidence: once the majority stops producing,
         /// B seals again within the 30 s evidence window (plus one round). Refusing
         /// producers produce nothing, so if every producer were refusing, the
