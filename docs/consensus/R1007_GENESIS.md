@@ -208,7 +208,25 @@ A re-issued grant carries the **remaining r1006 term**, not a fresh year:
   the mint, instead of `now + 1 year`. Add a test that a re-issued order's SBT expiry
   equals the order's `expires_at`. This lands before G5 runs.
 
-Still open for the owner: whether r1006-only grantees with no paid order get anything.
+**r1006-only grantees (owner decision 2026-11-09).** A member who held an r1006 SBT but
+has no paid order **is** re-granted on r1007, with the remaining term of that r1006 SBT.
+
+Where this is implemented (core-membership#83, stacked on #70):
+- **`scripts/r1007-reissue.ts`:**
+  - The end is the order's `expires_at`, else the r1006 SBT's `termEnd` from the final
+    snapshot export. With neither, the member goes to `term_unknown_operator_queue` and is
+    not granted.
+  - r1006-only grantees are re-granted by default (`--r1006-only regrant`, the owner's
+    decision). `skip` only lists them.
+  - `verify` checks each SBT's term end against the plan.
+- **#70's reconcile:**
+  - A re-issue with no recorded expiry is queued for an operator once (`grant.reissue`,
+    denied, `reissue_term_unknown`). It is never granted a fresh year.
+  - A re-issue with an expiry is minted to that expiry, as before.
+
+The final r1006 snapshot is taken at the ceremony's grant freeze, before the cut
+(federation `ops/r1007-ceremony/RUNBOOK.md`, T0). Slot r1006 stays on every host until
+S4-5, so the snapshot can be taken again until then.
 
 ## 5. Integration checklist (for the step that combines the r1007 lanes)
 
