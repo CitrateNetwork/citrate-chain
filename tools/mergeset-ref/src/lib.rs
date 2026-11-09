@@ -36,6 +36,8 @@ pub struct RefPolicy {
     pub registry: [u8; 20],
     pub priority_fee_share_bps: u64,
     pub block_subsidy: U256,
+    /// The system account §R' vests from (`creditReward`'s caller).
+    pub reward_minter: [u8; 20],
     pub staker_of: HashMap<[u8; 32], [u8; 20]>,
 }
 
@@ -50,6 +52,36 @@ pub struct RefConfig {
     pub pba_hardening_height: Option<u64>,
     pub supply_hardening_height: Option<u64>,
     pub storage_root_hardening_height: Option<u64>,
+    /// Genesis contract code: (address, runtime bytecode).
+    pub genesis_code: Vec<([u8; 20], Vec<u8>)>,
+    /// The EVM activation rules the node executed under.
+    pub evm: EvmRules,
+}
+
+/// The node's EVM activation heights (network-profile values). The reference
+/// executes contract transactions only where it implements the rule in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvmRules {
+    /// From this height REVM's balance changes are authoritative: every value
+    /// movement a call makes, top-level and internal, lands.
+    pub value_transfer_height: u64,
+    /// From this height a contract account's nonce, as REVM computes it, is
+    /// stored (EIP-161: 1 at creation, +1 per CREATE it runs).
+    pub create_nonce_fix_height: u64,
+    /// From this height code created inside a call is stored as its original
+    /// bytes; below it, as REVM's analysed (zero-padded) form.
+    pub exact_create_code_height: Option<u64>,
+}
+
+impl Default for EvmRules {
+    /// The r1007 genesis rules: everything active from block 1.
+    fn default() -> Self {
+        Self {
+            value_transfer_height: 0,
+            create_nonce_fix_height: 0,
+            exact_create_code_height: Some(1),
+        }
+    }
 }
 
 impl RefConfig {
@@ -140,6 +172,20 @@ pub struct Report {
     /// Transactions executed and occurrences skipped over the matched blocks.
     pub executed: u64,
     pub skipped: u64,
+    /// Skipped occurrences by reason: B1 nonce, B2 balance, B3 gas.
+    pub skipped_nonce: u64,
+    pub skipped_balance: u64,
+    pub skipped_gas: u64,
+    /// Of `executed`, how many failed (status 0: revert, halt, out of gas).
+    pub failed: u64,
+    /// Contracts created (top-level deployments and CREATE inside calls).
+    pub created: u64,
+    /// Logs emitted by executed transactions.
+    pub logs: u64,
+    /// The largest |Mergeset(C)| over the matched chain blocks, and the
+    /// number of red members accepted.
+    pub max_mergeset: u64,
+    pub reds: u64,
     pub tip_height: u64,
     pub divergence: Option<Divergence>,
 }
@@ -177,6 +223,14 @@ pub fn replay(
         lists_compared: 0,
         executed: 0,
         skipped: 0,
+        skipped_nonce: 0,
+        skipped_balance: 0,
+        skipped_gas: 0,
+        failed: 0,
+        created: 0,
+        logs: 0,
+        max_mergeset: 0,
+        reds: 0,
         tip_height: 0,
         divergence: None,
     };
@@ -318,6 +372,26 @@ pub fn replay(
         }
         report.executed += acc.receipts.len() as u64;
         report.skipped += acc.skipped.len() as u64;
+        for (_, _, kind) in &acc.skipped {
+            match kind {
+                exec::SkipKind::Nonce => report.skipped_nonce += 1,
+                exec::SkipKind::Balance => report.skipped_balance += 1,
+                exec::SkipKind::Gas => report.skipped_gas += 1,
+                exec::SkipKind::Code | exec::SkipKind::Invalid => {}
+            }
+        }
+        report.failed += acc.receipts.iter().filter(|r| !r.status).count() as u64;
+        report.created += acc.created;
+        report.logs += acc
+            .receipts
+            .iter()
+            .map(|r| r.logs.len() as u64)
+            .sum::<u64>();
+        report.max_mergeset = report.max_mergeset.max(members.len() as u64);
+        report.reds += members
+            .iter()
+            .filter(|(_, col)| *col == ghostdag::Color::Red)
+            .count() as u64;
         report.matched += 1;
     }
     Ok(report)

@@ -93,6 +93,8 @@ fn merging_block_executes_first_copy_skips_duplicate_and_pays_blues() {
         pba_hardening_height: None,
         supply_hardening_height: None,
         storage_root_hardening_height: None,
+        genesis_code: Vec::new(),
+        evm: citrate_mergeset_ref::EvmRules::default(),
     };
     let mut state = State::genesis(&cfg.genesis_alloc);
     let out = state.accept(&cfg, &c, &members).expect("covered");
@@ -108,7 +110,7 @@ fn merging_block_executes_first_copy_skips_duplicate_and_pays_blues() {
     );
     assert_eq!(
         out.skipped,
-        vec![(t.hash, a.header.block_hash)],
+        vec![(t.hash, a.header.block_hash, exec::SkipKind::Nonce)],
         "a's copy is a nonce skip"
     );
     assert_eq!(out.gas_used, 2 * TRANSFER_GAS);

@@ -170,6 +170,9 @@ pub async fn replay(rec: &Recording, mode: &dyn OrderingMode) -> Result<Report> 
     for (addr, balance) in &cfg.genesis_alloc {
         exec.set_balance(&Address(*addr), U256::from_big_endian(balance));
     }
+    for (addr, code) in &cfg.genesis_code {
+        exec.set_code(&Address(*addr), code.clone());
+    }
 
     let calculator = RewardCalculator::new(reference_reward_config());
     let treasury = reference_reward_config().treasury_address;

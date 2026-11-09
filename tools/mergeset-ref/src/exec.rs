@@ -65,18 +65,48 @@ pub struct RefReceipt {
     pub including_block: Hash,
     pub status: bool,
     pub gas_used: u64,
+    /// (address, topics, data) of each log, in emission order.
+    pub logs: Vec<RefLog>,
+}
+
+/// One log as the reference commits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefLog {
+    pub address: [u8; 20],
+    pub topics: Vec<[u8; 32]>,
+    pub data: Vec<u8>,
 }
 
 /// What one chain block's acceptance produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
     pub receipts: Vec<RefReceipt>,
-    /// Skipped occurrences: (tx hash, including block).
-    pub skipped: Vec<(Hash, Hash)>,
+    /// Skipped occurrences: (tx hash, including block, why).
+    pub skipped: Vec<(Hash, Hash, SkipKind)>,
+    /// Contracts created.
+    pub created: u64,
     pub gas_used: u64,
     pub accepted_root: Hash,
     pub receipt_root: Hash,
     pub state_root: Hash,
+}
+
+/// Why an occurrence was skipped (spec 06 §3.4 class B, plus the stateless
+/// leftovers). Not consensus: only "skipped" is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkipKind {
+    /// B1: the nonce is not the sender's state nonce (a duplicate, a double
+    /// spend's loser, or a gap).
+    Nonce,
+    /// B2: balance below gas_limit * gas_price + value.
+    Balance,
+    /// B3: gas_limit above what is left of ACCEPT_GAS_LIMIT.
+    Gas,
+    /// B4: the sender has code (EIP-3607).
+    Code,
+    /// Signature / chain id, a gas price below the base fee, or a shape no
+    /// transaction type decodes.
+    Invalid,
 }
 
 /// The reference world state.
@@ -172,23 +202,37 @@ impl State {
                     )));
                 }
                 let from = address_of(tx.from.as_bytes());
-                let skip = (pba.active_at(height)
-                    && citrate_consensus::tx_auth::verify_for_block(tx, cfg.chain_id).is_err())
-                    || tx.gas_price < base_fee
-                    || tx.gas_limit > ACCEPT_GAS_LIMIT.saturating_sub(cumulative)
-                    || self.accounts.get(&from).is_some_and(|a| a.has_code);
+                let acct = self.accounts.get(&from).cloned().unwrap_or_default();
                 let need =
                     U256::from(tx.gas_limit) * U256::from(tx.gas_price) + U256::from(tx.value);
-                let acct = self.accounts.get(&from).cloned().unwrap_or_default();
-                let Some(to_key) = tx.to else {
-                    // Empty calldata and no recipient: undecodable, skipped.
-                    skipped.push((tx.hash, block.header.block_hash));
-                    continue;
+                // Spec 06 §3.4, in the order the checks apply: stateless
+                // leftovers, B3 budget, B4 code, B1 nonce, B2 balance, then an
+                // undecodable shape (empty calldata and no recipient).
+                let skip = if (pba.active_at(height)
+                    && citrate_consensus::tx_auth::verify_for_block(tx, cfg.chain_id).is_err())
+                    || tx.gas_price < base_fee
+                {
+                    Some(SkipKind::Invalid)
+                } else if tx.gas_limit > ACCEPT_GAS_LIMIT.saturating_sub(cumulative) {
+                    Some(SkipKind::Gas)
+                } else if acct.has_code {
+                    Some(SkipKind::Code)
+                } else if tx.nonce != acct.nonce {
+                    Some(SkipKind::Nonce)
+                } else if acct.balance < need {
+                    Some(SkipKind::Balance)
+                } else if tx.to.is_none() {
+                    Some(SkipKind::Invalid)
+                } else {
+                    None
                 };
-                if skip || tx.nonce != acct.nonce || acct.balance < need {
-                    skipped.push((tx.hash, block.header.block_hash));
+                if let Some(kind) = skip {
+                    skipped.push((tx.hash, block.header.block_hash, kind));
                     continue;
                 }
+                let Some(to_key) = tx.to else {
+                    continue;
+                };
                 let to = address_of(to_key.as_bytes());
                 // Executed: the fee for the gas used, the nonce, the value.
                 let (status, gas_used) = if tx.gas_limit < TRANSFER_GAS {
@@ -219,6 +263,7 @@ impl State {
                     including_block: block.header.block_hash,
                     status,
                     gas_used,
+                    logs: Vec::new(),
                 });
                 executed.push(tx);
             }
@@ -227,6 +272,7 @@ impl State {
         Ok(Accepted {
             accepted_root: accepted_root(&receipts),
             receipt_root: receipt_root(&receipts),
+            created: 0,
             gas_used: cumulative,
             state_root: self.root(cfg.storage_root_hardening_height, height),
             receipts,

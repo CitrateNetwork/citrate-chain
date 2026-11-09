@@ -67,6 +67,45 @@ const PROBE_CODE: [u8; 19] = [
     0x00,
 ];
 
+/// S3-3c differential contracts. COUNTER: `v = sload(0) + 1; sstore(0, v);
+/// sstore(1, caller); log1(v, topic 0xAA)`, so its storage, its logs and the
+/// receipts' log data depend on the execution order of the calls to it.
+const COUNTER: [u8; 20] = [0xC1; 20];
+const COUNTER_CODE: [u8; 25] = [
+    0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x80, 0x60, 0x00,
+    0x55, // v = sload(0)+1; sstore(0, v)
+    0x60, 0x00, 0x52, // mstore(0, v)
+    0x33, 0x60, 0x01, 0x55, // sstore(1, caller)
+    0x60, 0xAA, 0x60, 0x20, 0x60, 0x00, 0xA1, // log1(0, 32, 0xAA)
+    0x00,
+];
+/// FORWARDER: `call(gas, 0x7F7F..7F, callvalue, 0, 0, 0, 0)`, an internal
+/// value transfer (REVM's balance changes are what land it).
+const FORWARDER: [u8; 20] = [0xF1; 20];
+const FORWARDER_CODE: [u8; 34] = [
+    0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x34, 0x73, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
+    0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x5A, 0xF1,
+    0x50, 0x00,
+];
+/// FACTORY: every call CREATEs a contract whose runtime code is `0x00`
+/// (internal CREATE: the factory's nonce and the created code are stored by
+/// the commit rules).
+const FACTORY: [u8; 20] = [0xFA; 20];
+const FACTORY_CODE: [u8; 23] = [
+    0x69, 0x60, 0x00, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xF3, // push10 init
+    0x60, 0x00, 0x52, // mstore(0, init)
+    0x60, 0x0A, 0x60, 0x16, 0x60, 0x00, 0xF0, // create(0, 22, 10)
+    0x50, 0x00,
+];
+/// Init code deploying a 10-byte counter (`sstore(0, sload(0) + 1)`).
+const DEPLOY_INIT: [u8; 22] = [
+    0x60, 0x0A, 0x60, 0x0C, 0x60, 0x00, 0x39, 0x60, 0x0A, 0x60, 0x00,
+    0xF3, // codecopy; return
+    0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00,
+];
+/// Init code that reverts: a failed deployment.
+const DEPLOY_INIT_REVERTS: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xFD];
+
 fn sender(i: u8) -> Address {
     Address([0x50 + i; 20])
 }
@@ -147,6 +186,8 @@ struct FleetSpec {
     blockhash_probe: bool,
     /// [`GASLIMIT_PROBE`] deployed at genesis.
     gaslimit_probe: bool,
+    /// [`COUNTER`], [`FORWARDER`] and [`FACTORY`] deployed at genesis.
+    contracts: bool,
 }
 
 impl FleetSpec {
@@ -159,7 +200,31 @@ impl FleetSpec {
             reverter: false,
             blockhash_probe: false,
             gaslimit_probe: false,
+            contracts: false,
         }
+    }
+
+    /// The contract code genesis seeds for this spec: (address, code).
+    fn genesis_code(&self) -> Vec<([u8; 20], Vec<u8>)> {
+        let mut out = Vec::new();
+        if self.reverter {
+            out.push((REVERTER, REVERTER_CODE.to_vec()));
+        }
+        if self.policy {
+            out.push((REG, REG_CODE.to_vec()));
+        }
+        if self.blockhash_probe {
+            out.push((PROBE, PROBE_CODE.to_vec()));
+        }
+        if self.gaslimit_probe {
+            out.push((GASLIMIT_PROBE, GASLIMIT_PROBE_CODE.to_vec()));
+        }
+        if self.contracts {
+            out.push((COUNTER, COUNTER_CODE.to_vec()));
+            out.push((FORWARDER, FORWARDER_CODE.to_vec()));
+            out.push((FACTORY, FACTORY_CODE.to_vec()));
+        }
+        out
     }
 }
 
@@ -177,17 +242,8 @@ fn genesis_state(spec: &FleetSpec) -> citrate_execution::state::StateSnapshot {
 /// execution reads it).
 fn seed_genesis(exec: &Executor, spec: &FleetSpec) {
     exec.state_restore(genesis_state(spec));
-    if spec.reverter {
-        exec.set_code(&Address(REVERTER), REVERTER_CODE.to_vec());
-    }
-    if spec.policy {
-        exec.set_code(&Address(REG), REG_CODE.to_vec());
-    }
-    if spec.blockhash_probe {
-        exec.set_code(&Address(PROBE), PROBE_CODE.to_vec());
-    }
-    if spec.gaslimit_probe {
-        exec.set_code(&Address(GASLIMIT_PROBE), GASLIMIT_PROBE_CODE.to_vec());
+    for (addr, code) in spec.genesis_code() {
+        exec.set_code(&Address(addr), code);
     }
 }
 
@@ -1521,4 +1577,433 @@ async fn gaslimit_opcode_is_the_accept_gas_limit() {
         U256::from(citrate_consensus::acceptance::ACCEPT_GAS_LIMIT),
         "GASLIMIT inside an accepted mergeset"
     );
+}
+
+// ---------------------------------------------------------------------------
+// S3-3c differential (spec 06 §8.3, I6): the production executor against the
+// INDEPENDENT reference, on adversarial DAGs carrying contract transactions.
+// ---------------------------------------------------------------------------
+
+/// A contract-path transaction (call when `to` is set, deployment otherwise).
+/// `salt` keeps two transactions that share (sender, nonce, to) distinct.
+#[allow(clippy::too_many_arguments)]
+fn evm_tx(
+    from: u8,
+    nonce: u64,
+    to: Option<[u8; 20]>,
+    value: u128,
+    data: Vec<u8>,
+    gas: u64,
+    gas_price: u64,
+    salt: u8,
+) -> Transaction {
+    let mut tx = transfer(
+        from,
+        nonce,
+        Address(to.unwrap_or([0; 20])),
+        value,
+        gas_price,
+    );
+    tx.to = to.map(|a| embedded(Address(a)));
+    tx.data = data;
+    tx.gas_limit = gas;
+    let mut h = *tx.hash.as_bytes();
+    h[0] = 0xD0;
+    h[30] = salt;
+    tx.hash = Hash::new(h);
+    tx
+}
+
+/// One random transaction of the differential mix, from `from` at `nonce`.
+/// Every kind the production executor routes through REVM is here: calls
+/// that write storage and log (order-dependent), an internal value transfer,
+/// an internal CREATE, deployments that succeed and that revert, a call that
+/// reverts, a call that runs out of gas; and plain transfers. Half pay a
+/// priority fee (so §R' vests run through the registry's code).
+fn mixed_tx(rng: &mut Rng, from: u8, nonce: u64) -> Transaction {
+    let price = if rng.below(2) == 0 {
+        GAS_PRICE
+    } else {
+        2 * GAS_PRICE
+    };
+    let kind = rng.below(9) as u8;
+    let salt = 0x10 + kind;
+    match kind {
+        0 => evm_tx(
+            from,
+            nonce,
+            Some(recipient(from).0),
+            VALUE,
+            vec![],
+            21_000,
+            price,
+            salt,
+        ),
+        1 | 2 => evm_tx(
+            from,
+            nonce,
+            Some(COUNTER),
+            0,
+            vec![0x01],
+            120_000,
+            price,
+            salt,
+        ),
+        3 => evm_tx(
+            from,
+            nonce,
+            Some(FORWARDER),
+            VALUE,
+            vec![0x02],
+            120_000,
+            price,
+            salt,
+        ),
+        4 => evm_tx(
+            from,
+            nonce,
+            Some(REVERTER),
+            0,
+            vec![0x03],
+            60_000,
+            price,
+            salt,
+        ),
+        5 => evm_tx(
+            from,
+            nonce,
+            Some(FACTORY),
+            0,
+            vec![0x04],
+            200_000,
+            price,
+            salt,
+        ),
+        6 => evm_tx(
+            from,
+            nonce,
+            None,
+            0,
+            DEPLOY_INIT.to_vec(),
+            200_000,
+            price,
+            salt,
+        ),
+        7 => evm_tx(
+            from,
+            nonce,
+            None,
+            0,
+            DEPLOY_INIT_REVERTS.to_vec(),
+            120_000,
+            price,
+            salt,
+        ),
+        // Out of gas: 700 + intrinsic leaves no gas for the SLOAD.
+        _ => evm_tx(
+            from,
+            nonce,
+            Some(COUNTER),
+            0,
+            vec![0x05],
+            21_800,
+            price,
+            salt,
+        ),
+    }
+}
+
+/// Rotate producers with full delivery until `min` slots passed and three
+/// blocks in a row carry nothing (every pool drained), bounded.
+async fn settle_fleet(fleet: &Fleet, min: u64) {
+    let n = fleet.nodes.len();
+    let mut empty_run = 0u64;
+    for s in 0..(min + 60) {
+        if s >= min && empty_run >= 3 {
+            break;
+        }
+        let i = (s as usize) % n;
+        if let Ok(h) = fleet.nodes[i].producer.produce_block().await {
+            let b = fleet.nodes[i]
+                .storage
+                .blocks
+                .get_block(&h)
+                .expect("read")
+                .expect("stored");
+            empty_run = if b.transactions.is_empty() {
+                empty_run + 1
+            } else {
+                0
+            };
+            for j in 0..n {
+                fleet.deliver(j, std::slice::from_ref(&b)).await;
+            }
+        }
+    }
+}
+
+/// The differential fleet's senders: 0..=3 random traffic, 4 and 5 the heavy
+/// senders, 6 the double spender.
+const DIFF_TRAFFIC: u8 = 4;
+const HEAVY_A: u8 = 4;
+const HEAVY_B: u8 = 5;
+const DOUBLE_SPENDER: u8 = 6;
+/// Two heavy reverting calls nearly fill ACCEPT_GAS_LIMIT (60M): the txs after
+/// them in the acceptance order are skipped for gas (B3), and a sender's later
+/// nonces then skip as gaps (B1) until both are re-included.
+const HEAVY_GAS: u64 = 29_990_000;
+
+/// An adversarial run for the differential (spec 06 §8.3 generator): random
+/// connected slots with the mixed transactions sent to one or two pools
+/// (duplicates across siblings), then a partition in which every producer
+/// seals `depth` blocks alone, with a cross-partition double spend (a large
+/// spend on one side, a small spend plus a follow-up on the other: the
+/// follow-up then fails B2 where the large spend wins) and two heavy calls on
+/// two sides; then the heal (every block to every node, shuffled: the next
+/// block's mergeset holds every other side's blocks, mostly red at small K)
+/// and the settle. Twice.
+async fn adversarial_run(fleet: &Fleet, rng: &mut Rng, depth: u64) {
+    let n = fleet.nodes.len();
+    let mut next_nonce: HashMap<u8, u64> = HashMap::new();
+    for round in 0..2u8 {
+        // Connected slots.
+        for _ in 0..3 {
+            for s in 0..DIFF_TRAFFIC {
+                for _ in 0..(1 + rng.below(2)) {
+                    let nonce = *next_nonce.entry(s).or_insert(0);
+                    let tx = mixed_tx(rng, s, nonce);
+                    let mut took = false;
+                    for _ in 0..(1 + rng.below(2)) {
+                        let i = rng.below(n as u64) as usize;
+                        took |= fleet.nodes[i].submit(&tx).await;
+                    }
+                    if took {
+                        next_nonce.insert(s, nonce + 1);
+                    }
+                }
+            }
+            let mut sealers: Vec<usize> = (0..n).filter(|_| rng.below(2) == 0).collect();
+            if sealers.is_empty() {
+                sealers.push(rng.below(n as u64) as usize);
+            }
+            let mut new = Vec::new();
+            for i in sealers {
+                if let Ok(h) = fleet.nodes[i].producer.produce_block().await {
+                    if let Some(b) = fleet.nodes[i].storage.blocks.get_block(&h).expect("read") {
+                        new.push(b);
+                    }
+                }
+            }
+            for i in 0..n {
+                let mut order = new.clone();
+                rng.shuffle(&mut order);
+                fleet.deliver(i, &order).await;
+            }
+        }
+        // Partition. The conflict set is placed on separate sides.
+        let d = fleet.nodes[0].nonce(sender(DOUBLE_SPENDER));
+        let salt = 0x40 + round;
+        // Sized from the current balance (round 0's winner spent part of it).
+        let bal = fleet.nodes[0].balance(sender(DOUBLE_SPENDER)).low_u128();
+        let big = evm_tx(
+            DOUBLE_SPENDER,
+            d,
+            Some(recipient(1).0),
+            bal / 10 * 9,
+            vec![],
+            21_000,
+            GAS_PRICE,
+            salt,
+        );
+        let small = evm_tx(
+            DOUBLE_SPENDER,
+            d,
+            Some(recipient(2).0),
+            1,
+            vec![],
+            21_000,
+            GAS_PRICE,
+            salt,
+        );
+        let follow = evm_tx(
+            DOUBLE_SPENDER,
+            d + 1,
+            Some(recipient(3).0),
+            bal / 2,
+            vec![],
+            21_000,
+            GAS_PRICE,
+            salt,
+        );
+        for (i, t, what) in [
+            (0, &big, "large spend"),
+            (1 % n, &small, "small spend"),
+            (1 % n, &follow, "follow-up"),
+        ] {
+            if let Err(e) = fleet.nodes[i]
+                .mempool
+                .add_transaction(t.clone(), TxClass::Standard)
+                .await
+            {
+                panic!("the {what} is not pooled: {e:?}");
+            }
+        }
+        for (i, s) in [(2 % n, HEAVY_A), (3 % n, HEAVY_B)] {
+            let nonce = fleet.nodes[0].nonce(sender(s));
+            assert!(
+                fleet.nodes[i]
+                    .submit(&reverting_call(s, nonce, HEAVY_GAS))
+                    .await,
+                "the heavy call of sender {s} is pooled"
+            );
+        }
+        let mut partitioned = Vec::new();
+        for _ in 0..depth {
+            for (i, node) in fleet.nodes.iter().enumerate() {
+                let s = (i as u8) % DIFF_TRAFFIC;
+                let nonce = *next_nonce.entry(s).or_insert(0);
+                let tx = mixed_tx(rng, s, nonce);
+                if node.submit(&tx).await {
+                    next_nonce.insert(s, nonce + 1);
+                }
+                if let Ok(h) = node.producer.produce_block().await {
+                    if let Some(b) = node.storage.blocks.get_block(&h).expect("read") {
+                        partitioned.push(b);
+                    }
+                }
+            }
+        }
+        // Heal.
+        for i in 0..n {
+            let mut order = partitioned.clone();
+            rng.shuffle(&mut order);
+            fleet.deliver(i, &order).await;
+        }
+        settle_fleet(fleet, 4).await;
+        // Traffic senders whose txs were dropped from every pool would leave
+        // a permanent gap; resume from the agreed state nonce.
+        for s in 0..DIFF_TRAFFIC {
+            next_nonce.insert(s, fleet.nodes[0].nonce(sender(s)));
+        }
+    }
+}
+
+/// S3-3c (spec 06 §8.3, I6), the differential the replay parity test cannot
+/// reach: the production executor (the node, end to end) and the independent
+/// reference (`citrate-mergeset-ref`, its own EVM driver over revm, its own
+/// GHOSTDAG, ordering, outcome classes, settlement and commitments) produce the
+/// same per-chain-block state root, receipt root (status, cumulative gas, gas
+/// used, logs), accepted root, gas used and accepted list, over adversarial
+/// DAGs with: contract calls that write order-dependent storage and logs,
+/// reverted calls and deployments, out-of-gas calls, internal value transfers
+/// and CREATEs, duplicates across siblings, a cross-partition double spend,
+/// balance conflicts, ACCEPT-budget overflow with the nonce gaps it opens,
+/// red blocks, §R' vests into a registry with code, and deep mergesets after a
+/// partition heals. The coverage of each class is asserted, so a generator
+/// that stops producing one fails here.
+#[tokio::test]
+async fn reference_executor_matches_production_on_adversarial_dags() {
+    let mut total = citrate_mergeset_ref::Report {
+        matched: 0,
+        lists_compared: 0,
+        executed: 0,
+        skipped: 0,
+        skipped_nonce: 0,
+        skipped_balance: 0,
+        skipped_gas: 0,
+        failed: 0,
+        created: 0,
+        logs: 0,
+        max_mergeset: 0,
+        reds: 0,
+        tip_height: 0,
+        divergence: None,
+    };
+    for seed in 31..=33u64 {
+        let mut spec = FleetSpec::new(4);
+        spec.senders = 7;
+        spec.k = 1;
+        spec.policy = true;
+        spec.reverter = true;
+        spec.contracts = true;
+        let fleet = Fleet::new(spec.clone()).await;
+        let mut rng = Rng(seed);
+        adversarial_run(&fleet, &mut rng, 4).await;
+        let roots: HashSet<Hash> = fleet
+            .nodes
+            .iter()
+            .map(|n| n.executor.calculate_state_root())
+            .collect();
+        assert_eq!(
+            roots.len(),
+            1,
+            "seed {seed}: the nodes disagree on the state"
+        );
+        for (ni, node) in fleet.nodes.iter().enumerate() {
+            let mut cfg = citrate_replay_ref::ReplayConfig::from_process(CHAIN_ID);
+            cfg.ghostdag_k = spec.k;
+            cfg.genesis_alloc = (0..spec.senders)
+                .map(|s| {
+                    let mut be = [0u8; 32];
+                    U256::from(FUND).to_big_endian(&mut be);
+                    (sender(s).0, be)
+                })
+                .collect();
+            cfg.genesis_code = spec.genesis_code();
+            cfg.validator_activation_height = Some(1);
+            cfg.reward_policy = Some(citrate_replay_ref::RecordedRewardPolicy::from_policy(
+                &policy(&spec),
+            ));
+            let rec = citrate_replay_ref::record_db(&node.storage.db, cfg, format!("node {ni}"))
+                .expect("record");
+            let report = citrate_replay_ref::replay_mergeset(&rec).expect("replay");
+            assert_eq!(
+                report.divergence, None,
+                "seed {seed} node {ni}: the production executor and the reference diverge"
+            );
+            assert_eq!(
+                report.matched,
+                rec.chain.len() as u64 - 1,
+                "seed {seed} node {ni}: every chain block compared"
+            );
+            assert_eq!(
+                report.lists_compared, report.matched,
+                "seed {seed} node {ni}: every accepted list compared"
+            );
+            println!("seed {seed} node {ni}: {report:?}");
+            total.matched += report.matched;
+            total.executed += report.executed;
+            total.skipped += report.skipped;
+            total.skipped_nonce += report.skipped_nonce;
+            total.skipped_balance += report.skipped_balance;
+            total.skipped_gas += report.skipped_gas;
+            total.failed += report.failed;
+            total.created += report.created;
+            total.logs += report.logs;
+            total.reds += report.reds;
+            total.max_mergeset = total.max_mergeset.max(report.max_mergeset);
+        }
+    }
+    // Coverage: every adversarial class reached the comparison.
+    println!("differential totals: {total:?}");
+    assert!(
+        total.failed > 0,
+        "no reverted / failed tx compared: {total:?}"
+    );
+    assert!(
+        total.created > 0,
+        "no contract creation compared: {total:?}"
+    );
+    assert!(total.logs > 0, "no log compared: {total:?}");
+    assert!(total.reds > 0, "no red block accepted: {total:?}");
+    assert!(
+        total.skipped_nonce > 0,
+        "no duplicate / double spend / gap skip: {total:?}"
+    );
+    assert!(
+        total.skipped_balance > 0,
+        "no balance-conflict skip: {total:?}"
+    );
+    assert!(total.skipped_gas > 0, "no ACCEPT-budget skip: {total:?}");
+    assert!(total.max_mergeset >= 8, "no deep mergeset: {total:?}");
 }

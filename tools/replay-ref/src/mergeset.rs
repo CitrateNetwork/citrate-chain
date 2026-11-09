@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use citrate_consensus::types::Hash;
-use citrate_mergeset_ref::{RefConfig, RefPolicy, Report};
+use citrate_mergeset_ref::{EvmRules, RefConfig, RefPolicy, Report};
 use primitive_types::U256;
 
 use crate::recording::Recording;
@@ -30,11 +30,18 @@ pub fn reference_config(rec: &Recording) -> RefConfig {
             registry: p.registry,
             priority_fee_share_bps: p.priority_fee_share_bps,
             block_subsidy: U256::from_big_endian(&p.block_subsidy),
+            reward_minter: p.reward_minter,
             staker_of: p.staker_of.iter().copied().collect(),
         }),
         pba_hardening_height: cfg.pba_hardening_height,
         supply_hardening_height: cfg.supply_hardening_height,
         storage_root_hardening_height: cfg.storage_root_hardening_height,
+        genesis_code: cfg.genesis_code.clone(),
+        evm: EvmRules {
+            value_transfer_height: cfg.evm_rules.value_transfer_height,
+            create_nonce_fix_height: cfg.evm_rules.create_nonce_fix_height,
+            exact_create_code_height: cfg.evm_rules.exact_create_code_height,
+        },
     }
 }
 

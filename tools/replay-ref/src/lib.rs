@@ -40,7 +40,9 @@ pub mod reference;
 
 pub use mergeset::{reference_config, replay_mergeset};
 pub use recorder::{record_data_dir, record_db};
-pub use recording::{ChainEntry, RecordedRewardPolicy, Recording, ReplayConfig, FORMAT_VERSION};
+pub use recording::{
+    ChainEntry, RecordedEvmRules, RecordedRewardPolicy, Recording, ReplayConfig, FORMAT_VERSION,
+};
 pub use reference::{
     full_hash, reference_reward_config, replay, Divergence, Field, OrderingMode, Report,
     SelectedChain,

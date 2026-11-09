@@ -53,6 +53,8 @@ fn main() -> ExitCode {
         storage_root_hardening_height: None,
         genesis_alloc: Vec::new(),
         ghostdag_k: citrate_consensus::ghostdag::GHOSTDAG_K,
+        genesis_code: Vec::new(),
+        evm_rules: citrate_replay_ref::RecordedEvmRules::from_process(),
     };
     let mut i = 0;
     while i < args.len() {

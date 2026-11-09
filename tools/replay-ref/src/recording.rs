@@ -14,8 +14,10 @@ pub const MAGIC: &[u8; 8] = b"CITRPLAY";
 
 /// Format version of [`Recording`]. 2: blocks carry `accepted_root`, the
 /// config the GHOSTDAG K, and chain entries the node's accepted list (r1007
-/// S3-3b).
-pub const FORMAT_VERSION: u32 = 2;
+/// S3-3b). 3: the config carries the genesis contract code and the EVM
+/// activation rules the node executed under (the mergeset reference runs
+/// contract transactions, S3-3c).
+pub const FORMAT_VERSION: u32 = 3;
 
 /// One block of the node's applied selected chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +108,39 @@ pub struct ReplayConfig {
     pub genesis_alloc: Vec<([u8; 20], [u8; 32])>,
     /// GHOSTDAG K the node colored with (`GhostDagParams::k`).
     pub ghostdag_k: u32,
+    /// Genesis contract code: (address, runtime bytecode). A data dir does
+    /// not say which accounts genesis seeded with code, so the caller does.
+    pub genesis_code: Vec<([u8; 20], Vec<u8>)>,
+    /// The EVM activation rules the node executed contract transactions
+    /// under.
+    pub evm_rules: RecordedEvmRules,
+}
+
+/// The process-wide EVM activation heights of `citrate_execution` (each one
+/// a network-profile value, not stored in a data dir).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedEvmRules {
+    /// `executor::value_transfer_activation_height`: from here REVM's balance
+    /// changes are authoritative (internal value transfers land).
+    pub value_transfer_height: u64,
+    /// `executor::create_nonce_fix_activation_height`: from here contract
+    /// account nonces REVM computes are persisted (EIP-161).
+    pub create_nonce_fix_height: u64,
+    /// `exact_code::exact_create_code_height`: from here code created inside
+    /// a call is stored as its original bytes, not REVM's padded analysis.
+    pub exact_create_code_height: Option<u64>,
+}
+
+impl RecordedEvmRules {
+    /// The rules of this process.
+    pub fn from_process() -> Self {
+        Self {
+            value_transfer_height: citrate_execution::executor::value_transfer_activation_height(),
+            create_nonce_fix_height:
+                citrate_execution::executor::create_nonce_fix_activation_height(),
+            exact_create_code_height: citrate_execution::exact_code::exact_create_code_height(),
+        }
+    }
 }
 
 impl ReplayConfig {
@@ -121,6 +156,8 @@ impl ReplayConfig {
                 citrate_execution::storage_root_hardening::storage_root_hardening_height(),
             genesis_alloc: Vec::new(),
             ghostdag_k: citrate_consensus::ghostdag::GHOSTDAG_K,
+            genesis_code: Vec::new(),
+            evm_rules: RecordedEvmRules::from_process(),
         }
     }
 }
