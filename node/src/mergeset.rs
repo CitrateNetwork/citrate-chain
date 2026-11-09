@@ -184,6 +184,61 @@ impl RecentChain {
     }
 }
 
+/// The mempool's included-run reader (r1007, spec 06 D6; lead decision
+/// 2026-11-09). Data source: the durable applied tip (`BlockStore::
+/// get_applied_tip`) and its body (`BlockStore::get_block`). Under mergeset
+/// execution the applied tip's OWN transactions are exactly the ones
+/// included on the applied chain and not yet executed (every earlier chain
+/// block's list was executed by its chain child), so the run starts at the
+/// sender's committed nonce and advances while the tip's list holds the next
+/// nonce. It is recomputed whenever the tip changes, so a reorg that drops
+/// the including block drops the run with it. Only the parsed list is cached
+/// (keyed by the tip hash). A read error yields no run (the committed nonce):
+/// the window never widens on doubt.
+pub(crate) fn included_nonce_reader(
+    storage: std::sync::Arc<StorageManager>,
+) -> citrate_sequencer::mempool::IncludedNonceReader {
+    type Cache = Option<(
+        Hash,
+        std::collections::HashMap<
+            citrate_consensus::types::PublicKey,
+            std::collections::BTreeSet<u64>,
+        >,
+    )>;
+    let cache: std::sync::Arc<parking_lot::Mutex<Cache>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+    std::sync::Arc::new(move |sender, committed| {
+        let Ok(Some((tip, _))) = storage.blocks.get_applied_tip() else {
+            return committed;
+        };
+        let mut guard = cache.lock();
+        if guard.as_ref().map(|(h, _)| *h) != Some(tip) {
+            let Ok(Some(block)) = storage.blocks.get_block(&tip) else {
+                *guard = None;
+                return committed;
+            };
+            let mut by_sender: std::collections::HashMap<_, std::collections::BTreeSet<u64>> =
+                std::collections::HashMap::new();
+            for tx in &block.transactions {
+                by_sender.entry(tx.from).or_default().insert(tx.nonce);
+            }
+            *guard = Some((tip, by_sender));
+        }
+        let mut next = committed;
+        if let Some((_, by_sender)) = guard.as_ref() {
+            if let Some(nonces) = by_sender.get(sender) {
+                while nonces.contains(&next) {
+                    match next.checked_add(1) {
+                        Some(n) => next = n,
+                        None => break,
+                    }
+                }
+            }
+        }
+        next
+    })
+}
+
 #[cfg(test)]
 mod included_window_tests {
     use super::*;

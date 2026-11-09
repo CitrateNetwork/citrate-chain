@@ -328,6 +328,15 @@ impl BoundedHashSet {
 /// txs already buffered here).
 pub type StateNonceReader = Arc<dyn Fn(&PublicKey) -> u64 + Send + Sync>;
 
+/// r1007 (spec 06 D6): given a sender and its committed nonce, the next nonce
+/// after the run of that sender's transactions INCLUDED on the applied chain
+/// but not yet executed, contiguous from the committed nonce (the committed
+/// nonce itself when there is none). Under mergeset execution a block's own
+/// transactions execute one block later, so the committed nonce lags
+/// inclusion; the nonce window counts from this instead. Only a contiguous
+/// run counts, so gap nonces a block carries never widen the window.
+pub type IncludedNonceReader = Arc<dyn Fn(&PublicKey, u64) -> u64 + Send + Sync>;
+
 /// PBA-N9 (security#134): reads a sender's COMMITTED (on-chain) SALT balance,
 /// wired to the executor exactly like [`StateNonceReader`]. Admission uses it to
 /// reject a transaction (on every ingress path) whose sender cannot pay for it
@@ -386,6 +395,9 @@ pub struct Mempool {
     /// PBA-L1a-001: optional committed-nonce reader (see [`StateNonceReader`]).
     state_nonce: Option<StateNonceReader>,
 
+    /// r1007: optional included-run reader (see [`IncludedNonceReader`]).
+    included_nonce: Option<IncludedNonceReader>,
+
     /// PBA-N9: optional committed-balance reader (see [`StateBalanceReader`]).
     /// When set, admission rejects a transaction whose sender cannot fund it
     /// together with its already-pooled transactions.
@@ -429,6 +441,7 @@ impl Mempool {
             evicted: Arc::new(RwLock::new(BoundedHashSet::new(EVICTED_CAP))),
             total_size: Arc::new(RwLock::new(0)),
             state_nonce: None,
+            included_nonce: None,
             state_balance: None,
             banned: Arc::new(RwLock::new(HashMap::new())),
             native_sig: None,
@@ -556,6 +569,25 @@ impl Mempool {
         self
     }
 
+    /// r1007: count the nonce window (both PBA-L1a-001 against state and
+    /// M-SEQ-01 against the pool) from the sender's included run rather than
+    /// its committed nonce alone. The bound (`max_nonce_gap`) is unchanged: a
+    /// sender still cannot queue more than that beyond what the applied chain
+    /// includes. Without it the window counts from the committed nonce.
+    pub fn with_included_nonce_reader(mut self, reader: IncludedNonceReader) -> Self {
+        self.included_nonce = Some(reader);
+        self
+    }
+
+    /// The first nonce of `sender`'s window: the next nonce after its included
+    /// run, never below `committed`.
+    fn window_floor(&self, sender: &PublicKey, committed: u64) -> u64 {
+        match &self.included_nonce {
+            Some(read) => read(sender, committed).max(committed),
+            None => committed,
+        }
+    }
+
     /// PBA-N9 (security#134): admit a transaction only if the sender's committed
     /// balance covers the max cost of the sender's already-pooled transactions
     /// PLUS this one. Wired to the executor's balance view. Without it the pool
@@ -658,6 +690,13 @@ impl Mempool {
         // arbitrary spacing (1, 1_000_000, u64::MAX, …) — 99 of
         // those rotted as gap-junk while consuming slots. The
         // 16-slot window matches Geth's `txpool.accountqueue`.
+        // r1007: pooled txs below the window floor are already included on
+        // the applied chain (they stay pooled until executed); the gap counts
+        // from the floor. Read before taking a pool guard (lock rule 2).
+        let pool_floor = self
+            .state_nonce
+            .as_ref()
+            .map(|read| self.window_floor(&sender, read(&sender)));
         if let Some(set) = self.sender_nonces.read().await.get(&sender) {
             if set.contains(&tx.nonce) {
                 tracing::warn!(
@@ -668,6 +707,7 @@ impl Mempool {
                 return Err(MempoolError::DuplicateNonce { nonce: tx.nonce });
             }
             if let Some(&min_nonce) = set.iter().next() {
+                let min_nonce = pool_floor.map_or(min_nonce, |f| f.max(min_nonce));
                 let gap = tx.nonce.saturating_sub(min_nonce);
                 if gap > self.config.max_nonce_gap {
                     tracing::warn!(
@@ -856,12 +896,15 @@ impl Mempool {
                     got: tx.nonce,
                 });
             }
-            // tx.nonce >= state_nonce (NonceTooLow returned above).
-            if tx.nonce.saturating_sub(state_nonce) > self.config.max_nonce_gap {
+            // tx.nonce >= state_nonce (NonceTooLow returned above). The window
+            // starts after the sender's included run (r1007), which is the
+            // committed nonce when nothing of it is included unexecuted.
+            let floor = self.window_floor(&tx.from, state_nonce);
+            if tx.nonce.saturating_sub(floor) > self.config.max_nonce_gap {
                 return Err(MempoolError::InvalidTransaction(format!(
                     "nonce {} is more than {} ahead of the sender's committed nonce {} \
-                     (PBA-L1a-001)",
-                    tx.nonce, self.config.max_nonce_gap, state_nonce
+                     (included up to {}) (PBA-L1a-001)",
+                    tx.nonce, self.config.max_nonce_gap, state_nonce, floor
                 )));
             }
         }

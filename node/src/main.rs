@@ -2043,6 +2043,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
             })
         })
+        // r1007 (spec 06 D6): the window counts from the sender's run included on
+        // the applied chain but not yet executed, so a steady sender is not
+        // refused while its txs wait one block for acceptance. Same bound (16).
+        .with_included_nonce_reader(crate::mergeset::included_nonce_reader(storage.clone()))
         // PBA-N9 (security#134): reject a transaction on every ingress path when the
         // sender's committed balance cannot cover it together with its already-pooled
         // transactions. Without this the pool admits unfunded floods that evict honest

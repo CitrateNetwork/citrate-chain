@@ -372,6 +372,7 @@ impl MNode {
                     exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
                 })
             })
+            .with_included_nonce_reader(crate::mergeset::included_nonce_reader(storage.clone()))
             .with_state_balance_reader({
                 let exec = executor.clone();
                 Arc::new(move |pk: &PublicKey| {
