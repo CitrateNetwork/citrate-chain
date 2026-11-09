@@ -570,9 +570,9 @@ contract WorkMarketTest is WorkMarketTestBase {
     function test_constructor_rejects_zero_verifier_and_zero_governance() public {
         address[] memory vs = new address[](1);
         vm.expectRevert(WorkMarket.BadParty.selector);
-        new WorkMarket(governance, guardian, vs);
+        new WorkMarket(governance, guardian, 1 ether, vs);
         vm.expectRevert(Governable.Governable_ZeroAddress.selector);
-        new WorkMarket(address(0), guardian, new address[](0));
+        new WorkMarket(address(0), guardian, 1 ether, new address[](0));
     }
 
     /// PBA-L2-002: a salted deploy runs the constructor from the CREATE2 factory, so no admin seat
@@ -580,9 +580,9 @@ contract WorkMarketTest is WorkMarketTestBase {
     function test_constructor_guardian_goes_through_initial_admin_check() public {
         address factory = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
         vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
-        new WorkMarket(governance, factory, new address[](0));
+        new WorkMarket(governance, factory, 1 ether, new address[](0));
         vm.expectRevert(InitialAdmin.InitialAdmin_Zero.selector);
-        new WorkMarket(governance, address(0), new address[](0));
+        new WorkMarket(governance, address(0), 1 ether, new address[](0));
     }
 
     function test_setGuardian_refuses_factory_but_may_clear() public {

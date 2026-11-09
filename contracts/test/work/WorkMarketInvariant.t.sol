@@ -16,7 +16,8 @@ contract WorkMarketHandler is Test {
 
     address[4] internal actors = [address(0xA1), address(0xA2), address(0xA3), address(0xA4)];
     address public poster = address(0x9001);
-    address public coordinator = address(0x9002);
+    uint256 internal constant COORD_KEY = 0xC0FFEE;
+    address public coordinator = vm.addr(COORD_KEY);
 
     uint32 internal constant WINDOW = 24 hours;
 
@@ -30,6 +31,9 @@ contract WorkMarketHandler is Test {
     bool public postedWithoutAcceptance;
     bool public refundTooEarly;
     bool public pauseBlockedExit;
+    bool public settledWhileChallenged;
+    uint256 public challengesRaised;
+    uint256 public challengesResolved;
 
     // liveness: the run actually exercised the market (an all-revert run proves nothing)
     uint256 public opens;
@@ -179,7 +183,9 @@ contract WorkMarketHandler is Test {
                 path[1] = n < 2
                     ? keccak256(abi.encodePacked(bytes1(0x01), leaves[2], leaves[3]))
                     : keccak256(abi.encodePacked(bytes1(0x01), leaves[0], leaves[1]));
+                uint32 openBefore = market.getOffer(id).openChallenges;
                 try market.settle(id, actors[i], per[i], cum, uint32(n), path) {
+                    if (openBefore != 0) settledWhileChallenged = true;
                     settleCount[id][actors[i]] += 1;
                     settles++;
                 } catch {}
@@ -188,6 +194,75 @@ contract WorkMarketHandler is Test {
             cum += per[i];
             n++;
         }
+    }
+
+    /// Opens the actor's leaf (or returns an empty opening if it has none) from the stored tree.
+    function _openingFor(uint256 id, uint256 target) internal view returns (WorkMarket.LeafOpening memory l, bool has) {
+        bytes32[] memory leaves = leavesOf[id];
+        uint64[] memory per = unitsOf[id];
+        if (leaves.length == 0 || per[target] == 0) return (l, false);
+        uint256 n;
+        uint64 cum;
+        for (uint256 i = 0; i < target; i++) {
+            if (per[i] == 0) continue;
+            cum += per[i];
+            n++;
+        }
+        bytes32[] memory path = new bytes32[](2);
+        path[0] = leaves[n ^ 1];
+        path[1] = n < 2
+            ? keccak256(abi.encodePacked(bytes1(0x01), leaves[2], leaves[3]))
+            : keccak256(abi.encodePacked(bytes1(0x01), leaves[0], leaves[1]));
+        l = WorkMarket.LeafOpening({
+            index: uint32(n), worker: actors[target], units: per[target], cumBefore: cum, path: path
+        });
+        return (l, true);
+    }
+
+    /// The challenger (the worker itself) presents 1..3 coordinator-signed receipts.
+    function challenge(uint256 seed, uint256 actorSeed, uint8 count) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        address w = actors[actorSeed % 4];
+        uint256 n = bound(count, 1, 3);
+        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](n);
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 lease = bytes32(i + 1);
+            bytes32 delta = keccak256(abi.encode(lease));
+            bytes32 d = market.receiptDigest(id, w, lease, delta);
+            (uint8 v, bytes32 r, bytes32 s_) =
+                vm.sign(COORD_KEY, keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", d)));
+            rs[i] = WorkMarket.Receipt({
+                worker: w, leaseId: lease, deltaHash: delta, signature: abi.encodePacked(r, s_, v)
+            });
+        }
+        vm.prank(w);
+        try market.challengeInclusion(id, rs) {
+            challengesRaised++;
+        } catch {}
+    }
+
+    /// An honest coordinator answers whenever the leaf covers the claim.
+    function answer(uint256 seed, uint256 actorSeed) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        (WorkMarket.LeafOpening memory l, bool has) = _openingFor(id, actorSeed % 4);
+        if (!has) return;
+        vm.prank(coordinator);
+        try market.answerChallenge(id, l) {} catch {}
+    }
+
+    function resolve(uint256 seed, uint256 actorSeed, bool jump) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        address w = actors[actorSeed % 4];
+        WorkMarket.Challenge memory c = market.challengeOf(id, w);
+        if (jump && c.open && block.timestamp <= c.answerBy) vm.warp(uint256(c.answerBy) + 1);
+        try market.resolveChallenge(id, w) {
+            challengesResolved++;
+            delete leavesOf[id];
+            delete unitsOf[id];
+        } catch {}
     }
 
     function disputeOrder(uint256 seed) external {
@@ -253,7 +328,7 @@ contract WorkMarketInvariantTest is Test {
         vs[0] = address(verifier);
         address gov = makeAddr("gov");
         address guard = makeAddr("guard");
-        market = new WorkMarket(gov, guard, vs);
+        market = new WorkMarket(gov, guard, 1 ether, vs);
         handler = new WorkMarketHandler(market, verifier, gov, guard);
         targetContract(address(handler));
     }
@@ -333,6 +408,25 @@ contract WorkMarketInvariantTest is Test {
         for (uint256 i = 0; i < handler.idsLength(); i++) {
             uint256 id = handler.ids(i);
             assertEq(market.getOffer(id).pricePerUnit, handler.priceAtOpen(id));
+        }
+    }
+
+    /// Q11: no worker settles while an inclusion challenge is open under the root.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_no_settle_while_challenged() public view {
+        assertFalse(handler.settledWhileChallenged());
+    }
+
+    /// Q11: open challenges never outnumber the joined workers of an offer.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_open_challenges_bounded() public view {
+        for (uint256 i = 0; i < handler.idsLength(); i++) {
+            WorkMarket.Offer memory o = market.getOffer(handler.ids(i));
+            assertLe(o.openChallenges, o.workers);
         }
     }
 

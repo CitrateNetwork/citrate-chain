@@ -22,7 +22,9 @@ contract WorkMarketVerifiersTest is Test {
     address internal flCoord = makeAddr("flCoord");
     address internal stranger = makeAddr("stranger");
 
-    uint64 internal constant REVIEW = 2 days;
+    /// The genesis review window (owner 2026-11-09, Q7).
+    uint64 internal constant REVIEW = 72 hours;
+    uint128 internal bondNow;
     uint32 internal constant WINDOW = 24 hours;
     uint128 internal constant PRICE = 1 ether;
     bytes32 internal constant RESULT = keccak256("result");
@@ -35,7 +37,7 @@ contract WorkMarketVerifiersTest is Test {
         address[] memory vs = new address[](2);
         vs[0] = address(flV);
         vs[1] = address(taskV);
-        market = new WorkMarket(governance, makeAddr("guardian"), vs);
+        market = new WorkMarket(governance, makeAddr("guardian"), 1 ether, vs);
         vm.deal(poster, 100 ether);
         vm.deal(worker, 10 ether);
         vm.deal(flCoord, 10 ether);
@@ -114,8 +116,9 @@ contract WorkMarketVerifiersTest is Test {
         taskV.accept(market, id, RESULT);
 
         bytes32 leaf = _leaf(id, worker, 1);
+        bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(worker);
-        market.postPayout(id, leaf, 1);
+        market.postPayout{value: bondNow}(id, leaf, 1);
         assertEq(market.getOffer(id).digest, RESULT);
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, worker, 1, 0, 0, new bytes32[](0));
@@ -127,13 +130,15 @@ contract WorkMarketVerifiersTest is Test {
         vm.prank(worker);
         taskV.submit(market, id, RESULT);
         bytes32 leaf = _leaf(id, worker, 1);
+        bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(worker);
         vm.expectRevert(WorkMarket.NotAccepted.selector);
-        market.postPayout(id, leaf, 1);
+        market.postPayout{value: bondNow}(id, leaf, 1);
         vm.warp(block.timestamp + REVIEW);
         leaf = _leaf(id, worker, 1);
+        bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(worker);
-        market.postPayout(id, leaf, 1);
+        market.postPayout{value: bondNow}(id, leaf, 1);
         assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.PayoutPosted));
     }
 
@@ -251,9 +256,10 @@ contract WorkMarketVerifiersTest is Test {
         bytes32 roundId = _commit(clusterId);
         assertEq(roundId, bind);
         bytes32 leaf = _leaf(id, worker, 3);
+        bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(flCoord);
         vm.expectRevert(WorkMarket.NotAccepted.selector);
-        market.postPayout(id, leaf, 3);
+        market.postPayout{value: bondNow}(id, leaf, 3);
 
         vm.roll(block.number + 21);
         frl.finalize(roundId);
@@ -262,8 +268,9 @@ contract WorkMarketVerifiersTest is Test {
         assertEq(d, frl.recordDigest(roundId));
 
         leaf = _leaf(id, worker, 3);
+        bondNow = market.getOffer(id).coordinatorBond;
         vm.prank(flCoord);
-        market.postPayout(id, leaf, 3);
+        market.postPayout{value: bondNow}(id, leaf, 3);
         assertEq(market.getOffer(id).digest, frl.recordDigest(roundId));
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, worker, 3, 0, 0, new bytes32[](0));

@@ -30,6 +30,14 @@ import {IVerifier, IWorkMarket} from "./IVerifier.sol";
 ///      sum makes over-allocation provable (two neighbours whose ranges do not abut) and lets
 ///      `settle` check `cumBefore + units <= payoutUnits` leaf by leaf. A tree that breaks either
 ///      rule is a coordinator fault anyone can prove inside the window (DISPUTE_ORDER/FIRST_LEAF).
+///
+///      Inclusion challenge (owner 2026-11-09, V60-GEN-Q11): a leaf whose payload has no valid
+///      preimage cannot be opened, so it could hide one absent worker from a MISSING_LEAF proof.
+///      Inside the dispute window, a joined worker or the poster may instead present
+///      coordinator-signed receipts for a worker and make the coordinator answer: anyone may
+///      answer by opening that worker's leaf with at least the receipted units before
+///      `answerBy`; if nobody does, the challenge is upheld like any objective dispute. Settling
+///      and the coordinator's bond wait while a challenge is open.
 contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     // ── constants ───────────────────────────────────────────────────
 
@@ -44,6 +52,12 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint256 internal constant MAX_TREE_DEPTH = 32;
     /// @notice Subjective (TASK) dispute reason codes start here; lower codes name objective kinds.
     uint16 public constant SUBJECTIVE_REASON_MIN = 256;
+    /// @notice How long the coordinator (or anyone holding the tree) has to answer an inclusion
+    ///         challenge by opening the challenged worker's leaf.
+    uint32 public constant CHALLENGE_RESPONSE_WINDOW = 24 hours;
+    /// @notice After `deadline + disputeWindow + RESERVE_CLAIM_PERIOD`, the poster may take back
+    ///         what a posted root reserved for workers who never settled (owner 2026-11-09, Q3).
+    uint64 public constant RESERVE_CLAIM_PERIOD = 180 days;
 
     bytes32 public constant LEAF_TAG = keccak256("citrate-workmarket-leaf/1");
     bytes32 public constant RECEIPT_TAG = keccak256("citrate-workmarket-lease-receipt/1");
@@ -55,6 +69,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint8 public constant DISPUTE_LOW_UNITS = 2;
     uint8 public constant DISPUTE_ORDER = 3;
     uint8 public constant DISPUTE_FIRST_LEAF = 4;
+    /// Reason code emitted when an inclusion challenge went unanswered.
+    uint8 public constant DISPUTE_UNANSWERED_CHALLENGE = 5;
 
     /// Non-inclusion modes for DISPUTE_MISSING_LEAF.
     uint8 public constant ABSENT_BETWEEN = 0;
@@ -108,7 +124,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint32 joinBondsReleased;
         uint128 joinBond;
         address coordinator; // FL: who posts the payout; TASK: the selected worker
-        uint128 coordinatorBond; // the bond `postPayout` must carry (poster-set)
+        uint128 coordinatorBond; // the bond `postPayout` must carry (poster-set; 0 at open = default)
         address disputeAdmin; // group TASK offers only; resolves subjective disputes
         bytes32 payoutRoot; // keccak(PAYOUT_TAG, digest, leavesRoot); 0 = none live
         bytes32 leavesRoot;
@@ -118,6 +134,18 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint64 settledUnits;
         bool coordinatorBondHeld;
         bool subjectiveDisputeUsed; // one subjective dispute per posted payout
+        bool reserveSwept; // the poster took back the unsettled reserve after the claim period
+        uint32 payoutEpoch; // bumps whenever a posted root is withdrawn; scopes challenges
+        uint32 openChallenges; // inclusion challenges awaiting an answer under the live root
+    }
+
+    struct Challenge {
+        uint32 epoch; // payoutEpoch it was raised under
+        bool open;
+        address challenger;
+        uint64 claimedUnits; // distinct receipted leases
+        uint64 answeredUnits; // highest claim already answered under this epoch
+        uint64 answerBy;
     }
 
     struct WorkerSlot {
@@ -147,6 +175,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     // ── state ───────────────────────────────────────────────────────
 
     uint256 public nextOfferId;
+    /// @notice The coordinator bond an offer gets when its poster passes 0 (owner 2026-11-09, Q1).
+    uint128 public immutable defaultCoordinatorBond;
     address public guardian;
     bool public newOffersPaused;
 
@@ -155,6 +185,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     mapping(uint256 => mapping(address => WorkerSlot)) internal _slots;
     /// @notice Pull balances (payouts, refunds, released and slashed bonds).
     mapping(address => uint256) public balanceOf;
+    mapping(uint256 => mapping(address => Challenge)) internal _challenges;
 
     // ── events ──────────────────────────────────────────────────────
 
@@ -181,6 +212,11 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     event VerifierAllowed(address indexed verifier, bool ok);
     event NewOffersPaused(address indexed by, bool paused);
     event GuardianSet(address indexed guardian);
+    event InclusionChallenged(
+        uint256 indexed id, address indexed worker, address indexed challenger, uint64 claimedUnits, uint64 answerBy
+    );
+    event ChallengeAnswered(uint256 indexed id, address indexed worker, uint64 leafUnits);
+    event ReserveSwept(uint256 indexed id, uint128 amount);
 
     // ── errors ──────────────────────────────────────────────────────
 
@@ -221,13 +257,28 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     error NothingToClaim();
     error TransferFailed();
     error NotGuardianOrGovernance();
+    error BadDefaultBond();
+    error ChallengeOpen();
+    error NoOpenChallenge();
+    error AnswerTooLate();
+    error AnswerTooEarly();
+    error BadAnswer();
+    error ReserveGone();
 
     // ── construction ────────────────────────────────────────────────
 
     /// @param governance_       the governance timelock (3-of-5 / 48 h); allows verifiers, pauses, unpauses
     /// @param guardian_         the guardian council (2-of-3); may pause new offers, nothing else; not 0 (InitialAdmin)
+    /// @param defaultCoordinatorBond_ the bond an offer requires when its poster passes 0; above zero
     /// @param initialVerifiers_ verifiers allowed at block 0 (CREATE2-predicted FLRoundVerifier and TaskVerifier)
-    constructor(address governance_, address guardian_, address[] memory initialVerifiers_) Governable(governance_) {
+    constructor(
+        address governance_,
+        address guardian_,
+        uint128 defaultCoordinatorBond_,
+        address[] memory initialVerifiers_
+    ) Governable(governance_) {
+        if (defaultCoordinatorBond_ == 0) revert BadDefaultBond();
+        defaultCoordinatorBond = defaultCoordinatorBond_;
         guardian = InitialAdmin.check(guardian_);
         emit GuardianSet(guardian_);
         for (uint256 i = 0; i < initialVerifiers_.length; i++) {
@@ -439,6 +490,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (o.state != State.PayoutPosted && o.state != State.Closed) revert WrongState();
         if (o.payoutRoot == bytes32(0)) revert WrongState();
         if (block.timestamp < uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowOpen();
+        if (o.openChallenges != 0) revert ChallengeOpen();
+        if (o.reserveSwept) revert ReserveGone();
         WorkerSlot storage s = _slots[id][worker];
         if (!s.joined) revert NotJoined();
         if (s.settled) revert AlreadySettled();
@@ -487,6 +540,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
             finalState = State.Expired;
         } else if (o.state == State.PayoutPosted) {
             if (block.timestamp < afterWindow) revert TooEarly();
+            if (o.openChallenges != 0) revert ChallengeOpen();
             amount = o.budget - uint128(uint256(o.payoutUnits) * o.pricePerUnit);
             finalState = State.Closed;
         } else if (o.state == State.Disputed) {
@@ -528,7 +582,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         }
 
         if (
-            msg.sender == o.coordinator && o.coordinatorBondHeld && o.payoutRoot != bytes32(0)
+            msg.sender == o.coordinator && o.coordinatorBondHeld && o.payoutRoot != bytes32(0) && o.openChallenges == 0
                 && (o.state == State.PayoutPosted || o.state == State.Closed)
                 && block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow
         ) {
@@ -539,6 +593,40 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
         if (total == 0) revert NothingToClaim();
         balanceOf[msg.sender] += total;
+    }
+
+    // ── inclusion challenge (V60-GEN-Q11) ───────────────────────────
+
+    /// @notice Inside the dispute window, a joined worker or the poster presents `receipts` (distinct,
+    ///         coordinator-signed, strictly ascending lease ids, all for one joined worker) and makes
+    ///         the root answer for that worker within `CHALLENGE_RESPONSE_WINDOW`. A worker may be
+    ///         challenged again under the same root only with more receipts than were last answered.
+    function challengeInclusion(uint256 id, Receipt[] calldata receipts) external nonReentrant {
+        revert("red: not implemented");
+    }
+
+    /// @notice Answer an open challenge by opening the worker's leaf with at least the claimed
+    ///         units. Anyone may answer (the proof is objective); only until `answerBy`.
+    function answerChallenge(uint256 id, LeafOpening calldata leaf) external nonReentrant {
+        revert("red: not implemented");
+    }
+
+    /// @notice After `answerBy`, an unanswered challenge is upheld: the root is withdrawn, the
+    ///         coordinator bond slashed (to the challenger and the poster) and the offer runs again.
+    function resolveChallenge(uint256 id, address worker) external nonReentrant {
+        revert("red: not implemented");
+    }
+
+    function challengeOf(uint256 id, address worker) external view returns (Challenge memory) {
+        return _challenges[id][worker];
+    }
+
+    // ── reserve sweep (V60-GEN-Q3) ──────────────────────────────────
+
+    /// @notice After the poster's refund and `deadline + disputeWindow + RESERVE_CLAIM_PERIOD`,
+    ///         return what the posted root reserved for workers who never settled. Settling stops.
+    function sweepReserve(uint256 id) external nonReentrant {
+        revert("red: not implemented");
     }
 
     // ── withdraw ────────────────────────────────────────────────────
@@ -618,6 +706,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         o.payoutPostedAt = 0;
         o.payoutUnits = 0;
         o.settledUnits = 0;
+        o.payoutEpoch += 1;
+        o.openChallenges = 0;
     }
 
     function _releaseCoordinatorBond(uint256 id, Offer storage o) internal {

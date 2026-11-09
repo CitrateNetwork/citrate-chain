@@ -81,7 +81,7 @@ abstract contract WorkMarketTestBase is Test {
         verifier = new SwitchVerifier();
         address[] memory vs = new address[](1);
         vs[0] = address(verifier);
-        market = new WorkMarket(governance, guardian, vs);
+        market = new WorkMarket(governance, guardian, 1 ether, vs);
         vm.deal(poster, 1_000_000 ether);
         vm.deal(coordinator, 1_000 ether);
         vm.deal(w1, 100 ether);
