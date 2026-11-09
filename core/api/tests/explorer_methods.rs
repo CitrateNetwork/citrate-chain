@@ -461,6 +461,9 @@ fn accepting_block_names_the_executing_chain_block() {
     assert_eq!(r["acceptingHeight"], "0x2");
     assert_eq!(r["semantics"], "including-chain-block");
     assert_eq!(r["inclusions"][0]["outcome"], "executed");
+    // Spec 06 §5.4 colour: before S3-3b the including block is the chain
+    // block itself, which the explorer renders as a chain block.
+    assert_eq!(r["inclusions"][0]["color"], "selected_parent", "{r}");
     assert_eq!(r["inclusionsComplete"], false);
     let none = result(
         &c.io,
@@ -862,6 +865,13 @@ fn selected_chain_changes_report_removed_and_added_blocks() {
         ])
     );
     assert_eq!(r["more"], false);
+    // The hash-only list the explorer's chain-change feed reads (Kaspa's
+    // `addedChainBlockHashes`), in the same order as `addedChainBlocks`.
+    assert_eq!(
+        r["addedChainBlockHashes"],
+        json!([hx(&h(0xA0, 2)), hx(&h(0xA0, 3))]),
+        "{r}"
+    );
 
     let on_chain = result(
         &d.io,
@@ -915,6 +925,16 @@ fn finality_status_reports_the_stored_certificate_not_depth() {
         "{r}"
     );
     assert_eq!(r["votingPinned"], false);
+
+    // The keys the explorer (citrate-explorer#51, src/lib/citrate/r1007.ts)
+    // and the finality lane's handler share: a view is always available from
+    // storage, so `published` is true; `finalized.blockHash` names the anchor.
+    assert_eq!(r["published"], true, "{r}");
+    assert_eq!(r["voting"], false, "{r}");
+    assert_eq!(r["finalized"]["blockHash"], hx(&h(0xA0, 0)), "{r}");
+    assert!(r["quorumRule"].is_string(), "{r}");
+    assert!(r["dataSource"].is_string(), "{r}");
+    assert!(r.get("mode").is_some(), "{r}");
 }
 
 // ── 6. citrate_getDagStats ───────────────────────────────────────────────

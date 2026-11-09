@@ -168,6 +168,9 @@ fn node_identity_sync_state_reads_the_marker_and_the_sync_signal() {
     let s = st(&io);
     assert_eq!(s["state"], "synced", "{s}");
     assert_eq!(s["appliedHeight"], 1, "{s}");
+    // CV-3: the applied tip's header-committed blue score, the unit of
+    // net_peerInfo[].headBlueScore, next to its height.
+    assert_eq!(s["appliedBlueScore"], 1, "{s}");
     assert!(s["forkDepth"].is_null(), "{s}");
     highest.store(40, Ordering::Relaxed);
     let s = st(&io);

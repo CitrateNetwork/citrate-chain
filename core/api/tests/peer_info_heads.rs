@@ -111,3 +111,56 @@ async fn a_peer_that_never_advertised_a_head_reports_null_not_zero() {
     assert!(peers[0]["headHeight"].is_null(), "{}", peers[0]);
     assert!(peers[0]["headHash"].is_null(), "{}", peers[0]);
 }
+
+/// CV-3 one blue-score unit: next to `headHeight` (block height,
+/// `header.height`, the unit of `eth_blockNumber` and
+/// `citrate_nodeIdentity.syncState.appliedHeight`) each peer reports the
+/// GHOSTDAG blue score of its head (`header.blue_score`, header-committed and
+/// validated at admission). Hello/HelloAck carry no blue score, so it is
+/// `null` until a gossiped block from that peer raises the head; the head
+/// height, hash and blue score always describe the same block.
+#[tokio::test]
+async fn peer_info_reports_the_heads_blue_score_once_gossip_names_it() {
+    let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+    add(
+        &pm,
+        "peer_c",
+        "10.0.0.4:30303",
+        PeerState::Connected,
+        50,
+        Hash::new([0x11; 32]),
+    )
+    .await;
+    let api = NetworkApi::new(pm.clone(), 40204);
+    let peers = api.get_peer_info().await.expect("peer info");
+    let c = &peers[0];
+    assert_eq!(c["heightUnit"], "header.height", "{c}");
+    assert_eq!(c["blueScoreUnit"], "ghostdag.blue_score", "{c}");
+    assert!(
+        c["headBlueScore"].is_null(),
+        "the handshake names no blue score: {c}"
+    );
+    assert!(c["headBlueScoreSource"].is_null(), "{c}");
+
+    let p = pm
+        .get_peer(&PeerId::new("peer_c".to_string()))
+        .expect("peer_c");
+    // A gossiped block above the head raises all three together.
+    assert!(p
+        .info
+        .write()
+        .await
+        .observe_gossiped_head(51, Hash::new([0x22; 32]), 77));
+    // A gossiped block at or below the head changes nothing.
+    assert!(!p
+        .info
+        .write()
+        .await
+        .observe_gossiped_head(51, Hash::new([0x33; 32]), 99));
+    let again = api.get_peer_info().await.expect("peer info");
+    let c = &again[0];
+    assert_eq!(c["headHeight"], "0x33", "{c}");
+    assert_eq!(c["headHash"], format!("0x{}", "22".repeat(32)));
+    assert_eq!(c["headBlueScore"], "0x4d", "{c}");
+    assert_eq!(c["headBlueScoreSource"], "gossip", "{c}");
+}
