@@ -1883,6 +1883,83 @@ mod tests {
         assert!(!c.contains(&pk(k0)));
     }
 
+    /// Epoch 0 (lead decision 1, 2026-11-09): on the production schedule
+    /// (EPOCH 1000, LAG 200) the first registry snapshot is S(1) = 800, so no
+    /// snapshot governs checkpoints 50..=800. The genesis validator set does:
+    /// those checkpoints get an epoch-0 committee drawn from it, and voting
+    /// starts at the first checkpoint. From 850 on, S(1) governs as before.
+    #[tokio::test]
+    async fn genesis_committee_governs_checkpoints_below_the_first_snapshot() {
+        let genesis: Vec<SigningKey> = (0u8..4).map(key).collect();
+        let later: Vec<SigningKey> = (40u8..44).map(key).collect();
+        let set = |ks: &[SigningKey]| -> Vec<(PublicKey, u128)> {
+            ks.iter().map(|k| (pk(k), 1000u128)).collect()
+        };
+        let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 200);
+        sel.sync_active_set_at(800, set(&later), 1).await;
+        let mut cfg = config();
+        cfg.interval = 50;
+        let g = FinalityGadget::with_switch(
+            Arc::new(CheckpointManager::with_persistence(
+                cfg,
+                dag_with(51).await,
+                Arc::new(MemKv::default()),
+            )),
+            Some(Arc::new(sel)),
+            true,
+        )
+        .with_genesis_committee(set(&genesis));
+        let genesis_pks: Vec<PublicKey> = genesis.iter().map(pk).collect();
+        for h in [50u64, 400, 800] {
+            let c = g.committee_for(h, &Hash::new([7; 32])).await.expect("epoch-0 committee");
+            assert_eq!(c.epoch, GENESIS_COMMITTEE_EPOCH, "height {h}");
+            let mut got = c.pubkeys();
+            got.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            let mut want = genesis_pks.clone();
+            want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            assert_eq!(got, want, "height {h}: the genesis set");
+        }
+        let c = g.committee_for(850, &Hash::new([7; 32])).await.expect("S(1) committee");
+        assert_eq!(c.epoch, 800);
+        assert!(c.pubkeys().iter().all(|m| !genesis_pks.contains(m)));
+
+        // The first checkpoint is proposed and this validator's vote signed.
+        let first = genesis.first().expect("genesis key");
+        let out = g
+            .on_buried_checkpoint(50, block_hash(50), &Hash::new([7; 32]), Some(first))
+            .await;
+        assert!(out.proposed, "{out:?}");
+        assert!(out.signed_own_vote, "{out:?}");
+    }
+
+    /// Epoch 0 with no ValidatorRegistry (no committee source): the genesis set
+    /// is the only validator set the chain ever has, so it governs every height.
+    /// Without a genesis set either, no committee is derived (as before).
+    #[tokio::test]
+    async fn genesis_committee_without_a_registry_governs_every_height() {
+        let genesis: Vec<SigningKey> = (0u8..4).map(key).collect();
+        let set: Vec<(PublicKey, u128)> = genesis.iter().map(|k| (pk(k), 1000u128)).collect();
+        let mgr = Arc::new(CheckpointManager::new(config(), dag_with(4).await));
+        let bare = FinalityGadget::with_switch(mgr.clone(), None, true);
+        assert_eq!(bare.committee_for(2, &Hash::new([7; 32])).await, None);
+        let g = FinalityGadget::with_switch(mgr, None, true).with_genesis_committee(set);
+        for h in [2u64, 850, 1_000_000] {
+            let c = g.committee_for(h, &Hash::new([7; 32])).await.expect("genesis committee");
+            assert_eq!(c.epoch, GENESIS_COMMITTEE_EPOCH);
+            assert_eq!(c.len(), 4, "height {h}");
+        }
+        // Zero-stake and duplicate entries never sit on a committee.
+        let mut messy: Vec<(PublicKey, u128)> =
+            genesis.iter().map(|k| (pk(k), 1000u128)).collect();
+        messy.push((pk(&key(9)), 0));
+        if let Some(first) = messy.first().copied() {
+            messy.push(first);
+        }
+        let mgr = Arc::new(CheckpointManager::new(config(), dag_with(4).await));
+        let g = FinalityGadget::with_switch(mgr, None, true).with_genesis_committee(messy);
+        assert_eq!(g.committee_for(2, &Hash::new([7; 32])).await.map(|c| c.len()), Some(4));
+    }
+
     /// Vote construction binds chain_id, height and block_hash.
     #[test]
     fn vote_construction_binds_chain_height_hash() {

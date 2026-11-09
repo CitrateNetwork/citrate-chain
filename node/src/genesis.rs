@@ -659,4 +659,50 @@ mod tests {
             shared_genesis::calculate_canonical_block_hash(&shared)
         );
     }
+
+    /// Epoch 0 (lead decision 1, 2026-11-09): the checkpoint committee below the
+    /// first registry snapshot S(1) comes from the genesis validator set, which
+    /// is compiled with the genesis (no config). On r1006 it is exactly the
+    /// producer set `validators.json` registers in the ValidatorRegistry at
+    /// block 0: each proposer key with its stake. Any other genesis compiles
+    /// none (its committees come only from registry snapshots).
+    #[test]
+    fn genesis_committee_is_the_block_0_validator_set() {
+        let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+        let set = genesis_committee_set(Some(&r1006))
+            .expect("the r1006 validator file parses")
+            .expect("r1006 compiles a final producer set");
+        let file: serde_json::Value =
+            serde_json::from_str(citrate_economics::r1006::R1006_VALIDATORS_JSON)
+                .expect("validators.json is JSON");
+        let want: Vec<(PublicKey, u128)> = file["validators"]
+            .as_array()
+            .expect("a validators array")
+            .iter()
+            .map(|v| {
+                let pk = hex::decode(
+                    v["proposer_pubkey"]
+                        .as_str()
+                        .expect("proposer_pubkey")
+                        .trim_start_matches("0x"),
+                )
+                .expect("hex proposer key");
+                let pk: [u8; 32] = pk.as_slice().try_into().expect("32-byte proposer key");
+                let stake: u128 = v["stake_wei"]
+                    .as_str()
+                    .expect("stake_wei")
+                    .parse()
+                    .expect("stake fits u128");
+                (PublicKey::new(pk), stake)
+            })
+            .collect();
+        assert_eq!(want.len(), 7, "the r1006 producer set");
+        assert_eq!(set, want);
+        assert!(set.iter().all(|(_, s)| *s > 0));
+        assert_eq!(
+            genesis_committee_set(Some(&[0x42; 32])).expect("unknown genesis"),
+            None
+        );
+        assert_eq!(genesis_committee_set(None).expect("no genesis"), None);
+    }
 }

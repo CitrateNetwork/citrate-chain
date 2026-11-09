@@ -732,6 +732,52 @@ mod tests {
         Hash::new([n; 32])
     }
 
+    /// Epoch 0 (lead decision 1, 2026-11-09), as the node wires it: on a
+    /// genesis that compiles its validator set (r1006), the gadget main.rs
+    /// builds derives a committee for the first checkpoint (50) from that set,
+    /// with or without a ValidatorRegistry selector (`CITRATE_VALIDATOR_REGISTRY`
+    /// unset): voting starts at the first checkpoint. Below S(1) = 800 a
+    /// registry chain's committee is the genesis set too. A genesis without a
+    /// compiled set derives none, as before.
+    #[tokio::test]
+    async fn node_gadget_has_a_committee_from_the_first_checkpoint() {
+        use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::vrf::VrfProposerSelector;
+        let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+        let mgr = || {
+            Arc::new(CheckpointManager::new(
+                CheckpointConfig {
+                    genesis_hash: Hash::new(r1006),
+                    ..CheckpointConfig::default()
+                },
+                Arc::new(DagStore::new()),
+            ))
+        };
+        let seed = h(7);
+        let no_registry = node_finality_gadget(mgr(), None, Some(&r1006)).expect("gadget");
+        let c = no_registry
+            .committee_for(50, &seed)
+            .await
+            .expect("epoch-0 committee without a registry");
+        assert_eq!((c.epoch, c.len()), (0, 7));
+        let registry = Arc::new(
+            VrfProposerSelector::production()
+                .with_snapshot_schedule(crate::registry_sync::EPOCH, crate::registry_sync::SNAPSHOT_LAG),
+        );
+        let with_registry =
+            node_finality_gadget(mgr(), Some(registry), Some(&r1006)).expect("gadget");
+        for h in [50u64, 800] {
+            let c = with_registry
+                .committee_for(h, &seed)
+                .await
+                .expect("epoch-0 committee below S(1)");
+            assert_eq!((c.epoch, c.len()), (0, 7), "height {h}");
+        }
+        let other = node_finality_gadget(mgr(), None, Some(&[0x42; 32])).expect("gadget");
+        assert_eq!(other.committee_for(50, &seed).await, None);
+    }
+
     #[test]
     fn never_votes_at_the_tip() {
         // depth 3, interval 2: tip 10 => buried 7 => boundary 6.
