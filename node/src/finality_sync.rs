@@ -56,9 +56,10 @@
 // read from this node's own copy):
 //
 //   * it VERIFIES against the committee derived here -> a quorum of this node's
-//     own committee finalized a block this node is not on: mismatch safety stop
-//     and alarm (`FloorVerifier::on_conflicting_certificate`). It is NOT
-//     installed and the floor is NOT raised;
+//     own committee finalized a block this node is not on: in Enforced mode a
+//     mismatch safety stop and alarm, in Observed mode a counted finality
+//     conflict with voting continuing (`FloorVerifier::on_conflicting_certificate`).
+//     Either way it is NOT installed and the floor is NOT raised;
 //   * it does not verify, or its committee cannot be derived -> refused with a
 //     log only. Unauthenticated peer input never halts finality.
 //
@@ -1075,7 +1076,14 @@ mod tests {
             } => {
                 assert_eq!(*certified, sib);
                 assert_eq!(*canonical, Some(a2.header.block_hash));
-                assert!(!matches!(floor, FloorTick::Halted(_)), "{floor:?}");
+                assert_eq!(
+                    *floor,
+                    FloorTick::Conflict {
+                        height: 2,
+                        certified: sib,
+                        canonical: Some(a2.header.block_hash),
+                    }
+                );
             }
             other => panic!("expected a conflicting-finality outcome, got {other:?}"),
         }
@@ -1086,6 +1094,7 @@ mod tests {
         assert_eq!(n.verified_height(), 0);
         assert!(!matches!(n.floor.tick().await, FloorTick::Halted(_)));
         assert!(!n.gadget.halted(), "the poll does not halt either");
+        assert_eq!(n.floor.finality_conflicts(), 1, "counted once");
         let later = n
             .gadget
             .on_buried_checkpoint(4, Hash::new([4; 32]), None)

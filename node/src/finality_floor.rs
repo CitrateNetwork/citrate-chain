@@ -41,7 +41,13 @@
 //                keep reading the applicator's floor, i.e. genesis): nothing
 //                enforces the floor in this mode, so a reorg below the verified
 //                height still proceeds, and labelling such a block "finalized"
-//                would claim a guarantee the node does not give.
+//                would claim a guarantee the node does not give. Such a reorg
+//                (or a verified peer certificate for a block this node is not
+//                on) is a FINALITY CONFLICT, not a safety stop: it is logged
+//                and counted (`citrate_finality_conflicts_total`) and the
+//                gadget keeps voting on this node's current selected chain
+//                (lead decision 3, 2026-11-09). A stop here would never clear,
+//                since no floor brings the node back onto the certified block.
 //   * Enforced — both ON. A verified certificate also raises the reorg floor
 //                (AT FINALIZATION — see below — with this poll as a backstop),
 //                and the finalized/safe RPC tags follow the verified
@@ -51,7 +57,8 @@
 //                wins). If that block is not stored locally the previous
 //                verified pair is served, else genesis.
 //
-// SAFETY STOP. A certificate that does not match this node's chain (a different
+// SAFETY STOP (Enforced; in Observed mode only for an invalid stored
+// certificate). A certificate that does not match this node's chain (a different
 // block at that height, or a chain that steps over it) — stored here, or a
 // peer's certificate that verifies against this node's own committee
 // (`on_conflicting_certificate`, Stage 1b) — or a stored one that does not
@@ -355,11 +362,34 @@ pub enum FloorTick {
     Unverifiable(String),
     /// In a safety stop.
     Halted(HaltReason),
+    /// Observed mode only: a verified certificate names `certified` at `height`
+    /// but this node's applied chain has `canonical` there (another block, or
+    /// none). Logged and counted as a finality conflict
+    /// ([`FloorVerifier::finality_conflicts`]); NOT a safety stop: nothing
+    /// enforces the floor in this mode, so the node keeps voting on its own
+    /// selected chain (lead decision 3, 2026-11-09).
+    Conflict {
+        height: u64,
+        certified: Hash,
+        canonical: Option<Hash>,
+    },
+}
+
+/// One finality conflict as last reported (Observed mode; dedupes the poll).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Conflict {
+    height: u64,
+    certified: Hash,
+    canonical: Option<Hash>,
 }
 
 #[derive(Default)]
 struct VerifierState {
     halt: Option<HaltReason>,
+    /// The finality conflict last reported (Observed), so the 5 s poll counts
+    /// and logs each distinct conflict once. Cleared once a certificate
+    /// verifies on this node's chain again.
+    conflict: Option<Conflict>,
 }
 
 /// Verifies finalized checkpoint certificates against this node's applied chain
@@ -391,6 +421,9 @@ pub struct FloorVerifier {
     /// never read from the certificate).
     committees: CertificateCommittees,
     state: Mutex<VerifierState>,
+    /// Distinct finality conflicts reported (Observed): also the
+    /// `citrate_finality_conflicts_total` metric.
+    conflicts: AtomicU64,
 }
 
 impl FloorVerifier {
@@ -421,6 +454,54 @@ impl FloorVerifier {
             verified_pairs: Arc::new(VerifiedFinalized::new()),
             committees,
             state: Mutex::new(VerifierState::default()),
+            conflicts: AtomicU64::new(0),
+        }
+    }
+
+    /// Distinct finality conflicts this verifier has reported (Observed mode;
+    /// see [`FloorTick::Conflict`]).
+    pub fn finality_conflicts(&self) -> u64 {
+        self.conflicts.load(Ordering::SeqCst)
+    }
+
+    /// Observed mode: a verified certificate for `certified` at `height` while
+    /// this node's applied chain holds `canonical` there. Report it as a
+    /// finality conflict — warn and count it once per distinct conflict — and
+    /// keep voting: no safety stop, nothing installed, floor and RPC tags
+    /// unchanged.
+    fn note_conflict(
+        &self,
+        st: &mut VerifierState,
+        height: u64,
+        certified: Hash,
+        canonical: Option<Hash>,
+    ) -> FloorTick {
+        let c = Conflict {
+            height,
+            certified,
+            canonical,
+        };
+        if st.conflict != Some(c) {
+            st.conflict = Some(c);
+            self.conflicts.fetch_add(1, Ordering::SeqCst);
+            crate::metrics::record_finality_conflict();
+            let here = canonical.map_or_else(
+                || "no block at that height (its chain steps over it)".to_string(),
+                |h| format!("block {h}"),
+            );
+            warn!(
+                "CHECKPOINT FINALITY CONFLICT (observed mode): the finalized checkpoint at height \
+                 {height} certifies block {certified}, but this node's applied chain has {here}. \
+                 Enforcement is off, so the reorg below it was allowed; finality voting \
+                 continues on this node's current selected chain. Counted in \
+                 citrate_finality_conflicts_total."
+            );
+        }
+        self.publish(false);
+        FloorTick::Conflict {
+            height,
+            certified,
+            canonical,
         }
     }
 
@@ -754,6 +835,7 @@ impl FloorVerifier {
             .await
         {
             FloorCheck::Match => {
+                st.conflict = None;
                 let _ = self.record_verified(cert.height, cert.block_hash);
                 self.publish(false);
                 FloorTick::Verified {
@@ -761,6 +843,9 @@ impl FloorVerifier {
                     floor_raised: raise,
                     recovered,
                 }
+            }
+            FloorCheck::Mismatch { canonical } if !raise => {
+                self.note_conflict(&mut st, cert.height, cert.block_hash, canonical)
             }
             FloorCheck::Mismatch { canonical } => {
                 let reason = HaltReason::Mismatch {
@@ -943,15 +1028,17 @@ impl FloorVerifier {
         }
     }
 
-    /// Conflicting finality (owner Q1 on #332, MAC recommendation): a peer's
+    /// Conflicting finality (owner Q1 on #332, MAC recommendation; Observed
+    /// mode amended by lead decision 3, 2026-11-09): a peer's
     /// certificate for `certified` at a height where this node's applied chain
     /// holds `canonical` (another block, or none), which VERIFIED against the
     /// committee this node derives for it ([`VerifiedCertificate`]: a quorum
     /// of this node's own committee, unforgeable under f < n/3). That is the
     /// same evidence as a stored-certificate mismatch — the network finalized a
-    /// block this node is not on — so it enters the same mismatch safety stop
-    /// and raises the same alarm. Nothing is installed and the floor is not
-    /// raised. The stop clears like any mismatch stop: once `certified` is
+    /// block this node is not on — so in Enforced mode it enters the same
+    /// mismatch safety stop and raises the same alarm; in Observed mode it is a
+    /// counted finality conflict and voting continues ([`FloorTick::Conflict`]).
+    /// Nothing is installed and the floor is not raised. The stop clears like any mismatch stop: once `certified` is
     /// canonical here through normal fork choice (re-checked every poll); that
     /// recovery pass records the pair as verified and, in Enforced mode,
     /// raises the floor to it under the advance lock, and certificate sync
@@ -969,6 +1056,9 @@ impl FloorVerifier {
         }
         let cp = cert.checkpoint();
         let mut st = self.state.lock().await;
+        if !self.mode.raises_floor() {
+            return self.note_conflict(&mut st, cp.height, cp.block_hash, canonical);
+        }
         let reason = HaltReason::Mismatch {
             height: cp.height,
             certified: cp.block_hash,
@@ -1622,19 +1712,30 @@ mod tests {
                 other => panic!("expected the reorg to proceed, got {other:?}"),
             }
         }
+        let conflict = FloorTick::Conflict {
+            height: 2,
+            certified: a2.header.block_hash,
+            canonical: Some(b2.header.block_hash),
+        };
         let first = r.verifier.tick().await;
         assert!(!matches!(first, FloorTick::Halted(_)), "{first:?}");
+        assert_eq!(first, conflict);
         assert!(!r.gadget.halted(), "observed: voting continues");
         assert_eq!(r.verifier.halt_reason().await, None);
         let again = r.verifier.tick().await;
         assert!(!matches!(again, FloorTick::Halted(_)), "{again:?}");
+        assert_eq!(again, conflict);
         assert!(!r.gadget.halted());
+        assert_eq!(
+            r.verifier.finality_conflicts(),
+            1,
+            "one conflict, counted once"
+        );
         let later = r
             .gadget
             .on_buried_checkpoint(4, Hash::new([4; 32]), None)
             .await;
         assert_ne!(later.skipped, Some(SkipReason::Halted), "{later:?}");
-        let _ = b2;
         assert_eq!(load(&r.floor), 0);
         assert_eq!(load(&r.verified), 2, "verified height frozen");
         assert_eq!(
@@ -1651,7 +1752,7 @@ mod tests {
     async fn observed_boot_on_another_branch_is_a_conflict_not_a_halt() {
         let (exec, storage, _dir) = fresh();
         let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
-        let (_a1, _a2, b2, _b3) = setup_fork(&app, &storage).await; // tip a2
+        let (_a1, a2, b2, _b3) = setup_fork(&app, &storage).await; // tip a2
         persist_certificate(&storage, &certificate(2, b2.header.block_hash, 3));
         let r = rig(
             &storage,
@@ -1662,6 +1763,15 @@ mod tests {
         .await;
         let boot = r.verifier.boot_check().await;
         assert!(!matches!(boot, FloorTick::Halted(_)), "{boot:?}");
+        assert_eq!(
+            boot,
+            FloorTick::Conflict {
+                height: 2,
+                certified: b2.header.block_hash,
+                canonical: Some(a2.header.block_hash),
+            }
+        );
+        assert_eq!(r.verifier.finality_conflicts(), 1);
         assert!(!r.gadget.halted());
         assert_eq!(load(&r.floor), 0);
         assert_eq!(load(&r.verified), 0);

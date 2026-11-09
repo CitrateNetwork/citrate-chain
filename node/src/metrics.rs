@@ -119,6 +119,10 @@ pub const METRIC_FINALITY_HALTED: &str = "citrate_finality_halted";
 /// Safety stops entered: a finalized certificate that does not match this
 /// node's applied chain, or does not verify.
 pub const METRIC_FINALITY_CERT_MISMATCH_TOTAL: &str = "citrate_finality_certificate_mismatch_total";
+/// Observed mode: distinct finality conflicts (a verified finalized
+/// certificate whose block is not on this node's applied chain, e.g. after a
+/// reorg below it). Counted, not a safety stop: voting continues.
+pub const METRIC_FINALITY_CONFLICTS_TOTAL: &str = "citrate_finality_conflicts_total";
 /// Highest finalized checkpoint height verified against this node's chain.
 /// The only place it is visible in Observed mode (voting ON, enforcement OFF);
 /// the `finalized`/`safe` RPC tags follow it in Enforced mode only.
@@ -315,6 +319,10 @@ fn register_metric_descriptions() {
         METRIC_FINALITY_CERT_MISMATCH_TOTAL,
         "Checkpoint finality safety stops entered (certificate not on this node's chain, or invalid)"
     );
+    describe_counter!(
+        METRIC_FINALITY_CONFLICTS_TOTAL,
+        "Checkpoint finality conflicts in observed mode (a verified certificate not on this node's chain; voting continues)"
+    );
     describe_gauge!(
         METRIC_FINALITY_VERIFIED_HEIGHT,
         "Highest finalized checkpoint height verified against this node's applied chain"
@@ -492,6 +500,11 @@ pub fn record_finality_finalize_retry(attempts: usize, recovered: usize, pending
 /// Count one checkpoint-finality safety stop (certificate mismatch / invalid).
 pub fn record_finality_certificate_mismatch() {
     counter!(METRIC_FINALITY_CERT_MISMATCH_TOTAL, 1);
+}
+
+/// Count one distinct checkpoint-finality conflict (observed mode).
+pub fn record_finality_conflict() {
+    counter!(METRIC_FINALITY_CONFLICTS_TOTAL, 1);
 }
 
 /// Record sync status
