@@ -154,7 +154,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint32 openChallenges; // inclusion and index challenges awaiting an answer under the live root
         uint8 payoutDepth; // the posted tree's depth: every opening carries exactly this many siblings
         uint64 answerGraceUntil; // disputes stay open until at least this time (set by answers)
-        uint32 resultEpoch;
+        uint32 resultEpoch; // bumps when a subjective dispute is upheld (TaskVerifier scopes results to it)
     }
 
     struct Challenge {
@@ -213,6 +213,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     mapping(address => uint256) public balanceOf;
     mapping(uint256 => mapping(address => Challenge)) internal _challenges;
     mapping(uint256 => mapping(uint32 => IndexChallenge)) internal _indexChallenges;
+    /// @notice Block a dispute commitment was made in (0 = none); see `commitDispute`.
+    mapping(bytes32 => uint256) public disputeCommitBlock;
 
     // ── events ──────────────────────────────────────────────────────
 
@@ -244,6 +246,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     );
     event ChallengeAnswered(uint256 indexed id, address indexed worker, uint64 leafUnits);
     event ReserveSwept(uint256 indexed id, uint128 amount);
+    event DisputeCommitted(uint256 indexed id, address indexed by, bytes32 commitment);
     event IndexChallenged(uint256 indexed id, uint32 indexed index, address indexed challenger, uint64 answerBy);
     event IndexChallengeAnswered(uint256 indexed id, uint32 indexed index, address worker);
 
@@ -366,6 +369,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (p.disputeAdmin != address(0) && (p.kind != Kind.TASK || p.groupHash == bytes32(0))) {
             revert BadParty();
         }
+        // A group task's subjective dispute has only the admin to rule on it; without one the
+        // group would fall back to the open-task timeout, which the group did not choose.
+        if (p.kind == Kind.TASK && p.groupHash != bytes32(0) && p.disputeAdmin == address(0)) revert BadParty();
 
         id = ++nextOfferId;
         Offer storage o = _offers[id];
@@ -435,6 +441,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (units == 0 || units > o.maxUnits) revert BadUnits();
         if (o.kind == Kind.TASK && units != 1) revert BadUnits();
         if (depth > _depthFor(o.maxWorkers)) revert BadDepth();
+        // TASK: the coordinator is the selected worker and the root's single leaf pays it.
+        if (o.kind == Kind.TASK && !_slots[id][o.coordinator].joined) revert NotJoined();
 
         (bool ok, bytes32 digest) = IVerifier(o.verifier).accepted(id, o.bindRef);
         if (!ok || digest == bytes32(0)) revert NotAccepted();
@@ -463,6 +471,42 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///        DISPUTE_ORDER       body = abi.encode(LeafOpening a, LeafOpening b)       a.index < b.index
     ///        DISPUTE_FIRST_LEAF  body = abi.encode(LeafOpening first)                  index 0
     function dispute(uint256 id, bytes calldata evidence) external nonReentrant {
+        _dispute(id, evidence);
+    }
+
+    /// @notice Commit to a dispute before revealing its evidence, so a copier who sees the
+    ///         evidence in the mempool cannot take the disputer's share of the slash. The
+    ///         commitment is `disputeCommitment(id, payoutEpoch, msg.sender, evidence, salt)`;
+    ///         reveal it with `revealDispute` from the next block on, inside the dispute window.
+    function commitDispute(uint256 id, bytes32 commitment) external {
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted) revert WrongState();
+        if (block.timestamp >= _disputeEnd(o)) revert WindowClosed();
+        if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
+        if (commitment == bytes32(0) || disputeCommitBlock[commitment] != 0) revert BadEvidence();
+        disputeCommitBlock[commitment] = block.number;
+        emit DisputeCommitted(id, msg.sender, commitment);
+    }
+
+    /// @notice Reveal a committed dispute (same rules and outcome as `dispute`).
+    function revealDispute(uint256 id, bytes calldata evidence, bytes32 salt) external nonReentrant {
+        bytes32 commitment = disputeCommitment(id, _offer(id).payoutEpoch, msg.sender, evidence, salt);
+        uint256 committedAt = disputeCommitBlock[commitment];
+        if (committedAt == 0) revert BadEvidence();
+        if (committedAt >= block.number) revert TooEarly();
+        delete disputeCommitBlock[commitment];
+        _dispute(id, evidence);
+    }
+
+    function disputeCommitment(uint256 id, uint32 epoch, address disputer, bytes calldata evidence, bytes32 salt)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(block.chainid, address(this), id, epoch, disputer, keccak256(evidence), salt));
+    }
+
+    function _dispute(uint256 id, bytes calldata evidence) internal {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
         if (block.timestamp >= _disputeEnd(o)) revert WindowClosed();
@@ -505,8 +549,11 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (o.state != State.Disputed) revert WrongState();
         if (o.disputeAdmin == address(0) || msg.sender != o.disputeAdmin) revert NotDisputeAdmin();
         if (upheld) {
+            // An open challenge keeps its challenger's claim on the bond: resolve it first.
+            if (o.openChallenges != 0) revert ChallengeOpen();
             _releaseCoordinatorBond(id, o);
             _clearPayout(o);
+            o.resultEpoch += 1; // the rejected result no longer counts as verified
             o.state = State.Running;
         } else {
             o.state = State.PayoutPosted;
@@ -581,6 +628,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
             finalState = State.Closed;
         } else if (o.state == State.Disputed) {
             if (block.timestamp < afterWindow) revert TooEarly();
+            // An open challenge keeps its challenger's claim on the bond: resolve it first.
+            if (o.openChallenges != 0) revert ChallengeOpen();
             _releaseCoordinatorBond(id, o);
             _clearPayout(o);
             amount = o.budget - o.paid;
@@ -635,7 +684,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @notice Inside the dispute window, a joined worker or the poster presents `receipts` (distinct,
     ///         coordinator-signed, strictly ascending lease ids, all for one joined worker) and makes
     ///         the root answer for that worker within `CHALLENGE_RESPONSE_WINDOW`. A worker may be
-    ///         challenged again under the same root only with more receipts than were last answered.
+    ///         challenged again under the same root only with more receipts than the answered leaf pays.
     function challengeInclusion(uint256 id, Receipt[] calldata receipts) external nonReentrant {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
@@ -679,7 +728,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (block.timestamp > c.answerBy) revert AnswerTooLate();
         if (leaf.units < c.claimedUnits || !_opens(id, o, leaf)) revert BadAnswer();
         c.open = false;
-        c.answeredUnits = c.claimedUnits;
+        c.answeredUnits = leaf.units; // the leaf pays this much: only a claim above it is new
         o.openChallenges -= 1;
         _extendForAnswer(o);
         emit ChallengeAnswered(id, leaf.worker, leaf.units);
@@ -699,23 +748,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         _upholdObjective(id, o, challenger);
     }
 
-    // red: commit-reveal disputes not implemented yet
-    function commitDispute(uint256, bytes32) external pure {
-        revert WrongState();
-    }
-
-    function revealDispute(uint256, bytes calldata, bytes32) external pure {
-        revert WrongState();
-    }
-
-    function disputeCommitment(uint256 id, uint32 epoch, address disputer, bytes calldata evidence, bytes32 salt)
-        public
-        view
-        returns (bytes32)
-    {
-        return keccak256(abi.encode(block.chainid, address(this), id, epoch, disputer, keccak256(evidence), salt));
-    }
-
+    /// @inheritdoc IWorkMarket
     function resultEpochOf(uint256 id) external view returns (uint32) {
         return _offers[id].resultEpoch;
     }

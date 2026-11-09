@@ -29,6 +29,7 @@ contract TaskVerifier is IVerifier {
         bytes32 resultHash;
         uint64 submittedAt;
         bool requesterAccepted;
+        uint32 epoch; // the market's resultEpochOf(offerId) at submit
     }
 
     mapping(address market => mapping(uint256 offerId => Result)) internal _results;
@@ -56,6 +57,9 @@ contract TaskVerifier is IVerifier {
 
     /// @notice The selected worker submits (or, before acceptance, replaces) its result hash.
     ///         Replacing restarts the review window. Only while the offer is Open or Running.
+    ///         After a dispute admin upholds a dispute against the result (the market's
+    ///         `resultEpochOf` moved on), the old result stops counting and a new one may be
+    ///         submitted even if the requester had accepted the old one.
     function submit(IWorkMarket market, uint256 offerId, bytes32 resultHash) external {
         // slither-disable-next-line unused-return (only the fields this check needs are read)
         (IWorkMarket.Kind kind, IWorkMarket.State state,, address verifier, address coordinator,) =
@@ -65,9 +69,14 @@ contract TaskVerifier is IVerifier {
         if (state != IWorkMarket.State.Open && state != IWorkMarket.State.Running) revert WrongState();
         if (resultHash == bytes32(0)) revert BadResult();
         Result storage r = _results[address(market)][offerId];
-        if (r.requesterAccepted) revert AlreadyAccepted();
+        uint32 epoch = market.resultEpochOf(offerId);
+        // An accepted result is final until a dispute admin upholds a dispute against it, which
+        // bumps the epoch; then a corrected result may be submitted.
+        if (r.requesterAccepted && r.epoch == epoch) revert AlreadyAccepted();
         r.resultHash = resultHash;
         r.submittedAt = uint64(block.timestamp);
+        r.requesterAccepted = false;
+        r.epoch = epoch;
         emit ResultSubmitted(address(market), offerId, msg.sender, resultHash, uint64(block.timestamp) + reviewWindow);
     }
 
@@ -79,7 +88,9 @@ contract TaskVerifier is IVerifier {
         if (verifier != address(this) || kind != IWorkMarket.Kind.TASK) revert NotTaskOffer();
         if (msg.sender != poster) revert NotRequester();
         Result storage r = _results[address(market)][offerId];
-        if (r.submittedAt == 0 || r.resultHash != resultHash) revert BadResult();
+        if (r.submittedAt == 0 || r.epoch != market.resultEpochOf(offerId) || r.resultHash != resultHash) {
+            revert BadResult();
+        }
         if (r.requesterAccepted) revert AlreadyAccepted();
         r.requesterAccepted = true;
         emit ResultAccepted(address(market), offerId, msg.sender, resultHash);
@@ -100,7 +111,8 @@ contract TaskVerifier is IVerifier {
             return (false, bytes32(0));
         }
         Result storage r = _results[address(market)][offerId];
-        if (r.submittedAt == 0) return (false, bytes32(0));
+        // A result rejected by an upheld dispute (an older epoch) never counts again.
+        if (r.submittedAt == 0 || r.epoch != market.resultEpochOf(offerId)) return (false, bytes32(0));
         if (r.requesterAccepted || block.timestamp >= uint256(r.submittedAt) + reviewWindow) {
             return (true, r.resultHash);
         }
