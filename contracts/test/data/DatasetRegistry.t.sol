@@ -11,7 +11,12 @@ abstract contract DatasetRegistryBase is Test {
     address internal gov = makeAddr("governance-timelock");
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
-    bytes32 internal constant ID = keccak256("dataset/notes");
+    /// Dataset ids live in the publisher's namespace: the top 20 bytes are the publisher address.
+    bytes32 internal ID = _nsId(alice, "dataset/notes");
+
+    function _nsId(address who, string memory name) internal pure returns (bytes32) {
+        return bytes32((uint256(uint160(who)) << 96) | uint256(uint96(uint256(keccak256(bytes(name))))));
+    }
 
     function setUp() public virtual {
         reg = new DatasetRegistry(gov);
@@ -258,10 +263,11 @@ contract DatasetRegistryTest is DatasetRegistryBase {
         vm.prank(alice);
         vm.expectRevert(DatasetRegistry.AlreadyWithdrawn.selector);
         reg.withdraw(ID, 1, 3);
+        // a governance takedown still applies to a version the publisher already withdrew
         vm.prank(gov);
-        vm.expectRevert(DatasetRegistry.AlreadyWithdrawn.selector);
         reg.withdraw(ID, 1, 1000);
         assertTrue(reg.getVersion(ID, 1).withdrawn);
+        assertTrue(reg.frozen(ID));
     }
 
     function test_withdraw_unknown_version_reverts() public {
@@ -337,7 +343,7 @@ contract DatasetRegistryTest is DatasetRegistryBase {
         _publishV1(alice);
         vm.prank(gov);
         reg.withdraw(ID, 1, 1000);
-        bytes32 other = keccak256("dataset/other");
+        bytes32 other = _nsId(alice, "dataset/other");
         vm.prank(alice);
         reg.publish(other, _v(keccak256("o1"), bytes32(0)));
         assertFalse(reg.frozen(other));
@@ -393,6 +399,130 @@ contract DatasetRegistryTest is DatasetRegistryBase {
     function test_constructor_refuses_zero_governance() public {
         vm.expectRevert();
         new DatasetRegistry(address(0));
+    }
+
+    // ── takedown applies whatever the version's state (Q15) ──────────
+
+    /// The publisher withdrawing a version before a queued takedown executes does not stop the
+    /// takedown: the id is frozen and accepts no further version.
+    function test_takedown_freezes_after_publisher_withdrew_first() public {
+        _publishV1(alice);
+        vm.prank(alice);
+        reg.withdraw(ID, 1, 1);
+        vm.expectEmit(true, false, false, true, address(reg));
+        emit DatasetRegistry.DatasetIdFrozen(ID, 1, 1000);
+        vm.prank(gov);
+        reg.withdraw(ID, 1, 1000);
+        assertTrue(reg.frozen(ID));
+        assertTrue(reg.getVersion(ID, 1).withdrawn);
+        vm.prank(alice);
+        vm.expectRevert(DatasetRegistry.DatasetFrozen.selector);
+        reg.publish(ID, _v(keccak256("m1-again"), keccak256("m1")));
+        assertEq(reg.versionCount(ID), 1);
+    }
+
+    /// A repeated takedown (for example a second queued timelock operation) does not revert and
+    /// changes nothing.
+    function test_repeated_takedown_is_a_noop() public {
+        _publishV1(alice);
+        vm.prank(gov);
+        reg.withdraw(ID, 1, 1000);
+        vm.recordLogs();
+        vm.prank(gov);
+        reg.withdraw(ID, 1, 1200);
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertTrue(reg.frozen(ID));
+        assertTrue(reg.getVersion(ID, 1).withdrawn);
+    }
+
+    /// forge-config: default.fuzz.runs = 10000
+    function testFuzz_takedown_freezes_regardless_of_version_state(
+        uint8 nVersions,
+        uint8 target,
+        uint256 withdrawnMask,
+        uint16 reason
+    ) public {
+        uint32 n = uint32(nVersions % 6) + 1;
+        uint32 t = uint32(target % n) + 1;
+        reason = uint16(bound(reason, 1000, type(uint16).max));
+        bytes32 prev;
+        for (uint32 i = 1; i <= n; i++) {
+            bytes32 m = keccak256(abi.encode("m", i));
+            vm.prank(alice);
+            reg.publish(ID, _v(m, prev));
+            prev = m;
+            if ((withdrawnMask >> i) & 1 == 1) {
+                vm.prank(alice);
+                reg.withdraw(ID, i, 1);
+            }
+        }
+        vm.prank(gov);
+        reg.withdraw(ID, t, reason);
+        assertTrue(reg.frozen(ID));
+        assertTrue(reg.getVersion(ID, t).withdrawn);
+        vm.prank(alice);
+        vm.expectRevert(DatasetRegistry.DatasetFrozen.selector);
+        reg.publish(ID, _v(keccak256("next"), prev));
+    }
+
+    // ── dataset ids are namespaced by publisher ──────────────────────
+
+    /// Nobody can take a dataset id in another publisher's namespace, so a copied pending v1
+    /// transaction cannot claim the id first.
+    function test_v1_must_be_in_the_publishers_namespace() public {
+        vm.prank(bob);
+        vm.expectRevert(DatasetRegistry.NotDatasetOwner.selector);
+        reg.publish(ID, _v(keccak256("m1"), bytes32(0)));
+        vm.prank(gov);
+        vm.expectRevert(DatasetRegistry.NotDatasetOwner.selector);
+        reg.publish(ID, _v(keccak256("m1"), bytes32(0)));
+        assertEq(reg.versionCount(ID), 0);
+        assertEq(_publishV1(alice), 1);
+        assertEq(reg.ownerOf(ID), alice);
+    }
+
+    /// forge-config: default.fuzz.runs = 10000
+    function testFuzz_v1_outside_namespace_refused(address caller, bytes32 id) public {
+        vm.assume(address(uint160(uint256(id) >> 96)) != caller);
+        vm.prank(caller);
+        vm.expectRevert(DatasetRegistry.NotDatasetOwner.selector);
+        reg.publish(id, _v(keccak256("m1"), bytes32(0)));
+    }
+
+    // ── governance as a dataset owner ────────────────────────────────
+
+    /// Governance publishing its own dataset can still take it down with a takedown code, and
+    /// withdraw one version with a publisher code.
+    function test_governance_owner_can_take_down_its_own_dataset() public {
+        bytes32 gid = _nsId(gov, "dataset/gov");
+        vm.startPrank(gov);
+        reg.publish(gid, _v(keccak256("g1"), bytes32(0)));
+        reg.publish(gid, _v(keccak256("g2"), keccak256("g1")));
+        reg.withdraw(gid, 1, 5);
+        assertTrue(reg.getVersion(gid, 1).withdrawn);
+        assertFalse(reg.frozen(gid));
+        reg.withdraw(gid, 2, 1000);
+        vm.stopPrank();
+        assertTrue(reg.frozen(gid));
+        assertTrue(reg.getVersion(gid, 2).withdrawn);
+    }
+
+    // ── license placeholders ─────────────────────────────────────────
+
+    function test_publish_refuses_noassertion_and_padded_licenses() public {
+        string[9] memory bad =
+            ["NOASSERTION", "noassertion", "NoAssertion", " unknown", "unknown ", "\tunknown", " MIT", "MIT\n", " "];
+        for (uint256 i = 0; i < bad.length; i++) {
+            DatasetRegistry.Version memory v = _v(keccak256("m1"), bytes32(0));
+            v.license = bad[i];
+            vm.prank(alice);
+            vm.expectRevert(DatasetRegistry.BadLicense.selector);
+            reg.publish(ID, v);
+        }
+        DatasetRegistry.Version memory ok = _v(keccak256("m1"), bytes32(0));
+        ok.license = "MIT OR Apache-2.0";
+        vm.prank(alice);
+        assertEq(reg.publish(ID, ok), 1);
     }
 
     // ── fuzz ────────────────────────────────────────────────────────
@@ -461,7 +591,11 @@ contract DatasetRegistryHandler is Test {
         reg = reg_;
         gov = gov_;
         actors = [makeAddr("h-alice"), makeAddr("h-bob"), gov_];
-        ids = [keccak256("d0"), keccak256("d1"), keccak256("d2")];
+        // one id in each actor's namespace; every actor tries every id
+        for (uint256 i = 0; i < 3; i++) {
+            ids[i] =
+                bytes32((uint256(uint160(actors[i])) << 96) | uint256(uint96(uint256(keccak256(abi.encode("d", i))))));
+        }
     }
 
     function publish(uint256 actorSeed, uint256 idSeed, bool goodPrev, uint8 privacySeed) external {
@@ -494,15 +628,17 @@ contract DatasetRegistryHandler is Test {
         uint32 ver = uint32(verSeed % n) + 1;
         address a = actors[actorSeed % 3];
         // bias toward valid codes so takedowns actually happen
-        if (reason % 2 == 0) reason = a == gov && reg.ownerOf(id) != gov ? 1000 + reason % 1000 : 1 + reason % 999;
+        if (reason % 2 == 0) reason = a == gov && reason % 4 == 0 ? 1000 + reason % 1000 : 1 + reason % 999;
+        bool takedown = a == gov && reason >= 1000;
         vm.prank(a);
         try reg.withdraw(id, ver, reason) {
             everWithdrawn[id][ver] = true;
-            if (a == gov && reg.ownerOf(id) != gov && reason >= 1000 && !frozenGhost[id]) {
-                frozenGhost[id] = true;
-                countAtFreeze[id] = n;
-            }
         } catch {}
+        // Q15: a governance takedown freezes the id whatever the version's state
+        if (takedown && !frozenGhost[id]) {
+            frozenGhost[id] = true;
+            countAtFreeze[id] = n;
+        }
     }
 
     function id(uint256 i) external view returns (bytes32) {
