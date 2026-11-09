@@ -2032,8 +2032,8 @@ fn with_wrong_state_root(b: &Block, i: u8) -> Block {
 /// A chain block whose state root is wrong is admitted to the DAG (admission
 /// never executes) and is disqualified when the applied chain reaches it:
 /// the mark is persisted, the node stays on its last valid chain block and
-/// keeps sealing on it, and the bad block is still a DAG block. The next
-/// block merges it, and the transactions it carries are executed.
+/// keeps sealing on it, and the bad block is still a DAG block: once the
+/// node's chain outweighs it, a block merges it and executes its own txs.
 #[tokio::test]
 async fn wrong_state_root_disqualifies_from_chain_not_from_dag() {
     let fleet = Fleet::new(FleetSpec::new(2)).await;
@@ -2050,7 +2050,10 @@ async fn wrong_state_root_disqualifies_from_chain_not_from_dag() {
     let xh = x.header.block_hash;
     assert!(b.offer(&x).await, "admission never executes: x is admitted");
     assert_eq!(b.tip().await.0, a1.header.block_hash, "x is never applied");
-    assert!(b.ghostdag.is_disqualified(&xh), "x is disqualified from chain");
+    assert!(
+        b.ghostdag.is_disqualified(&xh),
+        "x is disqualified from chain"
+    );
     assert!(
         b.storage.blocks.get_block(&xh).expect("read").is_some(),
         "x stays a DAG block"
@@ -2061,23 +2064,39 @@ async fn wrong_state_root_disqualifies_from_chain_not_from_dag() {
     ));
     let reloaded = DagStore::persistent_with_strict_vrf(kv, true).expect("reload");
     assert!(reloaded.is_disqualified(&xh), "the mark survives a restart");
-    // B keeps sealing on its applied tip, merges x, and runs x's own tx.
+    // B keeps sealing on its applied tip. x can be merged only by a block
+    // whose selected parent outweighs it (G3), so once B's own chain is
+    // heavier one of its blocks merges x and executes x's own tx.
     let m = b.produce().await;
     assert_eq!(m.header.selected_parent_hash, a1.header.block_hash);
-    assert!(
-        m.header.merge_parent_hashes.contains(&xh),
-        "x can still be merged"
-    );
-    assert_eq!(b.tip().await.0, m.header.block_hash);
-    let n = b.produce().await;
-    let j = b.receipt_json(&u.hash).expect("x's tx is executed once x is merged");
+    assert!(!b.ghostdag.is_disqualified(&m.header.block_hash));
+    let mut merger = None;
+    for _ in 0..3 {
+        let next = b.produce().await;
+        assert_eq!(
+            b.tip().await.0,
+            next.header.block_hash,
+            "B extends its own chain"
+        );
+        if next.header.merge_parent_hashes.contains(&xh) {
+            merger = Some(next);
+            break;
+        }
+    }
+    let merger = merger.expect("x is merged once B's chain outweighs it");
+    let j = b
+        .receipt_json(&u.hash)
+        .expect("x's tx is executed once x is merged");
     assert_eq!(
         j["acceptance"]["including_block_hash"],
         serde_json::to_value(xh).expect("j"),
-        "included by x, accepted by m's chain child"
+        "included by x"
     );
-    assert_eq!(j["block_hash"], serde_json::to_value(n.header.block_hash).expect("j"));
-    assert!(!b.ghostdag.is_disqualified(&m.header.block_hash));
+    assert_eq!(
+        j["block_hash"],
+        serde_json::to_value(merger.header.block_hash).expect("j"),
+        "accepted by the block that merges x"
+    );
 }
 
 /// Fork choice never names a disqualified block: a lone disqualified tip
@@ -2121,7 +2140,9 @@ async fn child_of_disqualified_sp_is_disqualified() {
     let x = with_wrong_state_root(&a2, 0);
     let a3 = a.produce().await;
     assert_eq!(a3.header.selected_parent_hash, a2.header.block_hash);
-    let y = resealed(&a3, 0, |y| y.header.selected_parent_hash = x.header.block_hash);
+    let y = resealed(&a3, 0, |y| {
+        y.header.selected_parent_hash = x.header.block_hash
+    });
     // After the mark.
     b.receive(&x).await;
     assert!(b.ghostdag.is_disqualified(&x.header.block_hash));

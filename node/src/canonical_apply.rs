@@ -1804,6 +1804,28 @@ impl CanonicalApplicator {
     /// commitments (`Executor::apply_accepting_block`). `persist` commits state,
     /// receipts and the applied tip atomically; `verify` false is the trusted
     /// replay of a from-genesis rebuild (the final root is checked once).
+    /// Spec 06 §3.10 (D11): disqualify `hash` from the selected chain when
+    /// `e` is a fault of the block's own data, found by executing its mergeset:
+    /// a commitment that does not reproduce. Node-local failures (a missing
+    /// member body, storage, an unmaterialized reward policy) never
+    /// disqualify; the node retries. Returns whether it disqualified.
+    async fn disqualify_on(&self, hash: Hash, e: &ExecutionError) -> bool {
+        if !matches!(
+            e,
+            ExecutionError::StateRootMismatch { .. }
+                | ExecutionError::AcceptanceCommitmentMismatch { .. }
+        ) {
+            return false;
+        }
+        match &self.ghostdag {
+            Some(g) => {
+                g.disqualify(&hash).await;
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn accept_block(
         &self,
         block: &Block,
@@ -2035,6 +2057,11 @@ impl CanonicalApplicator {
                         "execute-on-receive: REJECT block {} @ {} — state root mismatch (claimed {}, computed {})",
                         block_hash, height, expected, got
                     );
+                    self.disqualify_on(
+                        block_hash,
+                        &ExecutionError::StateRootMismatch { expected, got },
+                    )
+                    .await;
                     // SRP-S4: dump the injective per-account digest of the state that
                     // produced the DIVERGENT computed root, so a diff vs a healthy node's
                     // digest at this height NAMES the account (env-gated, diagnostic only).
@@ -2061,6 +2088,7 @@ impl CanonicalApplicator {
                         "execute-on-receive: REJECT block {} @ {} — execution error: {}",
                         block_hash, height, e
                     );
+                    self.disqualify_on(block_hash, &e).await;
                     return DrainOutcome {
                         applied,
                         rejected: Some((block_hash, format!("execution error: {e}"))),
@@ -2619,6 +2647,9 @@ impl CanonicalApplicator {
                         "execute-on-receive: reorg to {} aborted at {} — {} (reverted to {})",
                         new_tip, block.header.block_hash, e, pre_tip.hash
                     );
+                    // Spec 06 §3.10: a branch block whose commitments do not
+                    // reproduce is disqualified, so fork choice stops naming it.
+                    self.disqualify_on(block.header.block_hash, &e).await;
                     return ReorgOutcome::Rejected(format!(
                         "reorg reapply failed at {}: {e}",
                         block.header.block_hash
