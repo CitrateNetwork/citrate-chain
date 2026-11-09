@@ -138,6 +138,10 @@ fn the_r1007_note_is_its_own_and_names_r1007() {
         hex::encode(r1007::GENESIS_NOTE_ADDRESS.0),
         "000000000000000000000000000000c17a7e1007"
     );
-    assert!(r1007::GENESIS_NOTE.starts_with("Citrate r1007."));
+    // Owner decision 2026-11-09: the exact block-0 text.
+    assert_eq!(
+        r1007::GENESIS_NOTE,
+        "Citrate r1007: rehearsal genesis for chain 40204"
+    );
     assert_ne!(r1007::GENESIS_NOTE, r1006::GENESIS_NOTE);
 }
