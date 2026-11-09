@@ -56,7 +56,7 @@ abstract contract WorkMarketTestBase is Test {
     address internal poster = makeAddr("poster");
     address internal admin = makeAddr("admin");
     address internal stranger = makeAddr("stranger");
-    /// The governance treasury stand-in that receives slashes the poster must not take back.
+    /// The governance treasury stand-in: receives every slash not paid to a rewarded disputer.
     address internal SINK = makeAddr("slashSink");
     uint128 internal constant MINBOND = 0.1 ether;
     uint256 internal coordKey = 0xC00D;

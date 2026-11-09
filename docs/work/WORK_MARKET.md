@@ -129,7 +129,9 @@ budget refunded as before; an uncommitted `dispute()`, or a disputer who is the 
    `c = disputeCommitment(id, payoutEpoch, msg.sender, evidence, salt)`, then
    `revealDispute(id, evidence, salt)` at least `DISPUTE_REVEAL_DELAY` (60 s) later, inside the
    dispute window, binds the reward to the committer. `commitDispute` is refused once the reveal
-   could no longer land before the dispute end (#451 review 3). The delay is measured in block time, not
+   could no longer land before the dispute end (#451 review 3). A commitment is recorded per
+   offer and committer, and reveals only on the offer it was recorded through (#451 review 5:
+   otherwise a party on any live offer could pre-commit against another offer's future root). The delay is measured in block time, not
    `block.number`: on the BlockDAG, merged parallel blocks can repeat or lower the header
    height. `dispute()` stays callable, so a fault can always be proven at once, but it earns no
    disputer share (the slash goes to `slashSink`, point 4), so copying a reveal into `dispute()`
@@ -245,7 +247,7 @@ their addresses are known before the ceremony.
 | TaskVerifier | `reviewWindow_` | **72 h** (owner 2026-11-09, Q7); the contract bounds it to 1 h–30 d | immutable |
 | WorkMarket | `governance_` | the governance timelock | two-step transfer; may not be the CREATE2 factory (Governable) |
 | WorkMarket | `guardian_` | the guardian council 2-of-3 | not zero and not the CREATE2 factory (`InitialAdmin.check`); governance may rotate or clear it later |
-| WorkMarket | `slashSink_` | the governance treasury: the governance timelock (#451 review 3) | immutable; not zero and not the CREATE2 factory (`InitialAdmin.check`); receives slashes the poster must not take back and withdraws them like any pull balance. The governance timelock is used, not a burn, so slashed SALT stays under governance instead of being lost |
+| WorkMarket | `slashSink_` | the governance treasury: the governance timelock (#451 review 3) | immutable; not zero and not the CREATE2 factory (`InitialAdmin.check`); receives every slash not paid to a rewarded disputer (owner 2026-11-09, Q4 revised) and withdraws it like any pull balance. The governance timelock is used, not a burn, so slashed SALT stays under governance instead of being lost |
 | WorkMarket | `defaultCoordinatorBond_` | SALT wei, above zero (Q1), at least `minCoordinatorBond_` | immutable; the amount is a genesis-spec value tied to the tokenomics decision |
 | WorkMarket | `minCoordinatorBond_` | SALT wei, above zero (#451 review 3) | immutable; the least bond an offer may set, so a dust bond cannot neuter the slash or the challenge bond (10 % of it) |
 | WorkMarket | `initialVerifiers_` | `[FLRoundVerifier, TaskVerifier]` | the CREATE2-predicted addresses above; deploy order: FRL, the two verifiers, then WorkMarket |

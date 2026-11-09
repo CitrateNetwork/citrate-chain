@@ -220,7 +220,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint128 public immutable defaultCoordinatorBond;
     /// @notice The least coordinator bond an offer may set.
     uint128 public immutable minCoordinatorBond;
-    /// @notice Receives slashed coordinator bonds the poster must not take back.
+    /// @notice Receives every slash not paid to a rewarded disputer (owner 2026-11-09, Q4 revised).
     address public immutable slashSink;
     address public guardian;
     bool public newOffersPaused;
@@ -232,8 +232,11 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     mapping(address => uint256) public balanceOf;
     mapping(uint256 => mapping(address => Challenge)) internal _challenges;
     mapping(uint256 => mapping(uint32 => IndexChallenge)) internal _indexChallenges;
-    /// @notice When a dispute commitment was made (0 = none); see `commitDispute`.
-    mapping(bytes32 => uint256) public disputeCommittedAt;
+    /// @notice When `committer` recorded `commitment` on offer `id` (0 = none); see `commitDispute`.
+    ///         Keyed by offer and committer, so a commitment reveals only on the offer it was
+    ///         recorded through, and only by its committer.
+    mapping(uint256 id => mapping(address committer => mapping(bytes32 commitment => uint256))) public
+        disputeCommittedAt;
 
     // ── events ──────────────────────────────────────────────────────
 
@@ -323,7 +326,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
     /// @param governance_       the governance timelock (3-of-5 / 48 h); allows verifiers, pauses, unpauses
     /// @param guardian_         the guardian council (2-of-3); may pause new offers, nothing else; not 0 (InitialAdmin)
-    /// @param slashSink_        receives slashed bonds the poster must not take back (the governance treasury)
+    /// @param slashSink_        receives every slash not paid to a rewarded disputer (the governance treasury)
     /// @param defaultCoordinatorBond_ the bond an offer requires when its poster passes 0; above zero
     /// @param minCoordinatorBond_ the least bond an offer may set; above zero, at most the default
     /// @param initialVerifiers_ verifiers allowed at block 0 (CREATE2-predicted FLRoundVerifier and TaskVerifier)
@@ -519,18 +522,21 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         // the reveal must still fit inside the dispute window
         if (block.timestamp + DISPUTE_REVEAL_DELAY >= _disputeEnd(o)) revert WindowClosed();
         if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
-        if (commitment == bytes32(0) || disputeCommittedAt[commitment] != 0) revert BadEvidence();
-        disputeCommittedAt[commitment] = block.timestamp;
+        mapping(bytes32 => uint256) storage mine = disputeCommittedAt[id][msg.sender];
+        if (commitment == bytes32(0) || mine[commitment] != 0) revert BadEvidence();
+        mine[commitment] = block.timestamp;
         emit DisputeCommitted(id, msg.sender, commitment);
     }
 
     /// @notice Reveal a committed dispute (same rules as `dispute`; the disputer earns its share).
     function revealDispute(uint256 id, bytes calldata evidence, bytes32 salt) external nonReentrant {
         bytes32 commitment = disputeCommitment(id, _offer(id).payoutEpoch, msg.sender, evidence, salt);
-        uint256 committedAt = disputeCommittedAt[commitment];
+        // the preimage names `id`; the commitment must have been recorded on `id` by this sender
+        mapping(bytes32 => uint256) storage mine = disputeCommittedAt[id][msg.sender];
+        uint256 committedAt = mine[commitment];
         if (committedAt == 0) revert BadEvidence();
         if (block.timestamp < committedAt + DISPUTE_REVEAL_DELAY) revert TooEarly();
-        delete disputeCommittedAt[commitment];
+        delete mine[commitment];
         _dispute(id, evidence, true);
     }
 
