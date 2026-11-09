@@ -30,7 +30,10 @@ import {Governable} from "../lib/Governable.sol";
 ///           reason code (1..999). Governance (the timelock at genesis) may withdraw any version, but
 ///           only with a takedown reason code (>= 1000). Governance cannot edit or delete anything.
 ///           There is no legal review before publishing (owner answer 6); takedown is the remedy.
-///         * A withdrawn version stays in the chain: a later version still links to it through `prev`.
+///         * A governance takedown freezes the whole dataset id: it never accepts another version
+///           (owner decision Q15, 2026-11-09). Withdrawals of its other versions stay possible.
+///         * A publisher withdrawal affects one version: a later version still links to the
+///           withdrawn one through `prev`.
 contract DatasetRegistry is Governable {
     enum Privacy {
         Public,
@@ -58,6 +61,7 @@ contract DatasetRegistry is Governable {
 
     mapping(bytes32 datasetId => address) private _owner;
     mapping(bytes32 datasetId => Version[]) private _versions;
+    mapping(bytes32 datasetId => bool) private _frozen;
 
     event DatasetPublished(
         bytes32 indexed datasetId, uint32 version, address indexed publisher, Privacy privacy, string license
@@ -92,6 +96,7 @@ contract DatasetRegistry is Governable {
         if (v.manifestHash == bytes32(0)) revert ZeroManifestHash();
         if (v.manifestHash == v.prev) revert ManifestUnchanged();
 
+        if (_frozen[datasetId]) revert DatasetFrozen();
         Version[] storage vs = _versions[datasetId];
         uint256 n = vs.length;
         if (n == 0) {
@@ -129,28 +134,34 @@ contract DatasetRegistry is Governable {
     }
 
     /// @notice Withdraw one version. Sticky; sets only the flag.
-    /// @param reason 1..999 when the dataset owner withdraws; >= 1000 (a takedown code) when
-    ///        governance withdraws. 0 is never valid.
+    /// @param reason 1..999 when the dataset owner withdraws (that version only); >= 1000 (a
+    ///        takedown code) when governance withdraws, which also freezes the id. 0 is never valid.
     function withdraw(bytes32 datasetId, uint32 version, uint16 reason) external {
         Version storage v = _version(datasetId, version);
         if (v.withdrawn) revert AlreadyWithdrawn();
+        bool takedown = false;
         if (msg.sender == _owner[datasetId]) {
             if (reason == 0 || reason >= TAKEDOWN_REASON_MIN) revert BadReason();
         } else if (msg.sender == governance()) {
             if (reason < TAKEDOWN_REASON_MIN) revert BadReason();
+            takedown = true;
         } else {
             revert NotAuthorized();
         }
         v.withdrawn = true;
         emit DatasetWithdrawn(datasetId, version, reason);
+        if (takedown && !_frozen[datasetId]) {
+            _frozen[datasetId] = true;
+            emit DatasetIdFrozen(datasetId, version, reason);
+        }
     }
 
     // ── views ───────────────────────────────────────────────────────
 
     /// @notice True once a governance takedown (reason >= TAKEDOWN_REASON_MIN) hit any version of
     ///         `datasetId`; a frozen id accepts no further version (owner decision Q15, 2026-11-09).
-    function frozen(bytes32) external pure returns (bool) {
-        revert("red: not implemented");
+    function frozen(bytes32 datasetId) external view returns (bool) {
+        return _frozen[datasetId];
     }
 
     function ownerOf(bytes32 datasetId) external view returns (address) {
