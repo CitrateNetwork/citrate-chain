@@ -670,3 +670,45 @@ async fn pruned_node_validates_a_late_boundary_block_below_its_tip() {
         "no header source: fail closed"
     );
 }
+
+/// Characterisation (2026-11-09 verification; a decision for the lead, see the
+/// S3-5 report): voting is ON from genesis in this build, but a checkpoint
+/// needs a committee, and a committee comes from the epoch snapshot that
+/// governs its height. Under the node's production schedule
+/// (`node/src/registry_sync.rs` EPOCH = 1,000, SNAPSHOT_LAG = 200) the first
+/// snapshot is S(1) = 800, which governs heights 801..=1,800. So the
+/// checkpoints at 50..=800 have no committee and are never voted on, and the
+/// first checkpoint that can finalize is 850. This pins that behaviour, so
+/// that an epoch-0 (genesis) committee, if adopted with the r1007 genesis
+/// validator set (S3-6), shows up as a deliberate change here.
+#[tokio::test]
+async fn production_schedule_first_votable_checkpoint_is_850() {
+    const EPOCH: u64 = 1_000;
+    const SNAPSHOT_LAG: u64 = 200;
+    let ks: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let set: Vec<(PublicKey, u128)> = ks.iter().map(|k| (pk(k), 1_000u128)).collect();
+    let sel = VrfProposerSelector::production().with_snapshot_schedule(EPOCH, SNAPSHOT_LAG);
+    // registry_sync materializes S(1) = 800 when block 800 is applied.
+    sel.sync_active_set_at(EPOCH - SNAPSHOT_LAG, set, 1).await;
+    let kv: Arc<dyn KvStore> = Arc::new(MemKv::default());
+    let mgr = Arc::new(CheckpointManager::with_persistence(
+        config(),
+        dag_with(12).await,
+        kv,
+    ));
+    let g = FinalityGadget::new(mgr, Some(Arc::new(sel)));
+    assert!(g.enabled());
+    let seed = Hash::new([7; 32]);
+    for h in (SPEC_CHECKPOINT_INTERVAL..=EPOCH - SNAPSHOT_LAG).step_by(50) {
+        assert!(
+            g.committee_for(h, &seed).await.is_none(),
+            "checkpoint {h}: no snapshot governs it, so no committee"
+        );
+    }
+    let first = g
+        .committee_for(850, &seed)
+        .await
+        .expect("S(1) = 800 governs 850");
+    assert_eq!(first.epoch, 800);
+    assert_eq!(first.members.len(), 4);
+}

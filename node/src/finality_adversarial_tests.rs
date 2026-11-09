@@ -3970,3 +3970,148 @@ async fn cert_survives_restart() {
     assert_eq!(after.stakes, before.stakes);
     assert!(after.has_derived_quorum());
 }
+
+// ---------------------------------------------------------------------------
+// S3-5 verification (2026-11-09): spec 06 §7 "which block", and the RPC
+// ---------------------------------------------------------------------------
+
+/// Spec 06 §7 / §8.2 S3-5 `cannot_vote_for_unvalidated_checkpoint`: a
+/// validator votes only for a block it has applied (executed and
+/// state-root-checked), on its applied chain. A heavier branch it has stored
+/// but not applied gets no vote, neither at the sibling boundary nor at
+/// boundaries that branch has buried and the applied chain has not.
+#[tokio::test]
+async fn cannot_vote_for_unvalidated_checkpoint() {
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    // Node 0 also stores a longer sibling branch B forked at 4 (B reaches 12,
+    // burying 4, 6 and 8 on B), and never applies it.
+    let b = chains.branch(&a, 4, 12, VRF_B);
+    for blk in &b {
+        net.node_mut(0).import(blk).await;
+    }
+    assert_eq!(net.node(0).app.applied_tip().await.hash, hash_at(&a, 8));
+
+    let votes = net.drive(0).await;
+    let heights: Vec<u64> = votes.iter().map(|v| v.height).collect();
+    assert_eq!(
+        heights,
+        vec![2, 4],
+        "only boundaries buried on the applied chain (tip 8, depth 3)"
+    );
+    for v in &votes {
+        assert_eq!(
+            v.block_hash,
+            hash_at(&a, v.height),
+            "vote at {} is for the applied block, not B's",
+            v.height
+        );
+        if v.height >= 4 {
+            assert_ne!(v.block_hash, hash_at(&b, v.height), "not B's block");
+        }
+    }
+}
+
+/// `citrate_getFinalityStatus` end to end, as the node serves it: the
+/// finality driver's `status_view` over a gadget that finalized through real
+/// votes, published into the RPC cell and read over JSON-RPC, with every field
+/// the explorer (`citrate-explorer` src/lib/citrate/r1007.ts
+/// `parseFinalityStatus`) reads. Mode is the one this build runs on every
+/// chain (voting on, enforcement off: "observed").
+#[tokio::test]
+async fn finality_status_rpc_reports_the_certificate_the_votes_formed() {
+    use citrate_api::finality_status::{register_finality_status, FinalityStatusCell};
+    use jsonrpc_core::IoHandler;
+    use serde_json::Value;
+
+    fn call(io: &IoHandler) -> Value {
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"citrate_getFinalityStatus","params":[]}"#;
+        let resp = io.handle_request_sync(req).expect("a response");
+        let v: Value = serde_json::from_str(&resp).expect("json");
+        assert!(v.get("error").is_none(), "no error: {v}");
+        v["result"].clone()
+    }
+    let hx = |h: &Hash| format!("0x{}", hex::encode(h.as_bytes()));
+
+    let mode = FloorMode::for_genesis(CHAIN, &Hash::default());
+    assert_eq!(
+        mode,
+        FloorMode::Observed,
+        "enforcement is off in this build"
+    );
+
+    let chains = Chains::new();
+    let keys: Vec<Ed25519SigningKey> = (0..4).map(key).collect();
+    let vals = Validators::equal_stake(&keys);
+    let mut net = network(4, &vals, config(100)).await;
+    let cell = Arc::new(FinalityStatusCell::default());
+    let mut io = IoHandler::new();
+    register_finality_status(&mut io, cell.clone());
+
+    // Nothing published yet: no invented checkpoint.
+    let r = call(&io);
+    assert_eq!(r["published"], false);
+    assert_eq!(r["finalized"], Value::Null);
+
+    // Published before any vote: no finalized checkpoint, voting on.
+    cell.publish(crate::finality_driver::status_view(&net.node(0).gadget, mode).await);
+    let r = call(&io);
+    assert_eq!(r["published"], true);
+    assert_eq!(r["voting"], true);
+    assert_eq!(r["finalized"], Value::Null);
+
+    // Four validators vote; 2 and 4 finalize.
+    let a = chains.main(8);
+    net.follow_all(&a).await;
+    let ticks = net.round().await;
+    assert!(ticks.iter().all(|t| *t == verified(4)), "{ticks:?}");
+    // Node 0 also holds a pending boundary (6) once its tip buries it.
+    let a = chains.main(9);
+    net.follow_all(&a).await;
+    net.drive(0).await;
+
+    cell.publish(crate::finality_driver::status_view(&net.node(0).gadget, mode).await);
+    let r = call(&io);
+    assert_eq!(r["published"], true);
+    assert_eq!(r["voting"], true);
+    assert_eq!(r["enforcement"], false);
+    assert_eq!(r["mode"], "observed");
+    assert_eq!(r["halted"], false);
+    assert_eq!(r["interval"], 2);
+    assert_eq!(r["voteDepth"], 3);
+    assert!(r["quorumRule"].as_str().is_some_and(|s| s.contains("2/3")));
+    assert!(r["dataSource"]
+        .as_str()
+        .is_some_and(|s| s.contains("CheckpointManager")));
+
+    let f = &r["finalized"];
+    assert_eq!(f["height"], "0x4");
+    assert_eq!(f["blockHash"], hx(&hash_at(&a, 4)));
+    assert_eq!(f["epoch"], format!("0x{:x}", tb_at(4).epoch));
+    assert_eq!(f["stateRoot"], hx(&tb_at(4).state_root));
+    assert_eq!(f["acceptedRoot"], hx(&tb_at(4).accepted_root));
+    assert_eq!(f["committeeSize"], 4);
+    let voters = f["voters"].as_u64().expect("voters");
+    assert!(
+        (3..=4).contains(&voters),
+        "a quorum of the 4 members: {voters}"
+    );
+    assert_eq!(f["totalStake"], "128000");
+    assert_eq!(f["quorumStake"], "85334");
+    assert_eq!(f["votedStake"], (u128::from(voters) * 32_000).to_string());
+    assert_eq!(f["hasQuorum"], true);
+    assert!(f["quorumPct"].as_f64().is_some_and(|p| p >= 75.0));
+
+    let pending = r["pending"].as_array().expect("pending");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let p = &pending[0];
+    assert_eq!(p["height"], "0x6");
+    assert_eq!(p["blockHash"], hx(&hash_at(&a, 6)));
+    assert_eq!(p["voters"], 1, "only node 0's own vote so far");
+    assert_eq!(p["hasQuorum"], false);
+    assert_eq!(p["quorumPct"], 25.0);
+}
