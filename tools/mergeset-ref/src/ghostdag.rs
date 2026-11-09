@@ -232,7 +232,7 @@ impl<'a> Dag<'a> {
         new: &Record,
         c: &Hash,
         k: u32,
-    ) -> Result<Option<(u32, Vec<(Hash, u32)>)>, String> {
+    ) -> Result<Option<BlueCandidate>, String> {
         if new.blues.len() as u64 == u64::from(k) + 1 {
             return Ok(None);
         }
@@ -317,3 +317,7 @@ impl Color {
         !matches!(self, Self::Red)
     }
 }
+
+/// A blue candidate's anticone size and the blues whose anticone it joins,
+/// each with its anticone size.
+type BlueCandidate = (u32, Vec<(Hash, u32)>);

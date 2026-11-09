@@ -164,6 +164,9 @@ impl fmt::Display for Divergence {
 /// One accepted-list entry: (tx hash, including block, status).
 pub type ListEntry = (Hash, Hash, bool);
 
+/// The node's accepted list for a chain block, when it has one.
+pub type NodeLists<'a> = dyn Fn(&Hash) -> Option<Vec<ListEntry>> + 'a;
+
 /// The outcome of a replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -200,7 +203,7 @@ pub fn replay(
     cfg: &RefConfig,
     blocks: &[Block],
     chain: &[Hash],
-    node_lists: Option<&dyn Fn(&Hash) -> Option<Vec<ListEntry>>>,
+    node_lists: Option<&NodeLists<'_>>,
 ) -> Result<Report, String> {
     // A recording of a node that never stored a genesis block starts its
     // chain at the zero-hash sentinel; the reference holds it as a parentless,

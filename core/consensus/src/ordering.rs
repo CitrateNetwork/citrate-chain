@@ -99,7 +99,7 @@ where
             },
         ));
     }
-    rest.sort_by(|a, b| a.0.cmp(&b.0));
+    rest.sort_by_key(|(key, _)| *key);
     let mut out = Vec::with_capacity(rest.len().saturating_add(1));
     out.push(OrderedMember {
         hash: data.selected_parent,

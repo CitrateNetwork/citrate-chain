@@ -516,7 +516,7 @@ impl State {
         self.credit(TREASURY, treasury);
         // Blue recipients in mergeset order, then the red fees' recipient
         // (O4 default: the accepting block).
-        let mut recipients: Vec<([u8; 32], [u8; 20], Vec<Hash>, U256, U256)> = blues
+        let mut recipients: Vec<Recipient> = blues
             .iter()
             .zip(shares.iter().zip(subsidy.iter()))
             .map(|(b, (e, s))| {
@@ -601,6 +601,10 @@ impl State {
         Ok(())
     }
 }
+
+/// A settlement recipient: (proposer key, coinbase, the blocks whose
+/// priority fees it earns, emission share, subsidy share).
+type Recipient = ([u8; 32], [u8; 20], Vec<Hash>, U256, U256);
 
 fn split(total: U256, n: usize) -> Vec<U256> {
     if n == 0 {
