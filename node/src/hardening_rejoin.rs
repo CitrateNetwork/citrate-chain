@@ -1409,6 +1409,30 @@ pub(crate) mod tests {
             );
             built.push(g);
         }
+        // r1007's block 0 is rooted under the MPT state root rule, which is process-wide, so
+        // the node builds it in a child process (genesis::tests, the same build path) and
+        // the child asserts it is exactly R1007_GENESIS.
+        {
+            let exe = std::env::current_exe().expect("exe");
+            let out = std::process::Command::new(exe)
+                .args([
+                    "genesis::tests::r1007_child_build_after_publication",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(crate::genesis::R1007_CHILD_ENV, "1")
+                .env_remove(citrate_execution::mpt_state_root::MPT_STATE_ROOT_ENV)
+                .output()
+                .expect("spawn child");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "the r1007 genesis build failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            built.push(citrate_consensus::hardening::R1007_GENESIS);
+        }
         for (_, g) in RELEASE_GENESIS {
             assert!(
                 built.contains(g),

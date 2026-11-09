@@ -415,20 +415,31 @@ impl ConsensusManifest {
     }
 
     /// The rule schedule string for a genesis (`-` when it has no compiled activations).
+    ///
+    /// A genesis with compiled chain parameters (r1007) appends `|params:<rendering>`, so
+    /// the binding also covers its slot, retention, undo window and checkpoint values. A
+    /// genesis without them (r1006) renders exactly as before.
     pub fn genesis_rules_of(genesis: &[u8; 32]) -> String {
         match citrate_consensus::hardening::genesis_activations(genesis) {
             None => "-".to_string(),
-            Some(a) => a
-                .entries()
-                .iter()
-                .map(|(n, h)| {
-                    format!(
-                        "{n}:{}",
-                        h.map(|h| h.to_string()).unwrap_or_else(|| "unset".into())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("|"),
+            Some(a) => {
+                let mut r = a
+                    .entries()
+                    .iter()
+                    .map(|(n, h)| {
+                        format!(
+                            "{n}:{}",
+                            h.map(|h| h.to_string()).unwrap_or_else(|| "unset".into())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if let Some(p) = citrate_consensus::genesis_params::genesis_chain_params(genesis) {
+                    r.push_str("|params:");
+                    r.push_str(&p.render());
+                }
+                r
+            }
         }
     }
 

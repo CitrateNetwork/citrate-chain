@@ -180,6 +180,8 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
     ),
     // r1006 (profile `r1006`: genesis from ceremony state)
     (40204, R1006_GENESIS),
+    // r1007 (profile `r1007`: the r1006 ceremony state, its own note, MPT root from 0)
+    (40204, R1007_GENESIS),
     // mainnet
     (
         40204,
@@ -192,6 +194,16 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
 /// the compiled profile; any change to the allocation moves it, on purpose.
 pub const R1006_GENESIS: [u8; 32] =
     hex32("a3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4");
+
+/// The r1007 genesis block (profile `r1007`, ADR-2026-11-03 CV-2, planset S3-6): the
+/// r1006 ceremony state (same contracts, same producer set, owner Q-3) with its own
+/// genesis note, rooted under the MPT state root rule from block 0 (CV-14).
+/// Pinned by `r1007_genesis_hash_is_pinned_and_reproducible_under_the_mpt_rule` in
+/// citrate-economics, which rebuilds it from the compiled profile. Any change to the
+/// allocation, the genesis block encoding or the root rule moves it, on purpose; the
+/// integration of the r1007 consensus lanes re-pins it there (docs/consensus/R1007_GENESIS.md).
+pub const R1007_GENESIS: [u8; 32] =
+    hex32("4e0465e0015f5bd712c4e8b9267d7fd831b4d1b488f83f2f86ca115820eaad29");
 
 /// Activation heights compiled into this release for ONE genesis, keyed by its block-0
 /// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin
@@ -268,11 +280,34 @@ pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
     mpt_state_root: None,
 };
 
+/// r1007's rules (S3-6; docs/consensus/R1007_GENESIS.md): every genesis-keyed rule from
+/// 0, so the chain runs one rule set from its first block and none of the legacy
+/// behaviours is reachable.
+///
+/// * `mpt_state_root: Some(0)`: CV-14 (a)+(b), owner 2026-11-07. Activation 0 includes
+///   block 0 itself (lead decision 2026-11-09, docs/consensus/STATE_ROOT_MPT.md §1).
+/// * `supply_hardening` and `exact_create_code` at 0 (from block 1, as on r1006):
+///   PENDING OWNER confirmation of the mergeset lane's recommendation (no deployment
+///   bonus for a failed deployment, a deployment's `value` transferred, created code
+///   stored exactly, not zero-padded). The alternative, `None`, keeps the legacy
+///   behaviour on r1007 and needs a fork to remove before mainnet.
+/// * `pba_hardening`, `vrf_canonical_encoding`, `storage_root_hardening` at 0, as r1006.
+pub const R1007_ACTIVATIONS: GenesisActivations = GenesisActivations {
+    pba_hardening: Some(0),
+    exact_create_code: Some(0),
+    vrf_canonical_encoding: Some(0),
+    storage_root_hardening: Some(0),
+    supply_hardening: Some(0),
+    mpt_state_root: Some(0),
+};
+
 /// Per-genesis activations compiled into this release, keyed by (chain id, block-0 hash),
 /// beside [`RELEASE_GENESIS`]. The ONLY place a new rule gets a height: r1005's genesis has
 /// no entry, so every new rule stays unset there (replay-identical).
-pub const GENESIS_ACTIVATIONS: &[(u64, [u8; 32], GenesisActivations)] =
-    &[(40204, R1006_GENESIS, R1006_ACTIVATIONS)];
+pub const GENESIS_ACTIVATIONS: &[(u64, [u8; 32], GenesisActivations)] = &[
+    (40204, R1006_GENESIS, R1006_ACTIVATIONS),
+    (40204, R1007_GENESIS, R1007_ACTIVATIONS),
+];
 
 /// The genesis-keyed rules for a node on `chain_id` whose loaded block 0 is `genesis`:
 ///
@@ -1116,7 +1151,10 @@ mod tests {
     fn genesis_keyed_rules_r1005_none_r1006_zero_unknown_none() {
         let r1005 = RELEASE_GENESIS[0].1;
         assert_eq!(rules_for_genesis(40204, &r1005), None);
-        for (_, g) in RELEASE_GENESIS.iter().filter(|(_, g)| *g != R1006_GENESIS) {
+        for (_, g) in RELEASE_GENESIS
+            .iter()
+            .filter(|(_, g)| *g != R1006_GENESIS && *g != R1007_GENESIS)
+        {
             assert_eq!(rules_for_genesis(40204, g), None, "{}", hex::encode(g));
         }
         let r = rules_for_genesis(40204, &R1006_GENESIS).expect("r1006 has rules");

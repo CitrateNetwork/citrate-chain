@@ -222,16 +222,21 @@ fn pubkey_hex_opt_to_evm_address(hex_opt: Option<&String>) -> Option<String> {
     hex_opt.map(|s| pubkey_hex_to_evm_address(s))
 }
 
-/// `extraData` for a block. Block 0 of the r1006 genesis carries its genesis note (the
-/// same text block 0's state holds at `GENESIS_NOTE_ADDRESS`); every other block is `0x`.
+/// `extraData` for a block. Block 0 of the r1006 and r1007 geneses carries that genesis's
+/// note (the same text block 0's state holds at its `GENESIS_NOTE_ADDRESS`); every other
+/// block is `0x`.
 fn block_extra_data(height: u64, hash: &[u8; 32]) -> String {
-    if height == 0 && *hash == citrate_consensus::hardening::R1006_GENESIS {
-        return format!(
-            "0x{}",
-            hex::encode(citrate_economics::r1006::GENESIS_NOTE.as_bytes())
-        );
+    if height != 0 {
+        return "0x".to_string();
     }
-    "0x".to_string()
+    let note = if *hash == citrate_consensus::hardening::R1006_GENESIS {
+        citrate_economics::r1006::GENESIS_NOTE
+    } else if *hash == citrate_consensus::hardening::R1007_GENESIS {
+        citrate_economics::r1007::GENESIS_NOTE
+    } else {
+        return "0x".to_string();
+    };
+    format!("0x{}", hex::encode(note.as_bytes()))
 }
 
 fn eth_block_json(
@@ -3979,7 +3984,10 @@ mod genesis_extra_data_tests {
                 hex::encode(citrate_economics::r1007::GENESIS_NOTE.as_bytes())
             )
         );
-        assert_ne!(block_extra_data(0, &R1007_GENESIS), block_extra_data(0, &R1006_GENESIS));
+        assert_ne!(
+            block_extra_data(0, &R1007_GENESIS),
+            block_extra_data(0, &R1006_GENESIS)
+        );
         assert_eq!(block_extra_data(1, &R1007_GENESIS), "0x");
     }
 }

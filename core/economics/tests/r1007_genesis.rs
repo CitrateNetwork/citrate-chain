@@ -102,7 +102,10 @@ fn r1007_keeps_the_r1006_contract_and_validator_sets() {
         .iter()
         .find(|a| a.address == r1007::GENESIS_NOTE_ADDRESS)
         .expect("the r1007 note");
-    assert_eq!(note.storage, r1006::solidity_string_slots(r1007::GENESIS_NOTE));
+    assert_eq!(
+        note.storage,
+        r1006::solidity_string_slots(r1007::GENESIS_NOTE)
+    );
     assert_eq!(r7.accounts.len(), r6.accounts.len());
     let mut seen = HashSet::new();
     assert!(r7.accounts.iter().all(|a| seen.insert(a.address.0)));

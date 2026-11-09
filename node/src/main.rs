@@ -647,6 +647,13 @@ async fn main() -> Result<()> {
                             hex::encode(citrate_consensus::hardening::R1006_GENESIS)
                         )),
                     );
+                    obj.insert(
+                        "r1007_genesis".into(),
+                        serde_json::Value::String(format!(
+                            "0x{}",
+                            hex::encode(citrate_consensus::hardening::R1007_GENESIS)
+                        )),
+                    );
                 }
                 println!(
                     "{}",
@@ -915,7 +922,10 @@ async fn main() -> Result<()> {
         };
 
         let genesis_profile = config.chain.genesis_profile.as_deref();
-        if genesis_profile == Some(genesis::R1006_PROFILE) {
+        // r1007 is built from the r1006 ceremony state, so it is bootable exactly when r1006 is.
+        if genesis_profile == Some(genesis::R1006_PROFILE)
+            || genesis_profile == Some(genesis::R1007_PROFILE)
+        {
             genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
         }
         publish_mpt_rule_for_genesis_build(
@@ -1621,6 +1631,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?,
         genesis::r1006_rehearsal_from_env(),
     )?;
+    genesis::r1007_boot_guard(
+        config.chain.chain_id,
+        config.chain.genesis_profile.as_deref(),
+        running_genesis.as_ref(),
+        &citrate_economics::r1007::readiness()
+            .map_err(|e| anyhow::anyhow!("invalid r1007 genesis: {e}"))?,
+        genesis::r1006_rehearsal_from_env(),
+    )?;
+    // r1007 (S3-6): the chain parameters compiled for this block 0; the node's
+    // [checkpoint] section may only repeat them. Data source: GENESIS_CHAIN_PARAMS.
+    let genesis_params = running_genesis.and_then(|g| {
+        citrate_consensus::genesis_params::chain_params_for_genesis(config.chain.chain_id, &g)
+    });
+    genesis::check_checkpoint_params(genesis_params.as_ref(), &config.checkpoint)?;
+    if let Some(p) = &genesis_params {
+        info!("Genesis chain parameters: {}", p.render());
+    }
     let on_demand = producer::check_mine_on_demand(
         std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
         config.chain.genesis_profile.as_deref(),
@@ -2204,13 +2231,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // On the r1006 genesis with its producer set filled, the registry and the activation
     // height are compiled into the genesis profile (genesis::resolve_validator_registry);
     // the env may only repeat them. On any other chain the env decides, as before.
-    let compiled_validator_set =
-        if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
-            citrate_economics::r1006::validator_set_binding()
-                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
-        } else {
-            None
-        };
+    let compiled_validator_set = genesis::compiled_validator_set(running_genesis.as_ref())?;
     let validator_registry: Option<([u8; 20], u64)> = genesis::resolve_validator_registry(
         compiled_validator_set,
         std::env::var("CITRATE_VALIDATOR_REGISTRY").ok().as_deref(),

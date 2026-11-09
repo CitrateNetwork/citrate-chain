@@ -90,7 +90,125 @@ pub const R1006_PROFILE: &str = "r1006";
 /// block-0 hash, next to its `GENESIS_ACTIVATIONS` entry (`mpt_state_root:
 /// Some(0)`), so the r1007 block 0 is built and re-built under the MPT rule.
 pub fn compiled_genesis_for_profile(profile: Option<&str>) -> Option<[u8; 32]> {
-    (profile == Some(R1006_PROFILE)).then_some(citrate_consensus::hardening::R1006_GENESIS)
+    match profile {
+        Some(R1006_PROFILE) => Some(citrate_consensus::hardening::R1006_GENESIS),
+        Some(R1007_PROFILE) => Some(citrate_consensus::hardening::R1007_GENESIS),
+        _ => None,
+    }
+}
+
+/// The r1007 genesis profile (ADR-2026-11-03 CV-2, S3-6): the r1006 ceremony state with
+/// its own note, block 0 rooted under the MPT state root rule. Its block 0 is
+/// `citrate_consensus::hardening::R1007_GENESIS`; its rules and chain parameters are the
+/// genesis-keyed entries for that hash (docs/consensus/R1007_GENESIS.md).
+pub const R1007_PROFILE: &str = "r1007";
+
+/// The ValidatorRegistry binding compiled for the genesis a node runs: r1006 and r1007
+/// (block 0 holds the same registry state and producer set) compile it once their
+/// producer set is final; any other genesis gets `None` and the env decides
+/// ([`resolve_validator_registry`]). Data source: `citrate_economics::r1006` /
+/// `citrate_economics::r1007::validator_set_binding` (the compiled validators file).
+pub fn compiled_validator_set(
+    running_genesis: Option<&[u8; 32]>,
+) -> anyhow::Result<Option<([u8; 20], u64)>> {
+    use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+    match running_genesis {
+        Some(g) if *g == R1006_GENESIS => citrate_economics::r1006::validator_set_binding()
+            .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}")),
+        Some(g) if *g == R1007_GENESIS => citrate_economics::r1007::validator_set_binding()
+            .map_err(|e| anyhow::anyhow!("invalid r1007 genesis: {e}")),
+        _ => Ok(None),
+    }
+}
+
+/// On a genesis with compiled chain parameters (r1007), the node's `[checkpoint]`
+/// interval, committee size and vote depth may only repeat them: a per-node value would
+/// make this node propose, select and vote on other checkpoints than the fleet. `None`
+/// (any other genesis): the config decides, as before. Data source: the compiled table
+/// `citrate_consensus::genesis_params::GENESIS_CHAIN_PARAMS`.
+pub fn check_checkpoint_params(
+    params: Option<&citrate_consensus::genesis_params::GenesisChainParams>,
+    checkpoint: &crate::config::CheckpointNodeConfig,
+) -> anyhow::Result<()> {
+    let Some(p) = params else {
+        return Ok(());
+    };
+    let mut bad = Vec::new();
+    if checkpoint.interval != p.checkpoint_interval {
+        bad.push(format!(
+            "interval = {} (compiled {})",
+            checkpoint.interval, p.checkpoint_interval
+        ));
+    }
+    if checkpoint.committee_size != p.committee_size {
+        bad.push(format!(
+            "committee_size = {} (compiled {})",
+            checkpoint.committee_size, p.committee_size
+        ));
+    }
+    if checkpoint.vote_depth != p.checkpoint_vote_depth {
+        bad.push(format!(
+            "vote_depth = {} (compiled {})",
+            checkpoint.vote_depth, p.checkpoint_vote_depth
+        ));
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "[checkpoint] {} differs from the chain parameters this genesis compiles; remove the \
+         setting (a per-node value would split the fleet's checkpoints)",
+        bad.join(", ")
+    )
+}
+
+/// The start-up guard for the r1007 genesis (pure, unit tested), like
+/// [`r1006_boot_guard`]: `running` is the data directory's block 0.
+///
+/// * profile `r1007` with another (or no) block 0: refused (a fresh data directory is
+///   needed);
+/// * the r1007 block 0 on another chain id: refused;
+/// * the r1007 block 0 while the r1006 ceremony inputs it is built from are not
+///   release-ready: refused unless `rehearsal` (`CITRATE_R1006_REHEARSAL=1`);
+/// * any other genesis: not this guard's concern.
+pub fn r1007_boot_guard(
+    chain_id: u64,
+    profile: Option<&str>,
+    running: Option<&[u8; 32]>,
+    readiness: &citrate_economics::r1006::Readiness,
+    rehearsal: bool,
+) -> anyhow::Result<()> {
+    let r1007 = citrate_consensus::hardening::R1007_GENESIS;
+    let is_r1007 = running == Some(&r1007);
+    if profile == Some(R1007_PROFILE) && !is_r1007 {
+        anyhow::bail!(
+            "[chain] genesis_profile = \"r1007\" but this data directory's block 0 ({}) is not \
+             the r1007 genesis this build compiles ({}). Use a fresh data directory.",
+            running.map(hex::encode).unwrap_or_else(|| "missing".into()),
+            hex::encode(r1007)
+        );
+    }
+    if !is_r1007 {
+        return Ok(());
+    }
+    if chain_id != 40204 {
+        anyhow::bail!("the r1007 genesis runs only on chain 40204 (configured: {chain_id})");
+    }
+    if readiness.is_release_ready() {
+        return Ok(());
+    }
+    let missing = readiness.missing().join("; ");
+    if rehearsal {
+        tracing::warn!(
+            "r1007 genesis built from a REHEARSAL r1006 state ({R1006_REHEARSAL_ENV}=1): not \
+             release-ready: {missing}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the r1007 genesis in this build is not release-ready: {missing}. It must not start a \
+         network. For a local rehearsal only, set {R1006_REHEARSAL_ENV}=1."
+    )
 }
 
 /// Rehearsal opt-in: lets a node create or run an r1006 genesis that still has
@@ -194,7 +312,8 @@ pub fn resolve_validator_registry(
                 if parse_reg(raw)? != reg {
                     anyhow::bail!(
                         "CITRATE_VALIDATOR_REGISTRY={raw} is not the ValidatorRegistry the r1006 \
-                         genesis compiles (0x{}); remove it",
+                         ceremony registered (0x{}), the compiled ValidatorRegistry of this \
+                         genesis (r1006 and r1007 both compile it); remove it",
                         hex::encode(reg)
                     );
                 }
@@ -202,7 +321,7 @@ pub fn resolve_validator_registry(
             if let Some(raw) = env_activation {
                 if parse_act(raw)? != act {
                     anyhow::bail!(
-                        "CITRATE_VALIDATOR_ACTIVATION_HEIGHT={raw} is not the r1006 genesis's \
+                        "CITRATE_VALIDATOR_ACTIVATION_HEIGHT={raw} is not this genesis's \
                          compiled activation height {act}; remove it"
                     );
                 }
@@ -288,11 +407,18 @@ pub async fn initialize_genesis_state_with_profile(
             EconomicsGenesisConfig::r1006()
                 .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
         }
+        Some(R1007_PROFILE) => {
+            tracing::info!(
+                "Using r1007 genesis profile (r1006 ceremony state, MPT state root from block 0)"
+            );
+            EconomicsGenesisConfig::r1007()
+                .map_err(|e| anyhow::anyhow!("invalid r1007 genesis: {e}"))?
+        }
         Some(other) => {
             anyhow::bail!(
                 "[chain] genesis_profile = {other:?} is not compiled into this build (known: \
-                 default, testnet_beta, team_testnet, mainnet, r1006); refusing to build a genesis \
-                 instead of falling back to the chain-id default"
+                 default, testnet_beta, team_testnet, mainnet, r1006, r1007); refusing to build a \
+                 genesis instead of falling back to the chain-id default"
             );
         }
         None => {
@@ -367,6 +493,13 @@ pub async fn initialize_genesis_with_dag(
 
     Ok(genesis_hash)
 }
+
+/// The MPT state root rule is process-wide, so the r1007 genesis builds in tests run in a
+/// child process (the split_heal pattern): the parent's tests keep the legacy root. Any
+/// test that needs the r1007 block 0 built by the node path runs
+/// `genesis::tests::r1007_child_build_after_publication` with this set.
+#[cfg(test)]
+pub(crate) const R1007_CHILD_ENV: &str = "CITRATE_R1007_GENESIS_CHILD";
 
 #[cfg(test)]
 mod tests {
@@ -654,9 +787,7 @@ mod tests {
 
     // ---- r1007 (ADR-2026-11-03 CV-2, S3-6; docs/consensus/R1007_GENESIS.md) ----
 
-    /// The MPT state root rule is process-wide, so the r1007 builds run in a child
-    /// process (the split_heal pattern): the parent's tests keep the legacy root.
-    const R1007_CHILD_ENV: &str = "CITRATE_R1007_GENESIS_CHILD";
+    use super::R1007_CHILD_ENV;
 
     fn r1007_child(test: &str) {
         let exe = std::env::current_exe().expect("exe");
@@ -720,8 +851,9 @@ mod tests {
             hex::encode(g)
         );
         // A configured per-node height that disagrees with the compiled one is refused.
-        assert!(crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), Some(5))
-            .is_err());
+        assert!(
+            crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), Some(5)).is_err()
+        );
     }
 
     /// Without the rule published (a caller that skipped the publication) the r1007 build
@@ -759,9 +891,8 @@ mod tests {
             validators_final: false,
             ..ready.clone()
         };
-        let g = |p, run: Option<&[u8; 32]>, r: &Readiness, reh| {
-            r1007_boot_guard(40204, p, run, r, reh)
-        };
+        let g =
+            |p, run: Option<&[u8; 32]>, r: &Readiness, reh| r1007_boot_guard(40204, p, run, r, reh);
         assert!(g(Some("r1007"), Some(&R1007_GENESIS), &ready, false).is_ok());
         let e = g(Some("r1007"), Some(&R1007_GENESIS), &not_ready, false)
             .unwrap_err()
@@ -777,7 +908,9 @@ mod tests {
         // The r1007 block 0 under another profile name still runs (the name is display).
         assert!(g(Some("r1006"), Some(&R1007_GENESIS), &ready, false).is_ok());
         assert!(g(Some("testnet_beta"), Some(&r1005), &not_ready, false).is_ok());
-        assert!(r1007_boot_guard(1337, Some("r1007"), Some(&R1007_GENESIS), &ready, false).is_err());
+        assert!(
+            r1007_boot_guard(1337, Some("r1007"), Some(&R1007_GENESIS), &ready, false).is_err()
+        );
         // And the r1006 guard leaves the r1007 block 0 alone.
         assert!(r1006_boot_guard(40204, None, Some(&R1007_GENESIS), &not_ready, false).is_ok());
     }
@@ -792,16 +925,24 @@ mod tests {
         let r6 = compiled_validator_set(Some(&R1006_GENESIS)).expect("binding");
         assert!(r7.is_some(), "r1007 compiles its registry binding");
         assert_eq!(r7, r6, "same registry, same activation height");
-        assert_eq!(compiled_validator_set(Some(&[0x42; 32])).expect("none"), None);
+        assert_eq!(
+            compiled_validator_set(Some(&[0x42; 32])).expect("none"),
+            None
+        );
         assert_eq!(compiled_validator_set(None).expect("none"), None);
         let (reg, act) = r7.expect("some");
-        let e = resolve_validator_registry(r7, Some(&format!("0x{}", hex::encode([0xCD; 20]))), None)
-            .unwrap_err()
-            .to_string();
+        let e =
+            resolve_validator_registry(r7, Some(&format!("0x{}", hex::encode([0xCD; 20]))), None)
+                .unwrap_err()
+                .to_string();
         assert!(e.contains("compiled ValidatorRegistry"), "{e}");
         assert_eq!(
-            resolve_validator_registry(r7, Some(&format!("0x{}", hex::encode(reg))), Some(&act.to_string()))
-                .expect("repeat ok"),
+            resolve_validator_registry(
+                r7,
+                Some(&format!("0x{}", hex::encode(reg))),
+                Some(&act.to_string())
+            )
+            .expect("repeat ok"),
             r7
         );
     }
@@ -812,7 +953,10 @@ mod tests {
     fn r1007_undo_window_is_the_compiled_retention() {
         let p = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS;
         assert_eq!(p.undo_window, crate::canonical_apply::MAX_REORG_DEPTH);
-        assert_eq!(p.undo_window, citrate_storage::state::state_store::REORG_UNDO_DEPTH);
+        assert_eq!(
+            p.undo_window,
+            citrate_storage::state::state_store::REORG_UNDO_DEPTH
+        );
         assert_eq!(p.pruning_depth, crate::dag_prune::MIN_RETAIN_BLOCKS);
         assert_eq!(p.pruning_depth, crate::dag_prune::DEFAULT_RETAIN_BLOCKS);
         assert_eq!(
@@ -836,18 +980,34 @@ mod tests {
         let ok = CheckpointNodeConfig::default();
         assert!(check_checkpoint_params(Some(&p), &ok).is_ok());
         for (name, bad) in [
-            ("interval", CheckpointNodeConfig { interval: 2, ..ok.clone() }),
-            ("committee_size", CheckpointNodeConfig { committee_size: 10, ..ok.clone() }),
-            ("vote_depth", CheckpointNodeConfig { vote_depth: 1, ..ok.clone() }),
+            (
+                "interval",
+                CheckpointNodeConfig {
+                    interval: 2,
+                    ..ok.clone()
+                },
+            ),
+            (
+                "committee_size",
+                CheckpointNodeConfig {
+                    committee_size: 10,
+                    ..ok.clone()
+                },
+            ),
+            (
+                "vote_depth",
+                CheckpointNodeConfig {
+                    vote_depth: 1,
+                    ..ok.clone()
+                },
+            ),
         ] {
-            let e = check_checkpoint_params(Some(&p), &bad).unwrap_err().to_string();
+            let e = check_checkpoint_params(Some(&p), &bad)
+                .unwrap_err()
+                .to_string();
             assert!(e.contains(name), "{name}: {e}");
         }
-        assert!(check_checkpoint_params(
-            None,
-            &CheckpointNodeConfig { interval: 2, ..ok }
-        )
-        .is_ok());
+        assert!(check_checkpoint_params(None, &CheckpointNodeConfig { interval: 2, ..ok }).is_ok());
     }
 
     #[test]
