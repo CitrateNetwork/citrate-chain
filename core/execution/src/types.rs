@@ -692,4 +692,13 @@ pub enum ExecutionError {
         expected: String,
         got: String,
     },
+
+    /// A node-local input to applying a chain block could not be read: a
+    /// mergeset member's body, its GHOSTDAG record, or the BLOCKHASH window
+    /// (lead decision 2026-11-09). Says nothing about the block itself, so it
+    /// never disqualifies it (spec 06 §3.10): the node retries once the input
+    /// is available (sync, repair, restart). Distinct from
+    /// [`Self::InvalidBlockBody`], a fault of the block's own data.
+    #[error("Apply input unavailable on this node: {0}")]
+    ApplyInputUnavailable(String),
 }

@@ -452,6 +452,18 @@ pub fn canonical_emission(
     })
 }
 
+/// Spec 06 §3.10: whether applying a chain block failed because of the
+/// block's own data, so it is disqualified from the chain: a commitment that
+/// did not reproduce. A node-local failure (`ApplyInputUnavailable`, storage,
+/// an unmaterialized reward policy) is never one.
+pub(crate) fn is_block_fault(e: &ExecutionError) -> bool {
+    matches!(
+        e,
+        ExecutionError::StateRootMismatch { .. }
+            | ExecutionError::AcceptanceCommitmentMismatch { .. }
+    )
+}
+
 /// The block whose post-execution world state the executor currently reflects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppliedTip {
@@ -1810,11 +1822,7 @@ impl CanonicalApplicator {
     /// member body, storage, an unmaterialized reward policy) never
     /// disqualify; the node retries. Returns whether it disqualified.
     async fn disqualify_on(&self, hash: Hash, e: &ExecutionError) -> bool {
-        if !matches!(
-            e,
-            ExecutionError::StateRootMismatch { .. }
-                | ExecutionError::AcceptanceCommitmentMismatch { .. }
-        ) {
+        if !is_block_fault(e) {
             return false;
         }
         match &self.ghostdag {
@@ -1826,7 +1834,7 @@ impl CanonicalApplicator {
         }
     }
 
-    async fn accept_block(
+    pub(crate) async fn accept_block(
         &self,
         block: &Block,
         persist: bool,
@@ -1839,7 +1847,7 @@ impl CanonicalApplicator {
             None,
         )
         .await
-        .map_err(ExecutionError::InvalidBlockBody)?;
+        .map_err(ExecutionError::ApplyInputUnavailable)?;
         let block_hashes = if block.header.selected_parent_hash == Hash::default() {
             std::collections::HashMap::new()
         } else {
@@ -1849,7 +1857,7 @@ impl CanonicalApplicator {
                     block.header.selected_parent_hash,
                     block.header.height.saturating_sub(1),
                 )
-                .map_err(ExecutionError::InvalidBlockBody)?
+                .map_err(ExecutionError::ApplyInputUnavailable)?
         };
         let calc = &self.reward_calculator;
         let emission =
