@@ -986,6 +986,27 @@ mod tests {
         assert_ne!(other.fingerprint, r1006.fingerprint);
     }
 
+    /// r1007 shares chain id 40204 with r1005 and r1006: its manifest is bound to its own
+    /// block 0, and its binding also carries the compiled chain parameters (slot,
+    /// retention and undo window, checkpoint committee), so two binaries that disagree on
+    /// any of them print different fingerprints. r1006's binding is unchanged.
+    #[test]
+    fn r1007_is_bound_with_its_rules_and_chain_params() {
+        use citrate_consensus::genesis_params::R1007_CHAIN_PARAMS;
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+        let m = ConsensusManifest::current();
+        let r1006 = ConsensusManifest::for_node(Some("r1006"), Some(&R1006_GENESIS));
+        let r1007 = ConsensusManifest::for_node(Some("r1007"), Some(&R1007_GENESIS));
+        assert_ne!(r1007.fingerprint, r1006.fingerprint);
+        assert_ne!(r1007.fingerprint, m.fingerprint);
+        let rules = r1007.genesis_rules.clone().expect("bound");
+        assert!(rules.contains("mpt_state_root:0"), "{rules}");
+        assert!(rules.contains(&R1007_CHAIN_PARAMS.render()), "{rules}");
+        let r6 = r1006.genesis_rules.expect("bound");
+        assert!(!r6.contains("params"), "r1006's binding is unchanged: {r6}");
+        assert!(r6.contains("mpt_state_root:unset"), "{r6}");
+    }
+
     /// The fingerprint follows the chain a node runs, never what its config calls it:
     /// naming the genesis profile or not gives the same fingerprint, on r1005 and on
     /// r1006. On r1005 (no compiled per-genesis rules) it stays exactly the v3 one

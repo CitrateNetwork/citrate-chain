@@ -3968,4 +3968,18 @@ mod genesis_extra_data_tests {
         assert_eq!(block_extra_data(0, &RELEASE_GENESIS[0].1), "0x");
         assert_eq!(block_extra_data(1, &R1006_GENESIS), "0x");
     }
+
+    #[test]
+    fn r1007_block_zero_carries_its_own_genesis_note() {
+        use citrate_consensus::hardening::R1007_GENESIS;
+        assert_eq!(
+            block_extra_data(0, &R1007_GENESIS),
+            format!(
+                "0x{}",
+                hex::encode(citrate_economics::r1007::GENESIS_NOTE.as_bytes())
+            )
+        );
+        assert_ne!(block_extra_data(0, &R1007_GENESIS), block_extra_data(0, &R1006_GENESIS));
+        assert_eq!(block_extra_data(1, &R1007_GENESIS), "0x");
+    }
 }

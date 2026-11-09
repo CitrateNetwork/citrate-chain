@@ -652,6 +652,204 @@ mod tests {
         }
     }
 
+    // ---- r1007 (ADR-2026-11-03 CV-2, S3-6; docs/consensus/R1007_GENESIS.md) ----
+
+    /// The MPT state root rule is process-wide, so the r1007 builds run in a child
+    /// process (the split_heal pattern): the parent's tests keep the legacy root.
+    const R1007_CHILD_ENV: &str = "CITRATE_R1007_GENESIS_CHILD";
+
+    fn r1007_child(test: &str) {
+        let exe = std::env::current_exe().expect("exe");
+        let out = std::process::Command::new(exe)
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(R1007_CHILD_ENV, "1")
+            .env_remove(citrate_execution::mpt_state_root::MPT_STATE_ROOT_ENV)
+            .output()
+            .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child {test} failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn the_r1007_profile_is_compiled_to_its_block_0() {
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+        assert_eq!(
+            compiled_genesis_for_profile(Some(R1007_PROFILE)),
+            Some(R1007_GENESIS)
+        );
+        assert_eq!(
+            compiled_genesis_for_profile(Some(R1006_PROFILE)),
+            Some(R1006_GENESIS)
+        );
+        for p in [None, Some("default"), Some("testnet_beta"), Some("R1007")] {
+            assert_eq!(compiled_genesis_for_profile(p), None, "{p:?}");
+        }
+    }
+
+    /// The node's genesis build for profile `r1007`: the MPT rule is published for the
+    /// block 0 the profile compiles (main.rs `publish_mpt_rule_for_genesis_build`), and the
+    /// build then produces exactly `R1007_GENESIS`.
+    #[test]
+    fn r1007_profile_builds_the_pinned_block_0_under_the_published_rule() {
+        r1007_child("genesis::tests::r1007_child_build_after_publication");
+    }
+
+    #[test]
+    fn r1007_child_build_after_publication() {
+        if std::env::var(R1007_CHILD_ENV).is_err() {
+            return;
+        }
+        crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), None)
+            .expect("the r1007 rule publishes");
+        assert_eq!(
+            citrate_execution::mpt_state_root::mpt_state_root_height(),
+            Some(0)
+        );
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let g = rt
+            .block_on(build_profile(40204, Some(R1007_PROFILE)))
+            .expect("the r1007 genesis builds");
+        assert_eq!(
+            g,
+            citrate_consensus::hardening::R1007_GENESIS,
+            "the node built 0x{} for profile r1007",
+            hex::encode(g)
+        );
+        // A configured per-node height that disagrees with the compiled one is refused.
+        assert!(crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), Some(5))
+            .is_err());
+    }
+
+    /// Without the rule published (a caller that skipped the publication) the r1007 build
+    /// is refused, never built under the legacy root.
+    #[test]
+    fn r1007_profile_build_refuses_without_the_published_rule() {
+        r1007_child("genesis::tests::r1007_child_build_without_publication");
+    }
+
+    #[test]
+    fn r1007_child_build_without_publication() {
+        if std::env::var(R1007_CHILD_ENV).is_err() {
+            return;
+        }
+        citrate_execution::mpt_state_root::set_mpt_state_root_height(None);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let e = rt
+            .block_on(build_profile(40204, Some(R1007_PROFILE)))
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("MPT state root"), "{e}");
+    }
+
+    #[test]
+    fn r1007_boot_guard_cases() {
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS, RELEASE_GENESIS};
+        use citrate_economics::r1006::Readiness;
+        let r1005 = RELEASE_GENESIS[0].1;
+        let ready = Readiness {
+            inputs_final: true,
+            validators_final: true,
+            orangeseed_present: true,
+        };
+        let not_ready = Readiness {
+            validators_final: false,
+            ..ready.clone()
+        };
+        let g = |p, run: Option<&[u8; 32]>, r: &Readiness, reh| {
+            r1007_boot_guard(40204, p, run, r, reh)
+        };
+        assert!(g(Some("r1007"), Some(&R1007_GENESIS), &ready, false).is_ok());
+        let e = g(Some("r1007"), Some(&R1007_GENESIS), &not_ready, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not release-ready"), "{e}");
+        assert!(g(Some("r1007"), Some(&R1007_GENESIS), &not_ready, true).is_ok());
+        assert!(g(None, Some(&R1007_GENESIS), &not_ready, false).is_err());
+        // Profile r1007 on another block 0 (r1006's, r1005's, unknown, none): refused.
+        for run in [Some(&R1006_GENESIS), Some(&r1005), Some(&[0x42; 32]), None] {
+            let e = g(Some("r1007"), run, &ready, true).unwrap_err().to_string();
+            assert!(e.contains("is not the r1007 genesis"), "{e}");
+        }
+        // The r1007 block 0 under another profile name still runs (the name is display).
+        assert!(g(Some("r1006"), Some(&R1007_GENESIS), &ready, false).is_ok());
+        assert!(g(Some("testnet_beta"), Some(&r1005), &not_ready, false).is_ok());
+        assert!(r1007_boot_guard(1337, Some("r1007"), Some(&R1007_GENESIS), &ready, false).is_err());
+        // And the r1006 guard leaves the r1007 block 0 alone.
+        assert!(r1006_boot_guard(40204, None, Some(&R1007_GENESIS), &not_ready, false).is_ok());
+    }
+
+    /// The same producer set, the same ValidatorRegistry, compiled: on r1007 the env may
+    /// only repeat it, as on r1006, so registry snapshots and the finality committee form
+    /// from the same set on every node.
+    #[test]
+    fn the_r1007_validator_set_is_compiled_like_r1006() {
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+        let r7 = compiled_validator_set(Some(&R1007_GENESIS)).expect("binding");
+        let r6 = compiled_validator_set(Some(&R1006_GENESIS)).expect("binding");
+        assert!(r7.is_some(), "r1007 compiles its registry binding");
+        assert_eq!(r7, r6, "same registry, same activation height");
+        assert_eq!(compiled_validator_set(Some(&[0x42; 32])).expect("none"), None);
+        assert_eq!(compiled_validator_set(None).expect("none"), None);
+        let (reg, act) = r7.expect("some");
+        let e = resolve_validator_registry(r7, Some(&format!("0x{}", hex::encode([0xCD; 20]))), None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("compiled ValidatorRegistry"), "{e}");
+        assert_eq!(
+            resolve_validator_registry(r7, Some(&format!("0x{}", hex::encode(reg))), Some(&act.to_string()))
+                .expect("repeat ok"),
+            r7
+        );
+    }
+
+    /// The undo window is the prune retention (CV-7a), and the r1007 chain parameters
+    /// name exactly the constants the node and storage run with.
+    #[test]
+    fn r1007_undo_window_is_the_compiled_retention() {
+        let p = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS;
+        assert_eq!(p.undo_window, crate::canonical_apply::MAX_REORG_DEPTH);
+        assert_eq!(p.undo_window, citrate_storage::state::state_store::REORG_UNDO_DEPTH);
+        assert_eq!(p.pruning_depth, crate::dag_prune::MIN_RETAIN_BLOCKS);
+        assert_eq!(p.pruning_depth, crate::dag_prune::DEFAULT_RETAIN_BLOCKS);
+        assert_eq!(
+            p.validator_activation_height,
+            citrate_economics::r1006::R1006_VALIDATOR_ACTIVATION_HEIGHT
+        );
+        assert_eq!(
+            p.include_gas_limit,
+            crate::producer::PRODUCER_BLOCK_GAS_LIMIT,
+            "INCLUDE_GAS_LIMIT"
+        );
+    }
+
+    /// On a genesis with compiled chain parameters the node's `[checkpoint]` section may
+    /// only repeat them: a per-node interval, committee size or vote depth would split
+    /// the fleet's checkpoints. Elsewhere the config decides, as before.
+    #[test]
+    fn r1007_checkpoint_config_must_match_the_compiled_params() {
+        use crate::config::CheckpointNodeConfig;
+        let p = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS;
+        let ok = CheckpointNodeConfig::default();
+        assert!(check_checkpoint_params(Some(&p), &ok).is_ok());
+        for (name, bad) in [
+            ("interval", CheckpointNodeConfig { interval: 2, ..ok.clone() }),
+            ("committee_size", CheckpointNodeConfig { committee_size: 10, ..ok.clone() }),
+            ("vote_depth", CheckpointNodeConfig { vote_depth: 1, ..ok.clone() }),
+        ] {
+            let e = check_checkpoint_params(Some(&p), &bad).unwrap_err().to_string();
+            assert!(e.contains(name), "{name}: {e}");
+        }
+        assert!(check_checkpoint_params(
+            None,
+            &CheckpointNodeConfig { interval: 2, ..ok }
+        )
+        .is_ok());
+    }
+
     #[test]
     fn test_standalone_genesis_matches_shared_canonical_block() {
         let config = GenesisConfig::default();

@@ -1066,6 +1066,49 @@ mod tests {
         }
     }
 
+    /// r1007 (ADR-2026-11-03 CV-2, S3-6): its own block 0 on chain 40204, with every
+    /// genesis-keyed rule from 0, the MPT state root (CV-14) included, and nothing of it
+    /// reaching r1005 or r1006, which share the chain id.
+    #[test]
+    fn r1007_is_its_own_release_genesis_with_every_rule_from_zero() {
+        let r1005 = RELEASE_GENESIS[0].1;
+        assert_ne!(R1007_GENESIS, r1005);
+        assert_ne!(R1007_GENESIS, R1006_GENESIS);
+        assert!(RELEASE_GENESIS.contains(&(40204, R1007_GENESIS)));
+        assert!(check_genesis_chain(40204, &R1007_GENESIS).is_ok());
+        assert!(
+            check_genesis_chain(1337, &R1007_GENESIS).is_err(),
+            "r1007's block 0 runs only on 40204"
+        );
+        assert_eq!(
+            rules_for_genesis(40204, &R1007_GENESIS),
+            Some(R1007_ACTIVATIONS)
+        );
+        assert_eq!(rules_for_genesis(1337, &R1007_GENESIS), None);
+        for (name, h) in R1007_ACTIVATIONS.entries() {
+            assert_eq!(h, Some(0), "{name}: every r1007 rule is on from block 0");
+        }
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&R1007_GENESIS), |a| a.mpt_state_root),
+            Some(Some(0)),
+            "the r1007 block 0 is built and rebuilt under the MPT state root"
+        );
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&R1006_GENESIS), |a| a.mpt_state_root),
+            Some(None),
+            "r1006 never gets the MPT rule"
+        );
+        assert!(canonical_checkpoints(&R1007_GENESIS).is_empty());
+        assert_eq!(
+            GENESIS_ACTIVATIONS
+                .iter()
+                .filter(|(_, g, _)| *g == R1007_GENESIS)
+                .count(),
+            1,
+            "one entry per genesis"
+        );
+    }
+
     /// r1005's genesis on the new binary: no genesis-keyed rule, so every module keeps its
     /// per-chain pin (the new rules stay unset: replay-identical). r1006's genesis: every
     /// rule at 0. An unknown genesis on 40204: `None`, explicitly.
