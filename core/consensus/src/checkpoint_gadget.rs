@@ -1901,13 +1901,55 @@ mod tests {
         // Epoch-2 checkpoint: A can derive it, B (not yet materialized) cannot.
         assert!(ga.committee_for(20, &seed).await.is_some());
         assert!(gb.committee_for(20, &seed).await.is_none());
-        // Same inputs => same committee (seed fixed by H's block).
+        // Same inputs => same committee. The candidate block's beacon is NOT
+        // an input (lead decision 2): a sibling with another beacon at the
+        // same height gets the same committee.
         assert_eq!(ga.committee_for(12, &seed).await, Some(ca.clone()));
-        assert_ne!(
+        assert_eq!(
             ga.committee_for(12, &Hash::new([0x43; 32])).await,
             Some(ca),
-            "seed is an input"
+            "the candidate's beacon is not an input"
         );
+    }
+
+    /// S1 across siblings (lead decision 2, 2026-11-09): with more validators
+    /// than seats, every candidate block at one height gets ONE committee, a
+    /// function of the governing epoch snapshot and the height only. Before,
+    /// each candidate's own VRF beacon seeded the draw, so siblings drew
+    /// different committees and two disjoint honest quorums could finalize
+    /// both. Heights still rotate the committee.
+    #[tokio::test]
+    async fn committee_is_independent_of_the_candidate_block() {
+        let ks: Vec<SigningKey> = (0u8..12).map(key).collect();
+        let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 999);
+        let set: Vec<(PublicKey, u128)> = ks.iter().map(|k| (pk(k), 1000u128)).collect();
+        sel.sync_active_set_at(1, set, 1).await;
+        let mut cfg = config();
+        cfg.committee_size = 5;
+        let g = FinalityGadget::with_switch(
+            Arc::new(CheckpointManager::new(cfg, dag_with(4).await)),
+            Some(Arc::new(sel)),
+            true,
+        );
+        let at = |b: u8| Hash::new([b; 32]);
+        let first = g.committee_for(12, &at(1)).await.expect("committee @12");
+        assert_eq!(first.len(), 5);
+        for b in 2u8..=64 {
+            assert_eq!(
+                g.committee_for(12, &at(b)).await.as_ref(),
+                Some(&first),
+                "sibling beacon {b}"
+            );
+        }
+        let mut differs = false;
+        for h in (14u64..=200).step_by(2) {
+            let c = g.committee_for(h, &at(1)).await.expect("committee");
+            if c.members != first.members {
+                differs = true;
+                break;
+            }
+        }
+        assert!(differs, "the height still rotates the committee");
     }
 
     /// Below-min-stake members are not committee candidates.

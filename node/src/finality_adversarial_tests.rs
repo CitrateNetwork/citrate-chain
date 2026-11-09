@@ -36,8 +36,8 @@
 // pieces: each node has a `CertificateSync` (Enforced, installed only with the
 // finalization guard in place, as main.rs), and `Net::sync_cert` runs one
 // GetCheckpoint / CheckpointCertificate exchange over the real wire codec
-// (TLA+ SyncCert). The open S1 finding across sibling committees is
-// `#[ignore = "bug: ..."]`; it is not a pass today.
+// (TLA+ SyncCert). S1 across sibling candidates holds since the committee
+// became a function of the epoch snapshot and height, not of the candidate.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3010,16 +3010,16 @@ async fn a7_committee_is_fixed_by_snapshot_height_and_block_seed() {
     );
 }
 
-/// A7 follow-up, S1 across sibling candidates. The committee for a checkpoint
-/// is drawn from the governing snapshot with the CANDIDATE block's own VRF
-/// output as seed (`FinalityGadget::committee_for`), so two siblings at the
-/// same height get different committees once the validator set is larger than
-/// `committee_size`. Eight equal-stake validators, committee size 4 (quorum 3):
-/// a sibling B4 whose committee shares at most one member with A4's is found
-/// deterministically. The network splits along the fork: A4's committee
-/// members follow A, the rest of B4's committee follows B. No key signs two
-/// hashes, no one is Byzantine, and each side still collects 3 of its own 4.
-/// Returns both sides after one round each.
+/// A7 follow-up, S1 across sibling candidates. Before lead decision 2
+/// (2026-11-09) the committee for a checkpoint was drawn from the governing
+/// snapshot with the CANDIDATE block's own VRF output as seed, so two siblings
+/// at the same height got different committees once the validator set was
+/// larger than `committee_size`. This builds the split that rule allowed:
+/// eight equal-stake validators, committee size 4 (quorum 3), a sibling B4
+/// whose per-candidate committee shares at most one member with A4's, found
+/// deterministically. The network splits along the fork: A4's per-candidate
+/// committee members follow A, the rest of B4's follow B. No key signs two
+/// hashes and no one is Byzantine. Returns both sides after one round each.
 struct SiblingSplit {
     side_a: Net,
     side_b: Net,
@@ -3078,36 +3078,78 @@ async fn sibling_committee_split() -> SiblingSplit {
     }
 }
 
-/// Pins the counterexample (review of #333 @ 0286eff, P2): with per-candidate
-/// committees, sibling blocks A4 and B4 BOTH finalize, on disjoint honest
-/// signers, with no equivocation and no Byzantine key. Expected to start
-/// failing once the protocol fixes the committee independently of the
-/// candidate (or otherwise prevents this); then update this test and
-/// un-ignore `s1_sibling_committees_never_finalize_conflicting_blocks`.
-/// TLA+: CheckpointFinalitySafety_committees.cfg.
+/// The committee `node` holds for the checkpoint at `height` (finalized or
+/// pending), as recorded when it proposed it.
+async fn held_committee(node: &TestNode, height: u64) -> Option<Vec<PublicKey>> {
+    if let Some(cp) = node.mgr().get_checkpoint(height).await {
+        return Some(cp.committee);
+    }
+    node.mgr()
+        .pending_snapshot()
+        .await
+        .into_iter()
+        .find(|cp| cp.height == height)
+        .map(|cp| cp.committee)
+}
+
+/// Formerly `open_finding_sibling_committees_finalize_conflicting_blocks`,
+/// which pinned the counterexample (review of #333 @ 0286eff, P2): with
+/// per-candidate committees, sibling blocks A4 and B4 both finalized, on
+/// disjoint honest signers. Converted when the protocol fixed it (lead
+/// decision 2, 2026-11-09): the committee is a function of the checkpoint's
+/// epoch snapshot and height, never of the candidate block, so every node of
+/// both sides proposes its own sibling with ONE committee, and the sides can
+/// no longer both reach quorum. TLA+: CheckpointFinalitySafety_committees.cfg.
 #[tokio::test]
-async fn open_finding_sibling_committees_finalize_conflicting_blocks() {
+async fn sibling_candidates_at_one_height_share_one_committee() {
     let split = sibling_committee_split().await;
     let h = SPLIT_HEIGHT;
+    let mut seen: Option<Vec<PublicKey>> = None;
+    for n in split.side_a.nodes.iter().chain(split.side_b.nodes.iter()) {
+        let c = held_committee(n, h)
+            .await
+            .expect("each node proposed its sibling");
+        match &seen {
+            None => seen = Some(c),
+            Some(first) => assert_eq!(&c, first, "one committee for height {h}"),
+        }
+    }
     assert_ne!(
         split.committee_a, split.committee_b,
-        "committee follows the candidate"
+        "the pre-fix per-candidate rule gives these siblings different committees"
     );
-    for n in &split.side_a.nodes {
-        assert_eq!(n.finalized_hash(h).await, Some(hash_at(&split.a, h)));
+    let finalized_a = split
+        .side_a
+        .nodes
+        .first()
+        .expect("side A")
+        .finalized_hash(h)
+        .await;
+    let finalized_b = split
+        .side_b
+        .nodes
+        .first()
+        .expect("side B")
+        .finalized_hash(h)
+        .await;
+    if let Some(x) = finalized_a {
+        assert_eq!(x, hash_at(&split.a, h), "side A can only finalize A4");
     }
-    for n in &split.side_b.nodes {
-        assert_eq!(n.finalized_hash(h).await, Some(hash_at(&split.b, h)));
+    if let Some(x) = finalized_b {
+        assert_eq!(x, hash_at(&split.b, h), "side B can only finalize B4");
     }
+    assert!(
+        finalized_a.is_none() || finalized_b.is_none(),
+        "at most one side finalizes: {finalized_a:?} / {finalized_b:?}"
+    );
     split.side_a.assert_honest_no_equivocation();
     split.side_b.assert_honest_no_equivocation();
 }
 
 /// S1 as specified (§5): at most one block finalizes per height network-wide,
-/// whatever the candidate. Fails today with per-candidate committees (see the
-/// test above).
+/// whatever the candidate (was `#[ignore]`d while per-candidate committees
+/// broke it).
 #[tokio::test]
-#[ignore = "bug: S1 — sibling candidates draw their committees from their own VRF seeds; disjoint committees can both finalize"]
 async fn s1_sibling_committees_never_finalize_conflicting_blocks() {
     let split = sibling_committee_split().await;
     let h = SPLIT_HEIGHT;
