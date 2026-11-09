@@ -2470,3 +2470,46 @@ async fn nonce_window_is_bounded_by_the_included_run_and_follows_reorgs() {
     );
     submit(16).await.expect("16 ahead of the committed nonce");
 }
+
+/// Lead decision 2026-11-09: a node-local failure to read an input of apply
+/// (a mergeset member body, a GHOSTDAG record, the BLOCKHASH window) is its
+/// own error, `ApplyInputUnavailable`, never `InvalidBlockBody`, and never a
+/// block fault: it does not disqualify (spec 06 §3.10), the node retries.
+#[tokio::test]
+async fn unreadable_apply_input_is_node_local_not_a_block_fault() {
+    let fleet = Fleet::new(FleetSpec::new(2)).await;
+    let (a, b) = (&fleet.nodes[0], &fleet.nodes[1]);
+    let a1 = a.produce().await;
+    let b1 = b.produce().await;
+    a.receive(&b1).await;
+    let m = a.produce().await;
+    assert_eq!(
+        m.header.merge_parent_hashes.len(),
+        1,
+        "m merges its sibling"
+    );
+    let merged = m.header.merge_parent_hashes[0];
+    assert!(merged == a1.header.block_hash || merged == b1.header.block_hash);
+    // The merged member's body becomes unreadable on this node.
+    a.storage.blocks.delete_block(&merged).expect("delete");
+    let err = a
+        .app
+        .accept_block(&m, false, true)
+        .await
+        .expect_err("a member body is missing");
+    assert!(
+        matches!(
+            err,
+            citrate_execution::types::ExecutionError::ApplyInputUnavailable(_)
+        ),
+        "node-local, not a block fault: {err:?}"
+    );
+    assert!(!crate::canonical_apply::is_block_fault(&err));
+    assert!(crate::canonical_apply::is_block_fault(
+        &citrate_execution::types::ExecutionError::StateRootMismatch {
+            expected: Hash::new([1; 32]),
+            got: Hash::new([2; 32]),
+        }
+    ));
+    assert!(!a.ghostdag.is_disqualified(&m.header.block_hash));
+}
