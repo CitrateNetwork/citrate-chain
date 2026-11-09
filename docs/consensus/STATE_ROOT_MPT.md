@@ -178,3 +178,25 @@ independent of the state size (bench: `core/execution/tests/state_root_cost.rs`)
 3. Trie-node retention equals the undo window. That costs storage (see the bench's
    `node_bytes_per_block`). Restart needs only the tip's trie, so a shorter node window
    would be node-local and reversible.
+4. Genesis (height 0) keeps the legacy root (§1). r1007 is a new genesis, so block 0
+   could also be rooted by the MPT rule; that would make block 0's state provable too.
+   It is a genesis-lane decision (S3-6); the rule here leaves height 0 as every other
+   rule does.
+5. Storage-only addresses commit as the default account (§3). The alternative is to
+   create a resident account wherever storage is written (the executor's governance
+   precompile path), which would also change residency and the legacy root.
+
+## 8. Consumers of the root format, and whether each is wired (2026-11-09)
+
+| Consumer | Change needed | State |
+|---|---|---|
+| Node apply, admission, boot rebuild, replay (`canonical_apply`, `boot_state`, `tools/replay-ref`) | Root by the rule at each height | Wired (this branch) |
+| r1007 genesis entry (`GENESIS_ACTIVATIONS`, `mpt_state_root: Some(0)`) | Add with block 0 | **Not wired**: the genesis lane adds it (S3-6). Until then only devnets (`CITRATE_MPT_STATE_ROOT_HEIGHT` / `[chain] mpt_state_root_height`) run the rule |
+| Consensus manifest / fingerprint | Height appended when set | Wired |
+| `eth_getProof` RPC (CNV-RPC, S3-7; explorer parity 02 §3) | Handler over `StateDB::get_proof` | **Not wired**: accessor and verifier only; `core/api/src/eth_rpc.rs` still lists it as unsupported |
+| Explorer (citrate-explorer) | None: it stores and shows `stateRoot` as an opaque hash | No change needed |
+| Light node (citrate-native) | Uses the chain crates at its pin; it computes the genesis root via `citrate_economics` | Picks the rule up from the genesis table at its next chain pin bump; nothing to wire before the r1007 entry exists |
+| SDKs (sdk-js, sdk-python) | None found that recompute or verify state roots | No change needed |
+| State snapshots / fast sync | None exists (cold resync re-executes from peers) | n/a |
+| Trie-node store (`CF_STATE mpt_node:` / `mpt_root:`) | New, a cache only (§5) | Wired |
+| Public docs (citrate-docs `chain/storage.md`) | Say "no MPT, no trie proofs, SHA3 over sorted state" | **Stale** for r1007; update with the r1007 release |
