@@ -2283,11 +2283,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // never by env or config. Committee source: the shared epoch-snapshot
     // proposer selector (`validator_selector`, filled by registry_sync from
     // `ValidatorRegistry.activeSet()` at each S(E)); `None` when no registry is
-    // configured, in which case no committee can be derived and nothing is proposed.
-    let finality_gadget = Arc::new(citrate_consensus::checkpoint_gadget::FinalityGadget::new(
+    // configured, in which case only the genesis validator set can form a committee.
+    // Epoch 0: checkpoints no registry snapshot governs (at or below S(1) = 800, or
+    // every height on a chain without a registry) draw their committee from the
+    // genesis validator set compiled with this node's block 0 (spec 06 §7): the
+    // genesis the checkpoint manager read above (on a fresh database the
+    // start-up probe ran before block 0 existed).
+    let checkpoint_genesis = *checkpoint_manager.config().genesis_hash.as_bytes();
+    let finality_gadget = Arc::new(finality_driver::node_finality_gadget(
         checkpoint_manager.clone(),
         validator_selector.clone(),
-    ));
+        Some(&checkpoint_genesis),
+    )?);
     let finality_voting_on = finality_gadget.enabled();
     // Finalized height as VERIFIED by the Stage 1c floor verifier while the
     // producer path runs; only ever advances to a certificate whose (height,

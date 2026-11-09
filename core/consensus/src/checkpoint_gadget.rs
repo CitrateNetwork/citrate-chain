@@ -123,6 +123,11 @@ pub fn checkpoint_enforcement_on_for(
         .any(|(id, g)| *id == chain_id && g == genesis.as_bytes())
 }
 
+/// Epoch 0 (spec 06 §7): the epoch, i.e. the snapshot height bound into every
+/// vote, of a committee drawn from the genesis validator set. Block 0 is the
+/// genesis state the set is registered in, so the epoch is its height.
+pub const GENESIS_COMMITTEE_EPOCH: u64 = 0;
+
 /// §11.5 early-vote buffer bound: a vote more than this many blocks above the
 /// node's horizon base — the greater of its last observed canonical tip and its
 /// latest finalized height, so `0` before the first tip observation, never
@@ -692,9 +697,16 @@ pub struct FinalityGadget {
     manager: Arc<CheckpointManager>,
     /// §4.1/§11.6 committee source: the shared proposer selector whose per-epoch
     /// history is filled by `registry_sync` from `ValidatorRegistry.activeSet()`
-    /// read at each snapshot block S(E). `None` = no registry configured = no
-    /// committee can be derived = nothing is proposed.
+    /// read at each snapshot block S(E). `None` = no registry configured: only
+    /// the genesis validator set (if any) can form a committee.
     committee_source: Option<Arc<VrfProposerSelector>>,
+    /// Epoch 0: the genesis validator set `(consensus key, stake)`, normalized
+    /// (stake > 0, sorted by key bytes, no key twice). It governs every
+    /// checkpoint no registry snapshot governs: heights at or below S(1) on a
+    /// chain with a ValidatorRegistry, every height on a chain without one.
+    /// `None` = the genesis compiles no validator set. Data source: the genesis
+    /// file compiled into this build (node `genesis::genesis_committee_set`).
+    genesis_committee: Option<Vec<(PublicKey, u128)>>,
     enabled: bool,
     /// Stage 1c safety stop, engaged and cleared ONLY by the node's finality
     /// floor verifier. While engaged, nothing is proposed or signed; signing is
@@ -731,6 +743,7 @@ impl FinalityGadget {
         Self {
             manager,
             committee_source,
+            genesis_committee: None,
             enabled,
             safety_stop: Arc::new(SafetyStop::default()),
             state: Mutex::new(GadgetState::default()),
@@ -739,6 +752,46 @@ impl FinalityGadget {
             #[cfg(test)]
             sign_pause: None,
         }
+    }
+
+    /// Epoch 0: attach the genesis validator set (see the field docs).
+    /// Entries with zero stake are dropped and a key listed twice keeps its
+    /// first stake; an empty result attaches nothing. The node passes the set
+    /// its genesis compiles; it is never read from config or env.
+    pub fn with_genesis_committee(mut self, set: Vec<(PublicKey, u128)>) -> Self {
+        let mut members: Vec<(PublicKey, u128)> =
+            set.into_iter().filter(|(_, stake)| *stake > 0).collect();
+        // Stable: the first stake listed for a key wins the dedup.
+        members.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        members.dedup_by(|later, first| later.0 == first.0);
+        self.genesis_committee = (!members.is_empty()).then_some(members);
+        self
+    }
+
+    /// The genesis validator set, if this chain compiles one.
+    pub fn genesis_committee(&self) -> Option<&[(PublicKey, u128)]> {
+        self.genesis_committee.as_deref()
+    }
+
+    /// The validator set a checkpoint at `height` draws its committee from, as
+    /// `(epoch, set)`, where the epoch is the snapshot height S(E) bound into
+    /// every vote:
+    ///
+    /// - a registry snapshot governs `height` (the greatest S(E) < height, on
+    ///   the selector's schedule): that snapshot's set, never the live tip set,
+    ///   and `None` while it is not on this node (it is behind);
+    /// - otherwise (heights at or below S(1), or no registry on this chain):
+    ///   the genesis validator set, epoch [`GENESIS_COMMITTEE_EPOCH`]; `None` if
+    ///   the genesis compiles none.
+    async fn committee_input(&self, height: u64) -> Option<(u64, Vec<(PublicKey, u128)>)> {
+        if let Some(source) = self.committee_source.as_ref() {
+            if source.governing_snapshot(height).is_some() {
+                return source.epoch_committee_set(height).await;
+            }
+        }
+        self.genesis_committee
+            .as_ref()
+            .map(|set| (GENESIS_COMMITTEE_EPOCH, set.clone()))
     }
 
     /// Install a pause point before the signing gate (tests only).
@@ -783,8 +836,7 @@ impl FinalityGadget {
     /// snapshot height S(E), bound into every vote). `None` when no snapshot
     /// governs `height` on this node.
     pub async fn committee_for(&self, height: u64, seed: &Hash) -> Option<Committee> {
-        let source = self.committee_source.as_ref()?;
-        let (snapshot, set) = source.epoch_committee_set(height).await?;
+        let (snapshot, set) = self.committee_input(height).await?;
         let members = CommitteeSelector::select_weighted(
             &set,
             height,
@@ -1038,13 +1090,10 @@ impl FinalityGadget {
             hs.dedup();
             hs
         };
-        let Some(source) = self.committee_source.as_ref() else {
-            return;
-        };
         // Snapshot lookups happen outside the state lock.
         let mut resolved = Vec::new();
         for h in pending_heights {
-            if let Some((_snapshot, set)) = source.epoch_committee_set(h).await {
+            if let Some((_snapshot, set)) = self.committee_input(h).await {
                 resolved.push((h, set));
             }
         }
@@ -1148,12 +1197,12 @@ impl FinalityGadget {
         // committee membership needs the block's VRF seed and is checked on
         // replay; set membership is what keeps outsiders out of the buffer.
         // `None` = the snapshot is not on this node yet => unverified quota.
-        let Some(source) = self.committee_source.as_ref() else {
+        if self.committee_source.is_none() && self.genesis_committee.is_none() {
             // No committee can ever be derived here; nothing to buffer for.
             return InboundOutcome::Rejected(CheckpointError::NotInCommittee(vote.voter));
-        };
-        let member = source
-            .epoch_committee_set(height)
+        }
+        let member = self
+            .committee_input(height)
             .await
             .map(|(_snapshot, set)| set.iter().any(|(pk, _)| *pk == vote.voter));
         if member == Some(false) {
@@ -1161,9 +1210,9 @@ impl FinalityGadget {
         }
         // Governing snapshot missing: a provisional check against the latest
         // snapshot this node holds picks the unverified sub-quota (§11.5).
-        let provisional = match member {
-            Some(_) => false,
-            None => source
+        let provisional = match (member, self.committee_source.as_ref()) {
+            (Some(_), _) | (None, None) => false,
+            (None, Some(source)) => source
                 .latest_epoch_committee_set()
                 .await
                 .is_some_and(|(_snapshot, set)| set.iter().any(|(pk, _)| *pk == vote.voter)),
@@ -1911,7 +1960,10 @@ mod tests {
         .with_genesis_committee(set(&genesis));
         let genesis_pks: Vec<PublicKey> = genesis.iter().map(pk).collect();
         for h in [50u64, 400, 800] {
-            let c = g.committee_for(h, &Hash::new([7; 32])).await.expect("epoch-0 committee");
+            let c = g
+                .committee_for(h, &Hash::new([7; 32]))
+                .await
+                .expect("epoch-0 committee");
             assert_eq!(c.epoch, GENESIS_COMMITTEE_EPOCH, "height {h}");
             let mut got = c.pubkeys();
             got.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -1919,7 +1971,10 @@ mod tests {
             want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             assert_eq!(got, want, "height {h}: the genesis set");
         }
-        let c = g.committee_for(850, &Hash::new([7; 32])).await.expect("S(1) committee");
+        let c = g
+            .committee_for(850, &Hash::new([7; 32]))
+            .await
+            .expect("S(1) committee");
         assert_eq!(c.epoch, 800);
         assert!(c.pubkeys().iter().all(|m| !genesis_pks.contains(m)));
 
@@ -1944,20 +1999,27 @@ mod tests {
         assert_eq!(bare.committee_for(2, &Hash::new([7; 32])).await, None);
         let g = FinalityGadget::with_switch(mgr, None, true).with_genesis_committee(set);
         for h in [2u64, 850, 1_000_000] {
-            let c = g.committee_for(h, &Hash::new([7; 32])).await.expect("genesis committee");
+            let c = g
+                .committee_for(h, &Hash::new([7; 32]))
+                .await
+                .expect("genesis committee");
             assert_eq!(c.epoch, GENESIS_COMMITTEE_EPOCH);
             assert_eq!(c.len(), 4, "height {h}");
         }
         // Zero-stake and duplicate entries never sit on a committee.
-        let mut messy: Vec<(PublicKey, u128)> =
-            genesis.iter().map(|k| (pk(k), 1000u128)).collect();
+        let mut messy: Vec<(PublicKey, u128)> = genesis.iter().map(|k| (pk(k), 1000u128)).collect();
         messy.push((pk(&key(9)), 0));
         if let Some(first) = messy.first().copied() {
             messy.push(first);
         }
         let mgr = Arc::new(CheckpointManager::new(config(), dag_with(4).await));
         let g = FinalityGadget::with_switch(mgr, None, true).with_genesis_committee(messy);
-        assert_eq!(g.committee_for(2, &Hash::new([7; 32])).await.map(|c| c.len()), Some(4));
+        assert_eq!(
+            g.committee_for(2, &Hash::new([7; 32]))
+                .await
+                .map(|c| c.len()),
+            Some(4)
+        );
     }
 
     /// Vote construction binds chain_id, height and block_hash.

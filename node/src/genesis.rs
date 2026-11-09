@@ -207,6 +207,32 @@ pub fn resolve_validator_registry(
     }
 }
 
+/// The genesis validator set of the chain whose block 0 is `running_genesis`, as
+/// `(proposer consensus key, stake)`: the epoch-0 checkpoint committee's input (spec 06
+/// §7). It is compiled with the genesis, never read from config or env, so every node on
+/// the same block 0 derives the same epoch-0 committee.
+///
+/// - r1006: the producer set `validators.json` registers in the ValidatorRegistry at
+///   block 0 (`citrate_economics::r1006::genesis_validator_set`); `None` while that set
+///   is a placeholder.
+/// - Any other genesis (or none known): `None`. Such a chain's committees come only from
+///   registry snapshots, from S(1) on. A new genesis (r1007, S3-6) adds its own arm here
+///   from its own compiled validator file.
+pub fn genesis_committee_set(
+    running_genesis: Option<&[u8; 32]>,
+) -> anyhow::Result<Option<Vec<(PublicKey, u128)>>> {
+    if running_genesis != Some(&citrate_consensus::hardening::R1006_GENESIS) {
+        return Ok(None);
+    }
+    let set = citrate_economics::r1006::genesis_validator_set()
+        .map_err(|e| anyhow::anyhow!("invalid r1006 genesis validator set: {e}"))?;
+    Ok(set.map(|v| {
+        v.into_iter()
+            .map(|(key, stake)| (PublicKey::new(key), stake))
+            .collect()
+    }))
+}
+
 /// Whether the rehearsal opt-in is set in the environment (exactly `1`).
 pub fn r1006_rehearsal_from_env() -> bool {
     parse_r1006_rehearsal(std::env::var(R1006_REHEARSAL_ENV).ok().as_deref())

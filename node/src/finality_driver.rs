@@ -301,6 +301,38 @@ pub fn gate_outbound(
     Vec::new()
 }
 
+/// The finality gadget the node runs (main.rs), over `manager`. Committee sources:
+///
+/// - `registry_selector`: the shared epoch-snapshot proposer selector (filled by
+///   `registry_sync` from `ValidatorRegistry.activeSet()` at each S(E)); `None` when no
+///   ValidatorRegistry is configured for this chain;
+/// - the genesis validator set compiled with the genesis `running_genesis` runs
+///   (`genesis::genesis_committee_set`): epoch 0, which governs every checkpoint no
+///   registry snapshot governs (at or below S(1) = 800, or every height without a
+///   registry).
+///
+/// The switch is the compiled constant (`FinalityGadget::new`).
+pub fn node_finality_gadget(
+    manager: Arc<citrate_consensus::checkpoint::CheckpointManager>,
+    registry_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>>,
+    running_genesis: Option<&[u8; 32]>,
+) -> anyhow::Result<FinalityGadget> {
+    let gadget = FinalityGadget::new(manager, registry_selector);
+    Ok(
+        match crate::genesis::genesis_committee_set(running_genesis)? {
+            Some(set) => {
+                info!(
+                    "checkpoint finality: epoch-0 committee from the genesis validator set ({} \
+                 validators)",
+                    set.len()
+                );
+                gadget.with_genesis_committee(set)
+            }
+            None => gadget,
+        },
+    )
+}
+
 /// A canonical checkpoint block buried at least `vote_depth` deep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuriedCheckpoint {
@@ -761,10 +793,10 @@ mod tests {
             .await
             .expect("epoch-0 committee without a registry");
         assert_eq!((c.epoch, c.len()), (0, 7));
-        let registry = Arc::new(
-            VrfProposerSelector::production()
-                .with_snapshot_schedule(crate::registry_sync::EPOCH, crate::registry_sync::SNAPSHOT_LAG),
-        );
+        let registry = Arc::new(VrfProposerSelector::production().with_snapshot_schedule(
+            crate::registry_sync::EPOCH,
+            crate::registry_sync::SNAPSHOT_LAG,
+        ));
         let with_registry =
             node_finality_gadget(mgr(), Some(registry), Some(&r1006)).expect("gadget");
         for h in [50u64, 800] {
