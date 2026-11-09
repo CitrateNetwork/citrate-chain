@@ -157,6 +157,38 @@ class GeneratorRefuses(unittest.TestCase):
         self.refuses(g, self.p, "governance.GUARDIAN")
 
 
+class AddressCodeGenesisGate(unittest.TestCase):
+    """check_address_code.py ties the getCode snapshot to the book's block 0 (no network here)."""
+
+    def setUp(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "verification"))
+        import check_address_code
+        self.cac = check_address_code
+        self.book = load("40204.json")
+        self.snap = json.loads((ROOT / "verification" / "address-code.snapshot.json").read_text())
+
+    def test_committed_snapshot_was_probed_on_the_books_block_0(self):
+        self.assertEqual(self.snap["genesisHash"], self.book["genesisHash"])
+        self.assertEqual(self.cac.check_claims(self.book, self.snap), [])
+
+    def test_a_snapshot_from_another_network_fails_offline(self):
+        snap = dict(self.snap, genesisHash="0x" + "ab" * 32)
+        errs = self.cac.check_claims(self.book, snap)
+        self.assertTrue(any("re-run with --probe on the book's network" in e for e in errs), errs)
+
+    def test_probe_refuses_an_rpc_on_another_block_0(self):
+        answers = {"eth_chainId": hex(40204), "eth_getBlockByNumber": {"hash": "0x" + "cd" * 32}}
+        orig = self.cac.rpc
+        self.cac.rpc = lambda url, method, params: answers[method]
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                self.cac.probe("http://127.0.0.1:9", self.book)
+        finally:
+            self.cac.rpc = orig
+        self.assertIn("block-0 hash", str(cm.exception))
+
+
 class R1005Archive(unittest.TestCase):
     def test_archive_is_the_r1005_book_and_ledger(self):
         book = load("r1005/40204.json")

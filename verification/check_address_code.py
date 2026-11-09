@@ -14,8 +14,13 @@ Modes:
   --offline validate the snapshot against claims.json and the book without
             any network call (what CI runs on every PR).
 
+When the book names its network's block 0 (`genesisHash`), --probe and --check
+refuse an RPC whose block-0 hash differs (the addresses would describe another
+network), and the snapshot records the hash it was probed against.
+
 Precompile entries are codeless by design and are reported separately.
-Only JSON-RPC reads are made (eth_chainId, eth_blockNumber, eth_getCode).
+Only JSON-RPC reads are made (eth_chainId, eth_getBlockByNumber(0x0), eth_blockNumber,
+eth_getCode).
 """
 from __future__ import annotations
 
@@ -66,6 +71,12 @@ def probe(url: str, book: dict) -> dict:
     chain_id = int(rpc(url, "eth_chainId", []), 16)
     if chain_id != book["chainId"]:
         raise SystemExit(f"RPC chainId {chain_id} != book chainId {book['chainId']}")
+    genesis_hash = None
+    if book.get("genesisHash"):
+        block0 = rpc(url, "eth_getBlockByNumber", ["0x0", False]) or {}
+        genesis_hash = block0.get("hash")
+        if not isinstance(genesis_hash, str) or genesis_hash.lower() != book["genesisHash"].lower():
+            raise SystemExit(f"RPC block-0 hash {genesis_hash} != book genesisHash {book['genesisHash']}")
     # The node serves eth_getCode from its latest state and does not honour a block-number
     # tag, so the read asks for "latest" and `block` records the head when the probe started.
     block = int(rpc(url, "eth_blockNumber", []), 16)
@@ -82,6 +93,7 @@ def probe(url: str, book: dict) -> dict:
         time.sleep(0.05)  # stay polite to the public RPC
     return {
         "chainId": chain_id,
+        **({"genesisHash": genesis_hash} if genesis_hash else {}),
         "block": block,
         "probed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "book_deployedAt": book.get("deployedAt"),
@@ -117,6 +129,11 @@ def check_claims(book: dict, snap: dict) -> list[str]:
     stale = [n for n in snap["codeless"] if n not in known]
     if stale:
         errs.append(f"snapshot lists entries that are not in the book (regenerate with --probe): {stale}")
+    if snap.get("genesisHash") != book.get("genesisHash"):
+        errs.append(
+            f"snapshot was probed on block 0 {snap.get('genesisHash')} but the book names genesisHash "
+            f"{book.get('genesisHash')}; re-run with --probe on the book's network"
+        )
     if snap.get("book_deployedAt") != book.get("deployedAt"):
         errs.append(
             f"snapshot was probed for book deployedAt={snap.get('book_deployedAt')} but the book is "
