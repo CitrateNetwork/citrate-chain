@@ -626,6 +626,7 @@ mod tests {
     use citrate_consensus::checkpoint::{
         sign_checkpoint_vote, Checkpoint, CheckpointConfig, CheckpointManager, CheckpointStatus,
     };
+    use citrate_consensus::checkpoint_gadget::SkipReason;
     use citrate_consensus::crypto::Ed25519SigningKey;
     use citrate_consensus::dag_store::{cf, DagStore, KvStore};
     use citrate_consensus::types::Block;
@@ -972,9 +973,12 @@ mod tests {
     /// finality. Mismatch safety stop + alarm; nothing installed, floor and
     /// verified height untouched. The stop clears once fork choice moves this
     /// node onto b2 (normal poll recovery).
+    ///
+    /// Enforced mode only since lead decision 3 (2026-11-09); Observed mode is
+    /// `observed_verified_sibling_certificate_is_a_conflict_not_a_halt`.
     #[tokio::test]
     async fn verified_sibling_certificate_halts_and_is_not_installed() {
-        for mode in [FloorMode::Enforced, FloorMode::Observed] {
+        for mode in [FloorMode::Enforced] {
             let (n, (_a1, a2, b2, b3)) = node(mode).await;
             let now = Instant::now();
             n.solicit("peer-a", now).await;
@@ -1044,6 +1048,49 @@ mod tests {
             // the install).
             assert_eq!(n.verified_height(), 2, "{mode:?}: published once persisted");
         }
+    }
+
+    /// Observed mode (lead decision 3, 2026-11-09; the soak's mode): the same
+    /// verified sibling certificate is a FINALITY CONFLICT, logged and counted,
+    /// not a safety stop. Nothing is installed, the floor and the verified
+    /// height do not move, and the gadget keeps voting on this node's own
+    /// selected chain (a later checkpoint is not refused as halted). The poll
+    /// does not turn it into a stop either.
+    #[tokio::test]
+    async fn observed_verified_sibling_certificate_is_a_conflict_not_a_halt() {
+        let (n, (_a1, a2, b2, _b3)) = node(FloorMode::Observed).await;
+        let now = Instant::now();
+        n.solicit("peer-a", now).await;
+        let sib = b2.header.block_hash;
+        let out = n
+            .sync
+            .on_certificate_at("peer-a", cert_msg(2, sib, signed(&[0, 1, 2], 2, sib)), now)
+            .await;
+        match &out {
+            SyncOutcome::ConflictingFinality {
+                height: 2,
+                certified,
+                canonical,
+                floor,
+            } => {
+                assert_eq!(*certified, sib);
+                assert_eq!(*canonical, Some(a2.header.block_hash));
+                assert!(!matches!(floor, FloorTick::Halted(_)), "{floor:?}");
+            }
+            other => panic!("expected a conflicting-finality outcome, got {other:?}"),
+        }
+        assert!(!n.gadget.halted(), "observed: no safety stop");
+        assert_eq!(n.floor.halt_reason().await, None);
+        assert_eq!(n.latest().await, 0, "not installed");
+        assert_eq!(n.floor_height(), 0, "floor not raised");
+        assert_eq!(n.verified_height(), 0);
+        assert!(!matches!(n.floor.tick().await, FloorTick::Halted(_)));
+        assert!(!n.gadget.halted(), "the poll does not halt either");
+        let later = n
+            .gadget
+            .on_buried_checkpoint(4, Hash::new([4; 32]), None)
+            .await;
+        assert_ne!(later.skipped, Some(SkipReason::Halted), "{later:?}");
     }
 
     /// Owner Q1, the other half: a sibling certificate that does NOT verify

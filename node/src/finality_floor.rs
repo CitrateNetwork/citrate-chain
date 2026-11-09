@@ -1574,9 +1574,12 @@ mod tests {
     }
 
     /// Enforcement OFF: the certificate is verified and reported (metric), but
-    /// neither the floor nor the RPC tags move, so a reorg below it PROCEEDS —
-    /// and the node then reports that it left the finalized block (safety
-    /// stop). The tags never claimed it final.
+    /// neither the floor nor the RPC tags move, so a reorg below it PROCEEDS.
+    /// The node then reports that it left the finalized block as a FINALITY
+    /// CONFLICT (logged, counted), not a safety stop: Observed mode keeps
+    /// voting on its current selected chain (lead decision 3, 2026-11-09; was
+    /// a mismatch safety stop that, with no floor to bring the node back onto
+    /// the certified block, never cleared). The tags never claimed it final.
     #[tokio::test]
     async fn observed_does_not_raise_the_floor_and_reorg_proceeds() {
         let (exec, storage, _dir) = fresh();
@@ -1619,15 +1622,19 @@ mod tests {
                 other => panic!("expected the reorg to proceed, got {other:?}"),
             }
         }
-        assert_eq!(
-            r.verifier.tick().await,
-            FloorTick::Halted(HaltReason::Mismatch {
-                height: 2,
-                certified: a2.header.block_hash,
-                canonical: Some(b2.header.block_hash),
-            })
-        );
-        assert!(r.gadget.halted());
+        let first = r.verifier.tick().await;
+        assert!(!matches!(first, FloorTick::Halted(_)), "{first:?}");
+        assert!(!r.gadget.halted(), "observed: voting continues");
+        assert_eq!(r.verifier.halt_reason().await, None);
+        let again = r.verifier.tick().await;
+        assert!(!matches!(again, FloorTick::Halted(_)), "{again:?}");
+        assert!(!r.gadget.halted());
+        let later = r
+            .gadget
+            .on_buried_checkpoint(4, Hash::new([4; 32]), None)
+            .await;
+        assert_ne!(later.skipped, Some(SkipReason::Halted), "{later:?}");
+        let _ = b2;
         assert_eq!(load(&r.floor), 0);
         assert_eq!(load(&r.verified), 2, "verified height frozen");
         assert_eq!(
@@ -1635,6 +1642,38 @@ mod tests {
             FinalizedAnchor::GENESIS,
             "RPC tags never advanced"
         );
+    }
+
+    /// Observed mode (lead decision 3): booting with a persisted certificate
+    /// for ANOTHER branch is a finality conflict, not a safety stop. The floor
+    /// and RPC tags are not raised and the gadget keeps voting.
+    #[tokio::test]
+    async fn observed_boot_on_another_branch_is_a_conflict_not_a_halt() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (_a1, _a2, b2, _b3) = setup_fork(&app, &storage).await; // tip a2
+        persist_certificate(&storage, &certificate(2, b2.header.block_hash, 3));
+        let r = rig(
+            &storage,
+            FloorMode::Observed,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
+        let boot = r.verifier.boot_check().await;
+        assert!(!matches!(boot, FloorTick::Halted(_)), "{boot:?}");
+        assert!(!r.gadget.halted());
+        assert_eq!(load(&r.floor), 0);
+        assert_eq!(load(&r.verified), 0);
+        assert_eq!(
+            r.verifier.rpc_finalized_handle().resolve(&storage),
+            FinalizedAnchor::GENESIS
+        );
+        let out = r
+            .gadget
+            .on_buried_checkpoint(4, Hash::new([4; 32]), None)
+            .await;
+        assert_ne!(out.skipped, Some(SkipReason::Halted), "{out:?}");
     }
 
     /// Boot with a persisted certificate for ANOTHER branch: finality halts
