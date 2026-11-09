@@ -868,9 +868,36 @@ impl AttestedInner {
             }
             components.push(c);
         }
+        // r1007 G9 (#184): a component one of whose blocks another component
+        // names as a MERGE parent is in that branch's past, merged into it:
+        // with every producer sealing each slot, a slot's siblings that the
+        // next slot does not select are merged by it, and each is a component
+        // of its own (nobody's selected parent). Such an absorbed component
+        // is not a branch of its own, so its proposers are not "on two
+        // branches" for it. Merge parents still never LINK components, so a
+        // bridging key cannot join two sides, and two branches that never
+        // merge each other (an equivocator's) still count it on none.
+        let mut absorbed = vec![false; components.len()];
+        for (hash, b) in &fresh {
+            let Some(&from) = component_of.get(hash) else {
+                continue;
+            };
+            for m in b.parents.iter().skip(1) {
+                if let Some(&into) = component_of.get(m) {
+                    if into != from {
+                        if let Some(a) = absorbed.get_mut(into) {
+                            *a = true;
+                        }
+                    }
+                }
+            }
+        }
         // A proposer on more than one branch counts on none.
         let mut branches_of: HashMap<PublicKey, usize> = HashMap::new();
-        for c in &components {
+        for (id, c) in components.iter().enumerate() {
+            if absorbed.get(id).copied().unwrap_or(false) {
+                continue;
+            }
             for p in &c.proposers {
                 let n = branches_of.entry(*p).or_insert(0);
                 *n = n.saturating_add(1);
@@ -878,6 +905,9 @@ impl AttestedInner {
         }
         components
             .iter()
+            .enumerate()
+            .filter(|(id, _)| !absorbed.get(*id).copied().unwrap_or(false))
+            .map(|(_, c)| c)
             // Every component holds at least its start block, so it has a top.
             .filter_map(|c| {
                 Some(DeferredBranch {
