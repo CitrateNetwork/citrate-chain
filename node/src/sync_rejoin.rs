@@ -1253,6 +1253,8 @@ mod tests {
         };
         let fx = n.admission.admit_to_fixpoint(own.to_vec(), |_, _| {}).await;
         assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
+        // The node's drain task, woken by admission, applies them.
+        n.app.drive_drain().await;
         assert_eq!(
             n.applied(),
             own.last().map(|b| (h(b), b.header.height)),
@@ -1301,6 +1303,8 @@ mod tests {
             pending = bound_orphan_buffer(pending);
         }
         let fx = node.admission.admit_to_fixpoint(pending, |_, _| {}).await;
+        // The node's drain task, woken by admission, applies what was admitted.
+        node.app.drive_drain().await;
         let deferred = fx
             .deferred
             .iter()
@@ -2242,6 +2246,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(
             fx.newly_admitted,
             net.main.len(),
@@ -2274,6 +2279,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2302,6 +2308,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2336,6 +2343,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2392,6 +2400,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let dead_tip = net.side.last().expect("side");

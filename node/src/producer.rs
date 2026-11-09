@@ -7975,7 +7975,10 @@ mod tests {
         /// The gossip `NewBlock` arm of main.rs: admit; on Deferred record the
         /// deferred evidence and run SYNC-S3 against `server` (when given).
         pub(super) async fn gossip(n: &mut N, server: Option<&N>, b: &Block) -> &'static str {
-            match n.adm.admit(b).await {
+            let admitted = n.adm.admit(b).await;
+            // The node's drain task, woken by admission, applies it.
+            n.app.drive_drain().await;
+            match admitted {
                 AdmitOutcome::Admitted { .. } => {
                     n.attested.observe(&n.storage, b);
                     "admitted"
@@ -8031,6 +8034,7 @@ mod tests {
                     attested.observe(&storage, b);
                 })
                 .await;
+            n.app.drive_drain().await;
             let from_answer: Vec<&Block> = fixpoint
                 .deferred
                 .iter()

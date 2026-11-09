@@ -2753,8 +2753,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // more pass, not a back-to-back burst competing with the
                 // producer for the advance lock.
                 let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
+                // Admission wakes this task for every stored block
+                // (`request_drain`); it is the node's only executor of
+                // received blocks, so the P2P message loop never waits on
+                // execution. Wakes during a pass coalesce into one more pass.
+                let wake = app.drain_wake();
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = wake.notified() => {}
+                    }
                     app.drive_drain().await;
                 }
             });

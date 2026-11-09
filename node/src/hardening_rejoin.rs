@@ -506,8 +506,11 @@ pub(crate) mod tests {
     }
 
     impl Node {
+        /// One delivery: admission, then the drain task it wakes (as on a node).
         pub(crate) async fn receive(&self, b: &Block) -> AdmitOutcome {
-            self.adm.admit(b).await
+            let out = self.adm.admit(b).await;
+            self.app.drive_drain().await;
+            out
         }
 
         /// The start-up recovery in `start_node`: converge an applied tip

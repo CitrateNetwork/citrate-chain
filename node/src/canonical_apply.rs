@@ -17,9 +17,13 @@
 // concurrently with the producer's own execute→persist (a snapshot could
 // capture, and a restore roll back, the producer's in-flight state). A single
 // `Arc<Mutex<AppliedTip>>` serializes ALL state-advancing operations: the
-// receive path goes through `apply_received` (which locks internally) and the
-// producer holds the SAME lock (via `advance_lock()`) across its build critical
-// section, updating the tip inline before releasing it.
+// node's drain task (`drive_drain`, woken by admission through
+// `request_drain`) and the producer, which holds the SAME lock (via
+// `advance_lock()`) across its build critical section, updating the tip inline
+// before releasing it. Received blocks are never executed on the P2P message
+// loop (r1007 devnet, 2026-11-08: one slow apply there shed NewBlock and
+// tripped the stall watchdog); `apply_received` remains for callers that apply
+// one block directly (tools, tests).
 //
 // Reward reproducibility: a receiver can only reproduce a block's `state_root`
 // if it credits the exact same block rewards the producer did. The enhanced
@@ -836,6 +840,13 @@ pub struct CanonicalApplicator {
     /// blocks that the winning branch did not execute are re-injected here
     /// (`reinject_abandoned`). `None`: no pool (tests, tools).
     mempool: Option<Arc<citrate_sequencer::mempool::Mempool>>,
+    /// Wakes the drain task ([`Self::drive_drain`]'s loop in `start_node`) when
+    /// admission has stored a block (`request_drain`). Admission never executes:
+    /// execution held the P2P message loop for the whole apply (r1007 devnet,
+    /// 2026-11-08), so one slow apply shed every peer's NewBlock and tripped
+    /// the stall watchdog. `Notify` coalesces: blocks admitted while a pass is
+    /// running are covered by one more pass toward the then-current head.
+    drain_wake: Arc<tokio::sync::Notify>,
 }
 
 impl CanonicalApplicator {
@@ -966,7 +977,21 @@ impl CanonicalApplicator {
             refused_rebuild_head: parking_lot::Mutex::new(None),
             dead_branch: Arc::new(AtomicBool::new(dead_branch)),
             mempool: None,
+            drain_wake: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Admission stored a block: wake the drain task, which applies it (with
+    /// every other block admitted since its last pass) and follows fork choice.
+    /// Never waits; the caller is the P2P message loop.
+    pub fn request_drain(&self) {
+        self.drain_wake.notify_one();
+    }
+
+    /// The wake [`Self::request_drain`] signals. The node's drain task waits on
+    /// it alongside its 1 s tick.
+    pub fn drain_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.drain_wake.clone()
     }
 
     /// Wire the genesis world state + block hash used by the RUNTIME reorg fallback

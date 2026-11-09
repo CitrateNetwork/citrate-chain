@@ -866,6 +866,8 @@ impl Fleet {
                 let relay = fresh && node.relayed.insert(hash);
                 let t = std::time::Instant::now();
                 node.on_new_block(&peer, &pid, block.clone()).await;
+                // Admission's cost plus the apply it hands the drain task.
+                node.run_woken_drain().await;
                 let spent = t.elapsed();
                 if fresh {
                     self.admit_cost.push((self.slot_no, spent));
@@ -882,7 +884,10 @@ impl Fleet {
                     }
                 }
             }
-            NetworkMessage::Blocks { blocks } => node.on_blocks(&peer, &pid, blocks).await,
+            NetworkMessage::Blocks { blocks } => {
+                node.on_blocks(&peer, &pid, blocks).await;
+                node.run_woken_drain().await;
+            }
             _ => {}
         }
     }
@@ -1102,6 +1107,20 @@ impl Node {
             now,
         )
         .await;
+    }
+
+    /// The node's drain task (`start_node`): admission never executes, it
+    /// wakes this task (`CanonicalApplicator::request_drain`), which applies
+    /// what was stored and follows fork choice. The harness runs it right
+    /// after the message that woke it.
+    async fn run_woken_drain(&self) {
+        let wake = self.app.drain_wake();
+        if tokio::time::timeout(std::time::Duration::ZERO, wake.notified())
+            .await
+            .is_ok()
+        {
+            self.app.drive_drain().await;
+        }
     }
 
     /// main.rs `NetworkMessage::Blocks` arm.
@@ -2072,6 +2091,9 @@ mod tests {
             "|h| held_heads.contains(h)",
             "sync_rejoin::classify(",
             "sel.record_serve(",
+            // The drain task applies what admission stored, woken by it.
+            "let wake = app.drain_wake();",
+            "_ = wake.notified() => {}",
             // Serving plane (ADR CV-6).
             "peer_manager.set_serve_sink(serve_tx)",
             "serve_plane::spawn(storage.clone(), peer_manager.clone(), serve_rx)",

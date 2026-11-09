@@ -75,7 +75,7 @@ use citrate_consensus::types::{Block, Hash};
 use citrate_storage::StorageManager;
 use tracing::{debug, info, warn};
 
-use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
+use crate::canonical_apply::CanonicalApplicator;
 
 /// PBA-R2: verify a block's body against its header under the hardened
 /// validity rules. A no-op below the activation height (legacy validity is
@@ -628,31 +628,18 @@ impl BlockAdmission {
             }
         }
 
-        // ---- execute-on-receive ----
-        // Only for a genuinely new admission. A repaired partial admission is
-        // handed to the periodic drain instead: the repair may have filled a
-        // hole well BELOW the stored head, in which case the whole contiguous
-        // suffix above it should drain in one pass, which is precisely what
-        // `drive_drain` does and what a single `apply_received` would not.
-        if !completed_partial {
-            if let Some(app) = &self.applicator {
-                match app.apply_received(block).await {
-                    ApplyOutcome::Applied { root, height } => {
-                        debug!(
-                            "admission: execute-on-receive applied {} @ {} (root {})",
-                            hash, height, root
-                        );
-                    }
-                    ApplyOutcome::Rejected(why) => {
-                        warn!(
-                            "admission: execute-on-receive REJECTED {} @ {}: {}",
-                            hash, block.header.height, why
-                        );
-                    }
-                    // Deferred / AlreadyApplied: gap, fork, or echo. No-op.
-                    _ => {}
-                }
-            }
+        // ---- execute-on-receive: handed to the drain task ----
+        // Admission never executes. It runs on the P2P message loop, and
+        // execution there (once per admitted block, once per block of a
+        // 32-block `Blocks` answer, each waiting for the state-advance lock the
+        // producer and the drain hold while they execute) held that loop for
+        // the whole apply: at ~1.2 s per block a handler outlived the 60 s
+        // stall watchdog, NewBlock was shed and the node killed itself (r1007
+        // devnet, cand-236247b6, 2026-11-08). The drain task applies the
+        // stored block, and a repaired partial admission's suffix, in one pass
+        // toward fork choice's head (`CanonicalApplicator::drive_drain`).
+        if let Some(app) = &self.applicator {
+            app.request_drain();
         }
 
         AdmitOutcome::Admitted { completed_partial }
@@ -1062,6 +1049,12 @@ mod tests {
             storage.blocks.has_block(&b1.header.block_hash).unwrap(),
             "the block is stored for the drain to apply"
         );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            app.drain_wake().notified(),
+        )
+        .await
+        .expect("admission wakes the drain task, which applies the block");
         drop(held);
     }
 
