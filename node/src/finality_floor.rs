@@ -459,7 +459,9 @@ impl FloorVerifier {
     }
 
     /// Distinct finality conflicts this verifier has reported (Observed mode;
-    /// see [`FloorTick::Conflict`]).
+    /// see [`FloorTick::Conflict`]). The live node exports the same count as
+    /// `citrate_finality_conflicts_total`.
+    #[cfg(test)]
     pub fn finality_conflicts(&self) -> u64 {
         self.conflicts.load(Ordering::SeqCst)
     }

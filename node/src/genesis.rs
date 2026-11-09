@@ -207,6 +207,9 @@ pub fn resolve_validator_registry(
     }
 }
 
+/// A genesis validator set: `(proposer consensus key, stake)` per validator.
+pub type GenesisCommittee = Vec<(PublicKey, u128)>;
+
 /// The genesis validator set of the chain whose block 0 is `running_genesis`, as
 /// `(proposer consensus key, stake)`: the epoch-0 checkpoint committee's input (spec 06
 /// §7). It is compiled with the genesis, never read from config or env, so every node on
@@ -220,7 +223,7 @@ pub fn resolve_validator_registry(
 ///   from its own compiled validator file.
 pub fn genesis_committee_set(
     running_genesis: Option<&[u8; 32]>,
-) -> anyhow::Result<Option<Vec<(PublicKey, u128)>>> {
+) -> anyhow::Result<Option<GenesisCommittee>> {
     if running_genesis != Some(&citrate_consensus::hardening::R1006_GENESIS) {
         return Ok(None);
     }

@@ -312,13 +312,16 @@ pub fn validator_set_binding() -> Result<Option<([u8; 20], u64)>, GenesisError> 
     )))
 }
 
+/// One genesis validator: `(proposer public key, stake in wei)`.
+pub type GenesisValidator = ([u8; 32], u128);
+
 /// The genesis validator set of the compiled r1006 genesis: each producer the
 /// ValidatorRegistry registers at block 0, as `(proposer public key, stake in wei)`, in
 /// file order. It is the epoch-0 checkpoint committee's input (spec 06 §7): the
 /// committee for every checkpoint no registry snapshot governs. `None` while the producer
 /// set is a placeholder (status not `final`). Data source: `assets/r1006/validators.json`,
 /// the same file the block-0 registry state is built from.
-pub fn genesis_validator_set() -> Result<Option<Vec<([u8; 32], u128)>>, GenesisError> {
+pub fn genesis_validator_set() -> Result<Option<Vec<GenesisValidator>>, GenesisError> {
     let v = parse_validators()?;
     if v.status != "final" {
         return Ok(None);
