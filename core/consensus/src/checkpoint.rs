@@ -1888,6 +1888,14 @@ mod tests {
     }
 
     /// Committee selection is deterministic.
+    /// The committee size is a consensus constant (lead decision 2), the
+    /// default every production config uses.
+    #[test]
+    fn committee_size_is_the_consensus_constant() {
+        assert_eq!(CHECKPOINT_COMMITTEE_SIZE, 100);
+        assert_eq!(CheckpointConfig::default().committee_size, CHECKPOINT_COMMITTEE_SIZE);
+    }
+
     #[test]
     fn test_committee_selection_determinism() {
         let validators: Vec<(PublicKey, u128)> = (0..10)

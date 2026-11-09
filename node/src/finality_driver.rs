@@ -808,6 +808,32 @@ mod tests {
         assert_eq!(other.committee_for(50).await, None);
     }
 
+    /// Lead decision 2 (2026-11-09): the committee size is a consensus
+    /// parameter, like the interval. Nodes whose `[checkpoint]` sections differ
+    /// (team-testnet ships committee_size = 10, the others 100) used to derive
+    /// different committees for the same checkpoint; the node's checkpoint
+    /// config now takes both from the compiled constants and ignores the file.
+    #[test]
+    fn node_checkpoint_config_pins_the_consensus_parameters() {
+        use citrate_consensus::checkpoint::{CHECKPOINT_COMMITTEE_SIZE, CHECKPOINT_INTERVAL};
+        let team = crate::config::CheckpointNodeConfig {
+            committee_size: 10,
+            interval: 7,
+            ..crate::config::CheckpointNodeConfig::default()
+        };
+        let a = node_checkpoint_config(&team, 40204, h(1));
+        let b = node_checkpoint_config(&crate::config::CheckpointNodeConfig::default(), 40204, h(1));
+        assert_eq!(CHECKPOINT_COMMITTEE_SIZE, 100);
+        assert_eq!(a.committee_size, CHECKPOINT_COMMITTEE_SIZE);
+        assert_eq!(a.committee_size, b.committee_size, "one committee size fleet-wide");
+        assert_eq!(a.interval, CHECKPOINT_INTERVAL);
+        assert_eq!(
+            (a.chain_id, a.genesis_hash, a.vote_depth),
+            (40204, h(1), team.vote_depth),
+            "node-local values are still the node's"
+        );
+    }
+
     #[test]
     fn never_votes_at_the_tip() {
         // depth 3, interval 2: tip 10 => buried 7 => boundary 6.
