@@ -309,6 +309,47 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND);
     }
 
+    // ── commitments are bound to the offer they were made on ──────
+
+    /// A commitment recorded through one offer cannot be revealed on another: a party on any
+    /// live offer could otherwise pre-commit against a root that does not exist yet.
+    function test_commitment_made_through_another_offer_does_not_reveal() public {
+        (uint256 a,) = _postedFl3(); // a live offer the committer can act on (as its poster)
+        uint256 id = _openFl();
+        _join(id, w1);
+        _join(id, w2);
+        _join(id, w3);
+        _accept(id);
+        Entry[] memory e = _entries3();
+        (bytes32[] memory l,) = _leaves(id, e, _noOverride(), 2);
+        bytes memory ev = _ev(6, abi.encode(_opening(l, 2, e[2], 5), _padding(l, 3)));
+        bytes32 cm = market.disputeCommitment(id, 0, poster, ev, "x");
+        vm.prank(poster);
+        vm.expectRevert(WorkMarket.WrongState.selector);
+        market.commitDispute(id, cm); // the target has no root yet
+        vm.prank(poster);
+        market.commitDispute(a, cm); // recorded through offer a
+        vm.warp(block.timestamp + market.DISPUTE_REVEAL_DELAY());
+        _postTree(id, l, 9);
+        vm.prank(poster);
+        vm.expectRevert(WorkMarket.BadEvidence.selector);
+        market.revealDispute(id, ev, "x");
+        assertEq(market.getOffer(id).payoutRoot != bytes32(0), true, "the root stands");
+    }
+
+    /// A commitment is kept per offer and committer: another joined party cannot reveal it.
+    function test_commitment_is_kept_per_committer() public {
+        (uint256 id, bytes memory ev) = _underPosted(false);
+        bytes32 salt = _commit(id, w2, ev);
+        vm.warp(block.timestamp + market.DISPUTE_REVEAL_DELAY());
+        vm.prank(w3);
+        vm.expectRevert(WorkMarket.BadEvidence.selector);
+        market.revealDispute(id, ev, salt);
+        vm.prank(w2);
+        market.revealDispute(id, ev, salt);
+        assertEq(market.balanceOf(w2), CBOND / 2);
+    }
+
     // ── commit deadline ────────────────────────────────────────────
 
     function test_commit_refused_when_the_reveal_cannot_fit() public {
