@@ -407,8 +407,10 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
     // ── owner Q19 (2026-11-09): V2 never works alongside V1 ─────────
 
     function _installV1(address k) internal {
+        GuardianRecoveryModule v1m = GuardianRecoveryModule(address(module.v1()));
+        bytes memory data = _installBytes(2, _threeGuardians());
         vm.prank(k);
-        GuardianRecoveryModule(address(module.v1())).onInstall(_installBytes(2, _threeGuardians()));
+        v1m.onInstall(data);
     }
 
     function test_constructor_rejectsV1WithoutCode() public {
@@ -425,8 +427,9 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
 
     function test_install_allowedAfterV1Uninstalled() public {
         _installV1(kernel);
+        GuardianRecoveryModule v1m = GuardianRecoveryModule(address(module.v1()));
         vm.prank(kernel);
-        GuardianRecoveryModule(address(module.v1())).onUninstall("");
+        v1m.onUninstall("");
         _install(kernel);
         assertTrue(module.isInitialized(kernel));
     }

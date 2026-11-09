@@ -39,8 +39,14 @@ import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 ///         root validator) at any time before execution; uninstalling the module also clears it.
 ///         A new guardian quorum may replace a pending recovery, which restarts the 72 h clock.
 ///
-///         The module has **no owner, admin or governance role and no constructor parameters**:
-///         it is a per-account plug-in, and the delay is a constant. It holds no value.
+///         V2 never runs beside V1 (owner Q19, 2026-11-09): `onInstall` refuses an account that
+///         still has V1 initialized, and if V1 is installed after V2, `initiateRecovery` reverts
+///         and validation fails until V1 is uninstalled. The execution-op signer is an EOA
+///         guardian (Q20); contract guardians may still sign the initiation.
+///
+///         The module has **no owner, admin or governance role**. Its one constructor parameter
+///         is the genesis V1 address (immutable). It is a per-account plug-in, and the delay is a
+///         constant. It holds no value.
 ///         Citrate is never a guardian; nothing in the module gives the deployer any role.
 /// @notice The V1 read this module needs (contracts/src/aa/recovery/GuardianRecoveryModule.sol).
 interface IGuardianRecoveryModuleV1 {
@@ -125,6 +131,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
 
     /// @param v1_ the genesis GuardianRecoveryModule (V1) address (GEN-PARAM)
     constructor(IGuardianRecoveryModuleV1 v1_) {
+        if (address(v1_).code.length == 0) revert V1HasNoCode();
         v1 = v1_;
     }
 
@@ -133,6 +140,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
     /// `_data` layout (same as V1): uint8 threshold | uint8 count | address[count] guardians.
     function onInstall(bytes calldata _data) external payable override {
         if (_isInitialized(msg.sender)) revert AlreadyInstalled(msg.sender);
+        if (v1.isInitialized(msg.sender)) revert V1StillInstalled(msg.sender);
         if (_data.length < 2) revert InvalidInstallData();
 
         uint8 threshold = uint8(_data[0]);
@@ -226,6 +234,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
     {
         RecoveryConfig storage cfg = _config[account];
         if (cfg.count == 0) revert NotInitialized(account);
+        if (v1.isInitialized(account)) revert V1StillInstalled(account);
         if (!_isAllowedRecoveryAction(callData, account)) revert RecoveryActionNotAllowed();
 
         uint64 nonce = recoveryNonce[account];
@@ -256,7 +265,8 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
     /// @notice Validates the rotation UserOp of a pending recovery. Returns ERC-4337 validation
     ///         data with `validAfter = executeAfter`; the EntryPoint enforces the delay.
     /// @dev `userOp.signature` is one 65-byte guardian signature over
-    ///      `keccak256(userOpHash ‖ account)` (EIP-191 for EOAs, EIP-1271 for contracts), so the
+    ///      `keccak256(userOpHash ‖ account)` from an EOA guardian (EIP-191 only; owner Q20: no
+    ///      EIP-1271 call during validation, so unstaked accounts pass strict bundlers), so the
     ///      op's gas fields are guardian-chosen and a third party cannot submit the rotation with
     ///      inflated fees against the account's deposit.
     function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash)
@@ -270,13 +280,16 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
 
         PendingRecovery memory p = _pending[msg.sender];
         if (p.executeAfter == 0) return SIG_VALIDATION_FAILED_UINT;
+        // Q19: V1 installed after V2 would keep V1's instant path open; refuse while it is.
+        // Reads V1's storage keyed by the sender (associated storage, ERC-7562 STO-021).
+        if (v1.isInitialized(msg.sender)) return SIG_VALIDATION_FAILED_UINT;
         if (keccak256(userOp.callData) != p.callDataHash) return SIG_VALIDATION_FAILED_UINT;
         // Defence in depth: the hash was allowlisted at initiation; re-check the bytes.
         if (!_isAllowedRecoveryAction(userOp.callData, msg.sender)) return SIG_VALIDATION_FAILED_UINT;
 
         if (userOp.signature.length != 65) return SIG_VALIDATION_FAILED_UINT;
         bytes32 opDigest = keccak256(abi.encodePacked(userOpHash, msg.sender));
-        if (_matchGuardian(cfg, opDigest, userOp.signature) == NO_GUARDIAN) return SIG_VALIDATION_FAILED_UINT;
+        if (_matchEoaGuardian(cfg, opDigest, userOp.signature) == NO_GUARDIAN) return SIG_VALIDATION_FAILED_UINT;
 
         delete _pending[msg.sender];
         emit RecoveryExecuted(msg.sender, p.nonce, p.callDataHash);
@@ -307,7 +320,7 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
     {
         uint8 threshold = cfg.threshold;
         if (blob.length != uint256(threshold) * 65) return false;
-        uint8 used;
+        uint8 used = 0;
         for (uint256 i = 0; i < threshold; i++) {
             uint8 idx = _matchGuardian(cfg, digest, blob[i * 65:i * 65 + 65]);
             if (idx == NO_GUARDIAN) return false;
@@ -316,6 +329,22 @@ contract GuardianRecoveryModuleV2 is IValidator, IHook {
             used |= bit;
         }
         return true;
+    }
+
+    /// Index of the EOA guardian whose EIP-191 signature over `digest` is `sig`, or NO_GUARDIAN.
+    /// Never calls a guardian contract (execution phase, owner Q20).
+    function _matchEoaGuardian(RecoveryConfig storage cfg, bytes32 digest, bytes calldata sig)
+        internal
+        view
+        returns (uint8)
+    {
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest.toEthSignedMessageHash(), sig);
+        if (err != ECDSA.RecoverError.NoError || signer == address(0)) return NO_GUARDIAN;
+        uint8 n = cfg.count;
+        for (uint8 i = 0; i < n; i++) {
+            if (cfg.guardians[i] == signer) return i;
+        }
+        return NO_GUARDIAN;
     }
 
     /// Index of the guardian that produced `sig` over `digest`, or NO_GUARDIAN. EOAs are recovered
