@@ -30,6 +30,21 @@ pub const MAX_FUTURE_SLOT_DRIFT_SECS: u64 = 15;
 /// [`MAX_FUTURE_SLOT_DRIFT_SECS`] in whole slots.
 pub const MAX_FUTURE_SLOT_DRIFT_SLOTS: u64 = MAX_FUTURE_SLOT_DRIFT_SECS / SLOT_DURATION_SECS;
 
+/// G9 ingress policy, "hold, rather than reject" (spec G9, reviewer R12): a
+/// gossiped block stamped more than [`MAX_FUTURE_SLOT_DRIFT_SECS`] but at most
+/// this many seconds past the local clock is held, without a peer penalty,
+/// and handed to admission once its slot is inside the drift. Further ahead
+/// than this it is refused as before. Local policy, not a validity rule.
+///
+/// 120 s covers an honest host whose clock is badly off (NTP keeps healthy
+/// hosts within milliseconds) while bounding how long a held block occupies
+/// memory. It is below the pre-r1007 900 s drift, so the hold never accepts a
+/// block an older release would have refused.
+pub const HELD_FUTURE_HORIZON_SECS: u64 = 120;
+
+const _: () = assert!(HELD_FUTURE_HORIZON_SECS > MAX_FUTURE_SLOT_DRIFT_SECS);
+const _: () = assert!(HELD_FUTURE_HORIZON_SECS <= 900);
+
 const _: () = assert!(SLOT_DURATION_SECS > 0);
 const _: () = assert!(MAX_FUTURE_SLOT_DRIFT_SECS.is_multiple_of(SLOT_DURATION_SECS));
 // The parent-relative timestamp bound must be a whole number of slots, so the

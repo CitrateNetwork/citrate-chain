@@ -75,6 +75,7 @@ mod finality_adversarial_tests;
 mod finality_driver;
 mod finality_floor;
 mod genesis;
+mod gossip_hold;
 mod hardening_rejoin;
 mod host_identity;
 mod inference;
@@ -2584,6 +2585,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // Incoming message channel (log-only for now)
         let (in_tx, mut in_rx) =
             tokio::sync::mpsc::channel::<(PeerId, citrate_network::NetworkMessage)>(512);
+        // r1007 G9 ingress: gossip holds early blocks and this weak handle
+        // feeds them back into the queue once due (`gossip_hold`). Weak, so
+        // the queue still closes when the peer manager drops its sender.
+        let held_release_tx = in_tx.downgrade();
         peer_manager.set_incoming(in_tx).await;
         // ADR CV-6 (planset H3): history serving has its own lane and task.
         // GetBlocks/GetHeaders never enter the consensus queue above and are
@@ -2786,6 +2791,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             peer_manager.clone(),
         ));
         let gossip_for_rx = gossip.clone();
+        // r1007 G9 ingress ("hold, rather than reject"): early blocks gossip
+        // held go back through the NewBlock arm below once their slot is due.
+        gossip_hold::spawn_release(gossip.clone(), held_release_tx);
         // Sync manager (basic integration)
         // WEDGE #85: judge sync completion against THIS node's applied chain, not
         // the height of the last block handed to us. Without this a node with a
@@ -3672,7 +3680,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await
                         {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
-                                Ok(_) => {
+                                // r1007 G9 ingress: an early block is held by
+                                // gossip, not admitted; `gossip_hold` re-delivers
+                                // it here once its slot is inside the drift.
+                                Ok(
+                                    citrate_network::BlockGossip::Held
+                                    | citrate_network::BlockGossip::HoldFull,
+                                ) => {}
+                                Ok(
+                                    citrate_network::BlockGossip::Relayed
+                                    | citrate_network::BlockGossip::AlreadyRelayed,
+                                ) => {
                                     // PBA-L1b-006: gossip validation proves only a
                                     // self-consistent, self-signed header — any key
                                     // can sign height u64::MAX. The height becomes
