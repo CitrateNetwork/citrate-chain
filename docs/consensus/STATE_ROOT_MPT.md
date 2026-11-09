@@ -77,9 +77,19 @@ incremental computation is still a pure function of the state. Code:
     `PARAM:*` keys): `RLP[v]`, a one-item list. It never collides with an EVM value,
     which is an RLP string.
 
+### Which accounts are committed
+
+- Every resident account, and every address that holds storage but has no resident
+  account entry. The governance precompile, for example, writes its `PARAM:` and
+  `PENDING:` slots through `set_storage` without creating an account. Such an address
+  commits as the default account (nonce 0, balance 0, no code, no model permissions)
+  with its storage root, so it is present exactly when it holds a slot that is in the
+  storage trie. (`StateDB::committed_account`.)
+
 ### What the root commits to
 
-- It commits to the full resident account set and their slots. Models and training jobs
+- It commits to the full resident account set and their slots, including the slots of
+  storage-only addresses (above). Models and training jobs
   are not committed, as before (purity ADR §5).
 - It does not commit to the order of writes, to which node computed it, or to any cache.
 

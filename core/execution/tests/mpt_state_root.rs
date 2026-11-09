@@ -481,7 +481,7 @@ fn spec_state_root(snap: &citrate_execution::state::StateSnapshot) -> [u8; 32] {
                 if items.is_empty() {
                     EMPTY
                 } else {
-                    triehash::sec_trie_root::<Keccak, _, _, _>(items).into()
+                    triehash::sec_trie_root::<Keccak, _, _, _>(items)
                 }
             }
             None => EMPTY,
@@ -522,7 +522,7 @@ fn spec_state_root(snap: &citrate_execution::state::StateSnapshot) -> [u8; 32] {
     if leaves.is_empty() {
         return EMPTY;
     }
-    triehash::sec_trie_root::<Keccak, _, _, _>(leaves).into()
+    triehash::sec_trie_root::<Keccak, _, _, _>(leaves)
 }
 
 proptest! {

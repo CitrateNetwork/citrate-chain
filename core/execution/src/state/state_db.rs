@@ -607,7 +607,7 @@ impl StateDB {
                 .get(address)
                 .map(|t| t.mpt_root())
                 .unwrap_or(EMPTY_ROOT);
-            match self.accounts.get_resident(address) {
+            match self.committed_account(address) {
                 None => trie.remove(&key),
                 Some(account) => {
                     // Keep the resident account consistent with what is hashed
@@ -650,15 +650,40 @@ impl StateDB {
         self.folded_accounts.load(Ordering::Relaxed)
     }
 
+    /// The account the MPT state root commits for `address`: its resident
+    /// entry, or, for an address that holds storage but has no resident entry
+    /// (the governance precompile writes its slots without creating one), the
+    /// default account holding those slots. `None`: nothing to commit.
+    /// Spec: docs/consensus/STATE_ROOT_MPT.md §3.
+    fn committed_account(&self, address: &Address) -> Option<crate::types::AccountState> {
+        self.accounts.get_resident(address).or_else(|| {
+            self.storage_tries
+                .contains_key(address)
+                .then(crate::types::AccountState::default)
+        })
+    }
+
+    /// Every (address, account) [`Self::committed_account`] names: the resident
+    /// accounts plus the storage-only addresses.
+    fn committed_accounts(&self) -> Vec<(Address, crate::types::AccountState)> {
+        let mut all = self.accounts.all_accounts();
+        let resident: std::collections::HashSet<Address> = all.iter().map(|(a, _)| *a).collect();
+        for entry in self.storage_tries.iter() {
+            if !resident.contains(entry.key()) {
+                all.push((*entry.key(), crate::types::AccountState::default()));
+            }
+        }
+        all
+    }
+
     /// The MPT state root of the resident state computed FROM SCRATCH: every
-    /// resident account and slot re-encoded and the whole trie built in one
-    /// pass (`mpt::root_from_sorted`), with no cache, no incremental trie and
+    /// committed account (resident, or storage-only) and slot re-encoded and
+    /// the whole trie built in one pass (`mpt::root_from_sorted`), with no cache, no incremental trie and
     /// no side effect. The reference [`Self::mpt_state_root`] is tested and
     /// replayed against (tools/replay-ref).
     pub fn reference_state_root(&self) -> StateRoot {
         let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-            .accounts
-            .all_accounts()
+            .committed_accounts()
             .into_iter()
             .filter_map(|(address, account)| {
                 let storage_root = self
@@ -791,8 +816,7 @@ impl StateDB {
         use std::collections::HashMap;
         let account_trie = Mpt::load(root.as_bytes(), source).map_err(|e| e.to_string())?;
         let mut by_key: HashMap<[u8; 32], (Address, crate::types::AccountState)> = self
-            .accounts
-            .all_accounts()
+            .committed_accounts()
             .into_iter()
             .map(|(a, s)| (account_trie_key(&a.0), (a, s)))
             .collect();
