@@ -906,8 +906,19 @@ impl Fleet {
         }
     }
 
-    /// One slot: every running producer tries to seal (random order), its
-    /// block is gossiped, then each running node runs its sync tick and drain.
+    /// One slot: every running producer tries to seal (random order), then
+    /// the sealed blocks are gossiped (in that order), then each running node
+    /// runs its sync tick and drain.
+    ///
+    /// r1007 G9 (#184): every producer seals at the slot boundary, on the
+    /// slot grid, from what it held when the slot began; a block of slot s
+    /// reaches a peer during slot s and is merged by slot s + 1. So the
+    /// producers of one harness slot all seal before any of that slot's blocks
+    /// is delivered. (Before G9 the harness delivered each block before the
+    /// next producer sealed, and a later producer of the same round stacked a
+    /// block on it. Under G9 that producer would see a selected parent in its
+    /// own slot and skip, so one block per harness slot was sealed across the
+    /// whole fleet and a larger side could never outweigh a smaller one.)
     pub(crate) async fn slot(&mut self, order: &[usize]) -> Vec<(usize, Block)> {
         self.slot_no += 1;
         self.clock_ms.store(
@@ -936,13 +947,15 @@ impl Fleet {
                 .get_block(&h)
                 .expect("read produced")
                 .expect("produced stored");
-            for j in (0..n).filter(|j| *j != i) {
+            produced.push((i, b));
+        }
+        for (i, b) in &produced {
+            for j in (0..n).filter(|j| j != i) {
                 let _ = self
-                    .peer(i, j)
+                    .peer(*i, j)
                     .send(NetworkMessage::NewBlock { block: b.clone() })
                     .await;
             }
-            produced.push((i, b));
             self.pump().await;
         }
         let running: Vec<usize> = (0..n).filter(|i| !self.down.contains(i)).collect();
@@ -1937,9 +1950,14 @@ mod tests {
             fleet.slot(&o).await;
         }
         let heights = fleet.applied_heights().await;
+        // r1007 G9: a chain gains at most one height per slot (every parent is
+        // in an earlier slot), so SLOTS slots carry at most SLOTS heights; the
+        // first slot seals nothing (the #126 initial-sync gate opens at the
+        // first sync tick). Before G9 a producer stacked a second block on a
+        // same-round block, and the bound was `>= SLOTS`.
         assert!(
-            heights.iter().all(|h| *h >= SLOTS),
-            "both nodes apply every slot: {heights:?}"
+            heights.iter().all(|h| *h >= SLOTS - 1 && *h <= SLOTS),
+            "both nodes apply every slot after the first, one height per slot: {heights:?}"
         );
         // Every gossiped block a node admitted, by slot, in ms.
         let per_block: Vec<(u64, f64)> = fleet
@@ -2393,7 +2411,10 @@ mod tests {
                 "split_heal_tests::tests::stopped_side_forked_beyond_the_reorg_window_rejoins",
             );
         }
-        let r = stopped_side(45, 30, false, false).await;
+        // r1007 G9: a branch gains at most one height per slot, so the
+        // partition must be longer than the 100-block ring (it was 45 slots
+        // when producers stacked several heights per round).
+        let r = stopped_side(110, 30, false, false).await;
         assert!(
             r.fork_depth > crate::canonical_apply::SNAPSHOT_RING_DEPTH,
             "fixture: the three's branch is only {} deep ({})",
@@ -2423,7 +2444,8 @@ mod tests {
                 "split_heal_tests::tests::pruned_stopped_side_forked_beyond_the_reorg_window_rejoins",
             );
         }
-        let r = stopped_side(45, 30, false, true).await;
+        // r1007 G9: one height per slot; see the unpruned variant.
+        let r = stopped_side(110, 30, false, true).await;
         assert!(
             r.fork_depth > crate::canonical_apply::SNAPSHOT_RING_DEPTH,
             "fixture: the three's branch is only {} deep ({})",
