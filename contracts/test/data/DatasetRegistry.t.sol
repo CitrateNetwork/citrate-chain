@@ -482,6 +482,13 @@ contract DatasetRegistryTest is DatasetRegistryBase {
     }
 
     /// forge-config: default.fuzz.runs = 10000
+    function testFuzz_datasetIdFor_is_the_publisher_namespace(address who, string calldata name) public view {
+        bytes32 id = reg.datasetIdFor(who, name);
+        assertEq(id, _nsId(who, name));
+        assertEq(address(uint160(uint256(id) >> 96)), who);
+    }
+
+    /// forge-config: default.fuzz.runs = 10000
     function testFuzz_v1_outside_namespace_refused(address caller, bytes32 id) public {
         vm.assume(address(uint160(uint256(id) >> 96)) != caller);
         vm.prank(caller);
