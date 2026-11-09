@@ -228,6 +228,26 @@ The final r1006 snapshot is taken at the ceremony's grant freeze, before the cut
 (federation `ops/r1007-ceremony/RUNBOOK.md`, T0). Slot r1006 stays on every host until
 S4-5, so the snapshot can be taken again until then.
 
+### 4.2 Ceremony decisions (owner 2026-11-09)
+
+The procedures are in the federation `ops/r1007-ceremony/RUNBOOK.md` (fed#467).
+- **Treasury signer daily cap:** 20 grants a day for the re-grant window only, then
+  restored to 3 a day. The restore is mandatory, and both changes are verified from the
+  signer's `/health` (`r1007-reissue.ts cap-check`). Each grant counts 32,000.05 SALT against
+  the cap (the bond plus the gas top-up). That is why today's default of 96,000 SALT admits
+  only 2 grants, and why both values are set explicitly.
+- **Developer notice:** pencilled in for 2026-11-25. It is confirmed only after G4 passes on
+  the integrated candidate. Only at confirmation is the date set, in one change, in
+  `NEXT_PUBLIC_TESTNET_RESET_DATE` (docs), `CITRATE_TESTNET_RESET_DATE` (explorer) and the
+  email and X drafts.
+- **KYC attestations:** members verified on r1006 get the SBT attestation back right after
+  the re-issue, from the stored verification record (identity `/kyc/status`). Nobody redoes
+  KYC. The `setKycVerified` write is `onlyOwner`, and the treasury signer has no endpoint
+  for it, so the lead picks a write path before the ceremony (runbook §5.2).
+- **DPF timelock wiring (G7/D3):** queued right after the post-genesis deploys, so the 48 h
+  delay runs during the soak. It is executed at about T0+50 h and checked before the G5
+  sign-off.
+
 ## 5. Integration checklist (for the step that combines the r1007 lanes)
 
 1. Merge order: storage-cow is already in this branch. Then mergeset-execution,
