@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Governable} from "../lib/Governable.sol";
 import {ReentrancyGuard} from "../lib/ReentrancyGuard.sol";
+import {InitialAdmin} from "../lib/InitialAdmin.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
@@ -224,10 +225,10 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     // ── construction ────────────────────────────────────────────────
 
     /// @param governance_       the governance timelock (3-of-5 / 48 h); allows verifiers, pauses, unpauses
-    /// @param guardian_         the guardian council (2-of-3); may pause new offers, nothing else; may be 0
+    /// @param guardian_         the guardian council (2-of-3); may pause new offers, nothing else; not 0 (InitialAdmin)
     /// @param initialVerifiers_ verifiers allowed at block 0 (CREATE2-predicted FLRoundVerifier and TaskVerifier)
     constructor(address governance_, address guardian_, address[] memory initialVerifiers_) Governable(governance_) {
-        guardian = guardian_;
+        guardian = InitialAdmin.check(guardian_);
         emit GuardianSet(guardian_);
         for (uint256 i = 0; i < initialVerifiers_.length; i++) {
             address v = initialVerifiers_[i];
@@ -245,7 +246,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         emit VerifierAllowed(verifier, ok);
     }
 
+    /// @notice Rotate the guardian seat, or clear it with zero. Never the CREATE2 factory.
     function setGuardian(address guardian_) external onlyGovernance {
+        if (guardian_ == InitialAdmin.CREATE2_FACTORY) revert InitialAdmin.InitialAdmin_Create2Factory();
         guardian = guardian_;
         emit GuardianSet(guardian_);
     }

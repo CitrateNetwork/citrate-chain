@@ -22,7 +22,7 @@ Sources: `contracts/src/work/{IVerifier,WorkMarket,FLRoundVerifier,TaskVerifier}
 | Role | Who at genesis | What it can do | What it cannot do |
 |---|---|---|---|
 | Governance (`Governable`, two-step transfer) | the governance timelock (3-of-5 / 48 h) | allow or deny verifiers for **new** offers; pause and unpause **new** offers; set the guardian | touch any escrow, bond or pull balance; change an offer's price, verifier or terms; block `join`, `postPayout`, `dispute`, `settle`, `refund`, `claimBond`, `withdraw` |
-| Guardian | the guardian council (2-of-3), or zero | pause new offers | unpause; anything else |
+| Guardian | the guardian council (2-of-3); required at construction (`InitialAdmin.check`), governance may later clear it | pause new offers | unpause; anything else |
 | Poster | any account | open (escrows the budget); dispute; refund what no root can claim; accept a TASK result (TaskVerifier) | take escrow a posted, undisputed root reserves |
 | Coordinator | named by the poster at `open` (FL: the round's coordinator; TASK: the selected worker) | post the payout root (with the poster-set bond) once the verifier accepts; claim its bond after an undisputed window | post after the deadline; post more units than the budget buys |
 | Dispute admin | named at `open`, group TASK offers only | uphold or reject a subjective dispute | anything on FL offers or open tasks |
@@ -104,7 +104,7 @@ their addresses are known before the ceremony.
 | FLRoundVerifier | `frl_` | the genesis FederatedRoundLedger (CREATE2, already in the r1006 set) | immutable |
 | TaskVerifier | `reviewWindow_` | seconds, 1 h ≤ x ≤ 30 d | immutable; owner picks (proposal: 72 h) |
 | WorkMarket | `governance_` | the governance timelock | two-step transfer; may not be the CREATE2 factory (Governable) |
-| WorkMarket | `guardian_` | the guardian council 2-of-3, or zero | settable later by governance |
+| WorkMarket | `guardian_` | the guardian council 2-of-3 | not zero and not the CREATE2 factory (`InitialAdmin.check`, PBA-L2-002); governance may rotate or clear it later |
 | WorkMarket | `initialVerifiers_` | `[FLRoundVerifier, TaskVerifier]` | the CREATE2-predicted addresses above; deploy order: FRL, the two verifiers, then WorkMarket |
 
 Fixed in code (not parameters): `MIN_DISPUTE_WINDOW` = 24 h, `MAX_WORKERS_CAP` = 1024,
