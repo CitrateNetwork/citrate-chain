@@ -2557,9 +2557,21 @@ mod tests {
                 && stmt.contains(".with_dag_prune_floor(shared_dag_store.clone())"),
             "the applicator must be built with the DAG prune floor: {stmt}"
         );
+        let gd = src
+            .find("let shared_ghostdag = ")
+            .and_then(|at| src.get(at..))
+            .and_then(|t| t.find(';').and_then(|end| t.get(..end)))
+            .expect("shared_ghostdag statement");
         assert!(
-            src.contains("GhostDag::new(\n        GhostDagParams::default(),\n        shared_dag_store.clone(),"),
-            "fork choice and the prune floor must read the same DAG store"
+            gd.contains("GhostDag::new(GhostDagParams::default(), shared_dag_store.clone())"),
+            "fork choice and the prune floor must read the same DAG store: {gd}"
+        );
+        // G11: the pruning-point walk reads headers the DAG prune dropped
+        // from the chain store, so a pruned node admits what an unpruned does.
+        assert!(
+            gd.contains(".with_ancestry_headers(")
+                && gd.contains("ChainStoreHeaders(storage.clone())"),
+            "the shared GhostDag must read pruned ancestry from the chain store: {gd}"
         );
     }
 
