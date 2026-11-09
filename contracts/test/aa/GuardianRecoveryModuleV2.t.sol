@@ -51,6 +51,19 @@ abstract contract GuardianV2Base is Test {
 
     uint48 internal constant DELAY = 72 hours;
 
+    // Execution-op gas and fee bounds the guardian quorum approves in these tests.
+    uint64 internal constant B_MAX_VGL = 1_000_000;
+    uint64 internal constant B_MIN_CGL = 200_000;
+    uint64 internal constant B_MAX_CGL = 1_000_000;
+    uint64 internal constant B_MAX_PVG = 100_000;
+    uint128 internal constant B_MAX_PRIO = 1 gwei;
+    uint128 internal constant B_MAX_FEE = 2 gwei;
+
+    /// accountGasLimits / gasFees packing (high 128 | low 128).
+    function _pack(uint256 hi, uint256 lo) internal pure returns (bytes32) {
+        return bytes32((hi << 128) | lo);
+    }
+
     GuardianRecoveryModuleV2 internal module;
 
     function _threeGuardians() internal pure returns (address[] memory g) {
@@ -134,6 +147,9 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
     function _op(bytes memory cd, bytes memory sig) internal pure returns (PackedUserOperation memory op) {
         op.callData = cd;
         op.signature = sig;
+        op.accountGasLimits = _pack(B_MAX_VGL, B_MAX_CGL);
+        op.preVerificationGas = B_MAX_PVG;
+        op.gasFees = _pack(B_MAX_PRIO, B_MAX_FEE);
     }
 
     function _validate(address k, bytes memory cd) internal returns (uint256) {
@@ -592,6 +608,118 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         assertEq(_validate(kernel, cd), SIG_VALIDATION_FAILED_UINT);
     }
 
+    // ── execution-op bounds approved by the quorum ──────────────────
+
+    /// Validates `cd` with the given gas fields signed by guardian C.
+    function _validateWith(bytes memory cd, uint256 vgl, uint256 cgl, uint256 pvg, uint256 prio, uint256 maxFee)
+        internal
+        returns (uint256)
+    {
+        PackedUserOperation memory op = _op(cd, _execSig(PK_C, OP_HASH, kernel));
+        op.accountGasLimits = _pack(vgl, cgl);
+        op.preVerificationGas = pvg;
+        op.gasFees = _pack(prio, maxFee);
+        vm.prank(kernel);
+        return module.validateUserOp(op, OP_HASH);
+    }
+
+    /// Every bound is inclusive, and one unit past any bound fails validation without consuming
+    /// the pending recovery.
+    function test_validate_executionBoundsAreInclusive() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "bounds");
+        uint48 ea = _initiate(kernel, cd);
+        uint256 F = SIG_VALIDATION_FAILED_UINT;
+        assertEq(_validateWith(cd, B_MAX_VGL + 1, B_MIN_CGL, B_MAX_PVG, B_MAX_PRIO, B_MAX_FEE), F, "vgl");
+        assertEq(_validateWith(cd, B_MAX_VGL, B_MIN_CGL - 1, B_MAX_PVG, B_MAX_PRIO, B_MAX_FEE), F, "min cgl");
+        assertEq(_validateWith(cd, B_MAX_VGL, B_MAX_CGL + 1, B_MAX_PVG, B_MAX_PRIO, B_MAX_FEE), F, "max cgl");
+        assertEq(_validateWith(cd, B_MAX_VGL, B_MIN_CGL, B_MAX_PVG + 1, B_MAX_PRIO, B_MAX_FEE), F, "pvg");
+        assertEq(_validateWith(cd, B_MAX_VGL, B_MIN_CGL, B_MAX_PVG, B_MAX_PRIO + 1, B_MAX_FEE), F, "prio");
+        assertEq(_validateWith(cd, B_MAX_VGL, B_MIN_CGL, B_MAX_PVG, B_MAX_PRIO, B_MAX_FEE + 1), F, "max fee");
+        (, uint48 left,) = module.pendingRecovery(kernel);
+        assertEq(left, ea, "refused ops never consume the pending recovery");
+        assertEq(_validateWith(cd, B_MAX_VGL, B_MIN_CGL, B_MAX_PVG, B_MAX_PRIO, B_MAX_FEE), uint256(ea) << 208);
+        _initiate(kernel, cd);
+        assertEq(_validateWith(cd, B_MAX_VGL, B_MAX_CGL, B_MAX_PVG, B_MAX_PRIO, B_MAX_FEE), uint256(ea) << 208);
+    }
+
+    /// A single guardian signs the execution op, so its gas fields must stay inside the bounds the
+    /// quorum approved: validation passes iff every field is within them.
+    function testFuzz_validate_enforcesTheApprovedExecutionBounds(
+        uint8 outMask,
+        uint128 vgl,
+        uint128 cgl,
+        uint256 pvg,
+        uint128 prio,
+        uint128 maxFee
+    ) public {
+        if (outMask & 1 == 0) vgl = uint128(bound(vgl, 0, B_MAX_VGL));
+        if (outMask & 2 == 0) cgl = uint128(bound(cgl, B_MIN_CGL, B_MAX_CGL));
+        if (outMask & 4 == 0) pvg = bound(pvg, 0, B_MAX_PVG);
+        if (outMask & 8 == 0) prio = uint128(bound(prio, 0, B_MAX_PRIO));
+        if (outMask & 16 == 0) maxFee = uint128(bound(maxFee, 0, B_MAX_FEE));
+        bool inBounds = vgl <= B_MAX_VGL && cgl >= B_MIN_CGL && cgl <= B_MAX_CGL && pvg <= B_MAX_PVG
+            && prio <= B_MAX_PRIO && maxFee <= B_MAX_FEE;
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "fuzz-bounds");
+        uint48 ea = _initiate(kernel, cd);
+        uint256 vd = _validateWith(cd, vgl, cgl, pvg, prio, maxFee);
+        assertEq(vd == SIG_VALIDATION_FAILED_UINT, !inBounds);
+        (, uint48 left,) = module.pendingRecovery(kernel);
+        assertEq(left, inBounds ? 0 : ea);
+    }
+
+    // ── install: an EOA guardian must exist (Q20) ────────────────────
+
+    function test_install_refusesGuardianSetWithoutAnEoa() public {
+        address[] memory g = new address[](2);
+        g[0] = address(new V2SmartWalletGuardian(vm.addr(PK_A)));
+        g[1] = address(new V2SmartWalletGuardian(vm.addr(PK_B)));
+        vm.prank(kernel);
+        vm.expectRevert(bytes4(keccak256("NoEoaGuardian()")));
+        module.onInstall(_installBytes(1, g));
+    }
+
+    function test_install_acceptsOneEoaAmongContracts() public {
+        address[] memory g = new address[](3);
+        g[0] = address(new V2SmartWalletGuardian(vm.addr(PK_A)));
+        g[1] = address(new V2SmartWalletGuardian(vm.addr(PK_B)));
+        g[2] = vm.addr(PK_C);
+        vm.prank(kernel);
+        module.onInstall(_installBytes(2, g));
+        assertTrue(module.isInitialized(kernel));
+    }
+
+    /// An EIP-7702 delegated EOA still signs with its key, so it counts as an EOA guardian.
+    function test_install_countsA7702DelegatedEoaAsEoa() public {
+        address[] memory g = _threeGuardians();
+        for (uint256 i = 0; i < 3; i++) {
+            vm.etch(g[i], abi.encodePacked(hex"ef0100", address(0x7702)));
+        }
+        vm.prank(kernel);
+        module.onInstall(_installBytes(2, g));
+        assertTrue(module.isInitialized(kernel));
+    }
+
+    // ── the module holds no value ───────────────────────────────────
+
+    function test_moduleRefusesValue() public {
+        bytes4 err = bytes4(keccak256("ValueNotAccepted()"));
+        vm.deal(kernel, 4);
+        vm.startPrank(kernel);
+        vm.expectRevert(err);
+        module.preCheck{value: 1}(address(0), 0, "");
+        vm.expectRevert(err);
+        module.postCheck{value: 1}("");
+        vm.expectRevert(err);
+        module.onInstall{value: 1}(_installBytes(2, _threeGuardians()));
+        module.onInstall(_installBytes(2, _threeGuardians()));
+        vm.expectRevert(err);
+        module.onUninstall{value: 1}("");
+        vm.stopPrank();
+        assertEq(address(module).balance, 0);
+    }
+
     // ── fuzz ────────────────────────────────────────────────────────
 
     function testFuzz_executeAfterIsInitiationPlus72h(uint32 start) public {
@@ -802,6 +930,63 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
         entryPoint.handleOps(ops, beneficiary);
     }
 
+    function _expectSigError(AaPackedUserOperation memory op) internal {
+        AaPackedUserOperation[] memory ops = new AaPackedUserOperation[](1);
+        ops[0] = op;
+        vm.expectRevert(abi.encodeWithSelector(IEntryPoint.FailedOp.selector, 0, "AA24 signature error"));
+        entryPoint.handleOps(ops, payable(address(0xBAD)));
+    }
+
+    /// One guardian signs the execution op but cannot raise its fees past the bounds the quorum
+    /// approved: the op fails validation, the deposit is untouched and the recovery still executes.
+    function test_recovery_refusesFeesAboveTheApprovedBounds() public {
+        bytes memory cd = _rotationCallData();
+        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        vm.warp(ea);
+        uint256 depBefore = entryPoint.balanceOf(wallet);
+        AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
+        op.preVerificationGas = 5_000_000;
+        uint128 fee = uint128(depBefore / 7_100_000);
+        op.gasFees = bytes32(abi.encodePacked(fee, fee));
+        op.signature = _execSig(PK_C, entryPoint.getUserOpHash(op), wallet);
+        vm.fee(0);
+        _expectSigError(op);
+        assertEq(address(0xBAD).balance, 0);
+        assertEq(entryPoint.balanceOf(wallet), depBefore);
+        (, uint48 left,) = module.pendingRecovery(wallet);
+        assertEq(left, ea, "pending recovery kept");
+        _handle(_recoveryOp());
+        assertEq(_rootOwner(), vm.addr(NEW_OWNER_PK));
+    }
+
+    /// One guardian cannot burn the pending recovery with a callGasLimit too small for the rotation.
+    function test_recovery_refusesCallGasBelowTheApprovedMinimum() public {
+        bytes memory cd = _rotationCallData();
+        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        vm.warp(ea);
+        AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
+        op.accountGasLimits = bytes32(abi.encodePacked(uint128(1_000_000), uint128(30_000)));
+        op.signature = _execSig(PK_C, entryPoint.getUserOpHash(op), wallet);
+        _expectSigError(op);
+        (, uint48 left,) = module.pendingRecovery(wallet);
+        assertEq(left, ea, "pending recovery kept");
+        assertEq(_rootOwner(), vm.addr(OLD_OWNER_PK));
+        _handle(_recoveryOp());
+        assertEq(_rootOwner(), vm.addr(NEW_OWNER_PK));
+    }
+
+    /// The approved minimum callGasLimit is enough for the rotation itself.
+    function test_recovery_executesAtTheApprovedMinimumCallGas() public {
+        bytes memory cd = _rotationCallData();
+        uint48 ea = module.initiateRecovery(wallet, cd, _quorum(wallet, cd));
+        vm.warp(ea);
+        AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
+        op.accountGasLimits = bytes32(abi.encodePacked(uint128(1_000_000), uint128(B_MIN_CGL)));
+        op.signature = _execSig(PK_C, entryPoint.getUserOpHash(op), wallet);
+        _handle(op);
+        assertEq(_rootOwner(), vm.addr(NEW_OWNER_PK));
+    }
+
     function testFuzz_delayBoundary(uint32 dt) public {
         bytes memory cd = _rotationCallData();
         uint48 start = uint48(block.timestamp);
@@ -893,6 +1078,9 @@ contract GuardianV2Handler is GuardianV2Base {
         PackedUserOperation memory op;
         op.callData = cd;
         op.signature = _execSig(PK_C, opHash, ACCOUNT);
+        op.accountGasLimits = _pack(B_MAX_VGL, B_MIN_CGL);
+        op.preVerificationGas = B_MAX_PVG;
+        op.gasFees = _pack(B_MAX_PRIO, B_MAX_FEE);
         vm.prank(ACCOUNT);
         uint256 vd = module.validateUserOp(op, opHash);
         if (vd & 1 == 1 || block.timestamp < uint48(vd >> 208)) revert("not executable");
