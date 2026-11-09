@@ -4,6 +4,7 @@ branch: r1007/s3-state-root
 author: Claude Opus 5.5 (lane CHAIN-STATEROOT) for Larry Klosowski
 status: draft for second-reviewer review (Matr0xshka, kurtatwork); proposed text for planset 06 section "state root"
 adr: ADR-2026-11-03-chain-convergence-r1007 CV-14 (a)+(b), accepted 2026-11-07
+updated: 2026-11-09 on r1007/s3-storage-cow (block 0 under the rule; storage container), lead decisions delegated by the owner
 ---
 
 # The r1007 state root: standard MPT, computed incrementally
@@ -23,9 +24,30 @@ incremental computation is still a pure function of the state. Code:
 - r1007: its genesis entry must set `mpt_state_root: Some(0)` (the genesis lane adds the
   entry when block 0 exists). Devnets and rehearsals: `[chain] mpt_state_root_height = 0`
   or `CITRATE_MPT_STATE_ROOT_HEIGHT=0`.
-- It applies to the post-state of every block at height h with h >= activation and
-  h > 0. Genesis (height 0) keeps the legacy root, as for every rule.
+- It applies to the post-state of every block at height h with h >= activation. With
+  activation 0 (r1007) that includes block 0: the genesis post-state is rooted by this
+  rule too (lead decision 2026-11-09), so the chain has one root function from its first
+  block and block 0's state is provable. An activation above 0 leaves genesis alone.
+- Because block 0 is under the rule, the rule is published before a genesis is BUILT,
+  not only before start-up hydrates: every genesis build in the node's `main.rs` calls
+  `publish_mpt_rule_for_genesis_build` first, which resolves the rule for the block 0
+  the build is meant to produce (`genesis::compiled_genesis_for_profile`; unknown
+  genesis: env or config decides; a release chain id with no genesis known refuses a
+  per-node height). A tripwire test (`every_genesis_build_publishes_the_mpt_rule_first`)
+  keeps it that way.
 - Below the activation the legacy root is unchanged byte for byte.
+
+What the genesis lane (S3-6) must set for r1007, exactly:
+1. `GENESIS_ACTIVATIONS` entry `(40204, R1007_GENESIS, GenesisActivations { ..,
+   mpt_state_root: Some(0) })`.
+2. `genesis::compiled_genesis_for_profile` maps the r1007 profile to `R1007_GENESIS`,
+   so a node building the r1007 block 0 resolves `Some(0)` before it builds.
+3. The ceremony step that first computes `R1007_GENESIS` (before the hash exists, so
+   before 1 and 2 can resolve it) computes the block-0 state root with the rule active
+   from 0: `citrate_execution::mpt_state_root::set_mpt_state_root_height(Some(0))`
+   before `citrate_economics::genesis::initialize_shared_genesis_state`. That root is
+   `StateDB::reference_state_root()` of the genesis state
+   (`core/economics/tests/genesis_mpt_root.rs`).
 
 ## 2. Trie (Yellow Paper appendix D)
 
@@ -138,6 +160,17 @@ Checks:
 Cost per block: O((touched accounts + changed slots) x depth) node encodings and keccaks,
 independent of the state size (bench: `core/execution/tests/state_root_cost.rs`).
 
+The storage container (r1007/s3-storage-cow, not consensus). A contract's slot set is a
+persistent map (`core/execution/src/state/slot_map.rs`, a hash array mapped trie), so a
+snapshot that shares a contract costs nothing and the first write after it copies one
+O(log n) path instead of the whole storage; `pre_images_since` diffs two versions by
+skipping every shared subtree. With the rule active from 0 no legacy root is reachable
+(`mpt_state_root::legacy_root_reachable`), so storage tries keep no legacy structural
+tree. Roots are computed from the container's contents exactly as before: seeded
+histories give byte-identical roots, undo records, reads and proofs to the previous
+implementation (`core/execution/tests/storage_cow_differential.rs`), and the allocation
+bounds are in `storage_cow_cost.rs`.
+
 ## 5. Trie-node store (node-local, not consensus)
 
 - Nodes live in RocksDB `CF_STATE`: `mpt_node:` + hash -> RLP. Per-height root records
@@ -178,10 +211,8 @@ independent of the state size (bench: `core/execution/tests/state_root_cost.rs`)
 3. Trie-node retention equals the undo window. That costs storage (see the bench's
    `node_bytes_per_block`). Restart needs only the tip's trie, so a shorter node window
    would be node-local and reversible.
-4. Genesis (height 0) keeps the legacy root (§1). r1007 is a new genesis, so block 0
-   could also be rooted by the MPT rule; that would make block 0's state provable too.
-   It is a genesis-lane decision (S3-6); the rule here leaves height 0 as every other
-   rule does.
+4. Decided 2026-11-09 (lead, owner-delegated): block 0 is rooted by the MPT rule under
+   activation 0 (§1).
 5. Storage-only addresses commit as the default account (§3). The alternative is to
    create a resident account wherever storage is written (the executor's governance
    precompile path), which would also change residency and the legacy root.
@@ -191,7 +222,8 @@ independent of the state size (bench: `core/execution/tests/state_root_cost.rs`)
 | Consumer | Change needed | State |
 |---|---|---|
 | Node apply, admission, boot rebuild, replay (`canonical_apply`, `boot_state`, `tools/replay-ref`) | Root by the rule at each height | Wired (this branch) |
-| r1007 genesis entry (`GENESIS_ACTIVATIONS`, `mpt_state_root: Some(0)`) | Add with block 0 | **Not wired**: the genesis lane adds it (S3-6). Until then only devnets (`CITRATE_MPT_STATE_ROOT_HEIGHT` / `[chain] mpt_state_root_height`) run the rule |
+| r1007 genesis entry (`GENESIS_ACTIVATIONS`, `mpt_state_root: Some(0)`) | Add with block 0 | **Not wired**: the genesis lane adds it (S3-6, the three steps in §1). Until then only devnets (`CITRATE_MPT_STATE_ROOT_HEIGHT` / `[chain] mpt_state_root_height`) run the rule |
+| Genesis build (block 0's root under activation 0) | Publish the rule before building | Wired (r1007/s3-storage-cow): `publish_mpt_rule_for_genesis_build` before every build in `main.rs` |
 | Consensus manifest / fingerprint | Height appended when set | Wired |
 | `eth_getProof` RPC (CNV-RPC, S3-7; explorer parity 02 §3) | Handler over `StateDB::get_proof` | **Not wired**: accessor and verifier only; `core/api/src/eth_rpc.rs` still lists it as unsupported |
 | Explorer (citrate-explorer) | None: it stores and shows `stateRoot` as an opaque hash | No change needed |
