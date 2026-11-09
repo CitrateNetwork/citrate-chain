@@ -56,6 +56,9 @@ abstract contract WorkMarketTestBase is Test {
     address internal poster = makeAddr("poster");
     address internal admin = makeAddr("admin");
     address internal stranger = makeAddr("stranger");
+    /// The governance treasury stand-in that receives slashes the poster must not take back.
+    address internal SINK = makeAddr("slashSink");
+    uint128 internal constant MINBOND = 0.1 ether;
     uint256 internal coordKey = 0xC00D;
     address internal coordinator;
 
@@ -83,7 +86,7 @@ abstract contract WorkMarketTestBase is Test {
         verifier = new SwitchVerifier();
         address[] memory vs = new address[](1);
         vs[0] = address(verifier);
-        market = new WorkMarket(governance, guardian, 1 ether, vs);
+        market = new WorkMarket(governance, guardian, SINK, 1 ether, MINBOND, vs);
         vm.deal(poster, 1_000_000 ether);
         vm.deal(coordinator, 1_000 ether);
         vm.deal(w1, 100 ether);

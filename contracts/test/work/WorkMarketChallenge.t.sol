@@ -192,7 +192,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
 
     function test_constructor_refuses_zero_default_bond() public {
         vm.expectRevert(WorkMarket.BadDefaultBond.selector);
-        new WorkMarket(governance, guardian, 0, new address[](0));
+        new WorkMarket(governance, guardian, SINK, 0, MINBOND, new address[](0));
     }
 
     // ── Q3: reserve sweep after the claim period ───────────────────

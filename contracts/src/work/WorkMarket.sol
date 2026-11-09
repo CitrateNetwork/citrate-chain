@@ -213,6 +213,10 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint256 public nextOfferId;
     /// @notice The coordinator bond an offer gets when its poster passes 0 (owner 2026-11-09, Q1).
     uint128 public immutable defaultCoordinatorBond;
+    /// @notice The least coordinator bond an offer may set.
+    uint128 public immutable minCoordinatorBond;
+    /// @notice Receives slashed coordinator bonds the poster must not take back.
+    address public immutable slashSink;
     address public guardian;
     bool public newOffersPaused;
 
@@ -300,6 +304,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     error TransferFailed();
     error NotGuardianOrGovernance();
     error BadDefaultBond();
+    error BadMinBond();
+    error BondBelowMinimum();
     error ChallengeOpen();
     error NoOpenChallenge();
     error AnswerTooLate();
@@ -312,16 +318,22 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
     /// @param governance_       the governance timelock (3-of-5 / 48 h); allows verifiers, pauses, unpauses
     /// @param guardian_         the guardian council (2-of-3); may pause new offers, nothing else; not 0 (InitialAdmin)
+    /// @param slashSink_        receives slashed bonds the poster must not take back (the governance treasury)
     /// @param defaultCoordinatorBond_ the bond an offer requires when its poster passes 0; above zero
+    /// @param minCoordinatorBond_ the least bond an offer may set; above zero, at most the default
     /// @param initialVerifiers_ verifiers allowed at block 0 (CREATE2-predicted FLRoundVerifier and TaskVerifier)
     constructor(
         address governance_,
         address guardian_,
+        address slashSink_,
         uint128 defaultCoordinatorBond_,
+        uint128 minCoordinatorBond_,
         address[] memory initialVerifiers_
     ) Governable(governance_) {
         if (defaultCoordinatorBond_ == 0) revert BadDefaultBond();
         defaultCoordinatorBond = defaultCoordinatorBond_;
+        minCoordinatorBond = minCoordinatorBond_;
+        slashSink = slashSink_;
         guardian = InitialAdmin.check(guardian_);
         emit GuardianSet(guardian_);
         for (uint256 i = 0; i < initialVerifiers_.length; i++) {
@@ -845,7 +857,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
     /// @notice Return the bond of a worker challenge that a withdrawn root left open. Anyone may
     ///         call; the bond goes to the challenger.
-    function reclaimChallengeBond(uint256 id, address worker) external nonReentrant {
+    function releaseChallengeBond(uint256 id, address worker) external nonReentrant {
         Offer storage o = _offer(id);
         Challenge storage c = _challenges[id][worker];
         if (!c.open || c.epoch == o.payoutEpoch) revert NothingToClaim();
@@ -854,7 +866,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     }
 
     /// @notice Return the bond of an index challenge that a withdrawn root left open.
-    function reclaimIndexChallengeBond(uint256 id, uint32 index) external nonReentrant {
+    function releaseIndexChallengeBond(uint256 id, uint32 index) external nonReentrant {
         Offer storage o = _offer(id);
         IndexChallenge storage c = _indexChallenges[id][index];
         if (!c.open || c.epoch == o.payoutEpoch) revert NothingToClaim();

@@ -270,10 +270,10 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         market.resolveIndexChallenge(id, 0); // withdraws the root; w2's challenge is left open
         vm.expectRevert(WorkMarket.WrongState.selector); // the root is gone; only a reclaim is left
         market.resolveIndexChallenge(id, 1);
-        market.reclaimIndexChallengeBond(id, 1);
+        market.releaseIndexChallengeBond(id, 1);
         assertEq(market.balanceOf(w2), CHBOND);
         vm.expectRevert(WorkMarket.NothingToClaim.selector);
-        market.reclaimIndexChallengeBond(id, 1);
+        market.releaseIndexChallengeBond(id, 1);
         assertEq(market.owedOn(id), BUDGET);
 
         // a worker challenge left open by an upheld dispute is reclaimable too
@@ -287,7 +287,7 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         vm.prank(w1);
         market.dispute(id, tev);
         vm.prank(w1);
-        market.reclaimChallengeBond(id, w2);
+        market.releaseChallengeBond(id, w2);
         // w1: slash share and bond from the first (upheld) challenge, plus this reclaimed bond
         assertEq(market.balanceOf(w1), CBOND / 2 + 2 * CHBOND);
         assertEq(market.owedOn(id), BUDGET);
@@ -328,16 +328,16 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         assertEq(market.owedOn(id), BUDGET + CBOND + 2 * CHBOND);
         // live challenges are not reclaimable
         vm.expectRevert(WorkMarket.NothingToClaim.selector);
-        market.reclaimChallengeBond(id, w1);
+        market.releaseChallengeBond(id, w1);
         vm.expectRevert(WorkMarket.NothingToClaim.selector);
-        market.reclaimIndexChallengeBond(id, 1);
+        market.releaseIndexChallengeBond(id, 1);
     }
 
     function test_challenge_bond_rounds_up() public {
         WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.FL_ROUND);
-        p.coordinatorBond = 11; // 10 % is 1.1 wei
+        p.coordinatorBond = 1 ether + 1; // 10 % is 0.1 ether + 0.1 wei
         uint256 id = _open(p, BUDGET);
-        assertEq(market.challengeBondOf(id), 2);
+        assertEq(market.challengeBondOf(id), 0.1 ether + 1);
     }
 
     function _twoEntries() internal view returns (Entry[] memory e) {

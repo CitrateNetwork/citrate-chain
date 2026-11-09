@@ -18,6 +18,18 @@ contract WorkMarketHandler is Test {
     address public poster = address(0x9001);
     uint256 internal constant COORD_KEY = 0xC0FFEE;
     address public coordinator = vm.addr(COORD_KEY);
+    /// A poster that coordinates its own offers (FL only).
+    uint256 internal constant PC_KEY = 0xBADC0DE;
+    address public pc = vm.addr(PC_KEY);
+    mapping(uint256 => address) public posterOf;
+    mapping(uint256 => address) public coordOf;
+    mapping(uint256 => uint256) internal keyOf;
+    // value accounting for the coordinating poster
+    uint256 public pcIn; // everything pc sent the market
+    uint256 public pcWithdrawn;
+    uint256 public pcDismissedEarned; // dismissed challenge bonds paid to pc as coordinator
+    uint256 public reveals;
+    uint256 public pcLost; // coordinator bonds slashed by upheld disputes against pc's roots
 
     uint32 internal constant WINDOW = 24 hours;
     uint8 internal constant DEPTH = 2; // maxWorkers 4: four slots
@@ -75,6 +87,7 @@ contract WorkMarketHandler is Test {
         guardian = guard;
         vm.deal(poster, type(uint128).max);
         vm.deal(coordinator, 1e30);
+        vm.deal(pc, type(uint128).max);
         for (uint256 i = 0; i < 4; i++) {
             vm.deal(actors[i], 1e24);
         }
@@ -121,13 +134,32 @@ contract WorkMarketHandler is Test {
         delete malformedLive[id];
     }
 
+    /// Records a slash of pc's bond when an upholding call withdrew a pc root.
+    function _snap(uint256 id) internal view returns (uint32 epoch, bool held, uint128 bond) {
+        WorkMarket.Offer memory o = market.getOffer(id);
+        return (o.payoutEpoch, o.coordinatorBondHeld, o.coordinatorBond);
+    }
+
+    function _noteUpheld(uint256 id, uint32 epoch, bool held, uint128 bond) internal {
+        if (coordOf[id] != pc || !held) return;
+        WorkMarket.Offer memory o = market.getOffer(id);
+        if (o.payoutEpoch != epoch && o.state == IWorkMarket.State.Running && !o.coordinatorBondHeld) pcLost += bond;
+    }
+
     // ── actions ────────────────────────────────────────────────────
 
-    function open(uint128 price, uint64 units, uint128 joinBond, uint128 cbond, bool task) external {
+    /// `selfCoordinated`: an FL offer whose poster `pc` is also its coordinator.
+    function open(uint128 price, uint64 units, uint128 joinBond, uint128 cbond, bool task, bool selfCoordinated)
+        external
+    {
         price = uint128(bound(price, 1, 1e21));
         units = uint64(bound(units, 1, 50));
         joinBond = uint128(bound(joinBond, 0, 1e18));
-        cbond = uint128(bound(cbond, 0, 1e19));
+        // 0 takes the default; otherwise at least the market minimum
+        if (cbond != 0) cbond = uint128(bound(cbond, market.minCoordinatorBond(), 1e19));
+        bool pcMode = selfCoordinated && !task;
+        address who = pcMode ? pc : poster;
+        address coord = pcMode ? pc : coordinator;
         WorkMarket.OpenParams memory p = WorkMarket.OpenParams({
             kind: task ? IWorkMarket.Kind.TASK : IWorkMarket.Kind.FL_ROUND,
             verifier: address(verifier),
@@ -142,15 +174,20 @@ contract WorkMarketHandler is Test {
             disputeWindow: WINDOW,
             maxWorkers: 4,
             joinBond: joinBond,
-            coordinator: coordinator,
+            coordinator: coord,
             coordinatorBond: cbond,
             disputeAdmin: address(0)
         });
         if (!market.newOffersPaused()) opensTriedUnpaused++;
-        vm.prank(poster);
-        try market.open{value: uint256(price) * units + price / 2}(p) returns (uint256 id) {
+        uint256 budget = uint256(price) * units + price / 2;
+        vm.prank(who);
+        try market.open{value: budget}(p) returns (uint256 id) {
             ids.push(id);
             priceAtOpen[id] = price;
+            posterOf[id] = who;
+            coordOf[id] = coord;
+            keyOf[id] = pcMode ? PC_KEY : COORD_KEY;
+            if (pcMode) pcIn += budget;
             opens++;
         } catch {}
     }
@@ -192,7 +229,7 @@ contract WorkMarketHandler is Test {
         uint64 total;
         if (o.kind == IWorkMarket.Kind.TASK) {
             mode = 0;
-            slots[0] = Slot(coordinator, 1, 0, 0, false);
+            slots[0] = Slot(coordOf[id], 1, 0, 0, false);
             total = 1;
         } else {
             (address a, address b) = (address(0), address(0));
@@ -246,8 +283,9 @@ contract WorkMarketHandler is Test {
         bytes32 root = _node(_node(leaves[0], leaves[1]), _node(leaves[2], leaves[3]));
         (bool ok,) = verifier.accepted(id, o.bindRef);
         uint128 chBond = market.challengeBondOf(id);
-        vm.prank(coordinator);
+        vm.prank(coordOf[id]);
         try market.postPayout{value: o.coordinatorBond}(id, root, total, DEPTH) {
+            if (coordOf[id] == pc) pcIn += o.coordinatorBond;
             if (!ok) postedWithoutAcceptance = true;
             posts++;
             _clearTree(id);
@@ -299,8 +337,12 @@ contract WorkMarketHandler is Test {
             WorkMarket.LeafOpening memory next;
             if (i + 1 < 4) next = _openingAt(id, i + 1);
             bytes memory tev = abi.encode(uint8(6), abi.encode(_openingAt(id, i), next));
+            if (id % 2 == 0 && _commitReveal(id, w, tev)) return;
+            if (leavesOf[id].length == 0) return;
+            (uint32 ep, bool held, uint128 bond) = _snap(id);
             vm.prank(w);
             try market.dispute(id, tev) {
+                _noteUpheld(id, ep, held, bond);
                 _clearTree(id);
                 return;
             } catch {}
@@ -309,8 +351,10 @@ contract WorkMarketHandler is Test {
             for (uint256 j = i + 1; j < 4; j++) {
                 if (!seen[i] || !seen[j]) continue;
                 bytes memory ev = abi.encode(uint8(3), abi.encode(_openingAt(id, i), _openingAt(id, j)));
+                (uint32 ep, bool held, uint128 bond) = _snap(id);
                 vm.prank(w);
                 try market.dispute(id, ev) {
+                    _noteUpheld(id, ep, held, bond);
                     _clearTree(id);
                     return;
                 } catch {}
@@ -369,7 +413,7 @@ contract WorkMarketHandler is Test {
             bytes32 delta = keccak256(abi.encode(lease));
             bytes32 d = market.receiptDigest(id, w, lease, delta);
             (uint8 v, bytes32 r, bytes32 s_) =
-                vm.sign(COORD_KEY, keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", d)));
+                vm.sign(keyOf[id], keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", d)));
             rs[i] = WorkMarket.Receipt({
                 worker: w, leaseId: lease, deltaHash: delta, signature: abi.encodePacked(r, s_, v)
             });
@@ -390,7 +434,7 @@ contract WorkMarketHandler is Test {
         for (uint256 slot = 0; slot < 4; slot++) {
             Slot memory s = slotsOf[id][slot];
             if (s.worker != w || s.garbage || s.idx != slot) continue;
-            vm.prank(coordinator);
+            vm.prank(coordOf[id]);
             try market.answerChallenge(id, _openingAt(id, slot)) {
                 revealedOf[id][slot] = true;
                 _watch(id);
@@ -405,7 +449,9 @@ contract WorkMarketHandler is Test {
         address w = actors[actorSeed % 4];
         WorkMarket.Challenge memory c = market.challengeOf(id, w);
         if (jump && c.open && block.timestamp <= c.answerBy) vm.warp(uint256(c.answerBy) + 1);
+        (uint32 ep, bool held, uint128 bond) = _snap(id);
         try market.resolveChallenge(id, w) {
+            _noteUpheld(id, ep, held, bond);
             challengesResolved++;
             _clearTree(id);
         } catch {}
@@ -415,10 +461,11 @@ contract WorkMarketHandler is Test {
     function challengeIdx(uint256 seed, uint256 actorSeed, uint8 slot) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        address a = actorSeed % 5 == 4 ? poster : actors[actorSeed % 4];
+        address a = actorSeed % 5 == 4 ? posterOf[id] : actors[actorSeed % 4];
         uint128 chBond = market.challengeBondOf(id);
         vm.prank(a);
         try market.challengeIndex{value: chBond}(id, uint32(slot % 5)) {
+            if (a == pc) pcIn += chBond;
             challengesRaised++;
         } catch {}
     }
@@ -431,7 +478,7 @@ contract WorkMarketHandler is Test {
         uint256 sl = slot % 4;
         Slot memory s = slotsOf[id][sl];
         if (s.garbage || (s.worker != address(0) && s.idx != sl)) return;
-        vm.prank(coordinator);
+        vm.prank(coordOf[id]);
         try market.answerIndexChallenge(id, _openingAt(id, sl)) {
             revealedOf[id][sl] = true;
             _watch(id);
@@ -444,25 +491,85 @@ contract WorkMarketHandler is Test {
         uint32 sl = uint32(slot % 4);
         WorkMarket.IndexChallenge memory c = market.indexChallengeOf(id, sl);
         if (jump && c.open && block.timestamp <= c.answerBy) vm.warp(uint256(c.answerBy) + 1);
+        (uint32 ep, bool held, uint128 bond) = _snap(id);
         try market.resolveIndexChallenge(id, sl) {
+            _noteUpheld(id, ep, held, bond);
             challengesResolved++;
             _clearTree(id);
         } catch {}
     }
 
-    /// Challengers take back bonds of challenges a withdrawn root left open.
-    function reclaim(uint256 seed, uint256 actorSeed, uint8 slot) external {
+    /// Releases challenge bonds: to the challenger when the root was withdrawn, to the
+    /// coordinator once an answered challenge's root survived.
+    function release(uint256 seed, uint256 actorSeed, uint8 slot) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        try market.reclaimChallengeBond(id, actors[actorSeed % 4]) {} catch {}
-        try market.reclaimIndexChallengeBond(id, uint32(slot % 4)) {} catch {}
+        uint256 before = market.balanceOf(pc);
+        try market.releaseChallengeBond(id, actors[actorSeed % 4]) {} catch {}
+        try market.releaseIndexChallengeBond(id, uint32(slot % 4)) {} catch {}
+        if (coordOf[id] == pc) pcDismissedEarned += market.balanceOf(pc) - before;
+    }
+
+    /// A joined actor commits to TOTAL or ORDER evidence over leaves it has seen, waits the
+    /// reveal delay and reveals.
+    function commitReveal(uint256 seed, uint256 actorSeed, uint8 slot) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        if (leavesOf[id].length == 0) return;
+        address a = actors[actorSeed % 4];
+        uint256 i = slot % 4;
+        WorkMarket.LeafOpening memory next;
+        if (i + 1 < 4) next = _openingAt(id, i + 1);
+        bytes memory ev = slot % 2 == 0
+            ? abi.encode(uint8(6), abi.encode(_openingAt(id, i), next))
+            : abi.encode(uint8(3), abi.encode(_openingAt(id, i), next));
+        _commitReveal(id, a, ev);
+    }
+
+    function _commitReveal(uint256 id, address a, bytes memory ev) internal returns (bool ok) {
+        bytes32 salt = keccak256(abi.encode(id, a, ev));
+        bytes32 c = market.disputeCommitment(id, market.getOffer(id).payoutEpoch, a, ev, salt);
+        vm.prank(a);
+        try market.commitDispute(id, c) {}
+        catch {
+            return false;
+        }
+        vm.warp(block.timestamp + market.DISPUTE_REVEAL_DELAY());
+        (uint32 ep, bool held, uint128 bond) = _snap(id);
+        vm.prank(a);
+        try market.revealDispute(id, ev, salt) {
+            _noteUpheld(id, ep, held, bond);
+            reveals++;
+            _clearTree(id);
+            return true;
+        } catch {}
+    }
+
+    /// The poster (as coordinator: the party at fault) disputes its own root directly with any
+    /// TOTAL or ORDER evidence over the stored tree, e.g. on seeing a worker's commitment.
+    function selfDispute(uint256 seed, uint8 slot) external {
+        if (ids.length == 0) return;
+        uint256 id = _id(seed);
+        if (leavesOf[id].length == 0) return;
+        uint256 i = slot % 4;
+        WorkMarket.LeafOpening memory next;
+        if (i + 1 < 4) next = _openingAt(id, i + 1);
+        bytes memory ev = slot % 2 == 0
+            ? abi.encode(uint8(6), abi.encode(_openingAt(id, i), next))
+            : abi.encode(uint8(3), abi.encode(_openingAt(id, i), next));
+        (uint32 ep, bool held, uint128 bond) = _snap(id);
+        vm.prank(posterOf[id]);
+        try market.dispute(id, ev) {
+            _noteUpheld(id, ep, held, bond);
+            _clearTree(id);
+        } catch {}
     }
 
     function disputeOrder(uint256 seed) external {
         // A subjective-free objective dispute that must fail on well-formed trees.
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        vm.prank(poster);
+        vm.prank(posterOf[id]);
         try market.dispute(id, abi.encode(uint8(3), bytes(""))) {} catch {}
     }
 
@@ -470,7 +577,7 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         WorkMarket.Offer memory o = market.getOffer(id);
-        vm.prank(poster);
+        vm.prank(posterOf[id]);
         try market.refund(id) {
             WorkMarket.Offer memory after_ = market.getOffer(id);
             if (after_.state != IWorkMarket.State.Expired && block.timestamp < uint256(o.deadline) + o.disputeWindow) {
@@ -482,17 +589,21 @@ contract WorkMarketHandler is Test {
 
     function claimBond(uint256 seed, uint256 actorSeed, bool asCoordinator) external {
         if (ids.length == 0) return;
-        address a = asCoordinator ? coordinator : actors[actorSeed % 4];
+        uint256 id = _id(seed);
+        address a = asCoordinator ? coordOf[id] : actors[actorSeed % 4];
         vm.prank(a);
-        try market.claimBond(_id(seed)) {} catch {}
+        try market.claimBond(id) {} catch {}
     }
 
     function withdraw(uint256 actorSeed, uint8 who) external {
-        address a = who % 3 == 0 ? poster : (who % 3 == 1 ? coordinator : actors[actorSeed % 4]);
+        uint8 k = who % 5;
+        address a = k == 0 ? poster : (k == 1 ? coordinator : (k == 2 ? pc : actors[actorSeed % 4]));
+        if (k == 4) a = market.slashSink();
         uint256 bal = market.balanceOf(a);
         vm.prank(a);
-        try market.withdraw() {}
-        catch {
+        try market.withdraw() {
+            if (a == pc) pcWithdrawn += bal;
+        } catch {
             if (bal != 0) pauseBlockedExit = true;
         }
     }
@@ -521,7 +632,7 @@ contract WorkMarketInvariantTest is Test {
         vs[0] = address(verifier);
         address gov = makeAddr("gov");
         address guard = makeAddr("guard");
-        market = new WorkMarket(gov, guard, 1 ether, vs);
+        market = new WorkMarket(gov, guard, makeAddr("slashSink"), 1 ether, 0.1 ether, vs);
         handler = new WorkMarketHandler(market, verifier, gov, guard);
         targetContract(address(handler));
     }
@@ -535,7 +646,8 @@ contract WorkMarketInvariantTest is Test {
     }
 
     function _pullTotal() internal view returns (uint256 t) {
-        t = market.balanceOf(handler.poster()) + market.balanceOf(handler.coordinator());
+        t = market.balanceOf(handler.poster()) + market.balanceOf(handler.coordinator())
+            + market.balanceOf(handler.pc()) + market.balanceOf(market.slashSink());
         for (uint256 i = 0; i < 4; i++) {
             t += market.balanceOf(handler.actorAt(i));
         }
@@ -654,6 +766,19 @@ contract WorkMarketInvariantTest is Test {
     /// forge-config: default.invariant.fail-on-revert = false
     function invariant_honest_leaf_always_settles() public view {
         assertFalse(handler.honestLeafBlocked());
+    }
+
+    /// Slash rules: a poster that coordinates its own offers never ends with more than it put
+    /// in, apart from dismissed challenge bonds it earned as coordinator of a surviving root (the
+    /// documented withholding remainder). Upheld disputes against its roots pay it nothing.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_coordinating_poster_never_profits() public view {
+        assertLe(
+            market.balanceOf(handler.pc()) + handler.pcWithdrawn() + handler.pcLost(),
+            handler.pcIn() + handler.pcDismissedEarned()
+        );
     }
 
     /// 06 §7.7: pause never stops anyone pulling what they are owed.
