@@ -97,6 +97,20 @@ const FACTORY_CODE: [u8; 23] = [
     0x60, 0x0A, 0x60, 0x16, 0x60, 0x00, 0xF0, // create(0, 22, 10)
     0x50, 0x00,
 ];
+/// SLOT_WRITER: `for i in 0..1300 { sstore(base + i, 1) }`, base = the first
+/// calldata word. 1,300 fresh slots per call, about 28.8M gas: two calls fill
+/// an accepting block to ~96% of ACCEPT_GAS_LIMIT.
+const SLOT_WRITER: [u8; 20] = [0x5A; 20];
+const SLOT_WRITER_CODE: [u8; 29] = [
+    0x60, 0x00, 0x35, 0x60, 0x00, // base = calldata[0]; i = 0
+    0x5B, // loop:
+    0x61, 0x05, 0x14, 0x81, 0x10, 0x15, 0x60, 0x1B, 0x57, // if !(i < 1300) goto end
+    0x60, 0x01, 0x82, 0x82, 0x01, 0x55, // sstore(base + i, 1)
+    0x60, 0x01, 0x01, 0x60, 0x05, 0x56, // i += 1; goto loop
+    0x5B, 0x00, // end: stop
+];
+const SLOTS_PER_CALL: usize = 1300;
+
 /// Init code deploying a 10-byte counter (`sstore(0, sload(0) + 1)`).
 const DEPLOY_INIT: [u8; 22] = [
     0x60, 0x0A, 0x60, 0x0C, 0x60, 0x00, 0x39, 0x60, 0x0A, 0x60, 0x00,
@@ -188,6 +202,8 @@ struct FleetSpec {
     gaslimit_probe: bool,
     /// [`COUNTER`], [`FORWARDER`] and [`FACTORY`] deployed at genesis.
     contracts: bool,
+    /// [`SLOT_WRITER`] deployed at genesis.
+    slot_writer: bool,
 }
 
 impl FleetSpec {
@@ -201,6 +217,7 @@ impl FleetSpec {
             blockhash_probe: false,
             gaslimit_probe: false,
             contracts: false,
+            slot_writer: false,
         }
     }
 
@@ -218,6 +235,9 @@ impl FleetSpec {
         }
         if self.gaslimit_probe {
             out.push((GASLIMIT_PROBE, GASLIMIT_PROBE_CODE.to_vec()));
+        }
+        if self.slot_writer {
+            out.push((SLOT_WRITER, SLOT_WRITER_CODE.to_vec()));
         }
         if self.contracts {
             out.push((COUNTER, COUNTER_CODE.to_vec()));
@@ -245,6 +265,21 @@ fn seed_genesis(exec: &Executor, spec: &FleetSpec) {
     for (addr, code) in spec.genesis_code() {
         exec.set_code(&Address(addr), code);
     }
+}
+
+/// The genesis world state on a node's executor, as `start_node` lays it
+/// down (`genesis::initialize_genesis_state_with_profile`): written through
+/// the executor to its state store, then committed, so the store holds the
+/// allocation before block 1 and block 1's undo record holds only what block
+/// 1 changed.
+fn seed_genesis_persisted(exec: &Executor, spec: &FleetSpec) {
+    for i in 0..spec.senders {
+        exec.set_balance(&sender(i), U256::from(FUND));
+    }
+    for (addr, code) in spec.genesis_code() {
+        exec.set_code(&Address(addr), code);
+    }
+    exec.state_db().commit();
 }
 
 fn policy(spec: &FleetSpec) -> citrate_execution::block_rewards::EpochRewardPolicy {
@@ -308,7 +343,7 @@ impl MNode {
             Some(storage.state.clone()),
             CHAIN_ID,
         ));
-        seed_genesis(&executor, spec);
+        seed_genesis_persisted(&executor, spec);
         if spec.policy {
             executor.set_validator_activation_height(1);
             *executor.reward_policy_handle().write() = Some(policy(spec));
@@ -2163,4 +2198,180 @@ async fn child_of_disqualified_sp_is_disqualified() {
     // consensus test `disqualify_propagates_to_selected_parent_descendants`
     // (admission applies on receipt here, so x is always marked before y can
     // be admitted).
+}
+
+// ---------------------------------------------------------------------------
+// S3-3b: undo records at ACCEPT_GAS_LIMIT, and reorg reversibility (I7).
+// ---------------------------------------------------------------------------
+
+/// A call to [`SLOT_WRITER`] writing slots `base..base + 1300`.
+fn slot_writer_call(from: u8, nonce: u64, base: u64) -> Transaction {
+    let mut tx = transfer(from, nonce, Address(SLOT_WRITER), 0, GAS_PRICE);
+    let mut word = [0u8; 32];
+    word[24..].copy_from_slice(&base.to_be_bytes());
+    tx.data = word.to_vec();
+    tx.gas_limit = 29_990_000;
+    tx.hash = Hash::new({
+        let mut h = *tx.hash.as_bytes();
+        h[0] = 0x5A;
+        h
+    });
+    tx
+}
+
+/// Spec 06 §4.2 (S3-4, reviewer R9): an accepting block that executes close
+/// to ACCEPT_GAS_LIMIT of fresh storage writes keeps its undo record, whole:
+/// one storage pre-image per slot it wrote and the senders' account
+/// pre-images. The record is never dropped for its size (H6). A reorg off the
+/// block then gives exactly the winning chain's state.
+#[tokio::test]
+async fn undo_record_never_dropped_at_accept_gas_limit() {
+    let mut spec = FleetSpec::new(3);
+    spec.slot_writer = true;
+    let fleet = Fleet::new(spec).await;
+    let (a, b, c) = (&fleet.nodes[0], &fleet.nodes[1], &fleet.nodes[2]);
+    assert!(a.submit(&slot_writer_call(0, 0, 0)).await);
+    assert!(b.submit(&slot_writer_call(1, 0, 10_000)).await);
+    let a1 = a.produce().await;
+    let b1 = b.produce().await;
+    assert_eq!(a1.transactions.len(), 1);
+    assert_eq!(b1.transactions.len(), 1);
+    a.receive(&b1).await;
+    let m = a.produce().await;
+    let accept = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
+    assert!(
+        m.header.gas_used > accept / 10 * 9 && m.header.gas_used <= accept,
+        "m executes close to ACCEPT_GAS_LIMIT: {}",
+        m.header.gas_used
+    );
+    let rec = a
+        .storage
+        .state
+        .get_reorg_undo(m.header.height)
+        .expect("read")
+        .expect("the record of a block at ACCEPT_GAS_LIMIT is kept");
+    assert_eq!(rec.hash, m.header.block_hash);
+    assert_eq!(
+        rec.storage.len(),
+        2 * SLOTS_PER_CALL,
+        "one pre-image per slot written"
+    );
+    assert!(
+        rec.storage
+            .iter()
+            .all(|(addr, _, pre)| *addr == Address(SLOT_WRITER) && pre.is_none()),
+        "fresh slots: no pre-value"
+    );
+    for s in [sender(0), sender(1)] {
+        assert!(
+            rec.accounts.iter().any(|p| p.0 == s),
+            "the sender {s} has an account pre-image"
+        );
+    }
+    // A heavier chain that never saw a1, b1 or m: A reorgs off m.
+    let mut cs = Vec::new();
+    for _ in 0..4 {
+        cs.push(c.produce().await);
+    }
+    for blk in &cs {
+        a.receive(blk).await;
+    }
+    assert_eq!(a.tip().await.0, cs[3].header.block_hash, "A reorged off m");
+    assert_eq!(
+        a.executor.calculate_state_root(),
+        c.executor.calculate_state_root(),
+        "m's writes are undone exactly"
+    );
+}
+
+/// Spec 06 §8.1 I7: applying chain A, reorging to B, then back to A gives
+/// exactly what a fresh apply of A gives: the state, the receipts and
+/// accepted lists, and the undo records of every height.
+#[tokio::test]
+async fn reorg_round_trip_equals_fresh_apply() {
+    let spec = FleetSpec::new(2);
+    let fleet = Fleet::new(spec.clone()).await;
+    let (a, b) = (&fleet.nodes[0], &fleet.nodes[1]);
+    // A's branch carries sender 0's txs, B's branch sender 1's.
+    let mut a_blocks = Vec::new();
+    let mut b_blocks = Vec::new();
+    for n in 0..2u64 {
+        assert!(
+            a.submit(&transfer(0, n, recipient(0), VALUE, GAS_PRICE))
+                .await
+        );
+        a_blocks.push(a.produce().await);
+    }
+    for n in 0..3u64 {
+        assert!(
+            b.submit(&transfer(1, n, recipient(1), VALUE, GAS_PRICE))
+                .await
+        );
+        b_blocks.push(b.produce().await);
+    }
+    for n in 2..5u64 {
+        assert!(
+            a.submit(&transfer(0, n, recipient(0), VALUE, GAS_PRICE))
+                .await
+        );
+        a_blocks.push(a.produce().await);
+    }
+    // The round trip: A's first two, then B's heavier three, then A's five.
+    let r = MNode::start(7, &spec, &fleet.genesis).await;
+    for blk in &a_blocks[..2] {
+        r.receive(blk).await;
+    }
+    assert_eq!(r.tip().await.0, a_blocks[1].header.block_hash);
+    for blk in &b_blocks {
+        r.receive(blk).await;
+    }
+    assert_eq!(r.tip().await.0, b_blocks[2].header.block_hash, "A -> B");
+    for blk in &a_blocks[2..] {
+        r.receive(blk).await;
+    }
+    assert_eq!(r.tip().await.0, a_blocks[4].header.block_hash, "B -> A");
+    // A fresh node that only ever saw A's chain.
+    let f = MNode::start(8, &spec, &fleet.genesis).await;
+    for blk in &a_blocks {
+        f.receive(blk).await;
+    }
+    assert_eq!(f.chain().await, r.chain().await);
+    assert_eq!(
+        r.executor.calculate_state_root(),
+        f.executor.calculate_state_root(),
+        "state"
+    );
+    for blk in &a_blocks {
+        assert_eq!(
+            r.accepted_list(&blk.header.block_hash),
+            f.accepted_list(&blk.header.block_hash),
+            "accepted list of {}",
+            blk.header.block_hash
+        );
+        for t in &blk.transactions {
+            assert_eq!(
+                r.receipt_json(&t.hash),
+                f.receipt_json(&t.hash),
+                "receipt of {}",
+                t.hash
+            );
+        }
+        let h = blk.header.height;
+        assert_eq!(
+            r.storage.state.get_reorg_undo(h).expect("read"),
+            f.storage.state.get_reorg_undo(h).expect("read"),
+            "undo record at {h}"
+        );
+    }
+    for blk in &b_blocks {
+        for t in &blk.transactions {
+            assert!(
+                r.receipt_json(&t.hash).is_none(),
+                "B's tx {} is not executed on A's chain",
+                t.hash
+            );
+        }
+    }
+    assert_eq!(r.nonce(sender(1)), 0, "B's sender is untouched");
+    assert_eq!(r.nonce(sender(0)), f.nonce(sender(0)));
 }
