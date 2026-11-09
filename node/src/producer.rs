@@ -9196,6 +9196,67 @@ mod tests {
             assert!(split_guard_on(&b), "the split guard is not raised");
         }
 
+        /// r1007 G9 (#184): the majority branch only one or two heights above B.
+        /// Under G9 a chain gains at most one height per slot, so a majority
+        /// that seals every slot next to a B that also seals every slot stays
+        /// within the catch-up refuse gap (3) of B for ever, while fork choice
+        /// prefers it by blue work (four blocks per slot against B's one). The
+        /// split guard was raised but the round still sealed, because only the
+        /// height gap made it refuse. B must not seal next to a majority branch
+        /// it cannot admit, whatever the gap.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_majority_branch_level_with_b_still_stops_b() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let b_blue = b
+                .storage
+                .blocks
+                .get_block(&start.0)
+                .expect("read")
+                .expect("tip")
+                .header
+                .blue_score;
+            let mut tip = Hash::new([0xAB; 32]);
+            let mut losers: Vec<Hash> = Vec::new();
+            let mut sealed = Vec::new();
+            for step in 0..=12u64 {
+                let t = step * 10;
+                // One height above B's tip as it stood, then one per slot.
+                let height = start.1 + 1 + step;
+                let blue = b_blue + 10 + 4 * step;
+                let mut slot_blocks = Vec::new();
+                for i in 1..=4u8 {
+                    let mut x = signed(&templates, i, height, tip, t);
+                    x.header.blue_score = blue;
+                    x.header.blue_work = citrate_consensus::types::blue_work_for_score(blue);
+                    x.header.merge_parent_hashes = losers.clone();
+                    x.header.block_hash = x.compute_hash();
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    slot_blocks.push(x);
+                }
+                hear(&mut b, &slot_blocks).await;
+                tip = slot_blocks[0].header.block_hash;
+                losers = slot_blocks[1..].iter().map(|x| x.header.block_hash).collect();
+                if b.producer.produce_block().await.is_ok() {
+                    sealed.push(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            // Inside the 60 s refuse window the gate refuses on the height gap
+            // only (sync gets that long to admit the branch); past it, never.
+            let late: Vec<u64> = sealed.into_iter().filter(|t| *t > 60).collect();
+            assert_eq!(
+                late,
+                Vec::<u64>::new(),
+                "B sealed next to a majority branch it cannot admit that fork choice prefers, \
+                 because the branch was within the height refuse gap"
+            );
+            assert!(split_guard_on(&b), "the split guard is not raised");
+        }
+
         /// The guard is bounded by the evidence: once the majority stops producing,
         /// B seals again within the 30 s evidence window (plus one round). Refusing
         /// producers produce nothing, so if every producer were refusing, the
