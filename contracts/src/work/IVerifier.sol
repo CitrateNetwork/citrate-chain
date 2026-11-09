@@ -30,4 +30,8 @@ interface IWorkMarket {
         external
         view
         returns (Kind kind, State state, address poster, address verifier, address coordinator, bytes32 bindRef);
+
+    /// @notice Bumps each time a subjective dispute on `id` is upheld: a result the requester
+    ///         rejected that way must not count as verified again (TaskVerifier scopes results to it).
+    function resultEpochOf(uint256 id) external view returns (uint32);
 }

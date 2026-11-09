@@ -189,6 +189,78 @@ contract WorkMarketVerifiersTest is Test {
         assertFalse(ok);
     }
 
+    // ── an upheld subjective dispute rejects the result (chain #451 review) ──
+
+    address internal disputeAdmin = makeAddr("disputeAdmin");
+
+    function _groupTaskPosted(bool requesterAccepts) internal returns (uint256 id) {
+        WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.TASK, address(taskV), keccak256("task"), worker);
+        p.groupHash = keccak256("group");
+        p.disputeAdmin = disputeAdmin;
+        vm.prank(poster);
+        id = market.open{value: 2 ether}(p);
+        bytes32[] memory none;
+        vm.prank(worker);
+        market.join(id, PRICE, none);
+        vm.prank(worker);
+        taskV.submit(market, id, RESULT);
+        if (requesterAccepts) {
+            vm.prank(poster);
+            taskV.accept(market, id, RESULT);
+        } else {
+            vm.warp(block.timestamp + REVIEW);
+        }
+        bondNow = market.getOffer(id).coordinatorBond;
+        bytes32 leaf = _leaf(id, worker, 1);
+        vm.prank(worker);
+        market.postPayout{value: bondNow}(id, leaf, 1, 0);
+        vm.prank(poster);
+        market.dispute(id, abi.encode(uint8(0), abi.encode(uint16(300))));
+        vm.prank(disputeAdmin);
+        market.resolveDispute(id, true);
+    }
+
+    function test_task_upheld_dispute_rejects_accepted_result_and_takes_a_corrected_one() public {
+        uint256 id = _groupTaskPosted(true);
+        (bool ok,) = taskV.acceptedFor(market, id, keccak256("task"));
+        assertFalse(ok, "the rejected result is no longer accepted");
+        bondNow = market.getOffer(id).coordinatorBond;
+        bytes32 leaf = _leaf(id, worker, 1);
+        vm.prank(worker);
+        vm.expectRevert(WorkMarket.NotAccepted.selector);
+        market.postPayout{value: bondNow}(id, leaf, 1, 0);
+        vm.prank(poster);
+        vm.expectRevert(TaskVerifier.BadResult.selector); // nothing current to accept
+        taskV.accept(market, id, RESULT);
+
+        bytes32 v2 = keccak256("corrected");
+        vm.prank(worker);
+        taskV.submit(market, id, v2);
+        vm.prank(poster);
+        taskV.accept(market, id, v2);
+        vm.prank(worker);
+        market.postPayout{value: bondNow}(id, leaf, 1, 0);
+        assertEq(market.getOffer(id).digest, v2);
+        vm.warp(block.timestamp + WINDOW);
+        market.settle(id, worker, 1, 0, 0, new bytes32[](0));
+        assertEq(market.balanceOf(worker), PRICE + bondNow);
+    }
+
+    function test_task_upheld_dispute_rejects_auto_accepted_result() public {
+        uint256 id = _groupTaskPosted(false);
+        (bool ok,) = taskV.acceptedFor(market, id, keccak256("task"));
+        assertFalse(ok);
+        // re-posting the same hash starts a fresh review window
+        vm.prank(worker);
+        taskV.submit(market, id, RESULT);
+        (ok,) = taskV.acceptedFor(market, id, keccak256("task"));
+        assertFalse(ok);
+        vm.warp(block.timestamp + REVIEW);
+        (ok,) = taskV.acceptedFor(market, id, keccak256("task"));
+        assertTrue(ok);
+        assertEq(market.resultEpochOf(id), 1);
+    }
+
     // ── FLRoundVerifier over the real FederatedRoundLedger ─────────
 
     function _cluster() internal returns (bytes32 clusterId) {

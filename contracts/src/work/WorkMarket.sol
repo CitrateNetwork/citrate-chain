@@ -154,6 +154,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint32 openChallenges; // inclusion and index challenges awaiting an answer under the live root
         uint8 payoutDepth; // the posted tree's depth: every opening carries exactly this many siblings
         uint64 answerGraceUntil; // disputes stay open until at least this time (set by answers)
+        uint32 resultEpoch;
     }
 
     struct Challenge {
@@ -696,6 +697,27 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         address challenger = c.challenger;
         emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
         _upholdObjective(id, o, challenger);
+    }
+
+    // red: commit-reveal disputes not implemented yet
+    function commitDispute(uint256, bytes32) external pure {
+        revert WrongState();
+    }
+
+    function revealDispute(uint256, bytes calldata, bytes32) external pure {
+        revert WrongState();
+    }
+
+    function disputeCommitment(uint256 id, uint32 epoch, address disputer, bytes calldata evidence, bytes32 salt)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(abi.encode(block.chainid, address(this), id, epoch, disputer, keccak256(evidence), salt));
+    }
+
+    function resultEpochOf(uint256 id) external view returns (uint32) {
+        return _offers[id].resultEpoch;
     }
 
     function challengeOf(uint256 id, address worker) external view returns (Challenge memory) {
