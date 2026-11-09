@@ -524,6 +524,67 @@ fn call_tracer_shows_the_factory_create() {
     assert_eq!(dep["to"], ax(&c.factory));
 }
 
+/// 02 §3 bulk internal-tx indexing: one call traces every transaction of an
+/// applied-chain block (geth's `debug_traceBlockByNumber` /
+/// `debug_traceBlockByHash`), each entry identical to the per-transaction
+/// trace.
+#[test]
+fn block_tracer_traces_every_transaction_of_a_block() {
+    let c = executed_chain();
+    let by_number = result(
+        &c.io,
+        "debug_traceBlockByNumber",
+        json!(["0x2", {"tracer": "callTracer"}]),
+    );
+    let list = by_number.as_array().expect("one entry per transaction");
+    assert_eq!(list.len(), 2, "{by_number}");
+    assert_eq!(list[0]["txHash"], hx(&Hash::new([0x21; 32])));
+    assert_eq!(list[1]["txHash"], hx(&c.create_tx));
+    let single = result(
+        &c.io,
+        "debug_traceTransaction",
+        json!([hx(&c.create_tx), {"tracer": "callTracer"}]),
+    );
+    assert_eq!(list[1]["result"], single, "same frame as the single trace");
+    assert_eq!(list[1]["result"]["calls"][0]["type"], "CREATE");
+
+    let by_hash = result(
+        &c.io,
+        "debug_traceBlockByHash",
+        json!([hx(&c.blocks[2].header.block_hash), {"tracer": "callTracer"}]),
+    );
+    assert_eq!(by_hash, by_number);
+    // Genesis carries no transactions: an empty list, no replay.
+    assert_eq!(
+        result(&c.io, "debug_traceBlockByNumber", json!(["0x0"])),
+        json!([])
+    );
+    // Above the applied head, and an unknown hash: a -32000 refusal.
+    let above = call(&c.io, "debug_traceBlockByNumber", json!(["0x9"]));
+    assert_eq!(above["error"]["code"], -32000, "{above}");
+    let unknown = call(
+        &c.io,
+        "debug_traceBlockByHash",
+        json!([hx(&Hash::new([0xEE; 32]))]),
+    );
+    assert_eq!(unknown["error"]["code"], -32000, "{unknown}");
+    // Only callTracer is served per block.
+    let pre = call(
+        &c.io,
+        "debug_traceBlockByNumber",
+        json!(["0x2", {"tracer": "prestateTracer"}]),
+    );
+    assert_eq!(pre["error"]["code"], -32602, "{pre}");
+    assert_eq!(
+        citrate_api::rpc_limits::heavy_method_cost("debug_traceBlockByNumber"),
+        citrate_api::trace_rpc::TRACE_COST
+    );
+    assert_eq!(
+        citrate_api::rpc_limits::heavy_method_cost("debug_traceBlockByHash"),
+        citrate_api::trace_rpc::TRACE_COST
+    );
+}
+
 #[test]
 fn prestate_tracer_reports_the_state_before_the_transaction() {
     let c = executed_chain();
