@@ -56,8 +56,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
     uint32 public constant MIN_DISPUTE_WINDOW = 24 hours;
     uint32 public constant MAX_WORKERS_CAP = 1024;
-    /// @notice Share of a slashed coordinator bond paid to a disputer who is not the poster; the
-    ///         rest goes to the poster. Owner question V60-GEN-Q4 (06 §2.2 does not fix the split).
+    /// @notice Share of a slashed coordinator bond paid to the rewarded disputer (a revealed
+    ///         commitment or an unanswered challenge, not by the poster); the rest goes to
+    ///         `slashSink`. The poster never receives any part of a slash (owner 2026-11-09, Q4 revised).
     uint16 public constant SLASH_DISPUTER_BPS = 5000;
     uint16 internal constant BPS = 10_000;
     /// @notice Bounds the receipts one LOW_UNITS dispute may carry (calldata and gas).
@@ -90,7 +91,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// leaf short of them).
     uint8 public constant DISPUTE_TOTAL = 6;
     /// @notice A challenge carries this share of the offer's coordinator bond (rounded up): returned
-    ///         when the challenge is upheld or its root is withdrawn, paid to the answerer otherwise.
+    ///         when the challenge is upheld or its root is withdrawn; when answered, held until the
+    ///         root survives its dispute window and then paid to the offer's coordinator.
     uint16 public constant CHALLENGE_BOND_BPS = 1000;
     /// @notice Seconds between a dispute commitment and its reveal. Measured in block time, not
     ///         height: merged parallel blocks of the DAG can repeat or lower `block.number`.
@@ -249,9 +251,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     event PayoutPosted(uint256 indexed id, bytes32 root, uint64 units, bytes32 digest);
     event Disputed(uint256 indexed id, address indexed by, uint16 reason);
     event DisputeResolved(uint256 indexed id, address indexed admin, bool upheld);
-    event CoordinatorSlashed(
-        uint256 indexed id, address indexed disputer, uint128 toDisputer, uint128 toPoster, uint128 toSink
-    );
+    event CoordinatorSlashed(uint256 indexed id, address indexed disputer, uint128 toDisputer, uint128 toSink);
     event Settled(uint256 indexed id, address indexed worker, uint64 units, uint128 amount);
     event Refunded(uint256 indexed id, uint128 amount);
     event BondReleased(uint256 indexed id, address indexed to, uint128 amount);
@@ -501,7 +501,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///        DISPUTE_ORDER       body = abi.encode(LeafOpening a, LeafOpening b)       a.index < b.index
     ///        DISPUTE_FIRST_LEAF  body = abi.encode(LeafOpening first)                  index 0
     ///        DISPUTE_TOTAL       body = abi.encode(LeafOpening leaf, LeafOpening next) see _provesBadTotal
-    /// @dev   An upheld objective dispute made here pays the whole slash to the poster: only a
+    /// @dev   An upheld objective dispute made here sends the whole slash to `slashSink`: only a
     ///        revealed commitment (`commitDispute` / `revealDispute`) earns the disputer's share, so
     ///        copying evidence seen in the mempool earns nothing.
     function dispute(uint256 id, bytes calldata evidence) external nonReentrant {
@@ -784,7 +784,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     }
 
     /// @notice After `answerBy`, an unanswered challenge is upheld: the root is withdrawn, the
-    ///         coordinator bond slashed (to the challenger and the poster) and the offer runs again.
+    ///         coordinator bond slashed (to the challenger and `slashSink`) and the offer runs again.
     function resolveChallenge(uint256 id, address worker) external nonReentrant {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted && o.state != State.Disputed) revert WrongState();
@@ -1047,30 +1047,21 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     }
 
     /// Objective dispute upheld: payout frozen and withdrawn, bond slashed, offer runs again.
-    /// The poster never takes back a slash it could have brought about itself (its coordinator
-    /// may be a second address of its own):
+    /// Owner 2026-11-09 (Q4 revised): the poster never receives any part of a slash, since its
+    /// coordinator, and any worker, may be an address of its own.
     /// - not `rewarded` (a direct `dispute()`), or the disputer is the poster: all to `slashSink`;
     /// - `rewarded` (a revealed commitment or an unanswered bonded challenge) by another party:
-    ///   the whole bond to the disputer when the poster is the coordinator, otherwise
-    ///   SLASH_DISPUTER_BPS to the disputer and the rest to the poster (Q4).
+    ///   SLASH_DISPUTER_BPS to the disputer, the rest to `slashSink`. A colluding side (poster,
+    ///   coordinator, sybil workers) therefore recovers at most half of any slashed bond.
     function _upholdObjective(uint256 id, Offer storage o, address disputer, bool rewarded) internal {
         uint128 bond = o.coordinatorBondHeld ? o.coordinatorBond : 0;
         o.coordinatorBondHeld = false;
         uint128 toDisputer = 0;
-        uint128 toPoster = 0;
-        uint128 toSink = 0;
-        if (!rewarded || disputer == o.poster) {
-            toSink = bond;
-        } else if (o.coordinator == o.poster) {
-            toDisputer = bond;
-        } else {
-            toDisputer = uint128((uint256(bond) * SLASH_DISPUTER_BPS) / BPS);
-            toPoster = bond - toDisputer;
-        }
+        if (rewarded && disputer != o.poster) toDisputer = uint128((uint256(bond) * SLASH_DISPUTER_BPS) / BPS);
+        uint128 toSink = bond - toDisputer;
         if (toDisputer != 0) balanceOf[disputer] += toDisputer;
-        if (toPoster != 0) balanceOf[o.poster] += toPoster;
         if (toSink != 0) balanceOf[slashSink] += toSink;
-        emit CoordinatorSlashed(id, disputer, toDisputer, toPoster, toSink);
+        emit CoordinatorSlashed(id, disputer, toDisputer, toSink);
         _clearPayout(o);
         o.state = State.Running;
     }
