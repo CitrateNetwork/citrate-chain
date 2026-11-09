@@ -426,3 +426,216 @@ fn proofs_need_the_mpt_rule() {
     db.set_root_height(0);
     assert!(db.get_proof(&addr(1), &[]).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// An independent reference, written from the spec text alone
+// (docs/consensus/STATE_ROOT_MPT.md §2-§3), sharing no code with the node:
+// parity's `rlp` encoder for the leaves and parity's `triehash` (OpenEthereum's
+// root builder) for both tries. `reference_state_root` (the in-crate
+// from-scratch builder) is a second reference; this one also checks the leaf
+// encodings and the empty-account / zero-slot rules independently.
+// ---------------------------------------------------------------------------
+
+type Keccak = keccak_hasher::KeccakHasher;
+
+/// Big-endian with leading zero bytes removed (an RLP integer's payload).
+fn spec_trim(b: &[u8]) -> Vec<u8> {
+    b.iter().copied().skip_while(|x| *x == 0).collect()
+}
+
+/// §3 storage leaf, or `None` when the slot is not in the trie.
+fn spec_storage_leaf(v: &[u8]) -> Option<Vec<u8>> {
+    if v.len() == 32 {
+        let t = spec_trim(v);
+        if t.is_empty() {
+            return None;
+        }
+        Some(rlp::encode(&t).to_vec())
+    } else {
+        let mut s = rlp::RlpStream::new_list(1);
+        s.append(&v.to_vec());
+        Some(s.out().to_vec())
+    }
+}
+
+/// The state root of `snap` per the spec, from its resident accounts and slots.
+fn spec_state_root(snap: &citrate_execution::state::StateSnapshot) -> [u8; 32] {
+    const EMPTY: [u8; 32] = EMPTY_ROOT;
+    let keccak_empty: [u8; 32] = keccak(&[]);
+    let storage = snap.storage_map();
+    let mut accounts: HashMap<Address, AccountState> =
+        snap.account_entries().iter().cloned().collect();
+    // A contract's slots commit under its account even if no account entry is
+    // resident (the account is then the default one).
+    for a in storage.keys() {
+        accounts.entry(*a).or_default();
+    }
+    let mut leaves: Vec<([u8; 20], Vec<u8>)> = Vec::new();
+    for (a, acct) in &accounts {
+        let storage_root: [u8; 32] = match storage.get(a) {
+            Some(slots) => {
+                let items: Vec<(Vec<u8>, Vec<u8>)> = slots
+                    .iter()
+                    .filter_map(|(k, v)| spec_storage_leaf(v).map(|l| (k.clone(), l)))
+                    .collect();
+                if items.is_empty() {
+                    EMPTY
+                } else {
+                    triehash::sec_trie_root::<Keccak, _, _, _>(items).into()
+                }
+            }
+            None => EMPTY,
+        };
+        let code_hash: [u8; 32] = if acct.code_hash == Hash::default() {
+            keccak_empty
+        } else {
+            *acct.code_hash.as_bytes()
+        };
+        let empty = acct.nonce == 0
+            && acct.balance.is_zero()
+            && code_hash == keccak_empty
+            && storage_root == EMPTY
+            && acct.model_permissions.is_empty();
+        if empty {
+            continue;
+        }
+        let mut balance = [0u8; 32];
+        acct.balance.to_big_endian(&mut balance);
+        let items = if acct.model_permissions.is_empty() {
+            4
+        } else {
+            5
+        };
+        let mut s = rlp::RlpStream::new_list(items);
+        s.append(&acct.nonce);
+        s.append(&spec_trim(&balance));
+        s.append(&storage_root.to_vec());
+        s.append(&code_hash.to_vec());
+        if items == 5 {
+            s.begin_list(acct.model_permissions.len());
+            for m in &acct.model_permissions {
+                s.append(&m.0.as_bytes().to_vec());
+            }
+        }
+        leaves.push((a.0, s.out().to_vec()));
+    }
+    if leaves.is_empty() {
+        return EMPTY;
+    }
+    triehash::sec_trie_root::<Keccak, _, _, _>(leaves).into()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// CV-14: over random histories (the same operations as above), the node's
+    /// incremental root equals the root an independent implementation of the
+    /// spec computes from the resident state alone, after every root step.
+    #[test]
+    fn incremental_root_equals_independent_spec_reference(ops in prop::collection::vec(op(), 1..80)) {
+        let db = db();
+        let mut snaps = Vec::new();
+        for (i, o) in ops.iter().enumerate() {
+            apply(&db, o, &mut snaps);
+            if matches!(o, Op::Root | Op::Restore(_) | Op::Undo(_)) || i.is_multiple_of(5) {
+                let root = db.calculate_state_root();
+                prop_assert_eq!(
+                    *root.as_bytes(),
+                    spec_state_root(&db.snapshot()),
+                    "step {} ({:?}): node root != independent spec root", i, o
+                );
+            }
+        }
+        prop_assert_eq!(*db.calculate_state_root().as_bytes(), spec_state_root(&db.snapshot()));
+    }
+
+    /// CV-14 purity, by apply order: the same final writes applied in two
+    /// different orders, one db computing roots between writes and the other
+    /// only at the end, give the same root.
+    #[test]
+    fn root_does_not_depend_on_apply_order(
+        writes in prop::collection::vec((0u8..6, 0u8..10, any::<u8>(), any::<u8>(), any::<u64>()), 1..60),
+        seed in any::<u64>(),
+    ) {
+        // The last write per (account, slot) wins, so collapse to the final state
+        // first: both dbs then hold exactly the same state.
+        let mut fin: std::collections::BTreeMap<(u8, u8), (u8, u8, u64)> = Default::default();
+        for (a, s, k, n, b) in &writes {
+            fin.insert((*a, *s), (*k, *n, *b));
+        }
+        let mut order: Vec<_> = fin.iter().collect();
+        let a = db();
+        for ((ad, s), (k, n, b)) in &order {
+            a.accounts.set_balance(addr(*ad), U256::from(*b % 4));
+            a.set_storage(addr(*ad), slot(*s), value(*k, *n));
+            let _ = a.calculate_state_root();
+        }
+        // A deterministic shuffle of the same writes.
+        let mut x = seed | 1;
+        for i in (1..order.len()).rev() {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            order.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        let b = db();
+        // Balances are per account: replay them so the last write per account
+        // matches `a` (in `a`, the last (account, slot) in key order wins).
+        let mut last_balance: std::collections::BTreeMap<u8, u64> = Default::default();
+        for ((ad, _), (_, _, bal)) in fin.iter() {
+            last_balance.insert(*ad, *bal % 4);
+        }
+        for ((ad, s), (k, n, _)) in &order {
+            b.set_storage(addr(*ad), slot(*s), value(*k, *n));
+        }
+        for (ad, bal) in &last_balance {
+            b.accounts.set_balance(addr(*ad), U256::from(*bal));
+        }
+        let ra = a.calculate_state_root();
+        prop_assert_eq!(ra, b.calculate_state_root());
+        prop_assert_eq!(*ra.as_bytes(), spec_state_root(&b.snapshot()));
+    }
+}
+
+/// CV-14: storage held for an address with no resident account entry (the
+/// governance precompile writes its `PARAM:` / `PENDING:` slots through
+/// `set_storage` without creating an account) is state, so the root must
+/// commit it: it commits as the default account holding those slots. Two
+/// states that differ only in such a slot must have different roots, and a
+/// restarted node must reproduce the root.
+#[test]
+fn storage_of_an_address_with_no_account_entry_is_committed() {
+    let gov = addr(0xfe);
+    let a = db();
+    a.accounts.set_balance(addr(1), U256::from(5));
+    let before = a.calculate_state_root();
+    a.set_storage(gov, b"PARAM:artifact_replication".to_vec(), vec![3]);
+    assert!(a.accounts.get_resident(&gov).is_none(), "no account entry");
+    let after = a.calculate_state_root();
+    assert_ne!(after, before, "a storage-only address moved no root");
+    assert_eq!(after, a.reference_state_root());
+    assert_eq!(*after.as_bytes(), spec_state_root(&a.snapshot()));
+
+    // A different value: a different root.
+    let b = db();
+    b.accounts.set_balance(addr(1), U256::from(5));
+    b.set_storage(gov, b"PARAM:artifact_replication".to_vec(), vec![4]);
+    assert_ne!(b.calculate_state_root(), after);
+
+    // Restart: the same root, and the persisted trie is reused.
+    let mut store: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+    let mut write = |_: &Hash, nodes: &[([u8; 32], Vec<u8>)]| {
+        store.extend(nodes.iter().cloned());
+        Ok(())
+    };
+    a.persist_trie_nodes(&mut write).expect("persist");
+    let c = rehydrated(&a);
+    assert_eq!(c.calculate_state_root(), after, "a restarted node");
+    let d = rehydrated(&a);
+    d.reuse_persisted_trie(&after, &|h| store.get(h).cloned())
+        .expect("same state: the cache is reused");
+    assert_eq!(d.calculate_state_root(), after);
+
+    // Deleting the slot again restores the earlier root.
+    a.delete_storage(gov, b"PARAM:artifact_replication");
+    assert_eq!(a.calculate_state_root(), before);
+    assert_eq!(a.reference_state_root(), before);
+}
