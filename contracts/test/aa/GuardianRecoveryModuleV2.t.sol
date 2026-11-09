@@ -15,6 +15,7 @@ import {
     ERC1271_INVALID
 } from "@kernel/types/Constants.sol";
 import {IEntryPoint as IKernelEntryPoint} from "@kernel/interfaces/IEntryPoint.sol";
+import {IPaymaster} from "@account-abstraction/interfaces/IPaymaster.sol";
 
 import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/recovery/GuardianRecoveryModuleV2.sol";
 import {GuardianRecoveryModule} from "../../src/aa/recovery/GuardianRecoveryModule.sol";
@@ -37,6 +38,21 @@ contract V2SmartWalletGuardian {
         bytes32 s = bytes32(sig[32:64]);
         uint8 v = uint8(sig[64]);
         return ecrecover(hash, v, r, s) == owner ? bytes4(0x1626ba7e) : bytes4(0xffffffff);
+    }
+}
+
+/// A paymaster that sponsors anything and always reverts in postOp.
+contract RevertingPostOpPaymaster is IPaymaster {
+    function validatePaymasterUserOp(AaPackedUserOperation calldata, bytes32, uint256)
+        external
+        pure
+        returns (bytes memory, uint256)
+    {
+        return (hex"01", 0);
+    }
+
+    function postOp(PostOpMode, bytes calldata, uint256, uint256) external pure {
+        revert("postOp");
     }
 }
 
@@ -635,6 +651,22 @@ contract GuardianRecoveryModuleV2Test is GuardianV2Base {
         return module.validateUserOp(op, OP_HASH);
     }
 
+    /// Bounds that approve no paymaster refuse any paymasterAndData and keep the pending recovery.
+    function test_validate_refusesPaymasterDataWhenNoneApproved() public {
+        _install(kernel);
+        bytes memory cd = _rotateCallData(kernel, "no-pm");
+        uint48 ea = _initiate(kernel, cd);
+        PackedUserOperation memory op = _op(cd, _execSig(PK_C, OP_HASH, kernel));
+        op.paymasterAndData = abi.encodePacked(address(0xFA11), uint128(100_000), uint128(100_000));
+        vm.prank(kernel);
+        assertEq(module.validateUserOp(op, OP_HASH), SIG_VALIDATION_FAILED_UINT);
+        op.paymasterAndData = hex"00";
+        vm.prank(kernel);
+        assertEq(module.validateUserOp(op, OP_HASH), SIG_VALIDATION_FAILED_UINT);
+        (, uint48 left,) = module.pendingRecovery(kernel);
+        assertEq(left, ea);
+    }
+
     /// Every bound is inclusive, and one unit past any bound fails validation without consuming
     /// the pending recovery.
     function test_validate_executionBoundsAreInclusive() public {
@@ -1062,6 +1094,58 @@ contract GuardianRecoveryModuleV2E2ETest is GuardianV2Base {
         assertEq(_rootOwner(), vm.addr(OLD_OWNER_PK));
         _handle(_recoveryOp());
         assertEq(_rootOwner(), vm.addr(NEW_OWNER_PK));
+    }
+
+    /// A guardian-chosen paymaster whose postOp reverts would undo the rotation after validation
+    /// consumed the pending recovery; the op is refused in validation instead.
+    function test_recovery_refusesAPaymasterTheQuorumDidNotApprove() public {
+        bytes memory cd = _rotationCallData();
+        uint48 ea = module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
+        vm.warp(ea);
+        RevertingPostOpPaymaster gp = new RevertingPostOpPaymaster();
+        entryPoint.depositTo{value: 1 ether}(address(gp));
+        AaPackedUserOperation memory op = _packedOp(entryPoint.getNonce(wallet, _moduleNonceKey()), cd);
+        op.paymasterAndData = abi.encodePacked(address(gp), uint128(100_000), uint128(100_000));
+        op.signature = _execSig(PK_C, entryPoint.getUserOpHash(op), wallet);
+        _expectSigError(op);
+        (, uint48 left,) = module.pendingRecovery(wallet);
+        assertEq(left, ea, "pending recovery kept");
+        _handle(_recoveryOp());
+        assertEq(_rootOwner(), vm.addr(NEW_OWNER_PK));
+    }
+
+    /// Paymaster data the quorum did not approve is refused even for the genesis paymaster with a
+    /// valid recovery sponsorship (here with a postOp gas limit too small for its postOp).
+    function test_recovery_refusesUnapprovedGenesisPaymasterSponsorship() public {
+        bytes memory cd = _rotationCallData();
+        uint48 ea = module.initiateRecovery(wallet, cd, _bounds(), _quorum(wallet, cd));
+        vm.warp(ea);
+        AaPackedUserOperation memory op = _sponsoredOp(cd, 200_000, 1);
+        _expectSigError(op);
+        (, uint48 left,) = module.pendingRecovery(wallet);
+        assertEq(left, ea, "pending recovery kept");
+        assertEq(_rootOwner(), vm.addr(OLD_OWNER_PK));
+    }
+
+    /// A recovery op sponsored by the genesis CitratePaymaster (recovery category), signed by the
+    /// sponsor key, with the given paymaster gas limits.
+    function _sponsoredOp(bytes memory cd, uint128 pmVgl, uint128 pmPostOp)
+        internal
+        returns (AaPackedUserOperation memory op)
+    {
+        CitratePaymaster pm = CitratePaymaster(payable(factory.paymaster()));
+        vm.prank(address(0xA11CE));
+        factory.registerDeployedWallet(wallet);
+        pm.deposit{value: 1 ether}();
+        uint256 nonce = entryPoint.getNonce(wallet, _moduleNonceKey());
+        uint48 until = uint48(block.timestamp + 1 hours);
+        bytes32 sd = pm.sponsorDigest(wallet, 1, until, 0, nonce);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(IDENTITY_PK, sd.toEthSignedMessageHash());
+        op = _packedOp(nonce, cd);
+        op.accountGasLimits = _pack(B_MAX_VGL, B_MAX_CGL);
+        op.paymasterAndData =
+            abi.encodePacked(address(pm), pmVgl, pmPostOp, uint8(1), until, uint48(0), abi.encodePacked(r, s, v));
+        op.signature = _execSig(PK_C, entryPoint.getUserOpHash(op), wallet);
     }
 
     /// The approved minimum callGasLimit is enough for the rotation itself.
