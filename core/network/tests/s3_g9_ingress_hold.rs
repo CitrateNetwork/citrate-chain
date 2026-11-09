@@ -114,8 +114,10 @@ async fn score(peer: &Arc<Peer>) -> i32 {
 }
 
 /// The constants the policy rests on: the hold band starts where the 15 s
-/// drift ends and is bounded well below the parent-relative bound.
+/// drift ends and is bounded well below the parent-relative bound. (Constant
+/// assertions on purpose: they pin the policy constants this file relies on.)
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn hold_band_is_past_the_drift_and_bounded() {
     assert_eq!(MAX_FUTURE_BLOCK_DRIFT_SECS, 15);
     assert!(HELD_FUTURE_HORIZON_SECS > MAX_FUTURE_BLOCK_DRIFT_SECS);
