@@ -293,6 +293,53 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         assertEq(market.owedOn(id), BUDGET);
     }
 
+    /// A challenge a withdrawn root left open hands its bond back when the same slot or worker is
+    /// challenged under the next root.
+    function test_rechallenge_under_a_new_root_returns_the_stale_bond() public {
+        uint256 id = _openFl();
+        _join(id, w1);
+        _join(id, w2);
+        _accept(id);
+        bytes32[] memory leaves = new bytes32[](2);
+        leaves[0] = keccak256("no preimage");
+        leaves[1] = keccak256("none either");
+        _postTree(id, leaves, 1);
+        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
+        rs[0] = _receipt(id, w1, bytes32(uint256(1)));
+        vm.prank(w2);
+        market.challengeInclusion{value: CHBOND}(id, rs); // w2 challenges for w1
+        vm.prank(w2);
+        market.challengeIndex{value: CHBOND}(id, 1);
+        vm.prank(w1);
+        market.challengeIndex{value: CHBOND}(id, 0);
+        vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
+        market.resolveIndexChallenge(id, 0); // withdraws the root; w2's two challenges stay open
+
+        (bytes32[] memory l2,) = _leaves(id, _twoEntries(), _noOverride(), 1);
+        _postTree(id, l2, 6);
+        uint256 before = market.balanceOf(w2);
+        vm.prank(w1);
+        market.challengeIndex{value: CHBOND}(id, 1);
+        assertEq(market.balanceOf(w2), before + CHBOND, "stale index-challenge bond returned");
+        rs[0] = _receipt(id, w1, bytes32(uint256(1)));
+        vm.prank(w1);
+        market.challengeInclusion{value: CHBOND}(id, rs);
+        assertEq(market.balanceOf(w2), before + 2 * CHBOND, "stale worker-challenge bond returned");
+        assertEq(market.owedOn(id), BUDGET + CBOND + 2 * CHBOND);
+        // live challenges are not reclaimable
+        vm.expectRevert(WorkMarket.NothingToClaim.selector);
+        market.reclaimChallengeBond(id, w1);
+        vm.expectRevert(WorkMarket.NothingToClaim.selector);
+        market.reclaimIndexChallengeBond(id, 1);
+    }
+
+    function test_challenge_bond_rounds_up() public {
+        WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.FL_ROUND);
+        p.coordinatorBond = 11; // 10 % is 1.1 wei
+        uint256 id = _open(p, BUDGET);
+        assertEq(market.challengeBondOf(id), 2);
+    }
+
     function _twoEntries() internal view returns (Entry[] memory e) {
         e = new Entry[](2);
         e[0] = Entry(w1, 1);
