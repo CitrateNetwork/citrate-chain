@@ -4,6 +4,9 @@
 //! COVERAGE (what the reference executes):
 //!   * value transfers (empty calldata, `to` set): 21,000 gas, the self-
 //!     transfer no-op, a value above the balance after the fee fails the tx;
+//!   * contract calls and deployments through the reference's own EVM driver
+//!     (`crate::evm`, rules E1-E6 there): storage, code, logs, internal value
+//!     transfers and CREATEs, reverts, halts and out-of-gas;
 //!   * the outcome classes: B1 nonce, B2 balance, B3 ACCEPT gas budget, B4
 //!     sender has code, stateless skips (chain id / signature via the trusted
 //!     `tx_auth`, gas price below the base fee); C (failed: full gas_limit
@@ -13,17 +16,16 @@
 //!     for deployments), split among the blue members with a proposer per
 //!     O3, the treasury part, the §R' eligibility rule (coinbase must be the
 //!     proposer's staker in the policy, otherwise the share burns), and §R'
-//!     vesting as a plain value transfer minter -> registry;
-//!   * the commitments: state root (through the trusted trie hash),
-//!     accepted_root, receipt_root v3, gas_used.
+//!     vesting as the `creditReward` system call (E6);
+//!   * the commitments: state root (through the trusted trie hash, with code
+//!     and storage), accepted_root, receipt_root v3 (with logs), gas_used.
 //!
 //! NOT COVERED (the reference refuses with [`Unsupported`] instead of
-//! guessing): any transaction with calldata (contract calls, deployments and
-//! AI operations need the EVM, which the reference does not embed), §R'
-//! vesting into a registry that has code, and genesis state other than
-//! balances.
+//! guessing): AI operations, any call frame into a Citrate precompile or a
+//! reserved low address (see `crate::evm`), and blocks below an EVM rule's
+//! activation height.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use citrate_consensus::types::{Block, Hash, Transaction};
 use primitive_types::U256;
@@ -44,6 +46,11 @@ pub const TREASURY_PERCENT: u64 = 10;
 pub const BLOCK_REWARD_SALT: u64 = 10;
 pub const HALVING_INTERVAL: u64 = 2_100_000;
 pub const MODEL_DEPLOYMENT_BONUS_SALT: u64 = 1;
+/// The legacy (pre-supply-hardening) bonus arms: calldata prefixes and the
+/// inference bonus in hundredths of a SALT.
+pub const LEGACY_INFERENCE_SELECTOR: [u8; 4] = [0x02, 0x00, 0x00, 0x00];
+pub const LEGACY_MODEL_REGISTER_SELECTOR: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+pub const LEGACY_INFERENCE_BONUS_CENTI_SALT: u64 = 1;
 /// The §R' base fee constant.
 pub const CANONICAL_BASE_FEE: u64 = 1_000_000_000;
 
@@ -55,7 +62,21 @@ pub struct Unsupported(pub String);
 pub struct Account {
     pub balance: U256,
     pub nonce: u64,
-    pub has_code: bool,
+    /// Set when the account has a code hash (possibly of empty code).
+    pub code: Option<Vec<u8>>,
+    /// Storage slots, 32-byte big-endian key and value (zero values kept).
+    pub storage: BTreeMap<[u8; 32], [u8; 32]>,
+}
+
+impl Account {
+    /// EIP-3607 / B4: the account has (non-empty) code.
+    pub fn has_code(&self) -> bool {
+        self.code.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    fn is_blank(&self) -> bool {
+        self.balance.is_zero() && self.nonce == 0 && self.code.is_none() && self.storage.is_empty()
+    }
 }
 
 /// One executed transaction's receipt as the reference computes it.
@@ -112,6 +133,8 @@ pub enum SkipKind {
 /// The reference world state.
 pub struct State {
     pub accounts: BTreeMap<[u8; 20], Account>,
+    /// Code by keccak256 hash (REVM's `code_by_hash`).
+    pub codes: HashMap<[u8; 32], Vec<u8>>,
 }
 
 /// The address a transaction's sender or recipient key denotes: an embedded
@@ -144,7 +167,25 @@ impl State {
                 },
             );
         }
-        Self { accounts }
+        Self {
+            accounts,
+            codes: HashMap::new(),
+        }
+    }
+
+    /// The genesis state of `cfg`: its balances and its contract code.
+    pub fn genesis_of(cfg: &RefConfig) -> Self {
+        let mut s = Self::genesis(&cfg.genesis_alloc);
+        for (a, code) in &cfg.genesis_code {
+            s.set_code(*a, code.clone());
+        }
+        s
+    }
+
+    /// Give `a` the code `code` (and its hash).
+    pub fn set_code(&mut self, a: [u8; 20], code: Vec<u8>) {
+        self.codes.insert(crate::evm::keccak(&code), code.clone());
+        self.acct(a).code = Some(code);
     }
 
     fn acct(&mut self, a: [u8; 20]) -> &mut Account {
@@ -164,12 +205,18 @@ impl State {
     pub fn root(&self, storage_root_activation: Option<u64>, height: u64) -> Hash {
         let db = citrate_execution::StateDB::new();
         for (a, acct) in &self.accounts {
-            if acct.balance.is_zero() && acct.nonce == 0 {
+            if acct.is_blank() {
                 continue;
             }
             let addr = citrate_execution::types::Address(*a);
             db.accounts.set_balance(addr, acct.balance);
             db.accounts.set_nonce(addr, acct.nonce);
+            if let Some(code) = &acct.code {
+                db.set_code(addr, code.clone());
+            }
+            for (k, v) in &acct.storage {
+                db.set_storage(addr, k.to_vec(), v.to_vec());
+            }
         }
         db.calculate_state_root_with(storage_root_activation, height)
     }
@@ -182,7 +229,33 @@ impl State {
         c: &Block,
         members: &[(&Block, Color)],
     ) -> Result<Accepted, Unsupported> {
+        self.accept_with(cfg, c, members, &HashMap::new())
+    }
+
+    /// [`State::accept`] with the BLOCKHASH window of `c` (height -> hash of
+    /// `c`'s selected-chain ancestor, for the 256 heights below it).
+    pub fn accept_with(
+        &mut self,
+        cfg: &RefConfig,
+        c: &Block,
+        members: &[(&Block, Color)],
+        block_hashes: &HashMap<u64, [u8; 32]>,
+    ) -> Result<Accepted, Unsupported> {
         let height = c.header.height;
+        let env = crate::evm::Env {
+            chain_id: cfg.chain_id,
+            number: height,
+            timestamp: c.header.timestamp,
+            coinbase: c.header.coinbase,
+            prevrandao: *c.header.vrf_reveal.output.as_bytes(),
+            block_hashes,
+            exact_create_code: matches!(
+                cfg.evm.exact_create_code_height,
+                Some(a) if height > 0 && height >= a
+            ),
+            contract_nonces: height >= cfg.evm.create_nonce_fix_height,
+        };
+        let mut created: u64 = 0;
         let base_fee = c.header.base_fee_per_gas;
         let pba = match cfg.pba_hardening_height {
             Some(h) => citrate_consensus::hardening::PbaHardening::at(h),
@@ -194,13 +267,6 @@ impl State {
         let mut cumulative: u64 = 0;
         for (block, _) in members {
             for tx in &block.transactions {
-                if !tx.data.is_empty() {
-                    return Err(Unsupported(format!(
-                        "tx {} in {} carries calldata (contract call, deployment or AI \
-                         operation); the reference executes value transfers only",
-                        tx.hash, block.header.block_hash
-                    )));
-                }
                 let from = address_of(tx.from.as_bytes());
                 let acct = self.accounts.get(&from).cloned().unwrap_or_default();
                 let need =
@@ -215,13 +281,13 @@ impl State {
                     Some(SkipKind::Invalid)
                 } else if tx.gas_limit > ACCEPT_GAS_LIMIT.saturating_sub(cumulative) {
                     Some(SkipKind::Gas)
-                } else if acct.has_code {
+                } else if acct.has_code() {
                     Some(SkipKind::Code)
                 } else if tx.nonce != acct.nonce {
                     Some(SkipKind::Nonce)
                 } else if acct.balance < need {
                     Some(SkipKind::Balance)
-                } else if tx.to.is_none() {
+                } else if tx.to.is_none() && tx.data.is_empty() {
                     Some(SkipKind::Invalid)
                 } else {
                     None
@@ -230,49 +296,64 @@ impl State {
                     skipped.push((tx.hash, block.header.block_hash, kind));
                     continue;
                 }
-                let Some(to_key) = tx.to else {
-                    continue;
-                };
-                let to = address_of(to_key.as_bytes());
-                // Executed: the fee for the gas used, the nonce, the value.
-                let (status, gas_used) = if tx.gas_limit < TRANSFER_GAS {
-                    (false, tx.gas_limit)
+                let upfront = U256::from(tx.gas_limit) * U256::from(tx.gas_price);
+                let (status, gas_used, logs) = if tx.data.is_empty() {
+                    // A value transfer (the shape check above guarantees `to`).
+                    let to_key = tx.to.map(|k| *k.as_bytes()).unwrap_or_default();
+                    let to = address_of(&to_key);
+                    let ok = tx.gas_limit >= TRANSFER_GAS
+                        && acct.balance - upfront >= U256::from(tx.value);
+                    let gas_used = if ok { TRANSFER_GAS } else { tx.gas_limit };
+                    let fee = U256::from(gas_used) * U256::from(tx.gas_price);
+                    {
+                        let a = self.acct(from);
+                        a.balance -= fee;
+                        a.nonce += 1;
+                    }
+                    if ok && from != to {
+                        let v = U256::from(tx.value);
+                        self.acct(from).balance -= v;
+                        self.credit(to, v);
+                    }
+                    (ok, gas_used, Vec::new())
                 } else {
-                    let after_fee =
-                        acct.balance - U256::from(tx.gas_limit) * U256::from(tx.gas_price);
-                    if after_fee < U256::from(tx.value) {
-                        (false, tx.gas_limit)
-                    } else {
-                        (true, TRANSFER_GAS)
+                    let run = self.contract_tx(cfg, &env, tx, from, acct.balance - upfront)?;
+                    match run {
+                        Some((total, success)) => {
+                            self.acct(from).balance = acct.balance - upfront;
+                            success.apply(self);
+                            created += success.created;
+                            let refund =
+                                U256::from(tx.gas_limit - total) * U256::from(tx.gas_price);
+                            let a = self.acct(from);
+                            a.nonce = tx.nonce + 1;
+                            a.balance += refund;
+                            (true, total, success.logs)
+                        }
+                        None => {
+                            let a = self.acct(from);
+                            a.balance = acct.balance - upfront;
+                            a.nonce = tx.nonce + 1;
+                            (false, tx.gas_limit, Vec::new())
+                        }
                     }
                 };
-                let fee = U256::from(gas_used) * U256::from(tx.gas_price);
-                {
-                    let a = self.acct(from);
-                    a.balance -= fee;
-                    a.nonce += 1;
-                }
-                if status && from != to {
-                    let v = U256::from(tx.value);
-                    self.acct(from).balance -= v;
-                    self.credit(to, v);
-                }
                 cumulative += gas_used;
                 receipts.push(RefReceipt {
                     tx_hash: tx.hash,
                     including_block: block.header.block_hash,
                     status,
                     gas_used,
-                    logs: Vec::new(),
+                    logs,
                 });
                 executed.push(tx);
             }
         }
-        self.settle(cfg, c, members, &executed, &receipts)?;
+        self.settle(cfg, c, &env, members, &executed, &receipts)?;
         Ok(Accepted {
             accepted_root: accepted_root(&receipts),
             receipt_root: receipt_root(&receipts),
-            created: 0,
+            created,
             gas_used: cumulative,
             state_root: self.root(cfg.storage_root_hardening_height, height),
             receipts,
@@ -280,32 +361,138 @@ impl State {
         })
     }
 
+    /// Run a transaction with calldata (E1, E2, E3 in `crate::evm`):
+    /// `Some((gas charged, effect))` on success, `None` when it fails.
+    fn contract_tx(
+        &self,
+        cfg: &RefConfig,
+        env: &crate::evm::Env<'_>,
+        tx: &Transaction,
+        from: [u8; 20],
+        post_fee: U256,
+    ) -> Result<Option<(u64, crate::evm::Success)>, Unsupported> {
+        use crate::evm::{is_low, is_standard_precompile, Kind, CALL_BASE_GAS, CREATE_BASE_GAS};
+        let height = env.number;
+        if height < cfg.evm.value_transfer_height {
+            return Err(Unsupported(format!(
+                "tx {} at height {height}: below the value-transfer activation ({}), whose \
+                 legacy value semantics the reference does not implement",
+                tx.hash, cfg.evm.value_transfer_height
+            )));
+        }
+        let (kind, base) = match tx.to {
+            None => (
+                Kind::Create {
+                    init: tx.data.clone(),
+                },
+                CREATE_BASE_GAS,
+            ),
+            Some(key) => {
+                if citrate_consensus::types::AiOpKind::classify(true, &tx.data).is_some() {
+                    return Err(Unsupported(format!(
+                        "tx {} is an AI operation; the reference does not implement them",
+                        tx.hash
+                    )));
+                }
+                let to = address_of(key.as_bytes());
+                if is_low(&to) && !is_standard_precompile(&to) {
+                    return Err(Unsupported(format!(
+                        "tx {} calls 0x{}, a precompile the reference does not implement",
+                        tx.hash,
+                        hex::encode(to)
+                    )));
+                }
+                let pba = match cfg.pba_hardening_height {
+                    Some(h) => citrate_consensus::hardening::PbaHardening::at(h),
+                    None => citrate_consensus::hardening::PbaHardening::off(),
+                };
+                let runs = self.accounts.get(&to).is_some_and(|a| a.code.is_some())
+                    || (is_standard_precompile(&to) && pba.active_at(height));
+                if !runs {
+                    // E1: no code, nothing runs, no value moves.
+                    return Ok((tx.gas_limit >= CALL_BASE_GAS)
+                        .then(|| (CALL_BASE_GAS, crate::evm::Success::nothing())));
+                }
+                (
+                    Kind::Call {
+                        to,
+                        data: tx.data.clone(),
+                        value: U256::from(tx.value),
+                    },
+                    CALL_BASE_GAS,
+                )
+            }
+        };
+        if tx.gas_limit < base {
+            return Ok(None);
+        }
+        let out = crate::evm::run(
+            self,
+            env,
+            from,
+            post_fee,
+            kind,
+            tx.gas_limit - base,
+            env.timestamp,
+        )?;
+        Ok(out.and_then(|s| {
+            let total = base.checked_add(s.gas_used)?;
+            (total <= tx.gas_limit).then_some((total, s))
+        }))
+    }
+
     fn settle(
         &mut self,
         cfg: &RefConfig,
         c: &Block,
+        env: &crate::evm::Env<'_>,
         members: &[(&Block, Color)],
         executed: &[&Transaction],
         receipts: &[RefReceipt],
     ) -> Result<(), Unsupported> {
         let height = c.header.height;
-        // R(h): base subsidy, halving; executed-basis bonus for a deployment
-        // (never reached here: deployments carry calldata and are refused).
+        // R(h): base subsidy, halving; executed-basis bonus for a deployment.
         let halvings = height / HALVING_INTERVAL;
         let base = if halvings >= 64 {
             U256::zero()
         } else {
             wei(BLOCK_REWARD_SALT >> halvings)
         };
-        let deployed = cfg.executed_basis_at(height)
-            && executed
+        let bonus = if cfg.executed_basis_at(height) {
+            // Supply hardening: the bonus arms count SUCCESSFUL executed txs,
+            // decay with the halvings and are capped by the base. (AI
+            // inference and model registration are refused upstream.)
+            let deployed = executed
                 .iter()
                 .zip(receipts)
                 .any(|(t, r)| r.status && t.to.is_none());
-        let bonus = if deployed {
-            (wei(MODEL_DEPLOYMENT_BONUS_SALT) >> halvings as usize).min(base)
+            if deployed {
+                (wei(MODEL_DEPLOYMENT_BONUS_SALT) >> halvings as usize).min(base)
+            } else {
+                U256::zero()
+            }
         } else {
-            U256::zero()
+            // The legacy rule, below supply hardening: calldata-based arms
+            // over every executed tx whatever its status, undecayed and
+            // uncapped. 0.01 SALT per tx whose calldata starts with the
+            // inference selector; 1 SALT if any is a deployment or carries
+            // the model-register selector.
+            let inferences = executed
+                .iter()
+                .filter(|t| t.data.starts_with(&LEGACY_INFERENCE_SELECTOR))
+                .count() as u64;
+            let deployed = executed
+                .iter()
+                .any(|t| t.to.is_none() || t.data.starts_with(&LEGACY_MODEL_REGISTER_SELECTOR));
+            let inference = U256::from(LEGACY_INFERENCE_BONUS_CENTI_SALT)
+                * U256::from(inferences)
+                * U256::exp10(16);
+            let model = if deployed {
+                wei(MODEL_DEPLOYMENT_BONUS_SALT)
+            } else {
+                U256::zero()
+            };
+            inference + model
         };
         let total = base + bonus;
         let treasury = total * U256::from(TREASURY_PERCENT) / U256::from(100u64);
@@ -384,12 +571,32 @@ impl State {
             if share.is_zero() {
                 continue;
             }
-            if self.accounts.get(&p.registry).is_some_and(|a| a.has_code) {
-                return Err(Unsupported(
-                    "the §R' registry has code; the reference vests only by value transfer".into(),
-                ));
+            // E6: the vest is a system call into the registry; a failed call
+            // changes nothing (the share burns).
+            let minter = p.reward_minter;
+            let before = self
+                .accounts
+                .get(&minter)
+                .map(|a| a.balance)
+                .unwrap_or_default();
+            let funded = before + share;
+            let vest = crate::evm::run(
+                self,
+                env,
+                minter,
+                funded,
+                crate::evm::Kind::Call {
+                    to: p.registry,
+                    data: crate::evm::credit_reward_calldata(&proposer, share),
+                    value: share,
+                },
+                crate::evm::SYSTEM_CALL_GAS_LIMIT,
+                0,
+            )?;
+            if let Some(success) = vest {
+                self.acct(minter).balance = funded;
+                success.apply(self);
             }
-            self.credit(p.registry, share);
         }
         Ok(())
     }
@@ -420,12 +627,28 @@ pub fn accepted_root(receipts: &[RefReceipt]) -> Hash {
     Hash::new(h.finalize().into())
 }
 
+/// The commitment of one receipt's logs (spec 06 §3.9): SHA3-256 over u64le
+/// count ‖ (address ‖ u32le topic count ‖ topics ‖ u64le data length ‖
+/// data)*.
+pub fn logs_commitment(logs: &[RefLog]) -> [u8; 32] {
+    let mut h = Sha3_256::new();
+    h.update((logs.len() as u64).to_le_bytes());
+    for l in logs {
+        h.update(l.address);
+        h.update((l.topics.len() as u32).to_le_bytes());
+        for t in &l.topics {
+            h.update(t);
+        }
+        h.update((l.data.len() as u64).to_le_bytes());
+        h.update(&l.data);
+    }
+    h.finalize().into()
+}
+
 /// `receipt_root` v3 (spec 06 §3.9): SHA3-256 over "CITRATE-RECEIPTS-V3" ‖
 /// u64le count ‖ (tx_hash ‖ u8 status ‖ u64le cumulative ‖ u64le gas_used ‖
-/// logs_commitment)*. Value transfers emit no logs: the commitment of an
-/// empty log list is SHA3-256(u64le 0).
+/// logs_commitment)*.
 pub fn receipt_root(receipts: &[RefReceipt]) -> Hash {
-    let empty_logs: [u8; 32] = Sha3_256::digest(0u64.to_le_bytes()).into();
     let mut h = Sha3_256::new();
     h.update(b"CITRATE-RECEIPTS-V3");
     h.update((receipts.len() as u64).to_le_bytes());
@@ -436,7 +659,7 @@ pub fn receipt_root(receipts: &[RefReceipt]) -> Hash {
         h.update([u8::from(r.status)]);
         h.update(cumulative.to_le_bytes());
         h.update(r.gas_used.to_le_bytes());
-        h.update(empty_logs);
+        h.update(logs_commitment(&r.logs));
     }
     Hash::new(h.finalize().into())
 }

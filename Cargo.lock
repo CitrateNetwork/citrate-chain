@@ -1503,6 +1503,7 @@ dependencies = [
  "citrate-execution",
  "hex",
  "primitive-types",
+ "revm",
  "serde",
  "serde_json",
  "sha3 0.10.9",

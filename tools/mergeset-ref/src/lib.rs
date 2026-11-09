@@ -16,10 +16,12 @@
 //! Independence: nothing here imports `citrate_consensus::{ghostdag,
 //! ordering}`, `citrate_execution::executor` or the node. The trusted base
 //! is the block/tx types, `tx_auth` (signature and chain id) and the
-//! state-trie hash (`StateDB::calculate_state_root_with`). See `exec` for
+//! state-trie hash (`StateDB::calculate_state_root_with`) and REVM itself
+//! (driven from the reference's own state, `evm`). See `exec` for
 //! exactly which transactions are covered; anything else is reported as
 //! [`Field::Unsupported`], never guessed.
 
+pub mod evm;
 pub mod exec;
 pub mod ghostdag;
 
@@ -257,7 +259,12 @@ pub fn replay(
             return Ok(report);
         }
     }
-    let mut state = exec::State::genesis(&cfg.genesis_alloc);
+    let mut state = exec::State::genesis_of(cfg);
+    // The applied chain's (height, hash) so far: C's BLOCKHASH window.
+    let mut ancestors: Vec<(u64, Hash)> = Vec::new();
+    if let Some(g) = dag.blocks.get(genesis) {
+        ancestors.push((g.header.height, *genesis));
+    }
     for w in chain.windows(2) {
         let (prev, h) = (w[0], w[1]);
         let Some(c) = dag.blocks.get(&h).copied() else {
@@ -312,7 +319,15 @@ pub fn replay(
             .into_iter()
             .map(|(m, col)| (dag.blocks[&m], col))
             .collect();
-        let acc = match state.accept(cfg, c, &members) {
+        let window: HashMap<u64, [u8; 32]> = ancestors
+            .iter()
+            .rev()
+            .take_while(|(ht, _)| *ht + 256 >= height)
+            .filter(|(ht, _)| *ht < height)
+            .map(|(ht, hh)| (*ht, *hh.as_bytes()))
+            .collect();
+        ancestors.push((height, h));
+        let acc = match state.accept_with(cfg, c, &members, &window) {
             Ok(a) => a,
             Err(exec::Unsupported(why)) => {
                 report.divergence =

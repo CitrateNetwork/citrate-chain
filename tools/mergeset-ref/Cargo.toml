@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "Independent reference executor for r1007 mergeset acceptance (S3-3b/S3-3c, spec 06 §3 and §8.3): GHOSTDAG coloring, the consensus order, outcome classes, settlement and the four commitments, computed from block data alone. It never imports citrate_consensus::{ghostdag, ordering}, citrate_execution's executor or the node; it shares only the block and transaction types, transaction authentication and the state-trie hash."
+description = "Independent reference executor for r1007 mergeset acceptance (S3-3b/S3-3c, spec 06 §3 and §8.3): GHOSTDAG coloring, the consensus order, outcome classes, settlement and the four commitments, computed from block data alone. It never imports citrate_consensus::{ghostdag, ordering}, citrate_execution's executor or the node; it shares only the block and transaction types, transaction authentication, the state-trie hash and REVM."
 
 [lib]
 name = "citrate_mergeset_ref"
@@ -16,6 +16,9 @@ path = "src/lib.rs"
 # (citrate_execution::StateDB::calculate_state_root_with).
 citrate-consensus = { path = "../../core/consensus" }
 citrate-execution = { path = "../../core/execution" }
+# The EVM itself (trusted base, spec 06 §8.3), the version the chain pins;
+# `src/evm.rs` drives it from the reference's own state.
+revm = { version = "=10", default-features = false, features = ["std", "serde"] }
 primitive-types = "0.12"
 sha3 = { workspace = true }
 hex = "0.4"
