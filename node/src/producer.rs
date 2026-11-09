@@ -127,12 +127,17 @@ impl TestSimClock {
 
     /// A producer round's reading: simulated now, or one slot after the
     /// previous reading if that is later (then simulated time moves to it).
+    /// The thread's first reading is one slot after now: a test genesis is
+    /// stamped with the real clock just before, so a first round in the same
+    /// real second would read the genesis's own slot and G9 would refuse it
+    /// (seen as "the selected parent ... is in slot 0, not before this slot
+    /// (0)" whenever the fixture ran inside one second).
     fn next_slot_reading(&self, real_ms: u64) -> u64 {
         let slot_ms = citrate_consensus::slots::SLOT_DURATION_SECS.saturating_mul(1_000);
         let mut st = self.state.lock();
         let now = real_ms.saturating_add(st.0);
         let t = if st.1 == 0 {
-            now
+            now.saturating_add(slot_ms)
         } else {
             now.max(st.1.saturating_add(slot_ms))
         };
