@@ -301,8 +301,9 @@ fn policy(n: usize) -> citrate_execution::block_rewards::EpochRewardPolicy {
 enum Boot {
     /// A new data dir: genesis is written.
     Fresh,
-    /// The stopped process's open store and in-memory state.
-    Snapshot(citrate_execution::state::StateSnapshot),
+    /// The stopped process's open store and in-memory state (boxed: a
+    /// snapshot is larger than the other variants).
+    Snapshot(Box<citrate_execution::state::StateSnapshot>),
     /// A store reopened from disk; state is hydrated from it.
     Disk,
 }
@@ -359,7 +360,7 @@ impl Node {
             CHAIN_ID,
         ));
         if let Boot::Snapshot(state) = boot {
-            executor.state_restore(state);
+            executor.state_restore(*state);
         }
         executor.set_validator_activation_height(ACT);
         *executor.reward_policy_handle().write() = Some(policy(n));
@@ -732,7 +733,7 @@ impl Fleet {
             RestartMode::Snapshot => {
                 let boot = old.executor.state_snapshot();
                 let Node { storage, dir, .. } = old;
-                (storage, dir, Boot::Snapshot(boot))
+                (storage, dir, Boot::Snapshot(Box::new(boot)))
             }
             RestartMode::Disk => {
                 let dir = old.stop();

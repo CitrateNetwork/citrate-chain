@@ -21,8 +21,18 @@
 // get it (their geneses have no height for it), and the r1007 genesis entry in
 // `citrate_consensus::hardening::GENESIS_ACTIVATIONS` sets it to 0.
 //
+// ACTIVATION 0 INCLUDES BLOCK 0 (lead decision 2026-11-09): r1007's genesis
+// post-state is rooted under the rule too, so the chain has one root function
+// from its first block. The rule must therefore be published before a genesis
+// is BUILT (node `main.rs`: `publish_mpt_rule_for_genesis_build`), not only
+// before start-up hydrates. An activation above 0 never re-judges genesis.
+//
 // Below the height nothing changes: the legacy root (`Trie::legacy_root_hash`,
 // rebuilt from scratch every block) is reproduced byte for byte.
+//
+// LEGACY TREE. With the rule active from 0 no legacy root is reachable in the
+// process (`legacy_root_reachable`), so storage tries keep no legacy tree (r1007
+// storage copy-on-write, see `crate::state::trie::Trie`).
 //
 // RELEASE DEFAULT
 //
@@ -32,8 +42,8 @@
 //     genesis known yet: unset, and a per-node height is REFUSED.
 //   * Any other genesis (devnets, rehearsals, tests): unset unless
 //     `[chain] mpt_state_root_height` or `CITRATE_MPT_STATE_ROOT_HEIGHT` sets it.
-//     `0` activates it for every block after genesis.
-//   * Genesis (height 0) is never re-judged.
+//     `0` activates it for every block, genesis included.
+//   * An activation above 0 never re-judges genesis.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -62,12 +72,20 @@ pub fn mpt_state_root_height() -> Option<u64> {
 }
 
 /// Whether the rule applies to the post-state of a block at `height` under
-/// `activation` (pure). Genesis is never re-judged; the boundary is inclusive.
+/// `activation` (pure). The boundary is inclusive, so activation 0 covers block 0
+/// (the r1007 genesis rule); an activation above 0 leaves genesis alone.
 pub fn active_at(activation: Option<u64>, height: u64) -> bool {
     match activation {
-        Some(a) => height > 0 && height >= a,
+        Some(a) => height >= a,
         None => false,
     }
+}
+
+/// Whether any legacy state root can still be asked for in this process: false
+/// exactly when the rule is active from block 0. Storage tries then keep no
+/// legacy tree (`crate::state::trie::Trie`).
+pub fn legacy_root_reachable() -> bool {
+    mpt_state_root_height() != Some(0)
 }
 
 /// Whether the rule applies to the post-state of a block at `height` on this

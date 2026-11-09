@@ -80,6 +80,19 @@ impl Default for GenesisConfig {
 /// The genesis profile whose block 0 holds the ceremony's contracts (r1006).
 pub const R1006_PROFILE: &str = "r1006";
 
+/// The block 0 a genesis profile is compiled to produce, if this release pins one
+/// (r1006 today). The genesis-keyed rules a genesis BUILD runs under are resolved
+/// for it (`publish_mpt_rule_for_genesis_build` in main.rs, and the manifest
+/// command); `None` is an unknown genesis (devnets, rehearsals), where the env or
+/// config value decides, as start_node later decides for the block 0 it loads.
+///
+/// The r1007 genesis lane (S3-6) adds its profile here with the ceremony's
+/// block-0 hash, next to its `GENESIS_ACTIVATIONS` entry (`mpt_state_root:
+/// Some(0)`), so the r1007 block 0 is built and re-built under the MPT rule.
+pub fn compiled_genesis_for_profile(profile: Option<&str>) -> Option<[u8; 32]> {
+    (profile == Some(R1006_PROFILE)).then_some(citrate_consensus::hardening::R1006_GENESIS)
+}
+
 /// Rehearsal opt-in: lets a node create or run an r1006 genesis that still has
 /// placeholders (ceremony inputs, producer set, OrangeSeed). Never set on a network node.
 pub const R1006_REHEARSAL_ENV: &str = "CITRATE_R1006_REHEARSAL";

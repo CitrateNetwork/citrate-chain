@@ -429,13 +429,19 @@ fn storage_proof_verifies() {
     );
 }
 
-/// The legacy rule has no proofs: the accessor refuses instead of returning a
-/// proof against a different commitment.
+/// Proofs are against the MPT root, which (activation 0, lead decision
+/// 2026-11-09) covers block 0 too. The refusal under the legacy rule needs a
+/// later activation, so it is checked in `storage_cow_differential.rs`
+/// (`proofs_need_the_mpt_rule_below_a_later_activation`), whose tests serialize
+/// on the process-wide rule.
 #[test]
 fn proofs_need_the_mpt_rule() {
     let db = db();
     db.set_root_height(0);
-    assert!(db.get_proof(&addr(1), &[]).is_err());
+    let p = db
+        .get_proof(&addr(1), &[])
+        .expect("block 0 is under the rule");
+    assert_eq!(p.state_root, db.calculate_state_root());
 }
 
 // ---------------------------------------------------------------------------

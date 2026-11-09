@@ -133,7 +133,7 @@ type Undo = (
 
 fn record_undo(t: &mut Transcript, undo: &Undo) {
     let mut acc = undo.0.clone();
-    acc.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    acc.sort_by_key(|a| a.0 .0);
     let mut sto = undo.1.clone();
     sto.sort_by(|a, b| (a.0 .0, &a.1).cmp(&(b.0 .0, &b.1)));
     t.tag("undo");
@@ -197,14 +197,16 @@ fn record_proof(t: &mut Transcript, db: &StateDB, rng: &mut Rng) {
     }
 }
 
+type Slots = BTreeMap<Vec<u8>, Vec<u8>>;
+
 fn record_state(t: &mut Transcript, snap: &StateSnapshot) {
     t.tag("state");
-    let mut storage: Vec<(Address, BTreeMap<Vec<u8>, Vec<u8>>)> = snap
+    let mut storage: Vec<(Address, Slots)> = snap
         .storage_map()
         .into_iter()
         .map(|(a, m)| (a, m.into_iter().collect()))
         .collect();
-    storage.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    storage.sort_by_key(|a| a.0 .0);
     for (a, m) in storage {
         t.bytes(&a.0);
         for (k, v) in m {
@@ -213,7 +215,7 @@ fn record_state(t: &mut Transcript, snap: &StateSnapshot) {
         }
     }
     let mut accounts = snap.account_entries().to_vec();
-    accounts.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    accounts.sort_by_key(|a| a.0 .0);
     for (a, s) in accounts {
         t.bytes(&a.0);
         t.account(&Some(s));
@@ -439,6 +441,26 @@ fn transcripts_match_the_replaced_implementation() {
             );
         }
     }
+}
+
+/// The legacy rule has no proofs: the accessor refuses instead of returning a
+/// proof against a different commitment (moved from `mpt_state_root.rs`, where
+/// activation 0 now covers every height).
+#[test]
+fn proofs_need_the_mpt_rule_below_a_later_activation() {
+    let _g = RULE.lock().unwrap_or_else(|e| e.into_inner());
+    set_rule(Some(6));
+    let db = StateDB::new();
+    db.accounts.set_balance(addr(5), U256::from(3));
+    db.set_root_height(5);
+    assert!(db.get_proof(&addr(5), &[]).is_err(), "height 5 < 6: legacy");
+    db.set_root_height(0);
+    assert!(
+        db.get_proof(&addr(5), &[]).is_err(),
+        "genesis is not re-judged"
+    );
+    db.set_root_height(6);
+    assert!(db.get_proof(&addr(5), &[]).is_ok(), "from 6: the MPT rule");
 }
 
 #[derive(Debug, Clone)]

@@ -7,6 +7,7 @@ pub mod account;
 pub mod cache;
 pub mod mpt;
 pub mod mpt_state;
+pub mod slot_map;
 pub mod state_db;
 pub mod trie;
 

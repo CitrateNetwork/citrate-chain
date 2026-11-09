@@ -25,6 +25,12 @@
 //! Under the MPT rule (activation 0, the r1007 genesis rule) no legacy tree is
 //! maintained, so none of this may grow with the contract either.
 //!
+//! Debug builds check every incremental state root against the from-scratch
+//! reference (`StateDB::mpt_state_root`), which is O(state) by design. There
+//! the measured window holds the contract's storage root (the incremental
+//! storage MPT) and the account fold runs just outside it; release builds
+//! measure the full state root as well.
+//!
 //! The rule is process-wide; every test in this binary sets the same value.
 
 use citrate_execution::state::mpt::keccak;
@@ -158,8 +164,13 @@ fn contract_db(slots: u32) -> StateDB {
     db
 }
 
-/// One block: snapshot (kept in the ring), write one slot, root it.
-fn block(db: &StateDB, ring: &mut Vec<StateSnapshot>, n: u32, slots: u32) {
+/// Whether the measured window can hold the full state root (see the module
+/// docs: not in debug builds, whose root self-check is O(state)).
+const FULL_ROOT_MEASURED: bool = !cfg!(debug_assertions);
+
+/// One block's state work: snapshot (kept in the ring, the oldest dropped),
+/// write one slot, root the contract's storage (and, in release, the state).
+fn block_write(db: &StateDB, ring: &mut Vec<StateSnapshot>, n: u32, slots: u32) {
     ring.push(db.snapshot());
     if ring.len() > RING {
         ring.remove(0);
@@ -170,9 +181,27 @@ fn block(db: &StateDB, ring: &mut Vec<StateSnapshot>, n: u32, slots: u32) {
         word(u64::from(n) + 1_000_000),
     );
     db.set_root_height(u64::from(n) + 2);
-    let _ = db.calculate_state_root();
+    let _ = db.get_storage_root_recomputed(&addr(CONTRACT));
+    if FULL_ROOT_MEASURED {
+        block_root(db);
+    }
+}
+
+/// The rest of a block: the state root (in debug builds only at the end of a
+/// run, see `per_block_cost`, to keep the O(state) self-check off every block),
+/// then nothing dirty.
+fn block_root(db: &StateDB) {
+    if FULL_ROOT_MEASURED {
+        let _ = db.calculate_state_root();
+    }
     db.accounts.clear_dirty();
     let _ = db.take_dirty_storage();
+}
+
+/// One block, unmeasured.
+fn block(db: &StateDB, ring: &mut Vec<StateSnapshot>, n: u32, slots: u32) {
+    block_write(db, ring, n, slots);
+    block_root(db);
 }
 
 /// The largest per-block cost over `RING * 2` blocks (the ring full of
@@ -190,7 +219,8 @@ fn per_block_cost(slots: u32) -> Cost {
         frees: 0,
     };
     for n in RING as u32..(RING as u32 * 2) {
-        let ((), c) = measure(|| block(&db, &mut ring, n, slots));
+        let ((), c) = measure(|| block_write(&db, &mut ring, n, slots));
+        block_root(&db);
         worst.bytes = worst.bytes.max(c.bytes);
         worst.allocs = worst.allocs.max(c.allocs);
         worst.frees = worst.frees.max(c.frees);
@@ -245,6 +275,32 @@ fn rooted(snap: StateSnapshot, height: u64) -> StateSnapshot {
     scratch.snapshot()
 }
 
+/// `rooted`, measured: the full root inside the window in release builds, the
+/// contract's storage root inside and the account fold outside in debug.
+fn rooted_measured(above: &StateSnapshot, undo: &Undo, height: u64) -> (StateSnapshot, Cost) {
+    let ((scratch, snap), c) = measure(|| {
+        let scratch = StateDB::new();
+        scratch.restore(above.with_pre_images(&undo.0, &undo.1, height));
+        scratch.set_root_height(height);
+        let _ = scratch.get_storage_root_recomputed(&addr(CONTRACT));
+        let snap = FULL_ROOT_MEASURED.then(|| {
+            block_root(&scratch);
+            scratch.snapshot()
+        });
+        (scratch, snap)
+    });
+    let snap = snap.unwrap_or_else(|| {
+        block_root(&scratch);
+        scratch.snapshot()
+    });
+    (snap, c)
+}
+
+type Undo = (
+    Vec<citrate_execution::state::state_db::AccountPreImage>,
+    Vec<citrate_execution::state::state_db::StoragePreImage>,
+);
+
 /// The undo record of a one-slot block and the rebuild of the state below it
 /// (the boot reorg-window rebuild, per height) are bounded too.
 #[test]
@@ -259,9 +315,9 @@ fn undo_record_and_rebuild_of_a_one_slot_block_are_bounded() {
         let mut ring2 = vec![prev.clone()];
         block(&db, &mut ring2, 99, slots);
         let cur = rooted(db.snapshot(), 101);
-        let ((acc, sto), undo) = measure(|| cur.pre_images_since(&prev));
-        assert_eq!(sto.len(), 1, "one slot changed");
-        let (below, rebuild) = measure(|| rooted(cur.with_pre_images(&acc, &sto, 100), 100));
+        let (record, undo) = measure(|| cur.pre_images_since(&prev));
+        assert_eq!(record.1.len(), 1, "one slot changed");
+        let (below, rebuild) = rooted_measured(&cur, &record, 100);
         // The rebuilt state is the state before the block.
         let check = StateDB::new();
         check.restore(below);

@@ -23,7 +23,10 @@ pub struct StateDB {
     /// another reference to each trie instead of a deep copy, and a write after
     /// a snapshot copies only the one trie it touches (`Arc::make_mut`). The
     /// reorg ring keeps 100 snapshots, so this is what keeps its cost
-    /// proportional to what changed rather than 100x the contract state.
+    /// proportional to what changed rather than 100x the contract state. The
+    /// copy itself is O(1) in the contract's slots (the slot set is a
+    /// persistent map, `crate::state::slot_map`), and the write copies one
+    /// O(log n) path: see [`write_trie`].
     storage_tries: Arc<DashMap<Address, Arc<Trie>>>,
 
     /// Contract code storage
@@ -264,8 +267,11 @@ impl StateDB {
     /// Set storage value
     pub fn set_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
         self.dirty_storage.insert((address, key.clone()));
-        let mut trie = self.storage_tries.entry(address).or_default();
-        Arc::make_mut(trie.value_mut()).insert(key, value);
+        let mut trie = self
+            .storage_tries
+            .entry(address)
+            .or_insert_with(|| Arc::new(Trie::for_current_rule()));
+        write_trie(trie.value_mut()).insert(key, value);
         drop(trie);
         self.accounts.mark_root_touched(address);
     }
@@ -276,8 +282,11 @@ impl StateDB {
     /// it would create a no-op flush at next commit. Used by the REVM
     /// Database adapter to hydrate cold-cache misses for view calls.
     pub fn cache_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
-        let mut trie = self.storage_tries.entry(address).or_default();
-        Arc::make_mut(trie.value_mut()).insert(key, value);
+        let mut trie = self
+            .storage_tries
+            .entry(address)
+            .or_insert_with(|| Arc::new(Trie::for_current_rule()));
+        write_trie(trie.value_mut()).insert(key, value);
         drop(trie);
         // Not dirty (the store has it), but the root must still see it.
         self.accounts.mark_root_touched(address);
@@ -287,7 +296,7 @@ impl StateDB {
     pub fn delete_storage(&self, address: Address, key: &[u8]) {
         self.dirty_storage.insert((address, key.to_vec()));
         if let Some(mut trie) = self.storage_tries.get_mut(&address) {
-            Arc::make_mut(trie.value_mut()).remove(key);
+            write_trie(trie.value_mut()).remove(key);
         }
         self.accounts.mark_root_touched(address);
     }
@@ -941,7 +950,7 @@ impl StateDB {
                 let nslots = match self.storage_tries.get(&address) {
                     Some(t) => {
                         account.storage_root = Self::storage_root_of(&t, rule);
-                        t.entries_map().len()
+                        t.len()
                     }
                     None => 0,
                 };
@@ -1152,24 +1161,20 @@ impl StateSnapshot {
             if old.is_some_and(|o| Arc::ptr_eq(o, trie)) {
                 continue;
             }
-            let now = trie.entries_map();
-            let was = old.map(|o| o.entries_map()).unwrap_or_default();
-            for (key, value) in &now {
-                if was.get(key) != Some(value) {
-                    storage.push((**addr, key.clone(), was.get(key).cloned()));
-                }
-            }
-            for (key, value) in &was {
-                if !now.contains_key(key) {
-                    storage.push((**addr, key.clone(), Some(value.clone())));
-                }
+            // Only the slots that differ are visited: the two versions share
+            // every other node of the slot map.
+            match old {
+                Some(o) => o.diff_slots(trie, |key, was, _now| {
+                    storage.push((**addr, key.to_vec(), was.map(<[u8]>::to_vec)));
+                }),
+                None => trie.for_each_slot(|key, _| storage.push((**addr, key.to_vec(), None))),
             }
         }
         for (addr, trie) in &before_tries {
             if !after_tries.contains_key(addr) {
-                for (key, value) in trie.entries_map() {
-                    storage.push((**addr, key, Some(value)));
-                }
+                trie.for_each_slot(|key, value| {
+                    storage.push((**addr, key.to_vec(), Some(value.to_vec())));
+                });
             }
         }
         (accounts, storage)
@@ -1229,17 +1234,19 @@ impl StateSnapshot {
         root_touched.extend(accounts.iter().map(|(a, _)| *a));
         root_touched.extend(storage.iter().map(|(a, _, _)| *a));
         for (addr, key, value) in storage {
-            let trie = tries.entry(*addr).or_insert_with(|| Arc::new(Trie::new()));
+            let trie = tries
+                .entry(*addr)
+                .or_insert_with(|| Arc::new(Trie::for_current_rule()));
             match value {
-                Some(v) => Arc::make_mut(trie).insert(key.clone(), v.clone()),
+                Some(v) => write_trie(trie).insert(key.clone(), v.clone()),
                 None => {
-                    Arc::make_mut(trie).remove(key);
+                    write_trie(trie).remove(key);
                     shrunk.insert(*addr);
                 }
             }
         }
         for addr in shrunk {
-            if tries.get(&addr).is_some_and(|t| t.entries_map().is_empty()) {
+            if tries.get(&addr).is_some_and(|t| t.is_empty()) {
                 tries.remove(&addr);
             }
         }
@@ -1269,6 +1276,18 @@ impl StateSnapshot {
             .map(|(addr, trie)| (*addr, trie.entries_map()))
             .collect()
     }
+}
+
+/// A storage trie made writable: copied if a snapshot shares it (O(1) in its
+/// slots, see `Trie`'s `Clone`), and without its legacy tree once no legacy
+/// root is reachable in this process (`crate::mpt_state_root::legacy_root_reachable`:
+/// the MPT rule from genesis), so no old-format tree is maintained under it.
+fn write_trie(trie: &mut Arc<Trie>) -> &mut Trie {
+    let t = Arc::make_mut(trie);
+    if t.has_legacy_tree() && !crate::mpt_state_root::legacy_root_reachable() {
+        t.drop_legacy();
+    }
+    t
 }
 
 /// The entries of `before` that differ in `after` (by encoding), with their
