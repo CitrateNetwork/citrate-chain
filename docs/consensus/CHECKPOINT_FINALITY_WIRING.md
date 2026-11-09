@@ -128,6 +128,12 @@ randomness bound to block `H` (reuse the proposer-election beacon; the seed MUST
 `H` so every honest node derives the identical committee). Selection is already deterministic
 and stake-weighted with exact integer-sqrt weighting.
 
+> **Superseded for r1007 (2026-11-09).** The seed is `committee_epoch_seed(genesis, epoch)`,
+> not the block's beacon (a per-block seed gives siblings different committees, §6 "S1 across
+> sibling committees"); `committee_size` is the constant `CHECKPOINT_COMMITTEE_SIZE`; the
+> input set is the governing epoch snapshot or, below S(1), the genesis validator set
+> (epoch 0). Normative: planset spec 06 §7.
+
 ### 4.2 Propose
 On accepting the canonical block at a boundary height `H`, every node calls
 `CheckpointManager::propose(H, block_hash_at_H, committee)`. `propose` creates the pending
@@ -583,22 +589,21 @@ message).
   `CheckpointFinalitySafety_strict.cfg` must pass (`FinalizedNeverReverted`,
   `FinalizedStaysCanonical`), `CheckpointFinalitySafety_pollonly.cfg` (the poll-only design)
   must still produce the counterexample.
-- **Open finding (S1 across sibling committees; review of #333 @ 0286eff):** the committee for
-  `(H, block)` is drawn by `FinalityGadget::committee_for` from the governing snapshot with the
-  CANDIDATE block's own VRF output as seed. Once the validator set is larger than
-  `committee_size`, two siblings at `H` get different committees, and the quorum bound
-  (`floor(2n/3)+1` of ONE committee) no longer forces two quorums to share an honest signer.
-  Under a partition along the fork, each committee can finalize its own sibling with no
-  equivocation and no Byzantine key. Tests: `open_finding_sibling_committees_finalize_conflicting_blocks`
-  (passes: pins the counterexample — 8 validators, committees of 4 overlapping in at most one
-  member, both siblings finalize) and `s1_sibling_committees_never_finalize_conflicting_blocks`
-  (ignored, "bug: …"). TLA+: committees are now modelled per candidate (`comm`, `CommitteeSize`);
-  `CheckpointFinalitySafety_committees.cfg` (5 voters, f = 1, committees of 4) must produce the
-  violation. The gating configs keep `CommitteeSize` = all voters, i.e. they verify S1 only
-  for a committee shared by every candidate. Decision for the owner (protocol change, before
-  voting is enabled): make the committee independent of the candidate (e.g. seed it from a
-  block every candidate at `H` shares, or use the whole snapshot set while it is small), or
-  require the quorum over a fixed set.
+- **S1 across sibling committees (review of #333 @ 0286eff): resolved 2026-11-09 (lead
+  decision 2, r1007/s3-finality-fixes).** The committee was drawn with the CANDIDATE block's
+  own VRF output as seed, so once the validator set was larger than `committee_size` two
+  siblings at `H` got different committees and each could finalize its own sibling under a
+  partition, with no equivocation. `FinalityGadget::committee_for(H)` now draws from the
+  validator set governing `H` with `committee_epoch_seed(genesis, epoch)`: one committee for
+  every candidate at `H`. `committee_size` is the consensus constant
+  `CHECKPOINT_COMMITTEE_SIZE` (100), no longer per-node config. Tests:
+  `s1_sibling_committees_never_finalize_conflicting_blocks` (no longer ignored) and
+  `sibling_candidates_at_one_height_share_one_committee` (converted from the pinning test
+  `open_finding_sibling_committees_finalize_conflicting_blocks`). TLA+:
+  `CheckpointFinalitySafety_committees.cfg` still models per-candidate committees and must
+  still produce the violation (it documents the pre-fix rule); the gating configs, with one
+  committee shared by every candidate, are the model of the fixed protocol. Normative text:
+  planset spec 06 §7.
 - **TLA+:** `specs/tla/consensus/CheckpointFinalitySafety.tla` models S1/S2 across nodes
   (actions Propose, SignVote, Finalize, VerifyFloor, Reorg, Restart). TLC runs in CI
   (`.github/workflows/tla-finality.yml` → `scripts/ci/tla_finality.sh`, TLC 1.7.1 sha256-pinned):
