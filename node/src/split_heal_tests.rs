@@ -1907,6 +1907,36 @@ mod tests {
         .await;
     }
 
+    /// r1007 G9 (#184), OPEN: a producer that already holds another
+    /// producer's block of the current slot must still seal its own block for
+    /// this slot, on the best blocks of earlier slots, and leave the same-slot
+    /// block for the next slot to merge. Today it skips the slot ("the
+    /// selected parent is in slot s, not before this slot"), because fork
+    /// choice selects the same-slot block and the round may only seal on the
+    /// applied tip (MP-S1). So whichever producer's block arrives first takes
+    /// the slot from every producer that has not sealed yet: a producer whose
+    /// clock runs ahead, or that seals early within the drift, wins slots
+    /// alone. The fix has to choose parents from earlier slots and seal on
+    /// their state, which crosses MP-S1, the drain and fork choice; it is
+    /// left to a reviewed change. `Fleet::slot` seals every producer of a
+    /// slot before delivering, the honest synchronized-clock case.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "open (#184): a same-slot block received before the round makes the producer skip its slot"]
+    async fn a_producer_seals_its_slot_after_receiving_a_same_slot_block() {
+        let mut fleet = Fleet::new(2).await;
+        for _ in 0..6 {
+            fleet.slot(&[0, 1]).await;
+        }
+        // Slot 7: producer 0 seals and its block reaches producer 1 first.
+        let produced = fleet.slot(&[0]).await;
+        assert_eq!(produced.len(), 1, "producer 0 sealed slot 7");
+        let r = fleet.nodes[1].producer.produce_block().await;
+        assert!(
+            r.is_ok(),
+            "producer 1 must still seal slot 7 (on slot 6's blocks): {r:?}"
+        );
+    }
+
     /// See `apply_cost_per_block_stays_within_budget`.
     const APPLY_GROWTH_MAX: f64 = 3.0;
     /// See `apply_cost_per_block_stays_within_budget`.
