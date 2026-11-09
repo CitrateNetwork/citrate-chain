@@ -31,9 +31,10 @@
 //      or a chain that steps over it): see CONFLICTING FINALITY below;
 //   4. epoch-pinned committee: derived HERE, exactly as the producer path derives
 //      it (`finality_floor::CertificateCommittees`, i.e.
-//      `FinalityGadget::committee_for`): the validator snapshot governing the
-//      height, plus the VRF beacon in this node's own copy of the certified
-//      block's header. The message carries no committee;
+//      `FinalityGadget::committee_for`): a function of the height's epoch
+//      snapshot (or the genesis set), the same for every block at that height;
+//      the binding comes from this node's own copy of the certified block. The
+//      message carries no committee;
 //   5. quorum + signatures: `CheckpointManager::verify_synced_certificate` —
 //      boundary height, committee >= 4, floor(2n/3)+1 distinct members, every
 //      ed25519 signature valid for this chain id over (height, hash);
@@ -51,8 +52,8 @@
 //
 // CONFLICTING FINALITY (owner Q1 on #332; same semantics as a stored-certificate
 // mismatch in #323). A sibling certificate is checked further only if this
-// node holds the sibling's header (it needs the header's VRF beacon to derive
-// the committee):
+// node holds the sibling block (its binding — state root, accepted root — is
+// read from this node's own copy):
 //
 //   * it VERIFIES against the committee derived here -> a quorum of this node's
 //     own committee finalized a block this node is not on: mismatch safety stop
@@ -480,8 +481,8 @@ impl CertificateSync {
                 return SyncOutcome::Unverifiable { height, reason }
             }
         };
-        // 4. committee, derived here: governing epoch snapshot + this node's
-        // copy of the certified block's VRF beacon.
+        // 4. committee, derived here from the height's epoch; the binding from
+        // this node's copy of the certified block.
         let (committee, expected) = match self.floor.committees().derive(height, block_hash).await {
             Ok(c) => c,
             Err(why) => {
@@ -1228,11 +1229,7 @@ mod tests {
         n.solicit("peer-a", now).await;
         // Meanwhile this node finalizes height 2 itself (here: an install).
         let mgr = n.gadget.manager();
-        let committee = n
-            .gadget
-            .committee_for(2, &a2.header.vrf_reveal.output)
-            .await
-            .expect("committee");
+        let committee = n.gadget.committee_for(2).await.expect("committee");
         let sigs: Vec<(PublicKey, Signature)> = signed(&[0, 1, 2], 2, h)
             .into_iter()
             .map(|s| (s.voter, s.signature))
@@ -1447,11 +1444,7 @@ mod tests {
         // A: a node with a finalized checkpoint at 2 (signed by 3 of 4).
         let (probe, (_a1, a2, _b2, _b3)) = node(FloorMode::Enforced).await;
         let h = a2.header.block_hash;
-        let committee = probe
-            .gadget
-            .committee_for(2, &a2.header.vrf_reveal.output)
-            .await
-            .expect("committee");
+        let committee = probe.gadget.committee_for(2).await.expect("committee");
         drop(probe);
         let a_cert = Checkpoint {
             height: 2,

@@ -8,9 +8,10 @@
 // certificate is used for anything this module:
 //
 //   1. re-verifies the stored certificate against the committee THIS node
-//      derives for its (height, hash) — the governing epoch snapshot + the VRF
-//      beacon of its own copy of the certified block (`CertificateCommittees`),
-//      never the committee recorded in the certificate
+//      derives for its height — the governing epoch snapshot (or the genesis
+//      set) and the epoch seed, the same for every block at that height
+//      (`CertificateCommittees`); the binding comes from this node's own copy
+//      of the certified block. Never the committee recorded in the certificate
 //      (`Checkpoint::verify_certificate_against`: finalized, recorded committee
 //      == derived committee, committee >= 4, quorum reached, every voter a
 //      member, every signature valid for this chain). A certificate whose
@@ -239,7 +240,7 @@ impl HaltReason {
 pub enum CommitteeUnavailable {
     /// No validator snapshot governing the height is held here.
     NoSnapshot,
-    /// The certified block's header (its VRF beacon) is not usable here.
+    /// The certified block's header or body is not usable here.
     Header(String),
 }
 
@@ -254,9 +255,9 @@ impl std::fmt::Display for CommitteeUnavailable {
 
 /// Derives, on THIS node, the committee a certificate for `(height, hash)`
 /// must carry, exactly as the producer path derives it
-/// (`FinalityGadget::committee_for`): the validator snapshot governing the
-/// height, plus the VRF beacon in this node's own copy of the certified
-/// block's header. Never the committee recorded in a certificate.
+/// (`FinalityGadget::committee_for`): a function of the height's epoch
+/// snapshot, identical for every block at that height. Never the committee
+/// recorded in a certificate.
 ///
 /// Data sources: the gadget's epoch snapshot history (filled by
 /// `registry_sync`, rehydrated at boot before the floor verifier's boot check)
@@ -279,8 +280,11 @@ impl CertificateCommittees {
         height: u64,
         block_hash: Hash,
     ) -> Result<(Committee, VoteBinding), CommitteeUnavailable> {
-        let seed = match self.storage.blocks.get_header(&block_hash) {
-            Ok(Some(h)) if h.height == height => h.vrf_reveal.output,
+        // The committee is a function of the height's epoch, not of the block;
+        // the block (this node's own copy) supplies the binding, and must be
+        // the block at `height`.
+        match self.storage.blocks.get_header(&block_hash) {
+            Ok(Some(h)) if h.height == height => {}
             Ok(Some(h)) => {
                 return Err(CommitteeUnavailable::Header(format!(
                     "stored header {} is at height {}",
@@ -293,10 +297,10 @@ impl CertificateCommittees {
                 )))
             }
             Err(e) => return Err(CommitteeUnavailable::Header(e.to_string())),
-        };
+        }
         let committee = self
             .gadget
-            .committee_for(height, &seed)
+            .committee_for(height)
             .await
             .ok_or(CommitteeUnavailable::NoSnapshot)?;
         // The binding is read from the same chain store as the header: this
@@ -1662,7 +1666,7 @@ mod tests {
         assert!(r.gadget.halted());
         let out = r
             .gadget
-            .on_buried_checkpoint(4, Hash::new([4; 32]), &Hash::new([1; 32]), None)
+            .on_buried_checkpoint(4, Hash::new([4; 32]), None)
             .await;
         assert_eq!(out.skipped, Some(SkipReason::Halted));
         assert_eq!(load(&r.floor), 0, "mismatch: floor not raised");
@@ -1816,7 +1820,7 @@ mod tests {
     /// A4 at the unit level (review of #332 @ 354908b): a stored certificate
     /// that is internally consistent — four outsider keys, every signature
     /// valid, quorum reached — but whose committee is not the one this node
-    /// derives for the height (epoch snapshot + the block's VRF beacon) halts
+    /// derives for the height (its epoch's set and seed) halts
     /// at boot as an invalid certificate; the floor is not raised from it.
     #[tokio::test]
     async fn stored_certificate_with_a_foreign_committee_halts_at_boot() {

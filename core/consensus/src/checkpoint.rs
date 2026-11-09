@@ -560,8 +560,8 @@ impl Checkpoint {
 
 impl Checkpoint {
     /// [`Self::verify_certificate`] against `committee`, a committee the CALLER
-    /// derived for this height (epoch validator snapshot + the certified block's
-    /// VRF beacon; `FinalityGadget::committee_for`) — never the one recorded in
+    /// derived for this height (its epoch's validator set and seed, the same for
+    /// every block at the height; `FinalityGadget::committee_for`) — never the one recorded in
     /// the certificate — and against `expected`, the binding the caller derived
     /// from its own copy of the certified block. The recorded committee must be
     /// exactly that committee (same members, same stakes, no duplicates), the
@@ -667,6 +667,31 @@ pub fn integer_sqrt_u128(n: u128) -> u128 {
 
 /// Deterministic, stake-weighted committee selection for checkpoint voting.
 pub struct CommitteeSelector;
+
+/// Domain of [`committee_epoch_seed`].
+pub const COMMITTEE_EPOCH_SEED_DOMAIN: &[u8] = b"CITRATE-COMMITTEE-EPOCH-V1";
+
+/// The committee seed for every checkpoint of epoch `epoch` (the snapshot
+/// height S(E) its validator set was read at; 0 for the genesis set) on the
+/// chain whose block 0 is `genesis_hash` (spec 06 §7, lead decision 2):
+/// `SHA-256(COMMITTEE_EPOCH_SEED_DOMAIN ‖ genesis_hash ‖ epoch as u64 LE)`.
+///
+/// A function of the epoch only, so every candidate block at a checkpoint
+/// height draws the SAME committee: two disjoint honest committees can no
+/// longer each finalize a different sibling. Binding the genesis keeps
+/// r1006 and r1007 (same chain id) on different draws. The seed is public in
+/// advance; while the eligible set fits the committee
+/// (the committee size) the committee is the whole set and the seed
+/// only orders it, so it cannot be biased. A set larger than the committee
+/// needs an unbiasable per-epoch beacon first (spec 06 §12.2 R8).
+pub fn committee_epoch_seed(genesis_hash: &Hash, epoch: u64) -> Hash {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(COMMITTEE_EPOCH_SEED_DOMAIN);
+    hasher.update(genesis_hash.as_bytes());
+    hasher.update(epoch.to_le_bytes());
+    Hash::new(hasher.finalize().into())
+}
 
 /// Domain of the per-seat draw in [`CommitteeSelector::select_weighted`].
 const COMMITTEE_SEAT_DOMAIN: &[u8] = b"CITRATE-COMMITTEE-SEAT-V1";
@@ -1084,8 +1109,8 @@ impl CheckpointManager {
 
     /// Stage 1b (spec §11.10): verify a finalized checkpoint certificate
     /// received from a peer against `committee` — the committee THIS node
-    /// derived for `height` from the epoch validator snapshot governing it and
-    /// the checkpoint block's own VRF beacon (`FinalityGadget::committee_for`).
+    /// derived for `height` from the validator set governing it and that
+    /// epoch's seed (`FinalityGadget::committee_for`), whatever the block.
     /// No committee is ever taken from the peer.
     ///
     /// Accepts exactly what [`Checkpoint::verify_certificate`] accepts for a

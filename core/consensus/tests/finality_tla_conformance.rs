@@ -476,7 +476,6 @@ async fn walk(seed: u64, steps: usize) -> (usize, usize) {
     // Votes in flight (sent, not yet delivered everywhere): (vote, receivers left).
     let mut inflight: Vec<(CheckpointVote, Vec<usize>)> = Vec::new();
     let mut refusals = 0usize;
-    let seed_hash = Hash::new([9; 32]);
 
     for step in 0..steps {
         let n = rng.below(HONEST);
@@ -488,10 +487,7 @@ async fn walk(seed: u64, steps: usize) -> (usize, usize) {
             label = format!("Propose(n{n}, {h})");
             let node = nodes.get(n).expect("node");
             let x = *node.canon.get(&h).expect("canon");
-            let _ = node
-                .gadget
-                .on_buried_checkpoint(h, block(h, x), &seed_hash, None)
-                .await;
+            let _ = node.gadget.on_buried_checkpoint(h, block(h, x), None).await;
         } else if action < 40 {
             // SignVote(n, h): report again with the signer. Rust signs iff the
             // node has the pending checkpoint for its canonical block, has not
@@ -508,7 +504,7 @@ async fn walk(seed: u64, steps: usize) -> (usize, usize) {
                 .await;
             let out = node
                 .gadget
-                .on_buried_checkpoint(h, block(h, x), &seed_hash, Some(&node.key))
+                .on_buried_checkpoint(h, block(h, x), Some(&node.key))
                 .await;
             let model_guard = !shadow.sent.contains(&(n, h, 1 - x));
             if out.signed_own_vote {

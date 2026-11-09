@@ -159,9 +159,7 @@ async fn finality_votes_from_genesis() {
 
     // Height 2 is the first checkpoint boundary (interval 2) and S(1) = 1
     // governs it: the gadget proposes and signs there, at the first chance.
-    let out = g
-        .on_buried_checkpoint(2, block_hash(2), &Hash::new([9; 32]), ks.first())
-        .await;
+    let out = g.on_buried_checkpoint(2, block_hash(2), ks.first()).await;
     assert!(out.proposed, "the first boundary is proposed: {out:?}");
     assert!(out.signed_own_vote, "and voted on: {out:?}");
 }
@@ -244,9 +242,7 @@ async fn vote_binds_genesis_epoch_state_root_and_accepted_root() {
     let block4 = dag.get_block(&block_hash(4)).await.expect("block 4");
     let mgr = Arc::new(CheckpointManager::with_persistence(config(), dag, kv));
     let g = FinalityGadget::new(mgr.clone(), Some(selector(set).await));
-    let out = g
-        .on_buried_checkpoint(4, block_hash(4), &Hash::new([9; 32]), ks.first())
-        .await;
+    let out = g.on_buried_checkpoint(4, block_hash(4), ks.first()).await;
     let own = out.outbound.first().expect("own vote");
     assert_eq!(own.binding.state_root, state_root_at(4));
     assert_eq!(own.binding.epoch, 1, "S(1) governs height 4");
@@ -698,17 +694,13 @@ async fn production_schedule_first_votable_checkpoint_is_850() {
     ));
     let g = FinalityGadget::new(mgr, Some(Arc::new(sel)));
     assert!(g.enabled());
-    let seed = Hash::new([7; 32]);
     for h in (SPEC_CHECKPOINT_INTERVAL..=EPOCH - SNAPSHOT_LAG).step_by(50) {
         assert!(
-            g.committee_for(h, &seed).await.is_none(),
+            g.committee_for(h).await.is_none(),
             "checkpoint {h}: no snapshot governs it, so no committee"
         );
     }
-    let first = g
-        .committee_for(850, &seed)
-        .await
-        .expect("S(1) = 800 governs 850");
+    let first = g.committee_for(850).await.expect("S(1) = 800 governs 850");
     assert_eq!(first.epoch, 800);
     assert_eq!(first.members.len(), 4);
 }

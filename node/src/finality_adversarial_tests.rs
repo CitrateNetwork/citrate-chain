@@ -45,9 +45,9 @@ use std::sync::Arc;
 
 use citrate_api::finalized_tag::FinalizedAnchor;
 use citrate_consensus::checkpoint::{
-    derived_quorum, empty_accepted_root, sign_checkpoint_vote, Checkpoint, CheckpointConfig,
-    CheckpointError, CheckpointManager, CheckpointStatus, CheckpointVote, Committee,
-    CommitteeSelector, VoteBinding,
+    committee_epoch_seed, derived_quorum, empty_accepted_root, sign_checkpoint_vote, Checkpoint,
+    CheckpointConfig, CheckpointError, CheckpointManager, CheckpointStatus, CheckpointVote,
+    Committee, CommitteeSelector, VoteBinding,
 };
 use citrate_consensus::checkpoint_gadget::{
     finalize_retry_delay, FinalityGadget, InboundOutcome, SkipReason, FINALIZE_RETRY_BASE,
@@ -407,7 +407,7 @@ impl TestNode {
             storage
                 .blocks
                 .get_header(h)
-                .map(|o| o.map(|hd| (hd.height, hd.selected_parent_hash, hd.vrf_reveal.output)))
+                .map(|o| o.map(|hd| (hd.height, hd.selected_parent_hash)))
                 .map_err(|e| e.to_string())
         };
         let out = run_pass(
@@ -2903,13 +2903,14 @@ async fn s2_unconfirmed_becomes_mismatch_when_another_block_is_applied() {
 // ---------------------------------------------------------------------------
 
 /// A7 / S4: with 10 validators and committee size 4, every node derives the
-/// identical committee from (governing snapshot, H, the checkpoint block's
-/// committed VRF output); a validator outside that committee — e.g. one that
-/// would be selected under a different (ground) seed — cannot vote; stake
-/// registered after the snapshot does not move the committee for heights that
-/// snapshot governs.
+/// identical committee from (governing snapshot, H, the epoch seed
+/// `committee_epoch_seed(genesis, S(E))`), whatever the checkpoint block (lead
+/// decision 2); a validator outside that committee — e.g. one that would be
+/// selected under a different (ground) seed — cannot vote; stake registered
+/// after the snapshot does not move the committee for heights that snapshot
+/// governs.
 #[tokio::test]
-async fn a7_committee_is_fixed_by_snapshot_height_and_block_seed() {
+async fn a7_committee_is_fixed_by_snapshot_and_height() {
     let chains = Chains::new();
     let keys: Vec<Ed25519SigningKey> = (0..10).map(key).collect();
     let mut vals = Validators::equal_stake(&keys);
@@ -2927,11 +2928,11 @@ async fn a7_committee_is_fixed_by_snapshot_height_and_block_seed() {
         net.drive(i).await;
     }
     let h = 4u64;
-    let seed = at(&a, h).header.vrf_reveal.output;
+    let seed = committee_epoch_seed(&Hash::default(), 1);
     let expected = CommitteeSelector::select(&vals.set, h, &seed, 4);
     assert_eq!(expected.len(), 4);
     for (i, n) in net.nodes.iter().enumerate() {
-        let c = n.gadget.committee_for(h, &seed).await.expect("committee");
+        let c = n.gadget.committee_for(h).await.expect("committee");
         assert_eq!(c.pubkeys(), expected, "node {i} derives the same committee");
         assert!(
             !c.contains(&pk(&attacker)),
@@ -3002,11 +3003,16 @@ async fn a7_committee_is_fixed_by_snapshot_height_and_block_seed() {
         assert_eq!(cp.committee, expected, "node {i}");
     }
     // Heights governed by S(2) do see the new set (deterministically).
-    let late = net.node(0).gadget.committee_for(22, &seed).await;
+    let late = net.node(0).gadget.committee_for(22).await;
     let grown_set = vals.later.first().expect("S(2)").1.clone();
     assert_eq!(
         late.map(|c| c.pubkeys()),
-        Some(CommitteeSelector::select(&grown_set, 22, &seed, 4))
+        Some(CommitteeSelector::select(
+            &grown_set,
+            22,
+            &committee_epoch_seed(&Hash::default(), 21),
+            4
+        ))
     );
 }
 
@@ -3208,7 +3214,7 @@ async fn a8_old_committee_cannot_refinalize_a_competing_history() {
         }
         let out = n
             .gadget
-            .on_buried_checkpoint(4, hash_at(&b, 4), &Hash::new([1; 32]), Some(&n.key))
+            .on_buried_checkpoint(4, hash_at(&b, 4), Some(&n.key))
             .await;
         assert_eq!(out.skipped, Some(SkipReason::AlreadyFinalized));
         assert!(out.outbound.is_empty());

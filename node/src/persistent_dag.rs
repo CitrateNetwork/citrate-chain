@@ -170,13 +170,10 @@ mod tests {
             .map(|i| Ed25519SigningKey::from_bytes(&[i; 32]))
             .collect();
         let me = keys.first().expect("validator key");
-        let seed = hash(0x77);
         {
             let (g, db) = boot(dir.path(), &keys).await;
             let syncs_before = db.write_batch_sync_count();
-            let out = g
-                .on_buried_checkpoint(10, hash(0xA0), &seed, Some(me))
-                .await;
+            let out = g.on_buried_checkpoint(10, hash(0xA0), Some(me)).await;
             assert!(out.signed_own_vote);
             assert!(
                 db.write_batch_sync_count() > syncs_before,
@@ -186,9 +183,7 @@ mod tests {
         // Restart: the DB is closed and reopened; the canonical block at 10 is B.
         let (g, _db) = boot(dir.path(), &keys).await;
         assert_eq!(g.signed_vote_at(10), Some(hash(0xA0)));
-        let out = g
-            .on_buried_checkpoint(10, hash(0xB0), &seed, Some(me))
-            .await;
+        let out = g.on_buried_checkpoint(10, hash(0xB0), Some(me)).await;
         assert!(!out.signed_own_vote && out.outbound.is_empty());
         assert_eq!(
             out.sign_refused,

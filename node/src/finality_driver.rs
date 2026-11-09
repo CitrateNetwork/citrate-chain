@@ -8,7 +8,7 @@
 // its selected-parent chain down through the block store
 // (`StorageManager.blocks.get_header`), and for every checkpoint boundary height
 // H that is now buried at least `vote_depth` blocks below the tip (§3: never vote
-// at the tip) hands `(H, hash_at_H, header.vrf_reveal.output)` to the gadget,
+// at the tip) hands `(H, hash_at_H)` to the gadget,
 // which proposes, signs (if this node is a committee member) and replays early
 // votes. The resulting votes are broadcast as `NetworkMessage::CheckpointVote`.
 //
@@ -333,17 +333,17 @@ pub fn node_finality_gadget(
     )
 }
 
-/// A canonical checkpoint block buried at least `vote_depth` deep.
+/// A canonical checkpoint block buried at least `vote_depth` deep. Its committee
+/// is a function of its height's epoch snapshot, not of the block
+/// (`FinalityGadget::committee_for`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuriedCheckpoint {
     pub height: u64,
     pub hash: Hash,
-    /// The block's ECVRF beacon (`header.vrf_reveal.output`): the committee seed.
-    pub seed: Hash,
 }
 
-/// The header fields the walk needs: (height, selected parent, VRF output).
-pub type HeaderView = (u64, Hash, Hash);
+/// The header fields the walk needs: (height, selected parent).
+pub type HeaderView = (u64, Hash);
 
 /// The highest boundary height buried at least `depth` blocks below `tip_height`
 /// (i.e. `<= tip_height - depth`), or `None` if there is none yet. `depth` is
@@ -402,14 +402,13 @@ where
     let mut steps_left = tip_height.saturating_sub(lowest).saturating_add(1);
     while steps_left > 0 {
         steps_left = steps_left.saturating_sub(1);
-        let Some((height, parent, seed)) = lookup(&cursor)? else {
+        let Some((height, parent)) = lookup(&cursor)? else {
             return Err(format!("canonical walk: header {cursor} missing"));
         };
         if want.contains(&height) {
             found.push(BuriedCheckpoint {
                 height,
                 hash: cursor,
-                seed,
             });
         }
         if height <= lowest || height == 0 {
@@ -472,7 +471,7 @@ pub fn spawn(
             storage
                 .blocks
                 .get_header(h)
-                .map(|o| o.map(|hd| (hd.height, hd.selected_parent_hash, hd.vrf_reveal.output)))
+                .map(|o| o.map(|hd| (hd.height, hd.selected_parent_hash)))
                 .map_err(|e| e.to_string())
         };
         loop {
@@ -651,7 +650,7 @@ async fn report(
     retries: &mut OwnVoteRetries,
 ) -> Followup {
     let out = gadget
-        .on_buried_checkpoint(cp.height, cp.hash, &cp.seed, signer)
+        .on_buried_checkpoint(cp.height, cp.hash, signer)
         .await;
     if let Some(reason) = &out.skipped {
         debug!("checkpoint {}: not proposed ({:?})", cp.height, reason);
@@ -786,10 +785,9 @@ mod tests {
                 Arc::new(DagStore::new()),
             ))
         };
-        let seed = h(7);
         let no_registry = node_finality_gadget(mgr(), None, Some(&r1006)).expect("gadget");
         let c = no_registry
-            .committee_for(50, &seed)
+            .committee_for(50)
             .await
             .expect("epoch-0 committee without a registry");
         assert_eq!((c.epoch, c.len()), (0, 7));
@@ -801,13 +799,13 @@ mod tests {
             node_finality_gadget(mgr(), Some(registry), Some(&r1006)).expect("gadget");
         for h in [50u64, 800] {
             let c = with_registry
-                .committee_for(h, &seed)
+                .committee_for(h)
                 .await
                 .expect("epoch-0 committee below S(1)");
             assert_eq!((c.epoch, c.len()), (0, 7), "height {h}");
         }
         let other = node_finality_gadget(mgr(), None, Some(&[0x42; 32])).expect("gadget");
-        assert_eq!(other.committee_for(50, &seed).await, None);
+        assert_eq!(other.committee_for(50).await, None);
     }
 
     #[test]
@@ -843,12 +841,9 @@ mod tests {
         let mut headers: HashMap<Hash, HeaderView> = HashMap::new();
         for n in 0u8..=12 {
             let parent = if n == 0 { Hash::default() } else { h(n) };
-            headers.insert(
-                h(n.saturating_add(1)),
-                (u64::from(n), parent, h(n.saturating_add(100))),
-            );
+            headers.insert(h(n.saturating_add(1)), (u64::from(n), parent));
         }
-        headers.insert(h(200), (6, h(6), h(201))); // orphan sibling at height 6
+        headers.insert(h(200), (6, h(6))); // orphan sibling at height 6
         let found = canonical_at_heights(h(13), 12, &[6, 8], |x| Ok(headers.get(x).copied()))
             .expect("walk");
         assert_eq!(
@@ -857,12 +852,10 @@ mod tests {
                 BuriedCheckpoint {
                     height: 6,
                     hash: h(7),
-                    seed: h(106)
                 },
                 BuriedCheckpoint {
                     height: 8,
                     hash: h(9),
-                    seed: h(108)
                 },
             ]
         );
@@ -871,9 +864,9 @@ mod tests {
     #[test]
     fn walk_errors_on_missing_header_and_skips_stepped_over_heights() {
         let headers: HashMap<Hash, HeaderView> = HashMap::from([
-            (h(10), (10, h(7), h(1))),
-            (h(7), (7, h(5), h(2))), // selected parent jumps from 10 to 7
-            (h(5), (5, h(4), h(3))),
+            (h(10), (10, h(7))),
+            (h(7), (7, h(5))), // selected parent jumps from 10 to 7
+            (h(5), (5, h(4))),
         ]);
         let found = canonical_at_heights(h(10), 10, &[8, 6], |x| Ok(headers.get(x).copied()))
             .expect("walk");
@@ -1081,7 +1074,7 @@ mod tests {
                     .parent(parent)
                     .build_unhashed();
                 let hash = b.hash();
-                headers.insert(hash, (u64::from(i), parent, Hash::new([7; 32])));
+                headers.insert(hash, (u64::from(i), parent));
                 hashes.push(hash);
                 parent = hash;
                 dag.store_block(b).await.expect("store test block");
@@ -1309,9 +1302,7 @@ mod tests {
             {
                 // Earlier run: signed (4, a4).
                 let g = gadget_over(dag.clone(), &storage, &ks).await;
-                let out = g
-                    .on_buried_checkpoint(4, a4, &Hash::new([7; 32]), Some(me))
-                    .await;
+                let out = g.on_buried_checkpoint(4, a4, Some(me)).await;
                 assert!(out.signed_own_vote);
             }
             // Restart on branch B, halted before boundary 4 is reported.
@@ -1331,12 +1322,7 @@ mod tests {
             assert_eq!(retries.len(), 0, "a permanent refusal is not revisited");
             // Direct confirmation of the refusal reason.
             let again = g
-                .on_buried_checkpoint(
-                    4,
-                    b.get(4).copied().expect("b4"),
-                    &Hash::new([7; 32]),
-                    Some(me),
-                )
+                .on_buried_checkpoint(4, b.get(4).copied().expect("b4"), Some(me))
                 .await;
             assert_eq!(
                 again.sign_refused,

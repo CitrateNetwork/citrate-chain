@@ -190,7 +190,7 @@ async fn bury(
     let node = nodes.get(idx).expect("node index");
     let out = node
         .gadget
-        .on_buried_checkpoint(height, hash_at(height), &seed_at(height), Some(&node.key))
+        .on_buried_checkpoint(height, hash_at(height), Some(&node.key))
         .await;
     for v in out.outbound {
         queue.push_back((idx, v));
@@ -358,7 +358,7 @@ async fn switch_off_network_does_nothing() {
     for (i, node) in nodes.iter().enumerate() {
         let out = node
             .gadget
-            .on_buried_checkpoint(10, hash_at(10), &seed_at(10), Some(&node.key))
+            .on_buried_checkpoint(10, hash_at(10), Some(&node.key))
             .await;
         assert_eq!(out.skipped, Some(SkipReason::Disabled), "node {i}");
         assert!(out.outbound.is_empty());
@@ -397,10 +397,7 @@ async fn devnet_chain_id_is_bound_into_votes() {
     // A foreign-chain vote for a pending checkpoint on the devnet is rejected.
     let foreign_net = network(4, 1337, true).await;
     let n0 = foreign_net.first().expect("node 0");
-    let _ = n0
-        .gadget
-        .on_buried_checkpoint(12, hash_at(12), &seed_at(12), None)
-        .await;
+    let _ = n0.gadget.on_buried_checkpoint(12, hash_at(12), None).await;
     let k1 = foreign_net.get(1).expect("node 1");
     let foreign = sign_checkpoint_vote(
         CHAIN,
@@ -524,9 +521,7 @@ async fn restart_after_shorter_branch_reorg_never_double_signs() {
     {
         let g = boot(&kv, &keys, h).await;
         g.observe_tip(h.saturating_add(3)).await;
-        let out = g
-            .on_buried_checkpoint(h, hash_at(h), &seed_at(h), Some(me))
-            .await;
+        let out = g.on_buried_checkpoint(h, hash_at(h), Some(me)).await;
         assert!(out.signed_own_vote, "signed A at H");
         emitted.extend(out.outbound);
         assert_eq!(g.signed_vote_at(h), Some(hash_at(h)), "durable before emit");
@@ -539,9 +534,7 @@ async fn restart_after_shorter_branch_reorg_never_double_signs() {
     let g = boot(&kv, &keys, h).await;
     assert_eq!(g.manager().pending_hash(h).await, None, "fresh process");
     g.observe_tip(h.saturating_add(3)).await;
-    let out = g
-        .on_buried_checkpoint(h, fork_hash_at(h), &seed_at(h), Some(me))
-        .await;
+    let out = g.on_buried_checkpoint(h, fork_hash_at(h), Some(me)).await;
     assert!(out.proposed, "B is proposed for aggregation (not a vote)");
     assert!(!out.signed_own_vote, "MUST NOT sign B");
     assert_eq!(
@@ -553,9 +546,7 @@ async fn restart_after_shorter_branch_reorg_never_double_signs() {
     // A third process re-buries A: idempotent, same hash only.
     drop(g);
     let g = boot(&kv, &keys, h).await;
-    let out = g
-        .on_buried_checkpoint(h, hash_at(h), &seed_at(h), Some(me))
-        .await;
+    let out = g.on_buried_checkpoint(h, hash_at(h), Some(me)).await;
     assert!(out.signed_own_vote, "re-signing the same hash is allowed");
     emitted.extend(out.outbound);
 

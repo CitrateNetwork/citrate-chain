@@ -10,8 +10,9 @@
 // be exercised by in-process multi-node tests. The node supplies only two inputs:
 //
 //   * the canonical block at a boundary height H once it is buried `vote_depth`
-//     blocks deep, plus that block's VRF beacon (`header.vrf_reveal.output`) —
-//     see `node/src/finality_driver.rs`;
+//     blocks deep — see `node/src/finality_driver.rs`. The committee for H is
+//     a function of H's epoch snapshot and H only, never of the block
+//     ([`FinalityGadget::committee_for`]);
 //   * the node's consensus signing key (`proposer.key`, spec D-4).
 //
 // SWITCH. r1007 (ADR CV-8): voting is on from genesis in this build
@@ -68,8 +69,8 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint::{
-    sign_checkpoint_vote, verify_vote_signature, CheckpointError, CheckpointManager,
-    CheckpointVote, Committee, CommitteeSelector, ProposeOutcome,
+    committee_epoch_seed, sign_checkpoint_vote, verify_vote_signature, CheckpointError,
+    CheckpointManager, CheckpointVote, Committee, CommitteeSelector, ProposeOutcome,
 };
 use crate::crypto::Ed25519SigningKey;
 use crate::dag_store::{cf, KvOp, KvStore};
@@ -823,24 +824,28 @@ impl FinalityGadget {
         &self.manager
     }
 
-    /// §4.1 / §11.6: the committee for the checkpoint at `height` whose block
-    /// carries VRF beacon `seed`.
+    /// §4.1 / §11.6: the committee for the checkpoint at `height`, the same for
+    /// every candidate block at that height (lead decision 2, 2026-11-09).
     ///
-    /// Validator set: the epoch snapshot that GOVERNS `height` (the greatest
-    /// S(E) < height), from the selector's per-epoch history — never the live
-    /// tip set — so two nodes on either side of an epoch boundary derive the
-    /// identical committee. Seed: the ECVRF output committed in the header of the
-    /// checkpoint block itself (the same beacon proposer election and
-    /// `prevrandao` use), fixed by `(height, block_hash)`. Members carry their
-    /// stake (the quorum counts it, #185), and the committee its epoch (the
-    /// snapshot height S(E), bound into every vote). `None` when no snapshot
-    /// governs `height` on this node.
-    pub async fn committee_for(&self, height: u64, seed: &Hash) -> Option<Committee> {
+    /// Validator set: [`Self::committee_input`] — the epoch snapshot that
+    /// GOVERNS `height` (the greatest S(E) < height) from the selector's
+    /// per-epoch history, never the live tip set, so two nodes on either side
+    /// of an epoch boundary derive the identical committee; or, where no
+    /// snapshot governs, the genesis validator set (epoch 0). Seed:
+    /// [`committee_epoch_seed`]`(genesis, epoch)`, a function of the epoch
+    /// only. The candidate block is deliberately NOT an input: when its VRF
+    /// beacon seeded the draw, sibling blocks at one height drew different
+    /// committees and two disjoint honest quorums could finalize both (S1).
+    /// The height still rotates seats within the epoch. Members carry their
+    /// stake (the quorum counts it, #185), and the committee its epoch (bound
+    /// into every vote). `None` when no validator set governs `height` here.
+    pub async fn committee_for(&self, height: u64) -> Option<Committee> {
         let (snapshot, set) = self.committee_input(height).await?;
+        let seed = committee_epoch_seed(&self.manager.config().genesis_hash, snapshot);
         let members = CommitteeSelector::select_weighted(
             &set,
             height,
-            seed,
+            &seed,
             self.manager.config().committee_size,
         );
         if members.is_empty() {
@@ -869,7 +874,6 @@ impl FinalityGadget {
         &self,
         height: u64,
         block_hash: Hash,
-        seed: &Hash,
         signer: Option<&Ed25519SigningKey>,
     ) -> BuriedOutcome {
         let mut out = BuriedOutcome::default();
@@ -881,7 +885,7 @@ impl FinalityGadget {
             out.skipped = Some(SkipReason::Halted);
             return out;
         }
-        let Some(committee) = self.committee_for(height, seed).await else {
+        let Some(committee) = self.committee_for(height).await else {
             out.skipped = Some(SkipReason::NoCommittee);
             return out;
         };
@@ -1192,10 +1196,10 @@ impl FinalityGadget {
         if let Err(e) = verify_vote_signature(&vote, cfg.chain_id, &cfg.genesis_hash) {
             return InboundOutcome::Rejected(e);
         }
-        // Authenticate the voter against the epoch validator snapshot that
-        // governs `height` (the same set `committee_for` selects from). Exact
-        // committee membership needs the block's VRF seed and is checked on
-        // replay; set membership is what keeps outsiders out of the buffer.
+        // Authenticate the voter against the validator set that governs
+        // `height` (the same set `committee_for` selects from). Exact committee
+        // membership is checked on replay against the proposed checkpoint's
+        // committee; set membership is what keeps outsiders out of the buffer.
         // `None` = the snapshot is not on this node yet => unverified quota.
         if self.committee_source.is_none() && self.genesis_committee.is_none() {
             // No committee can ever be derived here; nothing to buffer for.
@@ -1833,9 +1837,7 @@ mod tests {
     async fn switch_off_is_a_no_op() {
         let ks = keys(4);
         let g = gadget(&ks, false).await;
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([9; 32]), ks.first())
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), ks.first()).await;
         assert_eq!(out.skipped, Some(SkipReason::Disabled));
         assert!(!out.proposed && !out.signed_own_vote && out.outbound.is_empty());
         assert_eq!(g.manager().pending_hash(10).await, None);
@@ -1883,8 +1885,8 @@ mod tests {
             true,
         );
         let seed = Hash::new([0x42; 32]);
-        let ca = ga.committee_for(12, &seed).await.expect("A committee @12");
-        let cb = gb.committee_for(12, &seed).await.expect("B committee @12");
+        let ca = ga.committee_for(12).await.expect("A committee @12");
+        let cb = gb.committee_for(12).await.expect("B committee @12");
         assert_eq!(
             ca, cb,
             "same epoch-1 committee on both sides of the boundary"
@@ -1899,57 +1901,61 @@ mod tests {
         let live = CommitteeSelector::select(&set(&epoch2), 12, &seed, 5);
         assert_ne!(ca.pubkeys(), live, "must not use the live tip set");
         // Epoch-2 checkpoint: A can derive it, B (not yet materialized) cannot.
-        assert!(ga.committee_for(20, &seed).await.is_some());
-        assert!(gb.committee_for(20, &seed).await.is_none());
-        // Same inputs => same committee. The candidate block's beacon is NOT
-        // an input (lead decision 2): a sibling with another beacon at the
-        // same height gets the same committee.
-        assert_eq!(ga.committee_for(12, &seed).await, Some(ca.clone()));
-        assert_eq!(
-            ga.committee_for(12, &Hash::new([0x43; 32])).await,
-            Some(ca),
-            "the candidate's beacon is not an input"
-        );
+        assert!(ga.committee_for(20).await.is_some());
+        assert!(gb.committee_for(20).await.is_none());
+        // Same inputs => same committee; no candidate block is an input.
+        assert_eq!(ga.committee_for(12).await, Some(ca));
     }
 
     /// S1 across siblings (lead decision 2, 2026-11-09): with more validators
     /// than seats, every candidate block at one height gets ONE committee, a
-    /// function of the governing epoch snapshot and the height only. Before,
-    /// each candidate's own VRF beacon seeded the draw, so siblings drew
-    /// different committees and two disjoint honest quorums could finalize
-    /// both. Heights still rotate the committee.
+    /// function of the governing epoch snapshot and the height only: exactly
+    /// the stake-weighted draw over that snapshot's set seeded by
+    /// `committee_epoch_seed(genesis, epoch)`. Before, each candidate's own VRF
+    /// beacon seeded the draw, so siblings drew different committees and two
+    /// disjoint honest quorums could finalize both (the node-level split is
+    /// `sibling_candidates_at_one_height_share_one_committee`). Heights still
+    /// rotate the committee, and the seed binds the genesis and the epoch.
     #[tokio::test]
     async fn committee_is_independent_of_the_candidate_block() {
         let ks: Vec<SigningKey> = (0u8..12).map(key).collect();
         let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 999);
         let set: Vec<(PublicKey, u128)> = ks.iter().map(|k| (pk(k), 1000u128)).collect();
-        sel.sync_active_set_at(1, set, 1).await;
+        sel.sync_active_set_at(1, set.clone(), 1).await;
         let mut cfg = config();
         cfg.committee_size = 5;
         let g = FinalityGadget::with_switch(
-            Arc::new(CheckpointManager::new(cfg, dag_with(4).await)),
+            Arc::new(CheckpointManager::new(cfg.clone(), dag_with(4).await)),
             Some(Arc::new(sel)),
             true,
         );
-        let at = |b: u8| Hash::new([b; 32]);
-        let first = g.committee_for(12, &at(1)).await.expect("committee @12");
+        let first = g.committee_for(12).await.expect("committee @12");
         assert_eq!(first.len(), 5);
-        for b in 2u8..=64 {
-            assert_eq!(
-                g.committee_for(12, &at(b)).await.as_ref(),
-                Some(&first),
-                "sibling beacon {b}"
-            );
-        }
+        assert_eq!(first.epoch, 1);
+        let seed = committee_epoch_seed(&cfg.genesis_hash, 1);
+        let mut sorted = set.clone();
+        sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        assert_eq!(
+            first.members,
+            CommitteeSelector::select_weighted(&sorted, 12, &seed, 5),
+            "the epoch-seeded draw for height 12"
+        );
         let mut differs = false;
         for h in (14u64..=200).step_by(2) {
-            let c = g.committee_for(h, &at(1)).await.expect("committee");
+            let c = g.committee_for(h).await.expect("committee");
+            assert_eq!(c.epoch, 1);
             if c.members != first.members {
                 differs = true;
                 break;
             }
         }
         assert!(differs, "the height still rotates the committee");
+        assert_ne!(
+            seed,
+            committee_epoch_seed(&Hash::new([1; 32]), 1),
+            "genesis"
+        );
+        assert_ne!(seed, committee_epoch_seed(&cfg.genesis_hash, 2), "epoch");
     }
 
     /// Below-min-stake members are not committee candidates.
@@ -1965,10 +1971,7 @@ mod tests {
         sel.sync_active_set_at(1, entries, 500).await;
         let mgr = Arc::new(CheckpointManager::new(config(), dag_with(4).await));
         let g = FinalityGadget::with_switch(mgr, Some(Arc::new(sel)), true);
-        let c = g
-            .committee_for(10, &Hash::new([1; 32]))
-            .await
-            .expect("committee");
+        let c = g.committee_for(10).await.expect("committee");
         assert_eq!(c.len(), 4);
         let k0 = ks.first().expect("key 0");
         assert!(!c.contains(&pk(k0)));
@@ -2002,10 +2005,7 @@ mod tests {
         .with_genesis_committee(set(&genesis));
         let genesis_pks: Vec<PublicKey> = genesis.iter().map(pk).collect();
         for h in [50u64, 400, 800] {
-            let c = g
-                .committee_for(h, &Hash::new([7; 32]))
-                .await
-                .expect("epoch-0 committee");
+            let c = g.committee_for(h).await.expect("epoch-0 committee");
             assert_eq!(c.epoch, GENESIS_COMMITTEE_EPOCH, "height {h}");
             let mut got = c.pubkeys();
             got.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -2013,17 +2013,14 @@ mod tests {
             want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             assert_eq!(got, want, "height {h}: the genesis set");
         }
-        let c = g
-            .committee_for(850, &Hash::new([7; 32]))
-            .await
-            .expect("S(1) committee");
+        let c = g.committee_for(850).await.expect("S(1) committee");
         assert_eq!(c.epoch, 800);
         assert!(c.pubkeys().iter().all(|m| !genesis_pks.contains(m)));
 
         // The first checkpoint is proposed and this validator's vote signed.
         let first = genesis.first().expect("genesis key");
         let out = g
-            .on_buried_checkpoint(50, block_hash(50), &Hash::new([7; 32]), Some(first))
+            .on_buried_checkpoint(50, block_hash(50), Some(first))
             .await;
         assert!(out.proposed, "{out:?}");
         assert!(out.signed_own_vote, "{out:?}");
@@ -2038,13 +2035,10 @@ mod tests {
         let set: Vec<(PublicKey, u128)> = genesis.iter().map(|k| (pk(k), 1000u128)).collect();
         let mgr = Arc::new(CheckpointManager::new(config(), dag_with(4).await));
         let bare = FinalityGadget::with_switch(mgr.clone(), None, true);
-        assert_eq!(bare.committee_for(2, &Hash::new([7; 32])).await, None);
+        assert_eq!(bare.committee_for(2).await, None);
         let g = FinalityGadget::with_switch(mgr, None, true).with_genesis_committee(set);
         for h in [2u64, 850, 1_000_000] {
-            let c = g
-                .committee_for(h, &Hash::new([7; 32]))
-                .await
-                .expect("genesis committee");
+            let c = g.committee_for(h).await.expect("genesis committee");
             assert_eq!(c.epoch, GENESIS_COMMITTEE_EPOCH);
             assert_eq!(c.len(), 4, "height {h}");
         }
@@ -2056,12 +2050,7 @@ mod tests {
         }
         let mgr = Arc::new(CheckpointManager::new(config(), dag_with(4).await));
         let g = FinalityGadget::with_switch(mgr, None, true).with_genesis_committee(messy);
-        assert_eq!(
-            g.committee_for(2, &Hash::new([7; 32]))
-                .await
-                .map(|c| c.len()),
-            Some(4)
-        );
+        assert_eq!(g.committee_for(2).await.map(|c| c.len()), Some(4));
     }
 
     /// Vote construction binds chain_id, height and block_hash.
@@ -2108,12 +2097,11 @@ mod tests {
         for n in 1u8..=4 {
             let ks = keys(n);
             let g = gadget(&ks, true).await;
-            let seed = Hash::new([7; 32]);
-            let committee = g.committee_for(10, &seed).await.expect("committee");
+            let committee = g.committee_for(10).await.expect("committee");
             assert_eq!(committee.len(), usize::from(n));
             let first = ks.first().expect("first key");
             let out = g
-                .on_buried_checkpoint(10, block_hash(10), &seed, Some(first))
+                .on_buried_checkpoint(10, block_hash(10), Some(first))
                 .await;
             assert!(out.proposed && out.signed_own_vote);
             let mut finalized = out.finalized;
@@ -2148,21 +2136,14 @@ mod tests {
     async fn propose_is_idempotent_and_never_double_signs() {
         let ks = keys(5);
         let g = gadget(&ks, true).await;
-        let seed = Hash::new([1; 32]);
         let k0 = ks.first().expect("key 0");
-        let first = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-            .await;
+        let first = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert!(first.proposed);
-        let again = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-            .await;
+        let again = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert_eq!(again.skipped, Some(SkipReason::AlreadyPending));
         assert!(again.outbound.is_empty());
         // A different hash at the same height (deep reorg): no re-propose, no vote.
-        let other = g
-            .on_buried_checkpoint(10, block_hash(11), &seed, Some(k0))
-            .await;
+        let other = g.on_buried_checkpoint(10, block_hash(11), Some(k0)).await;
         assert_eq!(
             other.skipped,
             Some(SkipReason::Conflicting {
@@ -2179,7 +2160,7 @@ mod tests {
         let g = gadget(&ks, true).await;
         let outsider = key(200);
         let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([3; 32]), Some(&outsider))
+            .on_buried_checkpoint(10, block_hash(10), Some(&outsider))
             .await;
         assert!(out.proposed);
         assert!(!out.signed_own_vote);
@@ -2222,9 +2203,7 @@ mod tests {
         assert_eq!(g.early_vote_count().await, 3);
 
         // Propose WITHOUT a signer: the three buffered votes alone reach quorum 3.
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([4; 32]), None)
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), None).await;
         assert!(out.proposed);
         assert_eq!(out.outbound.len(), 3, "each replayed vote relayed once");
         assert!(out.finalized);
@@ -2238,9 +2217,7 @@ mod tests {
     async fn relay_happens_once_per_vote() {
         let ks = keys(7);
         let g = gadget(&ks, true).await;
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([5; 32]), None)
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), None).await;
         assert!(out.proposed);
         let k2 = ks.get(2).expect("key 2");
         let v = sign_checkpoint_vote(CHAIN, &Hash::default(), 10, block_hash(10), &tb(10), k2);
@@ -2414,9 +2391,7 @@ mod tests {
                 .await;
             assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
         }
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([4; 32]), None)
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), None).await;
         assert!(out.proposed && out.finalized);
         assert_eq!(g.manager().latest_finalized_height().await, 10);
     }
@@ -2461,9 +2436,7 @@ mod tests {
                 .await;
             assert!(matches!(res, InboundOutcome::Buffered), "got {res:?}");
         }
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([4; 32]), None)
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), None).await;
         assert!(out.finalized);
     }
 
@@ -2704,9 +2677,7 @@ mod tests {
         g.observe_tip(991).await;
         assert_eq!(g.unverified_early_vote_count().await, 0);
         assert_eq!(g.early_vote_count().await, 3, "0 outsiders, 3 validators");
-        let out = g
-            .on_buried_checkpoint(h, target, &Hash::new([4; 32]), None)
-            .await;
+        let out = g.on_buried_checkpoint(h, target, None).await;
         assert!(out.proposed && out.finalized, "{out:?}");
         assert_eq!(g.manager().latest_finalized_height().await, h);
     }
@@ -2849,9 +2820,7 @@ mod tests {
         let k0 = ks.first().expect("key 0");
         for h in (10u64..=240).step_by(2) {
             let hash = Hash::new([u8::try_from(h).expect("h < 256").saturating_add(1); 32]);
-            let out = g
-                .on_buried_checkpoint(h, hash, &Hash::new([2; 32]), Some(k0))
-                .await;
+            let out = g.on_buried_checkpoint(h, hash, Some(k0)).await;
             assert!(out.proposed, "h={h}");
         }
         assert!(g.manager().pending_len().await <= MAX_PENDING_CHECKPOINTS);
@@ -2860,10 +2829,9 @@ mod tests {
         // Now a healthy committee finalizes height 30 => everything <= 30 pruned.
         let ks4 = keys(4);
         let g4 = gadget(&ks4, true).await;
-        let seed = Hash::new([6; 32]);
         for h in [26u64, 28, 30] {
             let _ = g4
-                .on_buried_checkpoint(h, block_hash(u8::try_from(h).expect("small")), &seed, None)
+                .on_buried_checkpoint(h, block_hash(u8::try_from(h).expect("small")), None)
                 .await;
         }
         let k1 = ks4.get(1).expect("key 1");
@@ -2911,9 +2879,7 @@ mod tests {
         let kv = Arc::new(MemKv::failing());
         let g = gadget_over(&ks, true, kv.clone(), 40).await;
         let k0 = ks.first().expect("key 0");
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([1; 32]), Some(k0))
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert!(out.proposed, "aggregation still proceeds");
         assert!(!out.signed_own_vote);
         assert!(out.outbound.is_empty(), "nothing to broadcast");
@@ -2936,16 +2902,11 @@ mod tests {
         let kv = Arc::new(MemKv::failing());
         let g = gadget_over(&ks, true, kv.clone(), 40).await;
         let k0 = ks.first().expect("key 0");
-        let seed = Hash::new([1; 32]);
-        let first = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-            .await;
+        let first = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert!(first.proposed && !first.signed_own_vote && first.outbound.is_empty());
         assert!(first.own_vote_retryable, "{:?}", first.sign_refused);
         // Still failing: the repeat report retries, is refused again, stays retryable.
-        let second = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-            .await;
+        let second = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert_eq!(second.skipped, Some(SkipReason::AlreadyPending));
         assert!(matches!(
             second.sign_refused,
@@ -2955,9 +2916,7 @@ mod tests {
         assert_eq!(g.signed_vote_at(10), None);
         // Storage recovers: the next report casts the vote (durably first).
         kv.fail_writes.store(false, Ordering::SeqCst);
-        let third = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-            .await;
+        let third = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert_eq!(third.skipped, Some(SkipReason::AlreadyPending));
         assert!(third.signed_own_vote, "{:?}", third.sign_refused);
         assert!(!third.own_vote_retryable);
@@ -2965,9 +2924,7 @@ mod tests {
         assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
         assert_eq!(g.manager().pending_vote_count(10).await, Some(1));
         // The vote is in: further reports are a plain no-op.
-        let fourth = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-            .await;
+        let fourth = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert_eq!(fourth.skipped, Some(SkipReason::AlreadyPending));
         assert!(!fourth.signed_own_vote && fourth.outbound.is_empty());
         assert!(fourth.sign_refused.is_none() && !fourth.own_vote_retryable);
@@ -2981,27 +2938,20 @@ mod tests {
         let ks = keys(4);
         let kv = Arc::new(MemKv::default());
         let k0 = ks.first().expect("key 0");
-        let seed = Hash::new([1; 32]);
         {
             let g = gadget_over(&ks, true, kv.clone(), 40).await;
-            let out = g
-                .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-                .await;
+            let out = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
             assert!(out.signed_own_vote);
         }
         let g = gadget_over(&ks, true, kv, 40).await;
         let expected = Some(SignRefusal::Conflicting {
             signed: block_hash(10),
         });
-        let first = g
-            .on_buried_checkpoint(10, block_hash(11), &seed, Some(k0))
-            .await;
+        let first = g.on_buried_checkpoint(10, block_hash(11), Some(k0)).await;
         assert!(first.proposed && !first.signed_own_vote);
         assert_eq!(first.sign_refused, expected);
         assert!(!first.own_vote_retryable);
-        let again = g
-            .on_buried_checkpoint(10, block_hash(11), &seed, Some(k0))
-            .await;
+        let again = g.on_buried_checkpoint(10, block_hash(11), Some(k0)).await;
         assert_eq!(again.skipped, Some(SkipReason::AlreadyPending));
         assert_eq!(again.sign_refused, expected);
         assert!(!again.signed_own_vote && again.outbound.is_empty() && !again.own_vote_retryable);
@@ -3015,9 +2965,7 @@ mod tests {
         let ks = keys(4);
         let mgr = Arc::new(CheckpointManager::new(config(), dag_with(40).await));
         let g = FinalityGadget::with_switch(mgr, Some(selector_with(&ks).await), true);
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([1; 32]), ks.first())
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), ks.first()).await;
         assert!(out.proposed && !out.signed_own_vote && out.outbound.is_empty());
         assert_eq!(out.sign_refused, Some(SignRefusal::NoDurableStore));
     }
@@ -3030,12 +2978,9 @@ mod tests {
         let ks = keys(5);
         let kv = Arc::new(MemKv::default());
         let k0 = ks.first().expect("key 0");
-        let seed = Hash::new([1; 32]);
         let first = {
             let g = gadget_over(&ks, true, kv.clone(), 40).await;
-            let out = g
-                .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-                .await;
+            let out = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
             assert!(out.signed_own_vote);
             assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
             assert_eq!(
@@ -3049,9 +2994,7 @@ mod tests {
         };
         // "Restart" #1, canonical block at 10 is now a different hash.
         let g = gadget_over(&ks, true, kv.clone(), 40).await;
-        let out = g
-            .on_buried_checkpoint(10, block_hash(11), &seed, Some(k0))
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(11), Some(k0)).await;
         assert!(out.proposed, "fresh manager proposes the new hash");
         assert!(!out.signed_own_vote && out.outbound.is_empty());
         assert_eq!(
@@ -3063,9 +3006,7 @@ mod tests {
         assert_eq!(g.signed_vote_at(10), Some(block_hash(10)), "unchanged");
         // "Restart" #2, back on the original hash: the identical vote again.
         let g = gadget_over(&ks, true, kv, 40).await;
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, Some(k0))
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), Some(k0)).await;
         assert!(out.signed_own_vote);
         let again = out.outbound.first().expect("own vote again");
         assert_eq!(
@@ -3124,16 +3065,10 @@ mod tests {
         let ks = keys(4);
         let kv = Arc::new(MemKv::default());
         let g = gadget_over(&ks, true, kv.clone(), 40).await;
-        let seed = Hash::new([6; 32]);
         let k0 = ks.first().expect("key 0");
         for h in [10u64, 12, 14] {
             let out = g
-                .on_buried_checkpoint(
-                    h,
-                    block_hash(u8::try_from(h).expect("small")),
-                    &seed,
-                    Some(k0),
-                )
+                .on_buried_checkpoint(h, block_hash(u8::try_from(h).expect("small")), Some(k0))
                 .await;
             assert!(out.signed_own_vote, "h={h}");
         }
@@ -3169,9 +3104,7 @@ mod tests {
         let kv = Arc::new(MemKv::default());
         let g = gadget_over(&ks, false, kv.clone(), 40).await;
         let before = kv.batches.load(Ordering::SeqCst);
-        let _ = g
-            .on_buried_checkpoint(10, block_hash(10), &Hash::new([1; 32]), ks.first())
-            .await;
+        let _ = g.on_buried_checkpoint(10, block_hash(10), ks.first()).await;
         g.prune().await;
         assert_eq!(kv.batches.load(Ordering::SeqCst), before);
         assert_eq!(kv.keys_with_prefix(SIGNED_VOTE_KEY_PREFIX), 0);
@@ -3218,10 +3151,7 @@ mod tests {
         g.safety_stop().engage().await;
         assert!(g.halted());
         let before = kv.batches.load(Ordering::SeqCst);
-        let seed = Hash::new([1; 32]);
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), ks.first()).await;
         assert_eq!(out.skipped, Some(SkipReason::Halted));
         assert!(!out.proposed && !out.signed_own_vote && out.outbound.is_empty());
         assert_eq!(g.manager().pending_hash(10).await, None, "nothing proposed");
@@ -3229,9 +3159,7 @@ mod tests {
         assert_eq!(kv.batches.load(Ordering::SeqCst), before, "nothing written");
 
         g.safety_stop().clear().await;
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), ks.first()).await;
         assert!(out.proposed && out.signed_own_vote, "resumes once cleared");
         assert_eq!(g.signed_vote_at(10), Some(block_hash(10)));
     }
@@ -3250,13 +3178,9 @@ mod tests {
                 .with_sign_pause(pause.clone()),
         );
         let k0 = ks.first().expect("key 0").clone();
-        let seed = Hash::new([1; 32]);
         let signer = {
             let g = g.clone();
-            tokio::spawn(async move {
-                g.on_buried_checkpoint(10, block_hash(10), &seed, Some(&k0))
-                    .await
-            })
+            tokio::spawn(async move { g.on_buried_checkpoint(10, block_hash(10), Some(&k0)).await })
         };
         // The signer passed every unlocked pre-check and proposed; it is now
         // paused just before the signing gate.
@@ -3333,10 +3257,7 @@ mod tests {
         let ks = keys(4);
         let kv = Arc::new(MemKv::default());
         let g = gadget_over(&ks, true, kv.clone(), 40).await;
-        let seed = Hash::new([1; 32]);
-        let out = g
-            .on_buried_checkpoint(10, block_hash(10), &seed, ks.first())
-            .await;
+        let out = g.on_buried_checkpoint(10, block_hash(10), ks.first()).await;
         assert!(out.signed_own_vote);
         for k in ks.iter().skip(1) {
             let _ = g

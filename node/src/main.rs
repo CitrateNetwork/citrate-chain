@@ -2413,8 +2413,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 finality_gadget.safety_stop(),
                 finality_observed.clone(),
                 // Every certificate (boot, poll, finalization, peer sync) is
-                // verified against the committee derived HERE (epoch snapshot,
-                // rehydrated above, + the certified block's VRF beacon).
+                // verified against the committee derived HERE (the height's epoch
+                // snapshot, rehydrated above, or the genesis set; its epoch seed).
                 finality_floor::CertificateCommittees::new(
                     finality_gadget.clone(),
                     storage.clone(),
