@@ -760,6 +760,9 @@ def step_rollback(a, fleet: Fleet, t: Transport, src: dict) -> None:
         t.agent(h, "switch", "--gen", snap.get("active") or "r1006", step="rollback")
         if snap.get("running"):
             t.agent(h, "start", step="rollback")
+            if (snap.get("active") or "r1006") == "r1006":
+                g = src["r1006_genesis"]
+                wait_until(f"{h['name']} serves the r1006 block 0 again", lambda h=h: gate_block0(t, h, g), a.gate_minutes)
         log(f"rollback {h['name']}: slot {snap.get('active') or 'r1006'}, {'started' if snap.get('running') else 'left stopped (as before the cut)'}")
 
 
