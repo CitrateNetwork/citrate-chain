@@ -55,3 +55,25 @@ Ground truth matched in every run.
     undo changes of this session.
   - Fix options for the lead and the reviewer: measure the window from the sender's
     included-but-not-accepted nonce, or widen it for r1007.
+
+## Re-run after the nonce-window fix (2026-11-09, later the same day)
+
+The 16-ahead mempool window now counts from the sender's run included in the applied tip and not
+yet executed (5d582760), not from the committed nonce alone. Same host, harness and settings. The
+runs were sequential on an idle host.
+- **Head:** `c915f229`. **Base:** `28e13057`.
+
+| Run | Signers | Accepted / offered | Included | Timeouts | Included tx/s | Avg inclusion latency |
+|---|---:|---:|---:|---:|---:|---:|
+| base | 64 | 18,001 / 18,001 | 18,001 | 0 | 295.55 | 1,938 ms |
+| head | 64 | 18,001 / 18,001 | 18,001 | 0 | 281.12 | 3,811 ms |
+| base | 256 | 18,001 / 18,001 | 18,001 | 0 | 284.21 | 1,898 ms |
+| head | 256 | 18,001 / 18,001 | 18,001 | 0 | 275.64 | 3,843 ms |
+
+Ground truth matched in every run.
+
+- **64 signers:** −4.9% vs base, and nothing refused, against 89% refused before the fix.
+- **256 signers:** −3.0% vs base.
+- Both are within the lead's ~5% target and the 10% regression bound.
+- Latency is still one block longer, by design (spec 06 D6). Most of the throughput gap is that
+  extra block: the last ~2 s of offered transactions land after the measured window.
