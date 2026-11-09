@@ -33,6 +33,7 @@ contract WorkMarketHandler is Test {
 
     // liveness: the run actually exercised the market (an all-revert run proves nothing)
     uint256 public opens;
+    uint256 public opensTriedUnpaused;
     uint256 public posts;
     uint256 public settles;
 
@@ -85,6 +86,7 @@ contract WorkMarketHandler is Test {
             coordinatorBond: cbond,
             disputeAdmin: address(0)
         });
+        if (!market.newOffersPaused()) opensTriedUnpaused++;
         vm.prank(poster);
         try market.open{value: uint256(price) * units + price / 2}(p) returns (uint256 id) {
             ids.push(id);
@@ -109,9 +111,10 @@ contract WorkMarketHandler is Test {
     }
 
     /// Posts a well-formed tree over the joined actors, splitting `units` among them.
-    function postPayout(uint256 seed, uint64 units) external {
+    function postPayout(uint256 seed, uint64 units, bool acceptFirst) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
+        if (acceptFirst) verifier.setAccepted(id, keccak256(abi.encode("digest", id)));
         WorkMarket.Offer memory o = market.getOffer(id);
         if (o.maxUnits == 0) return;
         units = uint64(bound(units, 1, o.maxUnits));
@@ -148,14 +151,24 @@ contract WorkMarketHandler is Test {
         } catch {}
     }
 
-    function settle(uint256 seed, uint256 actorSeed) external {
+    function settle(uint256 seed, uint256 actorSeed, bool jumpPastWindow) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         bytes32[] memory leaves = leavesOf[id];
         if (leaves.length == 0) return;
+        WorkMarket.Offer memory o = market.getOffer(id);
+        uint256 opensAt = uint256(o.payoutPostedAt) + o.disputeWindow;
+        if (jumpPastWindow && o.payoutPostedAt != 0 && block.timestamp < opensAt) vm.warp(opensAt);
         uint64[] memory per = unitsOf[id];
-        // find this actor's leaf index and prefix sum
-        uint256 target = actorSeed % 4;
+        // the first actor at or after the seed that has a leaf
+        uint256 target = 4;
+        for (uint256 k = 0; k < 4; k++) {
+            if (per[(actorSeed % 4 + k) % 4] != 0) {
+                target = (actorSeed % 4 + k) % 4;
+                break;
+            }
+        }
+        if (target == 4) return;
         uint256 n;
         uint64 cum;
         for (uint256 i = 0; i < 4; i++) {
@@ -222,7 +235,7 @@ contract WorkMarketHandler is Test {
     }
 
     function warp(uint256 dt) external {
-        vm.warp(block.timestamp + bound(dt, 1, 2 days));
+        vm.warp(block.timestamp + bound(dt, 1, 12 hours));
     }
 
     receive() external payable {}
@@ -245,9 +258,12 @@ contract WorkMarketInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// Every run must have opened offers; across the campaign, payouts were posted and settled.
+    /// A run that tried to open an offer while new offers were not paused must have opened one;
+    /// otherwise every call reverted and the run proved nothing.
     function afterInvariant() public view {
-        assertGt(handler.opens(), 0, "no offer opened: the run exercised nothing");
+        if (handler.opensTriedUnpaused() > 0) {
+            assertGt(handler.opens(), 0, "no offer opened: the run exercised nothing");
+        }
     }
 
     function _pullTotal() internal view returns (uint256 t) {

@@ -240,24 +240,72 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     // ── governance (new offers only) ────────────────────────────────
 
     function setVerifierAllowed(address verifier, bool ok) external onlyGovernance {
-        revert("red: not implemented");
+        if (verifier == address(0)) revert BadParty();
+        verifierAllowed[verifier] = ok;
+        emit VerifierAllowed(verifier, ok);
     }
 
     function setGuardian(address guardian_) external onlyGovernance {
-        revert("red: not implemented");
+        guardian = guardian_;
+        emit GuardianSet(guardian_);
     }
 
     /// @notice Pause or unpause NEW offers. Governance may do both; the guardian may only pause.
     ///         Never affects join, postPayout, dispute, settle, refund, claimBond or withdraw.
     function setNewOffersPaused(bool paused) external {
-        revert("red: not implemented");
+        if (msg.sender != governance() && !(paused && msg.sender == guardian && guardian != address(0))) {
+            revert NotGuardianOrGovernance();
+        }
+        newOffersPaused = paused;
+        emit NewOffersPaused(msg.sender, paused);
     }
 
     // ── open ────────────────────────────────────────────────────────
 
     /// @notice Open an offer. `msg.value` is the budget.
     function open(OpenParams calldata p) external payable returns (uint256 id) {
-        revert("red: not implemented");
+        if (newOffersPaused) revert NewOffersArePaused();
+        if (!verifierAllowed[p.verifier]) revert VerifierNotAllowed();
+        if (p.pricePerUnit == 0) revert BadPrice();
+        if (msg.value > type(uint128).max) revert BudgetTooLarge();
+        uint128 budget = uint128(msg.value);
+        if (budget < p.pricePerUnit) revert BudgetBelowPrice();
+        uint256 maxUnits = budget / p.pricePerUnit;
+        if (maxUnits > type(uint64).max) revert BudgetTooLarge();
+        if (p.disputeWindow < MIN_DISPUTE_WINDOW) revert BadDisputeWindow();
+        if (p.deadline <= block.timestamp + p.disputeWindow) revert BadDeadline();
+        if (p.maxWorkers == 0 || p.maxWorkers > MAX_WORKERS_CAP) revert BadMaxWorkers();
+        if (p.coordinator == address(0)) revert BadParty();
+        if (p.bindRef == bytes32(0)) revert BadBindRef();
+        // Subjective disputes exist only for group TASK offers (06 §2.2); an admin anywhere
+        // else would be a party that can freeze a payout without the contract checking anything.
+        if (p.disputeAdmin != address(0) && (p.kind != Kind.TASK || p.groupHash == bytes32(0))) {
+            revert BadParty();
+        }
+
+        id = ++nextOfferId;
+        Offer storage o = _offers[id];
+        o.kind = p.kind;
+        o.state = State.Open;
+        o.poster = msg.sender;
+        o.verifier = p.verifier;
+        o.bindRef = p.bindRef;
+        o.jobSpecHash = p.jobSpecHash;
+        o.requirementsHash = p.requirementsHash;
+        o.groupHash = p.groupHash;
+        o.allowlistRoot = p.allowlistRoot;
+        o.pricePerUnit = p.pricePerUnit;
+        o.budget = budget;
+        o.maxUnits = uint64(maxUnits);
+        o.deadline = p.deadline;
+        o.disputeWindow = p.disputeWindow;
+        o.maxWorkers = p.maxWorkers;
+        o.joinBond = p.joinBond;
+        o.coordinator = p.coordinator;
+        o.coordinatorBond = p.coordinatorBond;
+        o.disputeAdmin = p.disputeAdmin;
+
+        emit OfferOpened(id, p.kind, msg.sender, p.groupHash, p.pricePerUnit, budget, p.deadline, p.requirementsCid);
     }
 
     // ── join ────────────────────────────────────────────────────────
@@ -266,7 +314,23 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @param allowProof proof of `keccak256(bytes.concat(keccak256(abi.encode(worker))))` under
     ///        `allowlistRoot` (OpenZeppelin standard leaf, sorted-pair tree); ignored when the root is 0
     function join(uint256 id, uint128 minPrice, bytes32[] calldata allowProof) external payable {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (o.state != State.Open && o.state != State.Running) revert WrongState();
+        if (block.timestamp > o.deadline) revert PastDeadline();
+        if (o.pricePerUnit < minPrice) revert PriceBelowFloor(o.pricePerUnit, minPrice);
+        if (o.allowlistRoot != bytes32(0)) {
+            bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(msg.sender))));
+            if (!MerkleProof.verifyCalldata(allowProof, o.allowlistRoot, leaf)) revert NotAllowlisted();
+        }
+        WorkerSlot storage s = _slots[id][msg.sender];
+        if (s.joined) revert AlreadyJoined();
+        if (o.workers >= o.maxWorkers) revert OfferFull();
+        if (msg.value != o.joinBond) revert WrongBond();
+
+        s.joined = true;
+        o.workers += 1;
+        if (o.state == State.Open) o.state = State.Running;
+        emit Joined(id, msg.sender, minPrice);
     }
 
     // ── payout ──────────────────────────────────────────────────────
@@ -276,7 +340,28 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @param root  the payout tree's root over sorted, prefix-summed leaves (see contract notes)
     /// @param units the total units the tree pays (`<= maxUnits`; exactly 1 for TASK)
     function postPayout(uint256 id, bytes32 root, uint64 units) external payable {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (msg.sender != o.coordinator) revert NotCoordinator();
+        if (o.state != State.Open && o.state != State.Running) revert WrongState();
+        if (block.timestamp > o.deadline) revert PastDeadline();
+        if (msg.value != o.coordinatorBond) revert WrongBond();
+        if (root == bytes32(0)) revert BadRoot();
+        if (units == 0 || units > o.maxUnits) revert BadUnits();
+        if (o.kind == Kind.TASK && units != 1) revert BadUnits();
+
+        (bool ok, bytes32 digest) = IVerifier(o.verifier).accepted(id, o.bindRef);
+        if (!ok || digest == bytes32(0)) revert NotAccepted();
+
+        o.leavesRoot = root;
+        o.digest = digest;
+        o.payoutRoot = keccak256(abi.encode(PAYOUT_TAG, digest, root));
+        o.payoutPostedAt = uint64(block.timestamp);
+        o.payoutUnits = units;
+        o.settledUnits = 0;
+        o.coordinatorBondHeld = true;
+        o.subjectiveDisputeUsed = false;
+        o.state = State.PayoutPosted;
+        emit PayoutPosted(id, root, units, digest);
     }
 
     // ── disputes ────────────────────────────────────────────────────
@@ -289,14 +374,55 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///        DISPUTE_ORDER       body = abi.encode(LeafOpening a, LeafOpening b)       b.index == a.index + 1
     ///        DISPUTE_FIRST_LEAF  body = abi.encode(LeafOpening first)                  index 0
     function dispute(uint256 id, bytes calldata evidence) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted) revert WrongState();
+        if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
+        if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
+
+        (uint8 tag, bytes memory body) = abi.decode(evidence, (uint8, bytes));
+        if (tag == DISPUTE_SUBJECTIVE) {
+            if (o.kind != Kind.TASK || msg.sender != o.poster || o.subjectiveDisputeUsed) revert BadEvidence();
+            uint16 reason = abi.decode(body, (uint16));
+            if (reason < SUBJECTIVE_REASON_MIN) revert BadEvidence();
+            o.subjectiveDisputeUsed = true;
+            o.state = State.Disputed;
+            emit Disputed(id, msg.sender, reason);
+            return;
+        }
+
+        bool proven = false;
+        if (tag == DISPUTE_MISSING_LEAF) {
+            proven = _provesMissingLeaf(id, o, body);
+        } else if (tag == DISPUTE_LOW_UNITS) {
+            proven = _provesLowUnits(id, o, body);
+        } else if (tag == DISPUTE_ORDER) {
+            proven = _provesBadOrder(id, o, body);
+        } else if (tag == DISPUTE_FIRST_LEAF) {
+            proven = _provesBadFirstLeaf(id, o, body);
+        } else {
+            revert BadEvidence();
+        }
+        if (!proven) revert DisputeNotProven();
+
+        emit Disputed(id, msg.sender, tag);
+        _upholdObjective(id, o, msg.sender);
     }
 
     /// @notice The offer's dispute admin (group TASK offers) rules on a subjective dispute.
     ///         Upheld: the payout is withdrawn, the worker's bond is returned (a bad result is not
     ///         fraud) and the offer runs again until its deadline. Rejected: the payout stands.
     function resolveDispute(uint256 id, bool upheld) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (o.state != State.Disputed) revert WrongState();
+        if (o.disputeAdmin == address(0) || msg.sender != o.disputeAdmin) revert NotDisputeAdmin();
+        if (upheld) {
+            _releaseCoordinatorBond(id, o);
+            _clearPayout(o);
+            o.state = State.Running;
+        } else {
+            o.state = State.PayoutPosted;
+        }
+        emit DisputeResolved(id, msg.sender, upheld);
     }
 
     // ── settle ──────────────────────────────────────────────────────
@@ -306,7 +432,35 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         external
         nonReentrant
     {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (o.state != State.PayoutPosted && o.state != State.Closed) revert WrongState();
+        if (o.payoutRoot == bytes32(0)) revert WrongState();
+        if (block.timestamp < uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowOpen();
+        WorkerSlot storage s = _slots[id][worker];
+        if (!s.joined) revert NotJoined();
+        if (s.settled) revert AlreadySettled();
+        if (units == 0) revert BadUnits();
+        if (proof.length > MAX_TREE_DEPTH) revert BadProof();
+        if (!_verifyLeaf(o.leavesRoot, index, leafPayload(id, worker, units, cumBefore), proof)) revert BadProof();
+        if (uint256(cumBefore) + units > o.payoutUnits) revert ExceedsPayout();
+        if (uint256(o.settledUnits) + units > o.payoutUnits) revert ExceedsPayout();
+
+        uint128 amount = uint128(uint256(units) * o.pricePerUnit);
+        // payoutUnits <= maxUnits = budget / price, so paid never passes budget; checked anyway.
+        if (uint256(o.paid) + amount > o.budget) revert ExceedsPayout();
+
+        s.settled = true;
+        o.settledUnits += units;
+        o.paid += amount;
+        balanceOf[worker] += amount;
+        emit Settled(id, worker, units, amount);
+
+        if (!s.bondReleased && o.joinBond != 0) {
+            s.bondReleased = true;
+            o.joinBondsReleased += 1;
+            balanceOf[worker] += o.joinBond;
+            emit BondReleased(id, worker, o.joinBond);
+        }
     }
 
     // ── refund ──────────────────────────────────────────────────────
@@ -319,7 +473,33 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///         - Disputed (unresolved subjective dispute) at or after `deadline + disputeWindow`:
     ///           all of `budget - paid`; the coordinator's bond is returned to it.
     function refund(uint256 id) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        if (msg.sender != o.poster) revert NotPoster();
+        uint256 afterWindow = uint256(o.deadline) + o.disputeWindow;
+        uint128 amount = 0;
+        State finalState = o.state;
+        if (o.state == State.Open || o.state == State.Running) {
+            if (block.timestamp <= o.deadline) revert TooEarly();
+            amount = o.budget - o.paid;
+            finalState = State.Expired;
+        } else if (o.state == State.PayoutPosted) {
+            if (block.timestamp < afterWindow) revert TooEarly();
+            amount = o.budget - uint128(uint256(o.payoutUnits) * o.pricePerUnit);
+            finalState = State.Closed;
+        } else if (o.state == State.Disputed) {
+            if (block.timestamp < afterWindow) revert TooEarly();
+            _releaseCoordinatorBond(id, o);
+            _clearPayout(o);
+            amount = o.budget - o.paid;
+            finalState = State.Closed;
+        } else {
+            revert WrongState();
+        }
+        o.refunded = amount;
+        o.state = finalState;
+        balanceOf[o.poster] += amount;
+        emit Refunded(id, amount);
+        emit OfferClosed(id, finalState);
     }
 
     // ── bonds ───────────────────────────────────────────────────────
@@ -329,13 +509,44 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///         `deadline + disputeWindow` (join bonds are never slashed).
     ///         Coordinator bond: once the posted payout's window has passed undisputed.
     function claimBond(uint256 id) external nonReentrant {
-        revert("red: not implemented");
+        Offer storage o = _offer(id);
+        uint128 total = 0;
+
+        WorkerSlot storage s = _slots[id][msg.sender];
+        if (s.joined && !s.bondReleased && o.joinBond != 0) {
+            bool over = o.state == State.Closed || o.state == State.Expired
+                || block.timestamp >= uint256(o.deadline) + o.disputeWindow;
+            if (over) {
+                s.bondReleased = true;
+                o.joinBondsReleased += 1;
+                total += o.joinBond;
+                emit BondReleased(id, msg.sender, o.joinBond);
+            }
+        }
+
+        if (
+            msg.sender == o.coordinator && o.coordinatorBondHeld && o.payoutRoot != bytes32(0)
+                && (o.state == State.PayoutPosted || o.state == State.Closed)
+                && block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow
+        ) {
+            o.coordinatorBondHeld = false;
+            total += o.coordinatorBond;
+            emit BondReleased(id, msg.sender, o.coordinatorBond);
+        }
+
+        if (total == 0) revert NothingToClaim();
+        balanceOf[msg.sender] += total;
     }
 
     // ── withdraw ────────────────────────────────────────────────────
 
     function withdraw() external nonReentrant {
-        revert("red: not implemented");
+        uint256 amount = balanceOf[msg.sender];
+        if (amount == 0) revert NothingToClaim();
+        balanceOf[msg.sender] = 0;
+        emit Withdrawn(msg.sender, amount);
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert TransferFailed();
     }
 
     // ── views ───────────────────────────────────────────────────────
@@ -419,7 +630,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     function _upholdObjective(uint256 id, Offer storage o, address disputer) internal {
         uint128 bond = o.coordinatorBondHeld ? o.coordinatorBond : 0;
         o.coordinatorBondHeld = false;
-        uint128 toDisputer;
+        uint128 toDisputer = 0;
         if (disputer != o.poster) toDisputer = uint128((uint256(bond) * SLASH_DISPUTER_BPS) / BPS);
         uint128 toPoster = bond - toDisputer;
         if (toDisputer != 0) balanceOf[disputer] += toDisputer;
@@ -497,7 +708,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         (LeafOpening memory leaf, Receipt[] memory receipts) = abi.decode(body, (LeafOpening, Receipt[]));
         if (leaf.worker == address(0) || !_opens(id, o, leaf)) return false;
         if (receipts.length > MAX_RECEIPTS_PER_DISPUTE || receipts.length <= leaf.units) return false;
-        bytes32 prevLease;
+        bytes32 prevLease = bytes32(0);
         for (uint256 i = 0; i < receipts.length; i++) {
             Receipt memory r = receipts[i];
             // strictly ascending lease ids: distinct without a set

@@ -34,11 +34,12 @@ contract FLRoundVerifier is IVerifier {
 
     /// @notice The `bindRef` a poster passes to `WorkMarket.open` for round `ordinal` of `clusterId`.
     function bindRefOf(bytes32 clusterId, uint64 ordinal) external view returns (bytes32) {
-        revert("red: not implemented");
+        return frl.roundIdOf(clusterId, ordinal);
     }
 
     /// @inheritdoc IVerifier
     function accepted(uint256, bytes32 bindRef) external view returns (bool, bytes32) {
-        revert("red: not implemented");
+        if (!frl.isAccepted(bindRef)) return (false, bytes32(0));
+        return (true, frl.recordDigest(bindRef));
     }
 }

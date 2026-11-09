@@ -57,13 +57,32 @@ contract TaskVerifier is IVerifier {
     /// @notice The selected worker submits (or, before acceptance, replaces) its result hash.
     ///         Replacing restarts the review window. Only while the offer is Open or Running.
     function submit(IWorkMarket market, uint256 offerId, bytes32 resultHash) external {
-        revert("red: not implemented");
+        // slither-disable-next-line unused-return (only the fields this check needs are read)
+        (IWorkMarket.Kind kind, IWorkMarket.State state,, address verifier, address coordinator,) =
+            market.offerParties(offerId);
+        if (verifier != address(this) || kind != IWorkMarket.Kind.TASK) revert NotTaskOffer();
+        if (msg.sender != coordinator) revert NotWorker();
+        if (state != IWorkMarket.State.Open && state != IWorkMarket.State.Running) revert WrongState();
+        if (resultHash == bytes32(0)) revert BadResult();
+        Result storage r = _results[address(market)][offerId];
+        if (r.requesterAccepted) revert AlreadyAccepted();
+        r.resultHash = resultHash;
+        r.submittedAt = uint64(block.timestamp);
+        emit ResultSubmitted(address(market), offerId, msg.sender, resultHash, uint64(block.timestamp) + reviewWindow);
     }
 
     /// @notice The requester accepts the submitted result, by hash, so it cannot accept a result it
     ///         has not seen or one the worker replaced after it looked.
     function accept(IWorkMarket market, uint256 offerId, bytes32 resultHash) external {
-        revert("red: not implemented");
+        // slither-disable-next-line unused-return (only the fields this check needs are read)
+        (IWorkMarket.Kind kind,, address poster, address verifier,,) = market.offerParties(offerId);
+        if (verifier != address(this) || kind != IWorkMarket.Kind.TASK) revert NotTaskOffer();
+        if (msg.sender != poster) revert NotRequester();
+        Result storage r = _results[address(market)][offerId];
+        if (r.submittedAt == 0 || r.resultHash != resultHash) revert BadResult();
+        if (r.requesterAccepted) revert AlreadyAccepted();
+        r.requesterAccepted = true;
+        emit ResultAccepted(address(market), offerId, msg.sender, resultHash);
     }
 
     /// @inheritdoc IVerifier
@@ -74,7 +93,18 @@ contract TaskVerifier is IVerifier {
 
     /// @notice `accepted` as `market` would see it (for off-chain readers).
     function acceptedFor(IWorkMarket market, uint256 offerId, bytes32 bindRef) public view returns (bool, bytes32) {
-        revert("red: not implemented");
+        if (address(market).code.length == 0) return (false, bytes32(0));
+        // slither-disable-next-line unused-return (only the fields this check needs are read)
+        (IWorkMarket.Kind kind,,, address verifier,, bytes32 offerBind) = market.offerParties(offerId);
+        if (verifier != address(this) || kind != IWorkMarket.Kind.TASK || offerBind != bindRef) {
+            return (false, bytes32(0));
+        }
+        Result storage r = _results[address(market)][offerId];
+        if (r.submittedAt == 0) return (false, bytes32(0));
+        if (r.requesterAccepted || block.timestamp >= uint256(r.submittedAt) + reviewWindow) {
+            return (true, r.resultHash);
+        }
+        return (false, bytes32(0));
     }
 
     function resultOf(IWorkMarket market, uint256 offerId) external view returns (Result memory) {

@@ -347,6 +347,25 @@ contract WorkMarketTest is WorkMarketTestBase {
         _settle(id, leaves, 1, e[1], 3);
     }
 
+    /// The leaf whose range passes the posted units is refused even when it settles first, so an
+    /// over-allocating tree cannot pay whoever races to settle.
+    function test_settle_leaf_range_must_fit_posted_units_in_any_order() public {
+        uint256 id = _openFl();
+        _join(id, w1);
+        _join(id, w2);
+        _accept(id);
+        Entry[] memory e = new Entry[](2);
+        e[0] = Entry(w1, 3);
+        e[1] = Entry(w2, 3);
+        (bytes32[] memory leaves,) = _leaves(id, e, _noOverride(), 1);
+        _post(id, _rootOf(leaves), 4);
+        vm.warp(block.timestamp + WINDOW);
+        vm.expectRevert(WorkMarket.ExceedsPayout.selector);
+        _settle(id, leaves, 1, e[1], 3);
+        _settle(id, leaves, 0, e[0], 0);
+        assertEq(market.balanceOf(w1), 3 * PRICE);
+    }
+
     function test_settle_releases_join_bond() public {
         WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.FL_ROUND);
         p.joinBond = 0.5 ether;
