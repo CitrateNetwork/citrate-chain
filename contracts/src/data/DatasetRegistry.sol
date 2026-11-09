@@ -63,6 +63,8 @@ contract DatasetRegistry is Governable {
         bytes32 indexed datasetId, uint32 version, address indexed publisher, Privacy privacy, string license
     );
     event DatasetWithdrawn(bytes32 indexed datasetId, uint32 version, uint16 reason);
+    /// @notice A governance takedown froze `datasetId`: it can never gain another version.
+    event DatasetIdFrozen(bytes32 indexed datasetId, uint32 version, uint16 reason);
 
     error NotDatasetOwner();
     error BadPrev();
@@ -78,6 +80,7 @@ contract DatasetRegistry is Governable {
     error BadReason();
     error NotAuthorized();
     error TooManyVersions();
+    error DatasetFrozen();
 
     constructor(address governance_) Governable(governance_) {}
 
@@ -143,6 +146,12 @@ contract DatasetRegistry is Governable {
     }
 
     // ── views ───────────────────────────────────────────────────────
+
+    /// @notice True once a governance takedown (reason >= TAKEDOWN_REASON_MIN) hit any version of
+    ///         `datasetId`; a frozen id accepts no further version (owner decision Q15, 2026-11-09).
+    function frozen(bytes32) external pure returns (bool) {
+        revert("red: not implemented");
+    }
 
     function ownerOf(bytes32 datasetId) external view returns (address) {
         return _owner[datasetId];

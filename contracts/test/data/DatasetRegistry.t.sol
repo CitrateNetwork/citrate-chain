@@ -277,14 +277,99 @@ contract DatasetRegistryTest is DatasetRegistryBase {
         reg.withdraw(ID, 2, 1);
     }
 
+    /// A publisher withdrawal (1..999) affects one version only: the id stays open and the next
+    /// version chains through the withdrawn one. (Before owner decision Q15 this test used a
+    /// governance takedown; a takedown now freezes the id, see the freeze tests below.)
     function test_next_version_chains_through_withdrawn_one() public {
         _publishV1(alice);
-        vm.prank(gov);
-        reg.withdraw(ID, 1, 1000);
+        vm.prank(alice);
+        reg.withdraw(ID, 1, 3);
+        assertFalse(reg.frozen(ID));
         vm.prank(alice);
         assertEq(reg.publish(ID, _v(keccak256("m2"), keccak256("m1"))), 2);
         assertTrue(reg.getVersion(ID, 1).withdrawn);
         assertFalse(reg.getVersion(ID, 2).withdrawn);
+    }
+
+    // ── Q15/Q16 (owner 2026-11-09): a governance takedown freezes the whole id ──
+
+    function test_governance_takedown_freezes_whole_id() public {
+        _publishV1(alice);
+        assertFalse(reg.frozen(ID));
+        vm.expectEmit(true, false, false, true);
+        emit DatasetRegistry.DatasetIdFrozen(ID, 1, 1001);
+        vm.prank(gov);
+        reg.withdraw(ID, 1, 1001);
+        assertTrue(reg.frozen(ID));
+        vm.prank(alice);
+        vm.expectRevert(DatasetRegistry.DatasetFrozen.selector);
+        reg.publish(ID, _v(keccak256("m2"), keccak256("m1")));
+        assertEq(reg.versionCount(ID), 1);
+        assertEq(reg.ownerOf(ID), alice);
+    }
+
+    function test_takedown_of_older_version_freezes_id() public {
+        _publishV1(alice);
+        vm.prank(alice);
+        reg.publish(ID, _v(keccak256("m2"), keccak256("m1")));
+        vm.prank(gov);
+        reg.withdraw(ID, 1, 1500);
+        assertTrue(reg.frozen(ID));
+        assertFalse(reg.getVersion(ID, 2).withdrawn);
+        vm.prank(alice);
+        vm.expectRevert(DatasetRegistry.DatasetFrozen.selector);
+        reg.publish(ID, _v(keccak256("m3"), keccak256("m2")));
+    }
+
+    function test_frozen_id_still_allows_withdrawals_of_other_versions() public {
+        _publishV1(alice);
+        vm.prank(alice);
+        reg.publish(ID, _v(keccak256("m2"), keccak256("m1")));
+        vm.prank(gov);
+        reg.withdraw(ID, 1, 1000);
+        vm.prank(alice);
+        reg.withdraw(ID, 2, 7);
+        assertTrue(reg.getVersion(ID, 2).withdrawn);
+        assertTrue(reg.frozen(ID));
+    }
+
+    function test_freeze_is_per_id() public {
+        _publishV1(alice);
+        vm.prank(gov);
+        reg.withdraw(ID, 1, 1000);
+        bytes32 other = keccak256("dataset/other");
+        vm.prank(alice);
+        reg.publish(other, _v(keccak256("o1"), bytes32(0)));
+        assertFalse(reg.frozen(other));
+    }
+
+    function test_governance_withdraw_needs_takedown_code() public {
+        _publishV1(alice);
+        vm.startPrank(gov);
+        vm.expectRevert(DatasetRegistry.BadReason.selector);
+        reg.withdraw(ID, 1, 0);
+        vm.expectRevert(DatasetRegistry.BadReason.selector);
+        reg.withdraw(ID, 1, 999);
+        vm.stopPrank();
+        assertFalse(reg.frozen(ID));
+        assertFalse(reg.getVersion(ID, 1).withdrawn);
+    }
+
+    /// forge-config: default.fuzz.runs = 10000
+    function testFuzz_frozen_id_never_gains_a_version(uint16 reason, uint8 tries, bytes32 salt) public {
+        reason = uint16(bound(reason, 1000, type(uint16).max));
+        _publishV1(alice);
+        vm.prank(gov);
+        reg.withdraw(ID, 1, reason);
+        address[3] memory actors = [alice, bob, gov];
+        for (uint256 i = 0; i < uint256(tries % 8) + 1; i++) {
+            vm.prank(actors[i % 3]);
+            try reg.publish(ID, _v(keccak256(abi.encode(salt, i)), keccak256("m1"))) {
+                fail();
+            } catch {}
+        }
+        assertEq(reg.versionCount(ID), 1);
+        assertTrue(reg.frozen(ID));
     }
 
     function test_latest_reverts_when_empty() public {
@@ -314,6 +399,7 @@ contract DatasetRegistryTest is DatasetRegistryBase {
 
     /// A random sequence of publish attempts by random callers: the chain stays linear, the owner is
     /// the first successful publisher, and every stored version has prev = the previous manifest.
+    /// forge-config: default.fuzz.runs = 10000
     function testFuzz_publish_sequences(uint8[16] memory who, bytes32[16] memory manifests, bool[16] memory goodPrev)
         public
     {
@@ -343,6 +429,7 @@ contract DatasetRegistryTest is DatasetRegistryBase {
         }
     }
 
+    /// forge-config: default.fuzz.runs = 10000
     function testFuzz_license_unknown_any_case(uint8 mask) public {
         bytes memory w = bytes("unknown");
         for (uint256 i = 0; i < 7; i++) {
@@ -366,6 +453,8 @@ contract DatasetRegistryHandler is Test {
     mapping(bytes32 => address) public firstOwner;
     mapping(bytes32 => uint32) public maxCount;
     mapping(bytes32 => mapping(uint32 => bool)) public everWithdrawn;
+    mapping(bytes32 => bool) public frozenGhost;
+    mapping(bytes32 => uint32) public countAtFreeze;
     uint256 public nonce;
 
     constructor(DatasetRegistry reg_, address gov_) {
@@ -403,9 +492,16 @@ contract DatasetRegistryHandler is Test {
         uint32 n = reg.versionCount(id);
         if (n == 0) return;
         uint32 ver = uint32(verSeed % n) + 1;
-        vm.prank(actors[actorSeed % 3]);
+        address a = actors[actorSeed % 3];
+        // bias toward valid codes so takedowns actually happen
+        if (reason % 2 == 0) reason = a == gov && reg.ownerOf(id) != gov ? 1000 + reason % 1000 : 1 + reason % 999;
+        vm.prank(a);
         try reg.withdraw(id, ver, reason) {
             everWithdrawn[id][ver] = true;
+            if (a == gov && reg.ownerOf(id) != gov && reason >= 1000 && !frozenGhost[id]) {
+                frozenGhost[id] = true;
+                countAtFreeze[id] = n;
+            }
         } catch {}
     }
 
@@ -447,6 +543,19 @@ contract DatasetRegistryInvariantTest is StdInvariant, Test {
             uint32 n = reg.versionCount(id);
             for (uint32 v = 1; v <= n; v++) {
                 if (h.everWithdrawn(id, v)) assertTrue(reg.getVersion(id, v).withdrawn);
+            }
+        }
+    }
+
+    /// Q15: once a governance takedown froze an id, it never gains a version and stays frozen.
+    function invariant_frozen_id_never_gains_a_version() public view {
+        for (uint256 i = 0; i < 3; i++) {
+            bytes32 id = h.id(i);
+            if (h.frozenGhost(id)) {
+                assertTrue(reg.frozen(id));
+                assertEq(reg.versionCount(id), h.countAtFreeze(id));
+            } else if (reg.versionCount(id) > 0) {
+                assertFalse(reg.frozen(id));
             }
         }
     }
