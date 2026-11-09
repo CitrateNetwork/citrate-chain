@@ -198,17 +198,29 @@ Decided and implemented:
   (`UnitNotForPayment`), so a SALT ceiling can never be applied to BYO vendor spend.
 - **Q-8(b), a direct guardian with no delay.** `RegistryGuardian2of3` is the guardian seat: 2 of 3 fixed owners, no
   delay, and only `emergencyDelist`, `veto` and `pause`. It cannot list, restore, unpause or touch a role.
-- **Q-8(a), coexistence with #324's `GuardianCanceller`.** This PR does not change #324. The two veto paths are separate:
-  - `GuardianCanceller` (#324) holds `CANCELLER_ROLE` on the GOVERNANCE timelock. The GUARDIAN council can cancel any
+- **Q-8(a), coexistence with #324's `GuardianCanceller`.** This PR does not change #324's v1 contract. The two veto
+  paths are separate:
+  - The GOVERNANCE canceller holds `CANCELLER_ROLE` on the GOVERNANCE timelock. The GUARDIAN council can cancel any
     queued GOVERNANCE operation except one that only removes or replaces the guardian. That covers a queued
     `ProviderRegistry.proposeListing` or `updateCommitments` before it executes.
   - The registry's own veto (`veto`, through `RegistryGuardian2of3`) acts after the timelock has executed, inside the
     registry's veto window, and only on that registry's listing queue.
   - The registry seat holds no timelock role, so it cannot cancel `ProviderRegistry.setGuardian` (RT-15).
-    `GuardianCanceller` could, because `setGuardian` on the registry is not in its non-cancellable class. **Flag for DGX
-    to reconcile with C2 D5:** either add `ProviderRegistry.setGuardian` to `GuardianCanceller`'s guardian-removal
-    class, or accept that the GUARDIAN council can delay a rotation of the registry seat. The owners of the two seats
-    may be the same people; their keys and contracts are distinct.
+  - **Decided 2026-11-09 (V60-GEN-Q21, option 1): `GuardianCancellerV2` for the 0.6.0 ceremony genesis.** Under Q-9
+    the GUARDIAN council is both the registry's block-0 guardian and the canceller's guardian, so with v1 it could
+    cancel governance's rotation of the registry seat away from itself. `contracts/src/genesis/GuardianCancellerV2.sol`
+    is v1 plus one non-cancellable form: `providerRegistry.setGuardian(next)` with value 0, canonical calldata and
+    `next` not the registry's current guardian, where `providerRegistry` is an immutable constructor argument (the
+    block-0 ProviderRegistry, deployed before the canceller).
+  - The rest of v1's rule is kept. An operation is outside the veto only if every call in it is a management form and
+    at least one is a removal, so the rotation mixed with any other call stays cancellable, and a rotation to the
+    current guardian changes nothing and stays cancellable.
+  - v2 has its own CREATE2 salt, `Salts.salt("Genesis.GuardianCancellerV2")`, and its own init code (v2 creation code +
+    `abi.encode(governanceTimelock, guardian, providerRegistry)`). The ceremony genesis uses v2 in place of v1. r1006
+    and r1007 keep v1 unchanged at `Salts.salt("Genesis.GuardianCanceller")`, so the genesis scripts' check of the
+    live r1006 canceller is unaffected.
+  - Tests: `contracts/test/genesis/GuardianCancellerV2.t.sol`, on the block-0 configuration (real TimelockController,
+    v2 holding `CANCELLER_ROLE`, the council as guardian of both).
 - **Q-9, deploy batch (superseded 2026-11-07 / 2026-11-09).** The original answer was a post-genesis batch of these
   five contracts plus `BenchmarkRegistry`, `AnchorRegistry`, `AgentSBT` and `OrganizationSBT`. Now:
   `ProviderRegistry`, `UsageReceipts`, `OrgBudgets`, `WorkAttestations`, `AgentSBT` and `OrganizationSBT` are in the
@@ -230,4 +242,5 @@ Still open:
   governance timelock, guardian council as the registry's block-0 guardian, AgentSBT and OrganizationSBT addresses,
   the deploy-profile values above). Nothing here deploys. The post-genesis governance batch deploys
   `RegistryGuardian2of3` and installs it with `ProviderRegistry.setGuardian`.
-- **GuardianCanceller class (Q-8(a)).** As above, for DGX with C2 D5.
+- **Genesis wiring of `GuardianCancellerV2`.** The ceremony builder entry (deploy v2 at its salt after ProviderRegistry,
+  grant it `CANCELLER_ROLE` in place of v1) is part of the genesis entries above and is not written.

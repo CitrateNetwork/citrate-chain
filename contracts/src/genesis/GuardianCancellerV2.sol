@@ -153,6 +153,8 @@ contract GuardianCancellerV2 {
     }
 
     function _setGuardian(address guardian_) internal {
+        // check() reverts on zero or the CREATE2 factory; its return value is its input.
+        // slither-disable-next-line unused-return
         InitialAdmin.check(guardian_); // nonzero, never the CREATE2 factory
         if (guardian_ == governanceTimelock) revert GuardianIsTimelock();
         emit GuardianSet(guardian, guardian_);
@@ -178,6 +180,16 @@ contract GuardianCancellerV2 {
                 return account == uint256(uint160(address(this))) ? (false, false) : (true, false);
             }
             return account == uint256(uint160(address(this))) ? (true, true) : (false, false);
+        }
+        if (target == providerRegistry && sel == this.setGuardian.selector && data.length == 36) {
+            // ProviderRegistry.setGuardian(address) has the same selector as this.setGuardian.
+            uint256 next = abi.decode(data[4:], (uint256));
+            // A rotation to the registry's current guardian changes nothing: not a removal.
+            if (next > type(uint160).max) return (false, false);
+            if (next == uint256(uint160(IProviderRegistryGuardianSeat(providerRegistry).guardian()))) {
+                return (false, false);
+            }
+            return (true, true);
         }
         if (target == address(this) && sel == this.setGuardian.selector && data.length == 36) {
             uint256 account = abi.decode(data[4:], (uint256));
