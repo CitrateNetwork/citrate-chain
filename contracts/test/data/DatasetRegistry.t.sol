@@ -517,8 +517,19 @@ contract DatasetRegistryTest is DatasetRegistryBase {
     // ── license placeholders ─────────────────────────────────────────
 
     function test_publish_refuses_noassertion_and_padded_licenses() public {
-        string[9] memory bad =
-            ["NOASSERTION", "noassertion", "NoAssertion", " unknown", "unknown ", "\tunknown", " MIT", "MIT\n", " "];
+        string[11] memory bad = [
+            "NOASSERTION",
+            "noassertion",
+            "NoAssertion",
+            " unknown",
+            "unknown ",
+            "\tunknown",
+            " MIT",
+            "MIT\n",
+            " ",
+            "\x7fMIT",
+            "MIT\x7f"
+        ];
         for (uint256 i = 0; i < bad.length; i++) {
             DatasetRegistry.Version memory v = _v(keccak256("m1"), bytes32(0));
             v.license = bad[i];
