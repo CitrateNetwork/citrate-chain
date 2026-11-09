@@ -8,6 +8,20 @@ Generated from [`citrate-chain/contracts/addresses/40204.json`](../../contracts/
 (via [`scripts/generate.mjs`](scripts/generate.mjs)). That file remains the canonical
 source; this package is its typed, versioned distribution.
 
+## Versions
+
+| Version | Network | Block-0 hash |
+|---------|---------|--------------|
+| 0.2.0 | r1006 (live) | `0xa3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4` |
+| 0.1.0 | r1005 (retired; book archived in `contracts/addresses/r1005/`) | state root `0x1dcfc490…` |
+
+0.2.0 is a breaking release (a new network generation): most addresses moved, the r1005-only
+names `LiquidStakingPool`, `QuorumAnchorRegistry` and `CitAgentTimelock` are gone (`getAddress`
+throws for them), the post-genesis registries are added under their own keys (for example
+`Quorum.AnchorRegistry`), addresses are lowercase, and `governance` carries only `GOVERNANCE` and
+`GUARDIAN`. New export: `genesisHash`. Check it against `eth_getBlockByNumber(0x0).hash` before
+trusting any address.
+
 ## Why
 
 The 2026-07-27 federation sweep found stale vendored addresses in ~13 repos, each a
@@ -18,9 +32,10 @@ item `CL-C2`).
 ## Use
 
 ```js
-import { contracts, aaStack, memberSBT, getAddress, checkDrift } from '@citratelabs/chain-config'
+import { contracts, aaStack, memberSBT, genesisHash, getAddress, checkDrift } from '@citratelabs/chain-config'
 
-contracts.X402Facilitator      // "0xbd46…"
+contracts.X402Facilitator      // "0x0c51…"
+genesisHash                    // r1006 block 0; compare with the chain at boot
 aaStack.EntryPoint             // ERC-4337 entrypoint
 getAddress('ComputeMarketplace')
 memberSBT                       // nonce-based — getCode-verify at boot (it MOVES every re-roll)

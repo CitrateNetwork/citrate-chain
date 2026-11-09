@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import {
-  chainId, contracts, aaStack, precompiles, memberSBT, membershipVault,
+  chainId, genesisHash, contracts, aaStack, precompiles, memberSBT, membershipVault,
   flatten, getAddress, checkDrift, raw,
 } from '../src/index.mjs'
 
@@ -18,6 +18,17 @@ test('exports match the embedded canonical snapshot', () => {
   assert.deepEqual(precompiles, embedded.precompiles)
   assert.equal(memberSBT, embedded.CitrateMemberSBT)
   assert.equal(membershipVault, embedded.MembershipStakeVault)
+})
+
+test('the snapshot is the r1006 network book', () => {
+  assert.equal(genesisHash, '0xa3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4')
+  assert.equal(genesisHash, embedded.genesisHash)
+  // post-genesis registries are folded into contracts under their own keys
+  assert.match(getAddress('Quorum.AnchorRegistry'), /^0x[0-9a-f]{40}$/)
+  // r1005-only names are gone: a consumer still asking for one fails loudly
+  for (const gone of ['LiquidStakingPool', 'QuorumAnchorRegistry', 'CitAgentTimelock']) {
+    assert.throws(() => getAddress(gone), /unknown contract/)
+  }
 })
 
 test('flatten covers contracts + aaStack + precompiles + the two singletons, collision-free', () => {
