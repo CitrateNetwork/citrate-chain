@@ -658,6 +658,18 @@ impl Default for PollConfig {
     }
 }
 
+impl PollConfig {
+    /// The wait after `consecutive_errors` transient errors in a row: `interval`, doubled per
+    /// further error, capped at `transient_backoff_max` (never below `interval`). Zero errors
+    /// is the plain poll interval.
+    pub fn transient_backoff(&self, consecutive_errors: u32) -> Duration {
+        let factor = 2u32.saturating_pow(consecutive_errors.saturating_sub(1));
+        self.interval
+            .saturating_mul(factor)
+            .min(self.transient_backoff_max.max(self.interval))
+    }
+}
+
 /// HTTP client for the explorer's Etherscan-compatible API.
 #[derive(Clone)]
 pub struct ExplorerClient {
@@ -709,12 +721,25 @@ impl ExplorerClient {
             msg.push_str(&cause.to_string());
             source = cause.source();
         }
+        VerifyError::Transport(self.redact(msg))
+    }
+
+    /// Replace the API key, raw and percent-encoded, with `<redacted>`.
+    fn redact(&self, mut text: String) -> String {
         if let Some(key) = &self.api_key {
             for spelling in key_spellings(key) {
-                msg = msg.replace(&spelling, "<redacted>");
+                text = text.replace(&spelling, "<redacted>");
             }
         }
-        VerifyError::Transport(msg)
+        text
+    }
+
+    /// The first 512 characters of an answer body for an error message. A proxy or error
+    /// page can reflect the request, whose query or form body carries `apikey`, so the key
+    /// is scrubbed from the whole body before it is cut (a cut first could leave part of
+    /// the key behind).
+    fn error_body(&self, text: &str) -> String {
+        self.redact(text.to_owned()).chars().take(512).collect()
     }
 
     pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self> {
@@ -756,9 +781,9 @@ impl ExplorerClient {
             Some(env) => Ok(env),
             None if !status.is_success() => Err(VerifyError::Http {
                 status: status.as_u16(),
-                body: text.chars().take(512).collect(),
+                body: self.error_body(&text),
             }),
-            None => Err(VerifyError::Protocol(text.chars().take(512).collect())),
+            None => Err(VerifyError::Protocol(self.error_body(&text))),
         }
     }
 
@@ -856,11 +881,7 @@ impl ExplorerClient {
                 }
                 Err(e) if e.is_transient() => {
                     transient_errors = transient_errors.saturating_add(1);
-                    let factor = 2u32.saturating_pow(transient_errors.saturating_sub(1));
-                    delay = cfg
-                        .interval
-                        .saturating_mul(factor)
-                        .min(cfg.transient_backoff_max.max(cfg.interval));
+                    delay = cfg.transient_backoff(transient_errors);
                     e.to_string()
                 }
                 Err(e) => return Err(e),
