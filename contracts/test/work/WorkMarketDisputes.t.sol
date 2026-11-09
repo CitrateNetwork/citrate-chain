@@ -57,20 +57,22 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         assertEq(uint8(o.state), uint8(IWorkMarket.State.Running));
         assertEq(o.payoutRoot, bytes32(0));
         assertFalse(o.coordinatorBondHeld);
-        // a direct (uncommitted) dispute earns no disputer share: the poster takes the slash
+        // a direct (uncommitted) dispute earns no disputer share: the slash goes to the sink
         assertEq(market.balanceOf(w2), 0);
-        assertEq(market.balanceOf(poster), CBOND);
+        assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND);
         assertEq(market.owedOn(id), BUDGET);
     }
 
-    function test_dispute_by_poster_gets_whole_bond() public {
+    function test_dispute_by_poster_sends_the_slash_to_the_sink() public {
         (uint256 id, bytes32[] memory leaves, Entry[] memory e) = _postedOmittingW2();
         bytes memory ev = _missingEvidence(
             id, w2, market.ABSENT_BETWEEN(), _opening(leaves, 0, e[0], 0), _opening(leaves, 1, e[1], 2)
         );
         vm.prank(poster);
         market.dispute(id, ev);
-        assertEq(market.balanceOf(poster), CBOND);
+        assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND);
     }
 
     function test_after_upheld_dispute_a_new_root_pays() public {

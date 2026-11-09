@@ -171,7 +171,7 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         assertEq(market.balanceOf(w3), 0);
     }
 
-    function test_committed_dispute_by_poster_keeps_the_whole_bond() public {
+    function test_committed_dispute_by_poster_sends_the_slash_to_the_sink() public {
         (uint256 id, bytes memory ev) = _postedOmittingW2();
         bytes32 c = market.disputeCommitment(id, market.getOffer(id).payoutEpoch, poster, ev, bytes32(uint256(7)));
         vm.prank(poster);
@@ -185,7 +185,8 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         vm.warp(block.timestamp + market.DISPUTE_REVEAL_DELAY());
         vm.prank(poster);
         market.revealDispute(id, ev, bytes32(uint256(7)));
-        assertEq(market.balanceOf(poster), CBOND);
+        assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND);
     }
 
     function test_commitment_does_not_carry_to_a_new_root_or_past_the_window() public {

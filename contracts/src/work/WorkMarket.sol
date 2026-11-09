@@ -174,6 +174,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint64 claimedUnits; // distinct receipted leases
         uint64 answeredUnits; // highest claim already answered under this epoch
         uint64 answerBy;
+        bool answered; // dismissed under this epoch; its bond waits for the root to survive
+        bool bondHeld; // the challenge bond is still escrowed
     }
 
     struct IndexChallenge {
@@ -182,6 +184,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         bool answered; // a slot answered under this epoch cannot be challenged again
         address challenger;
         uint64 answerBy;
+        bool bondHeld; // the challenge bond is still escrowed
     }
 
     struct WorkerSlot {
@@ -246,7 +249,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     event PayoutPosted(uint256 indexed id, bytes32 root, uint64 units, bytes32 digest);
     event Disputed(uint256 indexed id, address indexed by, uint16 reason);
     event DisputeResolved(uint256 indexed id, address indexed admin, bool upheld);
-    event CoordinatorSlashed(uint256 indexed id, address indexed disputer, uint128 toDisputer, uint128 toPoster);
+    event CoordinatorSlashed(
+        uint256 indexed id, address indexed disputer, uint128 toDisputer, uint128 toPoster, uint128 toSink
+    );
     event Settled(uint256 indexed id, address indexed worker, uint64 units, uint128 amount);
     event Refunded(uint256 indexed id, uint128 amount);
     event BondReleased(uint256 indexed id, address indexed to, uint128 amount);
@@ -330,10 +335,11 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint128 minCoordinatorBond_,
         address[] memory initialVerifiers_
     ) Governable(governance_) {
-        if (defaultCoordinatorBond_ == 0) revert BadDefaultBond();
+        if (minCoordinatorBond_ == 0) revert BadMinBond();
+        if (defaultCoordinatorBond_ < minCoordinatorBond_) revert BadDefaultBond();
         defaultCoordinatorBond = defaultCoordinatorBond_;
         minCoordinatorBond = minCoordinatorBond_;
-        slashSink = slashSink_;
+        slashSink = InitialAdmin.check(slashSink_);
         guardian = InitialAdmin.check(guardian_);
         emit GuardianSet(guardian_);
         for (uint256 i = 0; i < initialVerifiers_.length; i++) {
@@ -414,6 +420,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         o.maxWorkers = p.maxWorkers;
         o.joinBond = p.joinBond;
         o.coordinator = p.coordinator;
+        // A bond too small to matter would neuter both the slash and the challenge bond.
+        if (p.coordinatorBond != 0 && p.coordinatorBond < minCoordinatorBond) revert BondBelowMinimum();
         o.coordinatorBond = p.coordinatorBond == 0 ? defaultCoordinatorBond : p.coordinatorBond;
         o.disputeAdmin = p.disputeAdmin;
 
@@ -508,7 +516,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     function commitDispute(uint256 id, bytes32 commitment) external {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
-        if (block.timestamp >= _disputeEnd(o)) revert WindowClosed();
+        // the reveal must still fit inside the dispute window
+        if (block.timestamp + DISPUTE_REVEAL_DELAY >= _disputeEnd(o)) revert WindowClosed();
         if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
         if (commitment == bytes32(0) || disputeCommittedAt[commitment] != 0) revert BadEvidence();
         disputeCommittedAt[commitment] = block.timestamp;
@@ -733,15 +742,23 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         Challenge storage c = _challenges[id][w];
         uint64 claimed = uint64(receipts.length);
         if (c.epoch != o.payoutEpoch) {
-            if (c.open) _returnChallengeBond(id, o, c.challenger, bond); // left open by a withdrawn root
+            // a withdrawn root left this challenge open or answered: its challenger gets the bond
+            if (c.bondHeld) _returnChallengeBond(id, o, c.challenger, bond);
             c.epoch = o.payoutEpoch;
             c.open = false;
+            c.answered = false;
+            c.bondHeld = false;
             c.answeredUnits = 0;
         }
         if (c.open) revert ChallengeOpen();
         if (claimed <= c.answeredUnits) revert BadEvidence();
+        // More receipts than the answered leaf pays prove the root faulty (LOW_UNITS), so the
+        // earlier, dismissed challenge was right after all: its bond goes back to its challenger.
+        if (c.bondHeld) _returnChallengeBond(id, o, c.challenger, bond);
         uint64 answerBy = uint64(block.timestamp) + CHALLENGE_RESPONSE_WINDOW;
         c.open = true;
+        c.answered = false;
+        c.bondHeld = true;
         c.challenger = msg.sender;
         c.claimedUnits = claimed;
         c.answerBy = answerBy;
@@ -760,9 +777,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (leaf.units < c.claimedUnits || !_opens(id, o, leaf)) revert BadAnswer();
         c.open = false;
         c.answeredUnits = leaf.units; // the leaf pays this much: only a claim above it is new
+        c.answered = true; // the bond waits for the root to survive (releaseChallengeBond)
         o.openChallenges -= 1;
         _extendForAnswer(o);
-        _returnChallengeBond(id, o, msg.sender, challengeBondOf(id)); // dismissed: to the answerer
         emit ChallengeAnswered(id, leaf.worker, leaf.units);
     }
 
@@ -776,6 +793,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (block.timestamp <= c.answerBy) revert AnswerTooEarly();
         c.open = false;
         address challenger = c.challenger;
+        c.bondHeld = false;
         _returnChallengeBond(id, o, challenger, challengeBondOf(id));
         emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
         _upholdObjective(id, o, challenger, true);
@@ -802,15 +820,18 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint128 bond = _takeChallengeBond(id, o);
         IndexChallenge storage c = _indexChallenges[id][index];
         if (c.epoch != o.payoutEpoch) {
-            if (c.open) _returnChallengeBond(id, o, c.challenger, bond); // left open by a withdrawn root
+            // a withdrawn root left this challenge open or answered: its challenger gets the bond
+            if (c.bondHeld) _returnChallengeBond(id, o, c.challenger, bond);
             c.epoch = o.payoutEpoch;
             c.open = false;
             c.answered = false;
+            c.bondHeld = false;
         }
         if (c.open) revert ChallengeOpen();
         if (c.answered) revert BadEvidence();
         uint64 answerBy = uint64(block.timestamp) + CHALLENGE_RESPONSE_WINDOW;
         c.open = true;
+        c.bondHeld = true;
         c.challenger = msg.sender;
         c.answerBy = answerBy;
         o.openChallenges += 1;
@@ -827,10 +848,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (block.timestamp > c.answerBy) revert AnswerTooLate();
         if (!_opens(id, o, leaf)) revert BadAnswer();
         c.open = false;
-        c.answered = true;
+        c.answered = true; // the bond waits for the root to survive (releaseIndexChallengeBond)
         o.openChallenges -= 1;
         _extendForAnswer(o);
-        _returnChallengeBond(id, o, msg.sender, challengeBondOf(id)); // dismissed: to the answerer
         emit IndexChallengeAnswered(id, leaf.index, leaf.worker);
     }
 
@@ -843,6 +863,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (block.timestamp <= c.answerBy) revert AnswerTooEarly();
         c.open = false;
         address challenger = c.challenger;
+        c.bondHeld = false;
         _returnChallengeBond(id, o, challenger, challengeBondOf(id));
         emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
         _upholdObjective(id, o, challenger, true);
@@ -855,23 +876,44 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         return uint128((cb * CHALLENGE_BOND_BPS + BPS - 1) / BPS);
     }
 
-    /// @notice Return the bond of a worker challenge that a withdrawn root left open. Anyone may
-    ///         call; the bond goes to the challenger.
+    /// @notice Pay out the bond of a worker challenge that is no longer open. Anyone may call.
+    ///         Its root was withdrawn: back to the challenger. It was answered and its root
+    ///         survived the dispute window: to the offer's coordinator.
     function releaseChallengeBond(uint256 id, address worker) external nonReentrant {
         Offer storage o = _offer(id);
         Challenge storage c = _challenges[id][worker];
-        if (!c.open || c.epoch == o.payoutEpoch) revert NothingToClaim();
+        if (!c.bondHeld) revert NothingToClaim();
+        address to = _bondRecipient(o, c.epoch, c.answered, c.challenger);
+        c.bondHeld = false;
         c.open = false;
-        _returnChallengeBond(id, o, c.challenger, challengeBondOf(id));
+        _returnChallengeBond(id, o, to, challengeBondOf(id));
     }
 
-    /// @notice Return the bond of an index challenge that a withdrawn root left open.
+    /// @notice `releaseChallengeBond` for an index challenge.
     function releaseIndexChallengeBond(uint256 id, uint32 index) external nonReentrant {
         Offer storage o = _offer(id);
         IndexChallenge storage c = _indexChallenges[id][index];
-        if (!c.open || c.epoch == o.payoutEpoch) revert NothingToClaim();
+        if (!c.bondHeld) revert NothingToClaim();
+        address to = _bondRecipient(o, c.epoch, c.answered, c.challenger);
+        c.bondHeld = false;
         c.open = false;
-        _returnChallengeBond(id, o, c.challenger, challengeBondOf(id));
+        _returnChallengeBond(id, o, to, challengeBondOf(id));
+    }
+
+    /// Who a held challenge bond goes to. Root withdrawn (epoch moved on): the challenger, even if
+    /// the challenge was answered (a withdrawn root earns its coordinator nothing). Answered and
+    /// the root survived its dispute window: the coordinator, whoever answered, so a challenger
+    /// that answers its own challenge to delay settling pays for the delay. Otherwise: not yet.
+    function _bondRecipient(Offer storage o, uint32 epoch, bool answered, address challenger)
+        internal
+        view
+        returns (address)
+    {
+        if (epoch != o.payoutEpoch) return challenger;
+        bool survived = (o.state == State.PayoutPosted || o.state == State.Closed) && o.payoutRoot != bytes32(0)
+            && o.openChallenges == 0 && block.timestamp >= _disputeEnd(o);
+        if (answered && survived) return o.coordinator;
+        revert NothingToClaim();
     }
 
     function indexChallengeOf(uint256 id, uint32 index) external view returns (IndexChallenge memory) {
@@ -1005,21 +1047,30 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     }
 
     /// Objective dispute upheld: payout frozen and withdrawn, bond slashed, offer runs again.
-    /// `rewarded`: the disputer earns SLASH_DISPUTER_BPS (a revealed commitment or a bonded
-    /// challenge); otherwise the poster takes the whole slash. When the poster is also the
-    /// coordinator it never takes back its own slashed bond: all of it goes to the disputer.
+    /// The poster never takes back a slash it could have brought about itself (its coordinator
+    /// may be a second address of its own):
+    /// - not `rewarded` (a direct `dispute()`), or the disputer is the poster: all to `slashSink`;
+    /// - `rewarded` (a revealed commitment or an unanswered bonded challenge) by another party:
+    ///   the whole bond to the disputer when the poster is the coordinator, otherwise
+    ///   SLASH_DISPUTER_BPS to the disputer and the rest to the poster (Q4).
     function _upholdObjective(uint256 id, Offer storage o, address disputer, bool rewarded) internal {
         uint128 bond = o.coordinatorBondHeld ? o.coordinatorBond : 0;
         o.coordinatorBondHeld = false;
         uint128 toDisputer = 0;
-        if (disputer != o.poster) {
-            if (o.coordinator == o.poster) toDisputer = bond;
-            else if (rewarded) toDisputer = uint128((uint256(bond) * SLASH_DISPUTER_BPS) / BPS);
+        uint128 toPoster = 0;
+        uint128 toSink = 0;
+        if (!rewarded || disputer == o.poster) {
+            toSink = bond;
+        } else if (o.coordinator == o.poster) {
+            toDisputer = bond;
+        } else {
+            toDisputer = uint128((uint256(bond) * SLASH_DISPUTER_BPS) / BPS);
+            toPoster = bond - toDisputer;
         }
-        uint128 toPoster = bond - toDisputer;
         if (toDisputer != 0) balanceOf[disputer] += toDisputer;
         if (toPoster != 0) balanceOf[o.poster] += toPoster;
-        emit CoordinatorSlashed(id, disputer, toDisputer, toPoster);
+        if (toSink != 0) balanceOf[slashSink] += toSink;
+        emit CoordinatorSlashed(id, disputer, toDisputer, toPoster, toSink);
         _clearPayout(o);
         o.state = State.Running;
     }

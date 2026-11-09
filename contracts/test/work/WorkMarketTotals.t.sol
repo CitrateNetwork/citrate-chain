@@ -95,7 +95,8 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         vm.prank(poster);
         market.dispute(id, ev);
         assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.Running));
-        assertEq(market.balanceOf(poster), CBOND);
+        assertEq(market.balanceOf(poster), 0);
+        assertEq(market.balanceOf(SINK), CBOND);
     }
 
     function test_empty_tree_with_posted_units_is_disputable_as_under_total() public {
@@ -174,7 +175,8 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         vm.prank(w1);
         market.dispute(id, ev);
         assertEq(market.balanceOf(w1), 0, "an uncommitted dispute earns nothing");
-        assertEq(market.balanceOf(poster), CBOND, "the poster keeps the whole slash");
+        assertEq(market.balanceOf(poster), 0, "the poster takes nothing back");
+        assertEq(market.balanceOf(SINK), CBOND, "an uncommitted slash goes to the sink");
         vm.prank(w3);
         vm.expectRevert(WorkMarket.BadEvidence.selector); // the root it committed against is gone
         market.revealDispute(id, ev, salt);
@@ -219,15 +221,17 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         market.challengeInclusion(id, rs);
     }
 
-    function test_answered_challenge_pays_its_bond_to_the_answerer() public {
+    /// Round 3: a dismissed challenge's bond is held until the root survives, then paid to the
+    /// coordinator (WorkMarketSlash covers the withdrawn-root refund).
+    function test_answered_challenge_bonds_are_held_then_paid_to_the_coordinator() public {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
         vm.prank(w1);
         market.challengeIndex{value: CHBOND}(id, 3);
         assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND);
         vm.prank(stranger);
         market.answerIndexChallenge(id, _padding(leaves, 3));
-        assertEq(market.balanceOf(stranger), CHBOND);
-        assertEq(market.owedOn(id), BUDGET + CBOND);
+        assertEq(market.balanceOf(stranger), 0);
+        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND, "held until the root survives");
 
         WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
         rs[0] = _receipt(id, w2, bytes32(uint256(1)));
@@ -235,7 +239,11 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         market.challengeInclusion{value: CHBOND}(id, rs);
         vm.prank(coordinator);
         market.answerChallenge(id, _opening(leaves, 1, _entries3()[1], 2));
-        assertEq(market.balanceOf(coordinator), CHBOND);
+        vm.warp(block.timestamp + market.POST_ANSWER_DISPUTE_WINDOW());
+        market.releaseIndexChallengeBond(id, 3);
+        market.releaseChallengeBond(id, w2);
+        assertEq(market.balanceOf(coordinator), 2 * CHBOND);
+        assertEq(market.owedOn(id), BUDGET + CBOND);
     }
 
     function test_upheld_challenge_returns_its_bond() public {
