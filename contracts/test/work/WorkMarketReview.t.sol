@@ -99,7 +99,7 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         market.refund(id);
 
         market.resolveIndexChallenge(id, 0);
-        assertEq(market.balanceOf(w1), CBOND / 2);
+        assertEq(market.balanceOf(w1), CBOND / 2 + CHBOND);
         assertEq(market.balanceOf(poster), CBOND / 2);
         vm.prank(poster);
         market.refund(id);
@@ -157,10 +157,10 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         market.commitDispute(id, c);
 
         vm.prank(w2);
-        vm.expectRevert(WorkMarket.TooEarly.selector); // reveal from the next block on
+        vm.expectRevert(WorkMarket.TooEarly.selector); // reveal after DISPUTE_REVEAL_DELAY
         market.revealDispute(id, ev, salt);
 
-        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + market.DISPUTE_REVEAL_DELAY());
         vm.prank(w3); // a copier holding the same evidence and salt has no commitment of its own
         vm.expectRevert(WorkMarket.BadEvidence.selector);
         market.revealDispute(id, ev, salt);
@@ -182,7 +182,7 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         vm.prank(poster);
         vm.expectRevert(WorkMarket.BadEvidence.selector); // one commitment, once
         market.commitDispute(id, c);
-        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + market.DISPUTE_REVEAL_DELAY());
         vm.prank(poster);
         market.revealDispute(id, ev, bytes32(uint256(7)));
         assertEq(market.balanceOf(poster), CBOND);
@@ -193,7 +193,7 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         bytes32 c = market.disputeCommitment(id, market.getOffer(id).payoutEpoch, w2, ev, bytes32(0));
         vm.prank(w2);
         market.commitDispute(id, c);
-        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + market.DISPUTE_REVEAL_DELAY());
         vm.warp(uint256(market.getOffer(id).payoutPostedAt) + WINDOW);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.WindowClosed.selector);

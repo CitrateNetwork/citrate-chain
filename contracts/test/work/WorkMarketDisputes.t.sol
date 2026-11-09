@@ -57,8 +57,9 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         assertEq(uint8(o.state), uint8(IWorkMarket.State.Running));
         assertEq(o.payoutRoot, bytes32(0));
         assertFalse(o.coordinatorBondHeld);
-        assertEq(market.balanceOf(w2), CBOND / 2);
-        assertEq(market.balanceOf(poster), CBOND / 2);
+        // a direct (uncommitted) dispute earns no disputer share: the poster takes the slash
+        assertEq(market.balanceOf(w2), 0);
+        assertEq(market.balanceOf(poster), CBOND);
         assertEq(market.owedOn(id), BUDGET);
     }
 
@@ -83,7 +84,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         _postTree(id, l3, 6);
         vm.warp(block.timestamp + WINDOW);
         _settle(id, l3, 1, _entries3()[1], 2);
-        assertEq(market.balanceOf(w2), CBOND / 2 + 3 * PRICE);
+        assertEq(market.balanceOf(w2), 3 * PRICE);
     }
 
     function test_dispute_missing_before_first() public {

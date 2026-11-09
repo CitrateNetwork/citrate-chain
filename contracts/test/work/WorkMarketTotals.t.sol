@@ -268,7 +268,7 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         market.challengeIndex{value: CHBOND}(id, 1);
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         market.resolveIndexChallenge(id, 0); // withdraws the root; w2's challenge is left open
-        vm.expectRevert(WorkMarket.NoOpenChallenge.selector);
+        vm.expectRevert(WorkMarket.WrongState.selector); // the root is gone; only a reclaim is left
         market.resolveIndexChallenge(id, 1);
         market.reclaimIndexChallengeBond(id, 1);
         assertEq(market.balanceOf(w2), CHBOND);
@@ -288,7 +288,8 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         market.dispute(id, tev);
         vm.prank(w1);
         market.reclaimChallengeBond(id, w2);
-        assertEq(market.balanceOf(w1), CHBOND);
+        // w1: slash share and bond from the first (upheld) challenge, plus this reclaimed bond
+        assertEq(market.balanceOf(w1), CBOND / 2 + 2 * CHBOND);
         assertEq(market.owedOn(id), BUDGET);
     }
 

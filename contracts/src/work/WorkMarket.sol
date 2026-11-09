@@ -86,8 +86,14 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint8 public constant DISPUTE_FIRST_LEAF = 4;
     /// Reason code emitted when an inclusion challenge went unanswered.
     uint8 public constant DISPUTE_UNANSWERED_CHALLENGE = 5;
+    /// A root whose leaves do not sum to exactly its posted units (one leaf past them, or the last
+    /// leaf short of them).
     uint8 public constant DISPUTE_TOTAL = 6;
+    /// @notice A challenge carries this share of the offer's coordinator bond (rounded up): returned
+    ///         when the challenge is upheld or its root is withdrawn, paid to the answerer otherwise.
     uint16 public constant CHALLENGE_BOND_BPS = 1000;
+    /// @notice Seconds between a dispute commitment and its reveal. Measured in block time, not
+    ///         height: merged parallel blocks of the DAG can repeat or lower `block.number`.
     uint32 public constant DISPUTE_REVEAL_DELAY = 60;
 
     /// Non-inclusion modes for DISPUTE_MISSING_LEAF.
@@ -158,7 +164,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint8 payoutDepth; // the posted tree's depth: every opening carries exactly this many siblings
         uint64 answerGraceUntil; // disputes stay open until at least this time (set by answers)
         uint32 resultEpoch; // bumps when a subjective dispute is upheld (TaskVerifier scopes results to it)
-        uint128 challengeBondsHeld;
+        uint128 challengeBondsHeld; // challenge bonds escrowed on this offer (any epoch)
     }
 
     struct Challenge {
@@ -217,8 +223,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     mapping(address => uint256) public balanceOf;
     mapping(uint256 => mapping(address => Challenge)) internal _challenges;
     mapping(uint256 => mapping(uint32 => IndexChallenge)) internal _indexChallenges;
-    /// @notice Block a dispute commitment was made in (0 = none); see `commitDispute`.
-    mapping(bytes32 => uint256) public disputeCommitBlock;
+    /// @notice When a dispute commitment was made (0 = none); see `commitDispute`.
+    mapping(bytes32 => uint256) public disputeCommittedAt;
 
     // ── events ──────────────────────────────────────────────────────
 
@@ -474,32 +480,37 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///        DISPUTE_LOW_UNITS   body = abi.encode(LeafOpening leaf, Receipt[] receipts)
     ///        DISPUTE_ORDER       body = abi.encode(LeafOpening a, LeafOpening b)       a.index < b.index
     ///        DISPUTE_FIRST_LEAF  body = abi.encode(LeafOpening first)                  index 0
+    ///        DISPUTE_TOTAL       body = abi.encode(LeafOpening leaf, LeafOpening next) see _provesBadTotal
+    /// @dev   An upheld objective dispute made here pays the whole slash to the poster: only a
+    ///        revealed commitment (`commitDispute` / `revealDispute`) earns the disputer's share, so
+    ///        copying evidence seen in the mempool earns nothing.
     function dispute(uint256 id, bytes calldata evidence) external nonReentrant {
-        _dispute(id, evidence);
+        _dispute(id, evidence, false);
     }
 
     /// @notice Commit to a dispute before revealing its evidence, so a copier who sees the
     ///         evidence in the mempool cannot take the disputer's share of the slash. The
     ///         commitment is `disputeCommitment(id, payoutEpoch, msg.sender, evidence, salt)`;
-    ///         reveal it with `revealDispute` from the next block on, inside the dispute window.
+    ///         reveal it with `revealDispute` at least `DISPUTE_REVEAL_DELAY` seconds later,
+    ///         inside the dispute window.
     function commitDispute(uint256 id, bytes32 commitment) external {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
         if (block.timestamp >= _disputeEnd(o)) revert WindowClosed();
         if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
-        if (commitment == bytes32(0) || disputeCommitBlock[commitment] != 0) revert BadEvidence();
-        disputeCommitBlock[commitment] = block.number;
+        if (commitment == bytes32(0) || disputeCommittedAt[commitment] != 0) revert BadEvidence();
+        disputeCommittedAt[commitment] = block.timestamp;
         emit DisputeCommitted(id, msg.sender, commitment);
     }
 
-    /// @notice Reveal a committed dispute (same rules and outcome as `dispute`).
+    /// @notice Reveal a committed dispute (same rules as `dispute`; the disputer earns its share).
     function revealDispute(uint256 id, bytes calldata evidence, bytes32 salt) external nonReentrant {
         bytes32 commitment = disputeCommitment(id, _offer(id).payoutEpoch, msg.sender, evidence, salt);
-        uint256 committedAt = disputeCommitBlock[commitment];
+        uint256 committedAt = disputeCommittedAt[commitment];
         if (committedAt == 0) revert BadEvidence();
-        if (committedAt >= block.number) revert TooEarly();
-        delete disputeCommitBlock[commitment];
-        _dispute(id, evidence);
+        if (block.timestamp < committedAt + DISPUTE_REVEAL_DELAY) revert TooEarly();
+        delete disputeCommittedAt[commitment];
+        _dispute(id, evidence, true);
     }
 
     function disputeCommitment(uint256 id, uint32 epoch, address disputer, bytes calldata evidence, bytes32 salt)
@@ -510,7 +521,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         return keccak256(abi.encode(block.chainid, address(this), id, epoch, disputer, keccak256(evidence), salt));
     }
 
-    function _dispute(uint256 id, bytes calldata evidence) internal {
+    function _dispute(uint256 id, bytes calldata evidence, bool committed) internal {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
         if (block.timestamp >= _disputeEnd(o)) revert WindowClosed();
@@ -536,13 +547,15 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
             proven = _provesBadOrder(id, o, body);
         } else if (tag == DISPUTE_FIRST_LEAF) {
             proven = _provesBadFirstLeaf(id, o, body);
+        } else if (tag == DISPUTE_TOTAL) {
+            proven = _provesBadTotal(id, o, body);
         } else {
             revert BadEvidence();
         }
         if (!proven) revert DisputeNotProven();
 
         emit Disputed(id, msg.sender, tag);
-        _upholdObjective(id, o, msg.sender);
+        _upholdObjective(id, o, msg.sender, committed);
     }
 
     /// @notice The offer's dispute admin (group TASK offers) rules on a subjective dispute.
@@ -704,9 +717,11 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
             if (!_receiptValid(id, o, r)) revert BadEvidence();
             prevLease = r.leaseId;
         }
+        uint128 bond = _takeChallengeBond(id, o);
         Challenge storage c = _challenges[id][w];
         uint64 claimed = uint64(receipts.length);
         if (c.epoch != o.payoutEpoch) {
+            if (c.open) _returnChallengeBond(id, o, c.challenger, bond); // left open by a withdrawn root
             c.epoch = o.payoutEpoch;
             c.open = false;
             c.answeredUnits = 0;
@@ -735,6 +750,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         c.answeredUnits = leaf.units; // the leaf pays this much: only a claim above it is new
         o.openChallenges -= 1;
         _extendForAnswer(o);
+        _returnChallengeBond(id, o, msg.sender, challengeBondOf(id)); // dismissed: to the answerer
         emit ChallengeAnswered(id, leaf.worker, leaf.units);
     }
 
@@ -748,8 +764,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (block.timestamp <= c.answerBy) revert AnswerTooEarly();
         c.open = false;
         address challenger = c.challenger;
+        _returnChallengeBond(id, o, challenger, challengeBondOf(id));
         emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
-        _upholdObjective(id, o, challenger);
+        _upholdObjective(id, o, challenger, true);
     }
 
     /// @inheritdoc IWorkMarket
@@ -770,8 +787,10 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
         if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
         if (uint256(index) >> o.payoutDepth != 0) revert BadEvidence();
+        uint128 bond = _takeChallengeBond(id, o);
         IndexChallenge storage c = _indexChallenges[id][index];
         if (c.epoch != o.payoutEpoch) {
+            if (c.open) _returnChallengeBond(id, o, c.challenger, bond); // left open by a withdrawn root
             c.epoch = o.payoutEpoch;
             c.open = false;
             c.answered = false;
@@ -799,6 +818,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         c.answered = true;
         o.openChallenges -= 1;
         _extendForAnswer(o);
+        _returnChallengeBond(id, o, msg.sender, challengeBondOf(id)); // dismissed: to the answerer
         emit IndexChallengeAnswered(id, leaf.index, leaf.worker);
     }
 
@@ -811,22 +831,35 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (block.timestamp <= c.answerBy) revert AnswerTooEarly();
         c.open = false;
         address challenger = c.challenger;
+        _returnChallengeBond(id, o, challenger, challengeBondOf(id));
         emit Disputed(id, challenger, DISPUTE_UNANSWERED_CHALLENGE);
-        _upholdObjective(id, o, challenger);
+        _upholdObjective(id, o, challenger, true);
     }
 
+    /// @notice The bond a challenge on `id` carries: CHALLENGE_BOND_BPS of the coordinator bond,
+    ///         rounded up (fixed at `open`).
     function challengeBondOf(uint256 id) public view returns (uint128) {
         uint256 cb = _offers[id].coordinatorBond;
         return uint128((cb * CHALLENGE_BOND_BPS + BPS - 1) / BPS);
     }
 
-    // red: challenge bonds not refunded yet
-    function reclaimChallengeBond(uint256, address) external pure {
-        revert NothingToClaim();
+    /// @notice Return the bond of a worker challenge that a withdrawn root left open. Anyone may
+    ///         call; the bond goes to the challenger.
+    function reclaimChallengeBond(uint256 id, address worker) external nonReentrant {
+        Offer storage o = _offer(id);
+        Challenge storage c = _challenges[id][worker];
+        if (!c.open || c.epoch == o.payoutEpoch) revert NothingToClaim();
+        c.open = false;
+        _returnChallengeBond(id, o, c.challenger, challengeBondOf(id));
     }
 
-    function reclaimIndexChallengeBond(uint256, uint32) external pure {
-        revert NothingToClaim();
+    /// @notice Return the bond of an index challenge that a withdrawn root left open.
+    function reclaimIndexChallengeBond(uint256 id, uint32 index) external nonReentrant {
+        Offer storage o = _offer(id);
+        IndexChallenge storage c = _indexChallenges[id][index];
+        if (!c.open || c.epoch == o.payoutEpoch) revert NothingToClaim();
+        c.open = false;
+        _returnChallengeBond(id, o, c.challenger, challengeBondOf(id));
     }
 
     function indexChallengeOf(uint256 id, uint32 index) external view returns (IndexChallenge memory) {
@@ -893,6 +926,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint256 owed = uint256(o.budget) - o.paid - o.refunded;
         owed += uint256(o.joinBond) * (o.workers - o.joinBondsReleased);
         if (o.coordinatorBondHeld) owed += o.coordinatorBond;
+        owed += o.challengeBondsHeld;
         return owed;
     }
 
@@ -959,17 +993,35 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     }
 
     /// Objective dispute upheld: payout frozen and withdrawn, bond slashed, offer runs again.
-    function _upholdObjective(uint256 id, Offer storage o, address disputer) internal {
+    /// `rewarded`: the disputer earns SLASH_DISPUTER_BPS (a revealed commitment or a bonded
+    /// challenge); otherwise the poster takes the whole slash. When the poster is also the
+    /// coordinator it never takes back its own slashed bond: all of it goes to the disputer.
+    function _upholdObjective(uint256 id, Offer storage o, address disputer, bool rewarded) internal {
         uint128 bond = o.coordinatorBondHeld ? o.coordinatorBond : 0;
         o.coordinatorBondHeld = false;
         uint128 toDisputer = 0;
-        if (disputer != o.poster) toDisputer = uint128((uint256(bond) * SLASH_DISPUTER_BPS) / BPS);
+        if (disputer != o.poster) {
+            if (o.coordinator == o.poster) toDisputer = bond;
+            else if (rewarded) toDisputer = uint128((uint256(bond) * SLASH_DISPUTER_BPS) / BPS);
+        }
         uint128 toPoster = bond - toDisputer;
         if (toDisputer != 0) balanceOf[disputer] += toDisputer;
         if (toPoster != 0) balanceOf[o.poster] += toPoster;
         emit CoordinatorSlashed(id, disputer, toDisputer, toPoster);
         _clearPayout(o);
         o.state = State.Running;
+    }
+
+    function _takeChallengeBond(uint256 id, Offer storage o) internal returns (uint128 bond) {
+        bond = challengeBondOf(id);
+        if (msg.value != bond) revert WrongBond();
+        o.challengeBondsHeld += bond;
+    }
+
+    function _returnChallengeBond(uint256 id, Offer storage o, address to, uint128 bond) internal {
+        o.challengeBondsHeld -= bond;
+        balanceOf[to] += bond;
+        emit BondReleased(id, to, bond);
     }
 
     /// Opens a leaf (real or padding) against the posted root and returns false if it does not open.
@@ -1055,6 +1107,23 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint256 aEnd = uint256(a.cumBefore) + a.units;
         if (b.index == uint256(a.index) + 1) return aEnd != b.cumBefore;
         return aEnd > b.cumBefore;
+    }
+
+    /// The leaves do not sum to exactly `payoutUnits` (owner of the decision: #451 review 2):
+    /// - `leaf` is an openable real leaf ending past `payoutUnits` (`cumBefore + units >
+    ///   payoutUnits`): the tree pays more than it posted, so some worker cannot settle; or
+    /// - `leaf` is the last real leaf (the tree's last slot, or `next` opens as padding right after
+    ///   it) and ends short of `payoutUnits`: the tree pays less than it reserved; or
+    /// - `leaf` opens as padding at slot 0: an empty tree posted with units (always >= 1).
+    function _provesBadTotal(uint256 id, Offer storage o, bytes memory body) internal view returns (bool) {
+        (LeafOpening memory leaf, LeafOpening memory next) = abi.decode(body, (LeafOpening, LeafOpening));
+        if (!_opens(id, o, leaf)) return false;
+        if (leaf.worker == address(0)) return leaf.index == 0;
+        uint256 end = uint256(leaf.cumBefore) + leaf.units;
+        if (end > o.payoutUnits) return true;
+        if (end == o.payoutUnits) return false;
+        if (uint256(leaf.index) + 1 == (uint256(1) << o.payoutDepth)) return true;
+        return next.worker == address(0) && next.index == uint256(leaf.index) + 1 && _opens(id, o, next);
     }
 
     /// The first real leaf must start the prefix sum at zero.

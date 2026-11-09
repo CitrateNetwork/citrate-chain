@@ -47,7 +47,7 @@ contract WorkMarketChallengeTest is WorkMarketTestBase {
         assertEq(uint8(o.state), uint8(IWorkMarket.State.Running));
         assertEq(o.payoutRoot, bytes32(0));
         assertEq(o.openChallenges, 0);
-        assertEq(market.balanceOf(w2), CBOND / 2);
+        assertEq(market.balanceOf(w2), CBOND / 2 + CHBOND); // share plus its challenge bond back
         assertEq(market.balanceOf(poster), CBOND / 2);
     }
 

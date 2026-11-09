@@ -68,7 +68,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         WorkMarket.Offer memory o = market.getOffer(id);
         assertEq(uint8(o.state), uint8(IWorkMarket.State.Running));
         assertEq(o.payoutRoot, bytes32(0));
-        assertEq(market.balanceOf(w1), CBOND / 2);
+        assertEq(market.balanceOf(poster), CBOND); // direct dispute: whole slash to the poster
         // the sybil leaf no longer settles anything
         vm.warp(block.timestamp + WINDOW);
         vm.expectRevert(WorkMarket.WrongState.selector);
@@ -99,7 +99,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         assertEq(uint8(o.state), uint8(IWorkMarket.State.Running));
         assertEq(o.payoutRoot, bytes32(0));
         assertEq(o.openChallenges, 0);
-        assertEq(market.balanceOf(w1), CBOND / 2);
+        assertEq(market.balanceOf(w1), CBOND / 2 + CHBOND);
         assertEq(market.balanceOf(poster), CBOND / 2);
     }
 
@@ -415,6 +415,6 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         bytes memory ev = _order(_real(leavesBuf, 0, w1, 2, 0), _real(leavesBuf, 2, w3, 2, 0));
         vm.prank(w1);
         market.dispute(id, ev);
-        assertEq(market.balanceOf(w1), CBOND / 2);
+        assertEq(market.balanceOf(poster), CBOND); // the bond was still there to slash
     }
 }
