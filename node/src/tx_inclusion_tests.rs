@@ -186,7 +186,7 @@ impl TxNode {
         )
         .await
         .with_v2_headers(true)
-        .with_applied_tip_lock(app.advance_lock());
+        .with_applicator(app.clone());
         Self {
             storage,
             executor,

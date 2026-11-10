@@ -4780,7 +4780,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // execute→persist never races the receive-path applier, and each sealed block
         // advances the applied tip. Present iff execute-on-receive (v2) is enabled.
         if let Some(app) = &canonical_applicator {
-            producer_instance = producer_instance.with_applied_tip_lock(app.advance_lock());
+            // RC-6: and advance the applied tip to fork choice's head under that lock
+            // before each build (the drain task may be one pass behind).
+            producer_instance = producer_instance.with_applicator(app.clone());
             // #126 (producer catch-up gate): refuse to seal while this node is rebuilding
             // its applied state from genesis or has not yet hydrated its DAG after a
             // restart, so a lagging/replaying node never forks the fleet by sealing on a

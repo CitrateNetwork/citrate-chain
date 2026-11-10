@@ -225,6 +225,12 @@ async fn yield_between_blocks() {
     tokio::task::yield_now().await;
 }
 
+/// RC-6: how far above the applied tip fork choice's head may be for the producer
+/// to advance to it under its own lock before building. One drain pass behind is
+/// one or two heights; the F2 gate refuses to seal beyond `CATCHUP_REFUSE_GAP` (3)
+/// anyway, so a larger gap is the drain task's to close.
+pub(crate) const PRODUCER_ADVANCE_MAX_HEIGHTS: u64 = 4;
+
 /// Treasury address that receives the treasury slice of each block reward.
 /// Mirrors the producer's `settle_block_rewards` basic-credit list and
 /// `RewardConfig.treasury_address`.
@@ -989,6 +995,52 @@ impl CanonicalApplicator {
             dead_branch: Arc::new(AtomicBool::new(dead_branch)),
             mempool: None,
             drain_wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// RC-6: the producer's catch-up, run under the advance lock it holds for its
+    /// build (`state` is that lock's contents). Moves the applied tip to fork choice's
+    /// head (an extension or a shallow switch, via [`Self::reorg_to`]) when the head is
+    /// at most [`PRODUCER_ADVANCE_MAX_HEIGHTS`] above the applied tip; anything further
+    /// is left to the drain task, and the producer's F2 gate refuses meanwhile.
+    /// Returns whether the applied tip moved. Never fails the build: a declined or
+    /// out-of-window reorg leaves the tip as it was.
+    pub async fn advance_to_head_locked(&self, state: &mut AppliedState) -> bool {
+        let Some(fc) = &self.fork_choice else {
+            return false;
+        };
+        let Some(best) = fc().await else {
+            return false;
+        };
+        if best == state.tip.hash {
+            return false;
+        }
+        let head_height = match read_block(&self.storage, &best) {
+            Ok(Some(b)) => b.header.height,
+            _ => return false,
+        };
+        if head_height
+            > state
+                .tip
+                .height
+                .saturating_add(PRODUCER_ADVANCE_MAX_HEIGHTS)
+        {
+            return false;
+        }
+        match self.reorg_to(state, best).await {
+            ReorgOutcome::Reorged {
+                new_tip,
+                height,
+                reverted,
+                applied,
+            } => {
+                debug!(
+                    "producer: advanced to fork-choice head {new_tip} @ {height} before building (reverted {reverted}, applied {applied})"
+                );
+                self.publish_applied_height(state);
+                true
+            }
+            _ => false,
         }
     }
 

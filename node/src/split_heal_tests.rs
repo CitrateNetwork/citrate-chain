@@ -425,7 +425,7 @@ impl Node {
         )
         .await
         .with_v2_headers(true)
-        .with_applied_tip_lock(app.advance_lock())
+        .with_applicator(app.clone())
         .with_equivocation_vote_config(EquivocationVoteConfig {
             chain_id: CHAIN_ID,
             registry: REG,
@@ -2094,6 +2094,8 @@ mod tests {
             // The drain task applies what admission stored, woken by it.
             "let wake = app.drain_wake();",
             "_ = wake.notified() => {}",
+            // The producer advances to fork choice's head under its lock (RC-6).
+            "producer_instance.with_applicator(app.clone())",
             // Serving plane (ADR CV-6).
             "peer_manager.set_serve_sink(serve_tx)",
             "serve_plane::spawn(storage.clone(), peer_manager.clone(), serve_rx)",

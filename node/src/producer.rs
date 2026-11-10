@@ -1495,6 +1495,12 @@ pub struct BlockProducer {
     /// the sealed block as the new applied tip before releasing it. `None` disables the
     /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
     applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
+    /// RC-6: the applicator whose advance lock is `applied_tip_lock`, wired by
+    /// [`Self::with_applicator`]. Under that lock, before building, the producer
+    /// advances the applied tip to fork choice's head itself
+    /// (`CanonicalApplicator::advance_to_head_locked`), so it never builds on, or
+    /// skips against, a head the drain task has not applied yet.
+    applicator: Option<Arc<crate::canonical_apply::CanonicalApplicator>>,
 
     /// #126 (producer catch-up gate): when set, the producer refuses to seal while a
     /// spine rebuild is in progress or before the DAG has hydrated after a restart.
@@ -1813,6 +1819,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
             vrf_prover: real_vrf_prover(),
@@ -1880,6 +1887,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
             vrf_prover: real_vrf_prover(),
@@ -1946,6 +1954,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
             vrf_prover: real_vrf_prover(),
@@ -2091,6 +2100,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
             vrf_prover: real_vrf_prover(),
@@ -2257,6 +2267,7 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
             vrf_prover: real_vrf_prover(),
@@ -2344,6 +2355,20 @@ impl BlockProducer {
         lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>,
     ) -> Self {
         self.applied_tip_lock = Some(lock);
+        self
+    }
+
+    /// The node's wiring: share `app`'s advance lock (as [`Self::with_applied_tip_lock`])
+    /// and let the producer advance the applied tip to fork choice's head under that
+    /// lock before each build (RC-6). The drain task applies received blocks off the
+    /// P2P loop, so the applied tip can lag the head by one drain pass; a producer that
+    /// built in that gap sealed a sibling of the head or skipped its slot.
+    pub fn with_applicator(
+        mut self,
+        app: Arc<crate::canonical_apply::CanonicalApplicator>,
+    ) -> Self {
+        self.applied_tip_lock = Some(app.advance_lock());
+        self.applicator = Some(app);
         self
     }
 
@@ -2643,6 +2668,12 @@ impl BlockProducer {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // RC-6: build on fork choice's head, not on whatever the drain task last
+        // applied. Bounded (`PRODUCER_ADVANCE_MAX_HEIGHTS`); a node further behind is
+        // refused below (F2) and caught up by the drain.
+        if let (Some(app), Some(guard)) = (&self.applicator, applied_guard.as_mut()) {
+            app.advance_to_head_locked(guard).await;
+        }
 
         // Get current tips for parent selection
         let tips = self.dag_store.get_tips().await;
@@ -7928,7 +7959,7 @@ mod tests {
             )
             .await
             .with_v2_headers(true)
-            .with_applied_tip_lock(app.advance_lock());
+            .with_applicator(app.clone());
             if gated {
                 // Same chain as main.rs.
                 producer = producer
@@ -9257,13 +9288,22 @@ mod tests {
                 b.adm.admit(&a1).await,
                 crate::admission::AdmitOutcome::Admitted { .. }
             ));
-            assert_eq!(applied(&b).1, 0, "precondition: the drain has not applied a1");
+            assert_eq!(
+                applied(&b).1,
+                0,
+                "precondition: the drain has not applied a1"
+            );
             let sealed = b.producer.produce_block().await;
             let h = sealed.expect(
                 "B skipped its slot: it sealed against an applied tip one block behind fork \
                  choice's head instead of advancing to it first",
             );
-            let blk = b.storage.blocks.get_block(&h).expect("read").expect("stored");
+            let blk = b
+                .storage
+                .blocks
+                .get_block(&h)
+                .expect("read")
+                .expect("stored");
             assert_eq!(
                 blk.selected_parent(),
                 a1.header.block_hash,
