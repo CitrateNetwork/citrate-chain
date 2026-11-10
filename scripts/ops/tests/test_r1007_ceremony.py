@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -32,6 +33,31 @@ import node_agent as NA  # noqa: E402
 import params as P  # noqa: E402
 
 SRC = P.load(REPO)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_guard  # noqa: E402
+
+# Every ssh-transport test uses this copy of the committed fleet: the same hosts, with ssh
+# aliases that cannot resolve (RFC 2606 .invalid). ceremony.HERE points at its directory, so
+# the tool's "committed fleet" checks accept it (fed #467 round 3).
+_FLEET_DIR = Path(tempfile.mkdtemp(prefix="r1007-fleet-copy-"))
+FLEET = _FLEET_DIR / "fleet.r1007.json"
+_HERE_REAL = C.HERE
+
+
+def setUpModule():
+    fleet_guard.install()
+    f = json.loads((R7 / "fleet.r1007.json").read_text())
+    for h in f["hosts"]:
+        h["ssh"] = h["name"] + ".invalid"
+    FLEET.write_text(json.dumps(f))
+    C.HERE = _FLEET_DIR
+
+
+def tearDownModule():
+    C.HERE = _HERE_REAL
+    fleet_guard.uninstall()
+    shutil.rmtree(_FLEET_DIR, ignore_errors=True)
 
 
 def peer(i: int) -> str:
@@ -106,7 +132,7 @@ class FleetIsolation(unittest.TestCase):
     def test_child_processes_get_an_ssh_that_refuses(self):
         import fleet_guard
         self.assertTrue(fleet_guard.installed())
-        r = subprocess.run(["sh", "-c", "ssh -G citrate-boot-1"], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["sh", "-c", "ssh -G host.invalid"], capture_output=True, text=True, timeout=5)
         self.assertEqual(r.returncode, 97, r.stdout + r.stderr)
 
     def test_ssh_tests_use_a_fleet_copy_that_cannot_resolve(self):
@@ -291,7 +317,7 @@ class RenderAndCheck(unittest.TestCase):
 
 class PlanAndGuards(unittest.TestCase):
     def test_the_plan_order(self):
-        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        fleet = C.Fleet(FLEET)
         steps = C.plan_steps(fleet)
         self.assertEqual([s["step"] for s in steps], ["prepare", "cut", "boots", "producers", "rpc", "indexer", "health", "rollback"])
         by = {s["step"]: s for s in steps}
@@ -310,7 +336,7 @@ class PlanAndGuards(unittest.TestCase):
         self.assertEqual(names, [p["name"] for p in SRC["producers"]])
 
     def test_ssh_steps_need_the_owner_go(self):
-        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        fleet = C.Fleet(FLEET)
         h = fleet.hosts("boot")[0]
         with self.assertRaises(C.Refuse):
             C.Transport(fleet, None).agent(h, "stop", step="cut")
@@ -322,7 +348,7 @@ class PlanAndGuards(unittest.TestCase):
     # explorer DB up as a managed-cluster fork from the operator machine, never a pg_dump on
     # rpc-1's disk.
     def _ssh_fleet(self, steps):
-        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        fleet = C.Fleet(FLEET)
         go = {"ceremony": "r1007", "genesis": SRC["r1007_genesis"], "approved_by": "owner", "approved_at": "x", "steps": steps}
         return fleet, C.Transport(fleet, go)
 
@@ -415,6 +441,24 @@ class PlanAndGuards(unittest.TestCase):
                 C.step_indexer(self._args(), fleet, t, SRC)
         self.assertFalse(any(c[0] == "host" and "indexer:reset" in c[2] for c in calls))
 
+    def test_a_failed_trusted_source_deletes_the_open_fork(self):
+        # BerryManifold P3 (fed #467 round 3): a fork left with no trusted source admits any
+        # IP, and a re-run then refuses on the existing name.
+        fleet, t = self._ssh_fleet(["indexer"])
+        calls, agent, ssh_run, operator_run = self._record()
+        def failing(argv):
+            if argv[:4] == ["doctl", "databases", "firewalls", "append"]:
+                calls.append(("operator", "", " ".join(argv)))
+                raise subprocess.CalledProcessError(1, argv)
+            return operator_run(argv)
+        p1, p2, p3 = self._patched(agent, ssh_run, failing)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            with self.assertRaises(C.Fail):
+                C.step_indexer(self._args(), fleet, t, SRC)
+        ops = [c[2] for c in calls if c[0] == "operator"]
+        self.assertIn("doctl databases delete fork-new --force", ops)
+        self.assertFalse(any(c[0] == "host" and "indexer:reset" in c[2] for c in calls))
+
     def test_an_owner_go_for_another_genesis_is_refused(self):
         with tempfile.TemporaryDirectory() as t:
             f = Path(t) / "go.json"
@@ -423,9 +467,9 @@ class PlanAndGuards(unittest.TestCase):
                 C.load_go(str(f), SRC["r1007_genesis"])
 
     def test_devnet_only_actions_are_refused_on_the_fleet(self):
-        rc, _ = run(["collect", "--fleet", str(R7 / "fleet.r1007.json"), "--mint", "--state", tempfile.mkdtemp()])
+        rc, _ = run(["collect", "--fleet", str(FLEET), "--mint", "--state", tempfile.mkdtemp()])
         self.assertEqual(rc, 2)
-        rc, _ = run(["render", "--fleet", str(R7 / "fleet.r1007.json"), "--network", "r1006", "--binary", sys.executable, "--state", tempfile.mkdtemp()])
+        rc, _ = run(["render", "--fleet", str(FLEET), "--network", "r1006", "--binary", sys.executable, "--state", tempfile.mkdtemp()])
         self.assertEqual(rc, 2)
 
 
