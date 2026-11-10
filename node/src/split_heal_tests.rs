@@ -1440,7 +1440,7 @@ impl Node {
         for p in connected {
             let info = p.info.read().await;
             if sync_recovery::peer_head_heard(&info.head_hash) {
-                heard += 1;
+                heard = heard.saturating_add(1);
             }
             best_h = best_h.max(info.head_height);
             candidates.push(sync_peer::SyncCandidate {

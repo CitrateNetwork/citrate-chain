@@ -3179,7 +3179,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         continue;
                     }
                     if sync_recovery::peer_head_heard(&info.head_hash) {
-                        heard_peers += 1;
+                        heard_peers = heard_peers.saturating_add(1);
                     }
                     if info.head_height > best_h {
                         best_h = info.head_height;
