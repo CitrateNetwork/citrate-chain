@@ -867,19 +867,34 @@ impl TipReask {
 
 /// The producer's one-time initial-sync condition, evaluated on every sync tick
 /// until it first holds.
+///
+/// `heard_peers` counts the connected peers whose head this node has heard
+/// ([`peer_head_heard`]), not every connected peer. A peer whose head is not
+/// known yet says nothing about where the network is, so it cannot show that
+/// this node is caught up (R2 early seal, devnet fin-r2-k1000-1: a producer
+/// restored ~23 behind declared initial sync complete with one connected peer
+/// it had not heard and sealed on its stale tip). With no heard peer the node
+/// waits as a solo node does: until it hears one, or the solo grace runs out.
 pub fn initial_sync_complete(
     applied: u64,
     target: u64,
-    connected_peers: usize,
+    heard_peers: usize,
     since_start: Duration,
 ) -> bool {
     if since_start >= INITIAL_SYNC_MAX_WAIT {
         return true;
     }
-    if connected_peers == 0 {
+    if heard_peers == 0 {
         return since_start >= INITIAL_SYNC_SOLO_GRACE;
     }
     applied.saturating_add(INITIAL_SYNC_LEAD) >= target
+}
+
+/// Whether this node has heard a connected peer's head: the handshake or a
+/// gossiped block gave it a head hash. A peer registered with no head yet
+/// carries the zero hash.
+pub fn peer_head_heard(head_hash: &citrate_consensus::types::Hash) -> bool {
+    *head_hash != citrate_consensus::types::Hash::default()
 }
 
 #[cfg(test)]
@@ -1046,6 +1061,29 @@ mod tests {
             3,
             INITIAL_SYNC_MAX_WAIT
         ));
+    }
+
+    /// R2 early seal: connected peers whose head is unknown are not counted. A
+    /// node that heard none waits like a solo node, so it cannot complete on
+    /// its own stale tip at 1 s; it completes once a heard peer shows it is
+    /// within the lead, or when the solo grace runs out.
+    #[test]
+    fn initial_sync_counts_only_peers_whose_head_was_heard() {
+        let s = Duration::from_secs(1);
+        // Applied 23,271, target 23,271 (nothing above the tip heard), no heard peer.
+        assert!(!initial_sync_complete(23_271, 23_271, 0, s));
+        assert!(initial_sync_complete(
+            23_271,
+            23_271,
+            0,
+            INITIAL_SYNC_SOLO_GRACE
+        ));
+        // One heard peer at the same height: caught up.
+        assert!(initial_sync_complete(23_271, 23_271, 1, s));
+        assert!(!peer_head_heard(&citrate_consensus::types::Hash::default()));
+        assert!(peer_head_heard(&citrate_consensus::types::Hash::new(
+            [1; 32]
+        )));
     }
 
     #[test]

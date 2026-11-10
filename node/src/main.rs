@@ -3161,10 +3161,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let mut best_h: u64 = 0;
                 let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
                 let mut split_candidates: Vec<sync_peer::SplitCandidate> = Vec::new();
+                let mut heard_peers: usize = 0;
                 for p in pm_for_sync.get_all_peers() {
                     let info = p.info.read().await;
                     if info.state != citrate_network::peer::PeerState::Connected {
                         continue;
+                    }
+                    if sync_recovery::peer_head_heard(&info.head_hash) {
+                        heard_peers += 1;
                     }
                     if info.head_height > best_h {
                         best_h = info.head_height;
@@ -3217,22 +3221,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 if target > 0 {
                     sync_for_loop.set_target(target).await;
                 }
-                // One-time initial-sync condition for the producer gate.
+                // One-time initial-sync condition for the producer gate. Only
+                // peers whose head this node has heard count (R2 early seal).
                 if !initial_sync_for_sync.load(std::sync::atomic::Ordering::Relaxed)
                     && sync_recovery::initial_sync_complete(
                         applied_height,
                         target,
-                        connected_peers.len(),
+                        heard_peers,
                         node_started_at.elapsed(),
                     )
                 {
                     initial_sync_for_sync.store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::info!(
-                        "Initial sync complete (applied={} target={} peers={}); block production \
-                         may start",
+                        "Initial sync complete (applied={} target={} peers={} heard={}); block \
+                         production may start",
                         applied_height,
                         target,
-                        connected_peers.len()
+                        connected_peers.len(),
+                        heard_peers
                     );
                 }
                 // Choose a peer to pull from — see node/src/sync_peer.rs for the

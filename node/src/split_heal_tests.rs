@@ -615,6 +615,11 @@ impl Fleet {
         for i in 0..n {
             fleet.attach_peers(i).await;
         }
+        // The transport handshake (Hello / HelloAck) gives each side the other's
+        // head as it connects (`transport.rs`), so a node of a fresh network has
+        // heard every peer's genesis head before its first sync tick. The
+        // initial-sync condition counts only heard peers (R2 early seal).
+        fleet.handshake().await;
         fleet
     }
 
@@ -1431,8 +1436,12 @@ impl Node {
         let mut best_h = 0u64;
         let mut candidates = Vec::new();
         let mut split = Vec::new();
+        let mut heard = 0usize;
         for p in connected {
             let info = p.info.read().await;
+            if sync_recovery::peer_head_heard(&info.head_hash) {
+                heard += 1;
+            }
             best_h = best_h.max(info.head_height);
             candidates.push(sync_peer::SyncCandidate {
                 id: info.id.0.clone(),
@@ -1454,12 +1463,7 @@ impl Node {
             self.sync.set_target(target).await;
         }
         if !self.initial_sync.load(Ordering::Relaxed)
-            && sync_recovery::initial_sync_complete(
-                applied_height,
-                target,
-                connected.len(),
-                since_start,
-            )
+            && sync_recovery::initial_sync_complete(applied_height, target, heard, since_start)
         {
             self.initial_sync.store(true, Ordering::Relaxed);
         }
