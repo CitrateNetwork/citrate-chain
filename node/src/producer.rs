@@ -9237,6 +9237,42 @@ mod tests {
         }
     }
 
+    /// RC-6 (r1007 devnet, gf-50a09463 vs gc-28e13057 at knob 0, 2026-11-10). With the
+    /// drain task applying received blocks, a producer whose drain had not yet run sealed
+    /// on (or skipped against) an applied tip one block behind fork choice's head: 3.3
+    /// blocks per height against 2.05, and 10-32% fewer heights per minute. The producer
+    /// holds the state-advance lock for its whole build, so it must first advance the
+    /// applied tip to fork choice's head itself, then build on that head.
+    mod advance_before_build {
+        use super::seal_gate_and_parent_walk::{applied, node, produce};
+        use super::*;
+
+        #[tokio::test]
+        async fn rc6_red_producer_builds_on_a_received_block_the_drain_has_not_applied() {
+            let a = node(1, false).await;
+            let b = node(7, false).await;
+            let a1 = produce(&a).await;
+            // B stores A's block; its drain task has not run yet.
+            assert!(matches!(
+                b.adm.admit(&a1).await,
+                crate::admission::AdmitOutcome::Admitted { .. }
+            ));
+            assert_eq!(applied(&b).1, 0, "precondition: the drain has not applied a1");
+            let sealed = b.producer.produce_block().await;
+            let h = sealed.expect(
+                "B skipped its slot: it sealed against an applied tip one block behind fork \
+                 choice's head instead of advancing to it first",
+            );
+            let blk = b.storage.blocks.get_block(&h).expect("read").expect("stored");
+            assert_eq!(
+                blk.selected_parent(),
+                a1.header.block_hash,
+                "B's block must extend the head it had received, not be a sibling of it"
+            );
+            assert_eq!(blk.header.height, a1.header.height + 1);
+        }
+    }
+
     /// r1006 2026-11-01, prod-3 after the reseed: one node serving catch-up
     /// `GetBlocks` to six peers for ten minutes shed `NewBlock` (inbound queue
     /// full), its own sync requests timed out, it dropped six peers for those
