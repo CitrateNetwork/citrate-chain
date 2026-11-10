@@ -91,6 +91,7 @@ pub mod metrics;
 mod model_manager;
 mod model_verifier;
 mod network_inference;
+mod panic_hook;
 mod persistent_dag;
 mod producer;
 mod registration_proof;
