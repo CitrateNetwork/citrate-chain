@@ -214,6 +214,17 @@ pub(crate) mod test_receipt_chunk {
     }
 }
 
+/// RC-1c (r1007 devnet, gf-p1-k1000-1, 2026-11-10): block execution is
+/// synchronous CPU work inside an async task, and the apply loops (forward drain,
+/// reorg re-apply, spine replay) had no await between blocks. A 425-block reorg
+/// after a partition heal held one runtime worker for minutes, and the P2P
+/// message loop, queued on that worker, did not run until the stall watchdog
+/// exited the node. Every apply loop yields after each block, so no task waits
+/// longer than one block's execution for its worker.
+async fn yield_between_blocks() {
+    tokio::task::yield_now().await;
+}
+
 /// Treasury address that receives the treasury slice of each block reward.
 /// Mirrors the producer's `settle_block_rewards` basic-credit list and
 /// `RewardConfig.treasury_address`.
@@ -1926,6 +1937,9 @@ impl CanonicalApplicator {
                     }
                     // VALIDATOR-S1: re-sync the selector if this crossed a snapshot boundary.
                     self.maybe_sync_registry(height).await;
+                    // RC-1c: one block's execution is the most this task holds its
+                    // runtime worker for (see `yield_between_blocks`).
+                    yield_between_blocks().await;
                 }
                 Err(ExecutionError::StateRootMismatch { expected, got }) => {
                     warn!(
@@ -2432,6 +2446,9 @@ impl CanonicalApplicator {
                 .executor
                 .apply_block_no_persist_with_receipts(block, block.header.coinbase, &reward)
                 .await;
+            // RC-1c: a reorg re-applies up to the undo window (10,000 blocks) under
+            // the advance lock; give the runtime a turn after each one.
+            yield_between_blocks().await;
             match apply_result {
                 Ok((_, receipts)) => {
                     win_index.extend(ReceiptIndexBatch::for_block(block, &receipts));
@@ -3499,6 +3516,8 @@ impl CanonicalApplicator {
                         &block.state_root,
                     );
                     self.maybe_sync_registry(block.header.height).await;
+                    // RC-1c: a spine replay can be tens of thousands of blocks.
+                    yield_between_blocks().await;
                 }
                 Err(e) => {
                     warn!(
