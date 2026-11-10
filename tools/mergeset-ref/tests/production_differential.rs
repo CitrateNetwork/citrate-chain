@@ -23,6 +23,7 @@
 //! - internal value transfers and internal CREATE (T3);
 //! - order-dependent storage and logs;
 //! - red members, ineligible proposers, and vests into a registry with code.
+//!
 //! `CITRATE_DIFF_SEEDS` sets the number of seeds (default 200); the spec's
 //! nightly gate is 10,000.
 

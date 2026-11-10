@@ -140,7 +140,7 @@ async fn a_traced_replay_gives_the_untraced_receipts_and_state_root() {
         "one frame for the call: {:?}",
         frames[1]
     );
-    let roots = vec![frames[0][0].clone(), frames[1][0].clone()];
+    let roots = [frames[0][0].clone(), frames[1][0].clone()];
     assert_eq!(roots[0].kind, FrameKind::Create);
     assert_eq!(roots[0].to, Some(factory));
     assert_eq!(roots[1].kind, FrameKind::Call);

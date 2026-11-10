@@ -291,21 +291,21 @@ fn reorg_rolls_back_trie_nodes() {
     let stats = store.prune_trie_nodes(25, window).expect("prune");
     assert_eq!(stats.roots, 10);
     assert!(stats.nodes_removed > 0, "{stats:?}");
-    for h in 16..=20 {
-        assert!(fully_loadable(&store, &roots_a[h]), "window root A{h} kept");
+    for (h, root) in roots_a.iter().enumerate().take(21).skip(16) {
+        assert!(fully_loadable(&store, root), "window root A{h} kept");
     }
-    for h in 21..=25 {
-        assert!(fully_loadable(&store, &roots_b[h]), "window root B{h} kept");
+    for (h, root) in roots_b.iter().enumerate().take(26).skip(21) {
+        assert!(fully_loadable(&store, root), "window root B{h} kept");
     }
-    for h in 26..=30 {
+    for (h, root) in roots_a.iter().enumerate().take(31).skip(26) {
         assert!(
-            !fully_loadable(&store, &roots_a[h]),
+            !fully_loadable(&store, root),
             "abandoned branch root A{h} pruned"
         );
     }
-    for h in 2..=10 {
+    for (h, root) in roots_a.iter().enumerate().take(11).skip(2) {
         assert!(
-            !fully_loadable(&store, &roots_a[h]),
+            !fully_loadable(&store, root),
             "root A{h} below the window pruned"
         );
         assert_eq!(store.trie_root_at(h as u64).expect("record"), None);
@@ -324,7 +324,7 @@ fn reorg_rolls_back_trie_nodes() {
     // Production: the window is the undo window = retention (CV-7a), swept
     // every TRIE_PRUNE_INTERVAL heights.
     assert_eq!(REORG_UNDO_DEPTH, 10_000);
-    assert!(TRIE_PRUNE_INTERVAL > 0 && TRIE_PRUNE_INTERVAL <= REORG_UNDO_DEPTH);
+    const { assert!(TRIE_PRUNE_INTERVAL > 0 && TRIE_PRUNE_INTERVAL <= REORG_UNDO_DEPTH) };
 }
 
 /// A fresh db with `src`'s resident state, as a restart hydrates it.

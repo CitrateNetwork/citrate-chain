@@ -279,7 +279,8 @@ async fn every_executed_tx_type_bumps_nonce() {
     let ai_to = Some(pk(0x10));
     // (name, to, value, data, gas): every shape `parse_transaction_type`
     // accepts, succeeding and failing.
-    let cases: Vec<(&str, Option<PublicKey>, u128, Vec<u8>, u64)> = vec![
+    type Case<'a> = (&'a str, Option<PublicKey>, u128, Vec<u8>, u64);
+    let cases: Vec<Case> = vec![
         (
             "transfer",
             Some(embed(Address([0x71; 20]))),

@@ -720,7 +720,7 @@ impl StateStore {
     fn stage_undo_record(&self, batch: &mut rocksdb::WriteBatch, record: &BlockUndo) -> Result<()> {
         let key = reorg_undo_key(record.height);
         let mut canonical = record.clone();
-        canonical.accounts.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+        canonical.accounts.sort_by_key(|a| a.0 .0);
         canonical
             .storage
             .sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.1.cmp(&b.1)));

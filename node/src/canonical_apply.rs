@@ -178,6 +178,8 @@ pub(crate) mod test_restore_budget {
 
 /// How long the receive path waits for the advance lock before it re-checks
 /// whether a rebuild has started (see [`CanonicalApplicator::apply_received`]).
+/// Test-only since RC-1: the node executes received blocks on the drain task.
+#[cfg(test)]
 const RECEIVE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Upper bound on the blocks a from-genesis spine rebuild (`recover_to_head`)
@@ -270,7 +272,7 @@ fn read_receipt(
     #[cfg(test)]
     read_faults::check(read_faults::Site::Receipt, Some(tx))?;
     match storage.transactions.get_stored_receipt(tx) {
-        Ok(StoredReceipt::Decoded(r)) => Ok(Some(r)),
+        Ok(StoredReceipt::Decoded(r)) => Ok(Some(*r)),
         Ok(StoredReceipt::Absent) => Ok(None),
         Ok(StoredReceipt::Undecodable(e)) => {
             warn!("C1-R: the stored receipt of {tx} does not decode ({e}); it is dropped from the receipt index");
@@ -759,6 +761,8 @@ pub enum FloorCheck {
 }
 
 /// Result of attempting to apply a received block on the fast path.
+/// Test-only since RC-1 (see [`CanonicalApplicator::apply_received`]).
+#[cfg(test)]
 #[derive(Debug)]
 pub enum ApplyOutcome {
     /// Executed, `state_root` verified, applied tip advanced + persisted.
@@ -2882,6 +2886,11 @@ impl CanonicalApplicator {
     /// The outcome is classified for the RECEIVED block: `Applied` iff it ended up
     /// on the applied chain (via drain or reorg); `Rejected` iff it was reached and
     /// rejected; otherwise `Deferred`.
+    ///
+    /// Test-only since RC-1 (r1007/cnv-heal-apply-off-loop): the node never
+    /// executes on the P2P loop; admission stores the block and wakes the drain
+    /// task. The fixtures still drive the applicator through this entry point.
+    #[cfg(test)]
     pub async fn apply_received(&self, block: &Block) -> ApplyOutcome {
         // The receive path runs inside the P2P message handler. A from-genesis
         // rebuild holds the advance lock for its whole replay; waiting for it
@@ -3831,6 +3840,7 @@ impl CanonicalApplicator {
 
     /// Whether `(hash, height)` is the applied block at that height on the current
     /// applied chain (i.e., it was applied — possibly via reorg — and retained).
+    #[cfg(test)]
     fn on_applied_chain(&self, state: &AppliedState, hash: Hash, height: u64) -> bool {
         height <= state.tip.height
             && state
@@ -4131,6 +4141,9 @@ impl CanonicalApplicator {
 /// failed verification, if any (blocks in `applied` are valid + committed).
 struct DrainOutcome {
     applied: Vec<Hash>,
+    /// Read by the test-only receive entry point (`apply_received`); the drain
+    /// task logs a rejection where it happens.
+    #[cfg_attr(not(test), allow(dead_code))]
     rejected: Option<(Hash, String)>,
 }
 

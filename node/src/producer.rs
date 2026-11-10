@@ -2555,6 +2555,9 @@ impl BlockProducer {
     /// EXECUTE-ON-RECEIVE (step 2): share the applied-tip lock with the receive-path
     /// applier. Held across produce→persist so production and reception never race the
     /// executor's snapshot/restore; the sealed block becomes the new applied tip.
+    /// Test-only since RC-6: the node wires the producer with
+    /// [`Self::with_applicator`] (below), which shares the same lock.
+    #[cfg(test)]
     pub fn with_applied_tip_lock(
         mut self,
         lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>,
@@ -9773,7 +9776,6 @@ mod tests {
     /// applied tip to fork choice's head itself, then build on that head.
     mod advance_before_build {
         use super::seal_gate_and_parent_walk::{applied, node, produce};
-        use super::*;
 
         #[tokio::test]
         async fn rc6_red_producer_builds_on_a_received_block_the_drain_has_not_applied() {

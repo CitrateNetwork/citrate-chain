@@ -278,8 +278,9 @@ pub(crate) fn stage_receipt_index(
 pub enum StoredReceipt {
     /// Nothing stored under the transaction hash.
     Absent,
-    /// The stored receipt.
-    Decoded(TransactionReceipt),
+    /// The stored receipt (boxed: a receipt is far larger than the other
+    /// variants since it carries its r1007 acceptance record).
+    Decoded(Box<TransactionReceipt>),
     /// A value is stored but does not decode as a receipt.
     Undecodable(bincode::Error),
 }
@@ -288,7 +289,7 @@ fn read_stored_receipt(db: &RocksDB, tx_hash: &Hash) -> Result<StoredReceipt> {
     Ok(match db.get_cf(CF_RECEIPTS, tx_hash.as_bytes())? {
         None => StoredReceipt::Absent,
         Some(bytes) => match bincode::deserialize(&bytes) {
-            Ok(r) => StoredReceipt::Decoded(r),
+            Ok(r) => StoredReceipt::Decoded(Box::new(r)),
             Err(e) => StoredReceipt::Undecodable(e),
         },
     })
