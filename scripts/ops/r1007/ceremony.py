@@ -777,8 +777,19 @@ def fork_explorer_db(a) -> str:
     if len(fork) != 1 or fork[0].get("status") != "online":
         raise Fail(f"the fork {INDEXER_FORK_NAME} is not online: {fork}")
     fid = fork[0]["id"]
-    # A new DO database has no trusted sources, which means any IP may connect.
-    operator_run(["doctl", "databases", "firewalls", "append", fid, "--rule", a.db_fork_rule])
+    # A new DO database has no trusted sources, which means any IP may connect. If the rule
+    # cannot be added, delete the fork we just made: an open copy of production data must not
+    # stay, and a re-run would otherwise refuse on the existing name.
+    try:
+        operator_run(["doctl", "databases", "firewalls", "append", fid, "--rule", a.db_fork_rule])
+    except subprocess.CalledProcessError as e:
+        try:
+            operator_run(["doctl", "databases", "delete", fid, "--force"])
+        except subprocess.CalledProcessError:
+            raise Fail(f"the fork {INDEXER_FORK_NAME} ({fid}) has no trusted source and could not be deleted; "
+                       f"delete it now: doctl databases delete {fid}") from e
+        raise Fail(f"could not add the trusted source to {INDEXER_FORK_NAME}; the fork was deleted. "
+                   f"Fix --db-fork-rule and re-run") from e
     log(f"indexer: explorer DB forked to {INDEXER_FORK_NAME} ({fid}), trusted source {a.db_fork_rule}")
     return fid
 
