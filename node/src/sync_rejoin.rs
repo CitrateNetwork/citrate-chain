@@ -174,7 +174,7 @@ pub enum Answer {
     /// As [`Answer::Known`], with the highest served block (all held). The node
     /// can hold a middle stretch of a branch it cannot apply yet (stored from
     /// gossip and missing-parent walks while the parts above and below were
-    /// not); `Held` lets a follow see where that stretch ends.
+    /// not); in a follow, `Held` above the cursor moves the cursor past it.
     Held { highest: (Hash, u64) },
 }
 
@@ -568,9 +568,16 @@ impl RejoinTracker {
         anchor_height: u64,
     ) -> Option<Transition> {
         let from = self.answered_by.take();
-        let answer = match answer {
-            Answer::Held { .. } => Answer::Known,
-            other => other,
+        // A follow that meets a stretch of blocks it already holds moves on to the
+        // highest one served (`block_serve` serves by height, every branch), so
+        // it reaches the missing blocks above the stretch; anywhere else, or when
+        // the answer reaches no higher than the cursor, held is Known.
+        let answer = match (&self.mode, answer) {
+            (Mode::Follow { cursor }, Answer::Held { highest }) if highest.1 > cursor.1 => {
+                Answer::Progress { highest }
+            }
+            (_, Answer::Held { .. }) => Answer::Known,
+            (_, other) => other,
         };
         let behind = behind || self.target_behind || self.split;
         if !behind {
@@ -1326,6 +1333,10 @@ mod tests {
             .expect("validate");
         let mut pending = node.sync.drain_validated_blocks().await;
         let verified: HashSet<Hash> = pending.iter().map(h).collect();
+        let highest_served = pending
+            .iter()
+            .max_by_key(|b| b.header.height)
+            .map(|b| (h(b), b.header.height));
         let answered = tracker.take_answer(from, &received, &verified);
         let reprocessed = !pending.is_empty();
         if reprocessed {
@@ -1346,11 +1357,12 @@ mod tests {
         node.app.drive_drain().await;
         let applied_now = node.applied().expect("applied tip").1;
         if let Some(ah) = answered {
-            let verdict = classify(
+            let verdict = classify_answer(
                 received.is_empty(),
                 fx.newly_admitted,
                 fx.highest_admitted,
                 deferred,
+                highest_served,
             );
             tracker.on_answer(verdict, network_height > applied_now, ah);
         }

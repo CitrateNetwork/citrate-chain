@@ -1129,6 +1129,10 @@ impl Node {
         let _ = self.sync.handle_blocks(pid, blocks).await;
         let mut pending = self.sync.drain_validated_blocks().await;
         let answer_top = pending.iter().map(|b| b.header.height).max();
+        let answer_highest = pending
+            .iter()
+            .max_by_key(|b| b.header.height)
+            .map(|b| (b.header.block_hash, b.header.height));
         let verified: HashSet<Hash> = pending.iter().map(|b| b.header.block_hash).collect();
         let answers_rejoin = self
             .rejoin
@@ -1213,11 +1217,12 @@ impl Node {
         let _ = peer;
         let mut gave_up = false;
         if let Some(anchor_height) = answers_rejoin {
-            let answer = sync_rejoin::classify(
+            let answer = sync_rejoin::classify_answer(
                 answer_hashes.is_empty(),
                 newly_admitted,
                 highest,
                 deferred_from_answer,
+                answer_highest,
             );
             let t = self.rejoin.lock().on_answer(answer, gap > 0, anchor_height);
             gave_up = matches!(t, Some(sync_rejoin::Transition::GaveUp { .. }));
@@ -2089,7 +2094,7 @@ mod tests {
             "tip_reask_for_rx.lock().note_answer(",
             "tip_reask_for_loop.lock().hold(",
             "|h| held_heads.contains(h)",
-            "sync_rejoin::classify(",
+            "sync_rejoin::classify_answer(",
             "sel.record_serve(",
             // The drain task applies what admission stored, woken by it.
             "let wake = app.drain_wake();",
