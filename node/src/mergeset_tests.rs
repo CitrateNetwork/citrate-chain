@@ -1365,9 +1365,33 @@ async fn skipped_merged_block_txs_are_reinjected_and_execute_once() {
     for i in 0..3 {
         sibs.push(fleet.nodes[i].produce().await);
     }
-    let a = &fleet.nodes[0];
+    // m is produced by the node whose own block fork choice selects as m's
+    // selected parent. Its own calls then execute first (spec 06 §3.1: SP,
+    // then the mergeset ascending by key), so the calls the budget skips are
+    // the other producers', which its pool holds only once they are
+    // reinjected. Which sibling is selected depends on the block hashes, so
+    // it is read from fork choice, not assumed.
     fleet.deliver(0, &sibs[1..]).await;
+    let head = fleet.nodes[0].ghostdag.select_tip().await.expect("a head");
+    let ai = sibs
+        .iter()
+        .position(|b| b.header.block_hash == head)
+        .expect("fork choice selects one of the siblings");
+    if ai != 0 {
+        let others: Vec<Block> = sibs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != ai)
+            .map(|(_, b)| b.clone())
+            .collect();
+        fleet.deliver(ai, &others).await;
+    }
+    let a = &fleet.nodes[ai];
     let m = a.produce().await;
+    assert_eq!(
+        m.header.selected_parent_hash, head,
+        "m is built on the head"
+    );
     let skipped: Vec<&Transaction> = calls
         .iter()
         .filter(|t| a.receipt_json(&t.hash).is_none())
