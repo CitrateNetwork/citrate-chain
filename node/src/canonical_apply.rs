@@ -4660,6 +4660,68 @@ pub(crate) mod tests {
         );
     }
 
+    /// Counts how often a task that yields in a loop gets polled while `work` runs
+    /// on the same single-threaded runtime: 0 when `work` never yields.
+    async fn polls_of_another_task_during<F: std::future::Future>(work: F) -> (F::Output, u64) {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let t = ticks.clone();
+        let other = tokio::spawn(async move {
+            loop {
+                t.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        let out = work.await;
+        let polled = ticks.load(Ordering::Relaxed);
+        other.abort();
+        (out, polled)
+    }
+
+    /// RED (r1007 devnet gf-p1-k1000-1, 2026-11-10, RC-1c). With execution moved
+    /// to the drain task, the P2P message loop still stopped for 60 s on three
+    /// nodes the moment the drain began a 425-block reorg after a partition heal,
+    /// and the watchdog exited them mid-reorg. The drain's apply loops have no
+    /// await between blocks, so a long drain holds its runtime worker for the
+    /// whole run (at ~1.2 s per block, minutes), and a task waiting on that
+    /// worker (tokio's LIFO slot is not stolen) does not run. The drain must give
+    /// the runtime a turn after every block it applies.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_forward_drain_yields_between_blocks() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let c = chain(6);
+        for b in &c {
+            persist(&storage, b);
+        }
+        let (applied, polled) = polls_of_another_task_during(app.drive_drain()).await;
+        assert_eq!(applied, 6, "fixture: the drain applies the whole chain");
+        assert!(
+            polled >= 5,
+            "another task ran {polled} time(s) while the drain applied 6 blocks: the drain \
+             holds the runtime for its whole run"
+        );
+    }
+
+    /// RED (RC-1c), the reorg half: re-applying the winning branch also yields
+    /// after every block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reorg_yields_between_reapplied_blocks() {
+        let (exec, storage, _dir) = fresh();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, _a2, _b2, b3) = setup_fork(&app, &storage).await; // tip = a2 @ 2
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let (_, polled) = polls_of_another_task_during(app.drive_drain()).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            b3.header.block_hash,
+            "fixture: the drain reorgs to the heavier branch"
+        );
+        assert!(
+            polled >= 2,
+            "another task ran {polled} time(s) while the reorg re-applied 2 blocks"
+        );
+    }
+
     /// Re-delivering a block whose whole chain is already persisted drains it in a
     /// single call (all intermediates present) — the "top arrives last" case.
     #[tokio::test]
