@@ -203,9 +203,14 @@ pub const R1006_GENESIS: [u8; 32] =
 /// r1006 ceremony state (same contracts, same producer set, owner Q-3) with its own
 /// genesis note, rooted under the MPT state root rule from block 0 (CV-14).
 /// Pinned by `r1007_genesis_hash_is_pinned_and_reproducible_under_the_mpt_rule` in
-/// citrate-economics, which rebuilds it from the compiled profile. Any change to the
-/// allocation, the genesis block encoding or the root rule moves it, on purpose; the
-/// integration of the r1007 consensus lanes re-pins it there (docs/consensus/R1007_GENESIS.md).
+/// citrate-economics, which rebuilds it from the compiled layout. Any change to the
+/// allocation, the genesis block encoding or the root rule moves it, on purpose
+/// (docs/consensus/R1007_GENESIS.md).
+///
+/// **Candidate, not final (D-K3, owner 2026-11-10):** this is the hash of the layout
+/// over r1006's role keys, which r1007 rotates, so no node builds it
+/// (`GenesisConfig::r1007` refuses while the fresh keys are pending). It keys the r1007
+/// tables until the fresh-keys alloc exists; that alloc re-pins it.
 pub const R1007_GENESIS: [u8; 32] =
     hex32("d245a960a616896a2b80f9aa8e92417b44a4fb451640efdb9c75dda5abc1ba7f");
 

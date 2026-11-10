@@ -863,8 +863,9 @@ mod tests {
     }
 
     /// The node's genesis build for profile `r1007`: the MPT rule is published for the
-    /// block 0 the profile compiles (main.rs `publish_mpt_rule_for_genesis_build`), and the
-    /// build then produces exactly `R1007_GENESIS`.
+    /// block 0 the profile compiles (main.rs `publish_mpt_rule_for_genesis_build`). Under
+    /// D-K3 (owner 2026-11-10) the build is then refused: the only r1007 layout names the
+    /// rotated r1006 non-producer keys, so the node never starts that block 0.
     #[test]
     fn r1007_profile_builds_the_pinned_block_0_under_the_published_rule() {
         r1007_child("genesis::tests::r1007_child_build_after_publication");
@@ -882,15 +883,12 @@ mod tests {
             Some(0)
         );
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        let g = rt
+        let e = rt
             .block_on(build_profile(40204, Some(R1007_PROFILE)))
-            .expect("the r1007 genesis builds");
-        assert_eq!(
-            g,
-            citrate_consensus::hardening::R1007_GENESIS,
-            "the node built 0x{} for profile r1007",
-            hex::encode(g)
-        );
+            .expect_err("r1007 is pending under D-K3: refused, not built")
+            .to_string();
+        assert!(e.contains("D-K3"), "{e}");
+        assert!(e.contains("TREASURY") && e.contains("DEPLOYER"), "{e}");
         // A configured per-node height that disagrees with the compiled one is refused.
         assert!(
             crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), Some(5)).is_err()
@@ -898,7 +896,9 @@ mod tests {
     }
 
     /// Without the rule published (a caller that skipped the publication) the r1007 build
-    /// is refused, never built under the legacy root.
+    /// is refused, never built under the legacy root. Under D-K3 the pending keys refuse
+    /// it first; the MPT guard on the layout itself is
+    /// `r1007_genesis_state_refuses_to_build_without_the_mpt_rule` (economics).
     #[test]
     fn r1007_profile_build_refuses_without_the_published_rule() {
         r1007_child("genesis::tests::r1007_child_build_without_publication");
@@ -915,7 +915,7 @@ mod tests {
             .block_on(build_profile(40204, Some(R1007_PROFILE)))
             .expect_err("refused")
             .to_string();
-        assert!(e.contains("MPT state root"), "{e}");
+        assert!(e.contains("D-K3") || e.contains("MPT state root"), "{e}");
     }
 
     #[test]

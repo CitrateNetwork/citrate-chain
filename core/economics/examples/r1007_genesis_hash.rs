@@ -1,6 +1,8 @@
 //! Print the r1007 genesis hash the compiled profile builds under the MPT state root rule
 //! (the ceremony step of docs/consensus/STATE_ROOT_MPT.md §1, step 3), and what it still
 //! waits for. Re-pin `citrate_consensus::hardening::R1007_GENESIS` from its output.
+//! While the rotated r1006 keys are pending (D-K3, owner 2026-11-10) it prints the
+//! refusal, which names every role still to fill.
 use citrate_economics::r1007;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

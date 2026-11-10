@@ -238,7 +238,13 @@ fn the_r1006_layout_shows_where_r1007_must_replace_each_rotated_key() {
     };
     let governance = "0x3975c796e3ca6825de3c8ac7dae0820a1c0b2c5c";
     let guardian = "0xc6ed3ed2a3a302f1ed2249fb43e94808c9fbaf1d";
-    for r in ["GOV_OWNER_1", "GOV_OWNER_2", "GOV_OWNER_3", "GOV_OWNER_4", "GOV_OWNER_5"] {
+    for r in [
+        "GOV_OWNER_1",
+        "GOV_OWNER_2",
+        "GOV_OWNER_3",
+        "GOV_OWNER_4",
+        "GOV_OWNER_5",
+    ] {
         assert!(at(r).contains(governance), "{r}: {:?}", at(r));
     }
     for r in ["GRD_OWNER_1", "GRD_OWNER_2", "GRD_OWNER_3"] {
@@ -249,17 +255,38 @@ fn the_r1006_layout_shows_where_r1007_must_replace_each_rotated_key() {
         assert!(at(r).contains(institutional), "{r}");
     }
     let grantor = at("MEMBERSHIP_GRANTOR");
-    assert!(grantor.contains("0x883165132776171fbcfde2d3c789ef5bdb0d060d"), "SBT");
-    assert!(grantor.contains("0xd6632ea2179d047d2460f1de90abcc519839555e"), "vault");
+    assert!(
+        grantor.contains("0x883165132776171fbcfde2d3c789ef5bdb0d060d"),
+        "SBT"
+    );
+    assert!(
+        grantor.contains("0xd6632ea2179d047d2460f1de90abcc519839555e"),
+        "vault"
+    );
     let treasury = at("TREASURY");
-    assert!(treasury.contains("0xeb6082db09c5383489a0b75057c739818bf33440"), "funded");
-    assert!(treasury.len() >= 4, "funded + fee recipient in 3 contracts: {treasury:?}");
+    assert!(
+        treasury.contains("0xeb6082db09c5383489a0b75057c739818bf33440"),
+        "funded"
+    );
+    assert!(
+        treasury.len() >= 4,
+        "funded + fee recipient in 3 contracts: {treasury:?}"
+    );
     assert!(at("FAUCET").contains("0xd75b8b3776532ea38f7683fdddc94401d0719b59"));
     let team = at("TEAM");
-    assert!(team.contains("0x2a60d582019e002dce914c8a24f28435605a47be"), "vesting");
-    assert!(at("CITRATE_AA_OWNER").len() >= 2, "paymaster and wallet factory");
+    assert!(
+        team.contains("0x2a60d582019e002dce914c8a24f28435605a47be"),
+        "vesting"
+    );
+    assert!(
+        at("CITRATE_AA_OWNER").len() >= 2,
+        "paymaster and wallet factory"
+    );
     assert!(!at("CITRATE_AA_IDENTITY_SIGNER").is_empty());
     assert!(!at("CITRATE_AA_SPONSOR_SIGNER").is_empty());
     assert!(at("DEPLOYER").contains("0xe40325ba1f4cf362b203d9fe2b8160312e926c11"));
-    assert!(at("RELAYER").is_empty(), "held under a hashed slot, if at all");
+    assert!(
+        at("RELAYER").is_empty(),
+        "held under a hashed slot, if at all"
+    );
 }
