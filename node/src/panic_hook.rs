@@ -45,6 +45,18 @@ pub fn panic_line(thread: &str, info: &PanicHookInfo<'_>) -> String {
     )
 }
 
+/// Install the hook. Call it once, before the async runtime starts, so it
+/// covers every worker thread and spawned task.
+pub fn install() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let current = std::thread::current();
+        let thread = current.name().unwrap_or("<unnamed>");
+        tracing::error!("{}", panic_line(thread, info));
+        default_hook(info);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

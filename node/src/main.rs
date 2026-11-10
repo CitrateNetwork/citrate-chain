@@ -487,8 +487,18 @@ fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The panic hook first, before the runtime and its worker threads exist, so
+    // every panic in any task leaves a timestamped PANIC line in the node log
+    // (panic_hook.rs; it logs and runs the default hook, it does not abort).
+    panic_hook::install();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(node_main())
+}
+
+async fn node_main() -> Result<()> {
     // Initialize structured logging
     // Uses LOG_FORMAT env var (json, pretty, compact) and RUST_LOG for levels
     let log_config = logging::LogConfig::from_env();
