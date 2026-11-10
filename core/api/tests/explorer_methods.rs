@@ -990,20 +990,30 @@ fn finality_status_reports_the_stored_certificate_not_depth() {
     assert_eq!(r["latestCertificate"]["blockHash"], hx(&h(0xA0, 2)));
     assert_eq!(r["latestCertificate"]["committeeSize"], 4);
     assert_eq!(r["latestCertificate"]["voters"], 3);
-    assert!(
-        r["latestCertificate"]["stateRoot"].is_null(),
-        "finality-lane field: {r}"
+    // The v2 certificate fields, as stored (the finality lane is merged).
+    let c = &r["latestCertificate"];
+    assert_eq!(c["epoch"], "0x0", "{r}");
+    assert_eq!(c["stateRoot"], hx(&Hash::new([0x51; 32])), "{r}");
+    assert_eq!(c["acceptedRoot"], hx(&Hash::new([0x52; 32])), "{r}");
+    // u128 stakes as decimal strings, as the finality lane's handler reports
+    // them (JSON numbers lose precision).
+    assert_eq!(c["totalStake"], "100", "10 + 20 + 30 + 40: {r}");
+    // The three voters are the committee's first three members.
+    assert_eq!(c["votedStake"], "60", "10 + 20 + 30: {r}");
+    assert_eq!(
+        c["quorumStake"],
+        cp_quorum_stake(100).to_string(),
+        "more than two thirds of the committee's stake: {r}"
     );
+    // Only the driver's live view is not in storage: pending checkpoints and
+    // the halt flag (the lane's handler reports them).
     let pending: Vec<&str> = r["pendingFinalityLane"]
         .as_array()
         .expect("list")
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert!(
-        pending.contains(&"stateRoot") && pending.contains(&"votedStake"),
-        "{r}"
-    );
+    assert_eq!(pending, vec!["pending", "halted"], "{r}");
     // r1007 (ADR CV-8): voting is on from block 0 in this build; enforcement
     // is on for no (chain id, genesis) pair until the soak (G5).
     assert_eq!(r["votingPinned"], true, "{r}");
@@ -1018,6 +1028,11 @@ fn finality_status_reports_the_stored_certificate_not_depth() {
     assert!(r["quorumRule"].is_string(), "{r}");
     assert!(r["dataSource"].is_string(), "{r}");
     assert!(r.get("mode").is_some(), "{r}");
+}
+
+/// The stake quorum of a committee with `total` stake (spec 06 §7, #185).
+fn cp_quorum_stake(total: u128) -> u128 {
+    citrate_consensus::checkpoint::quorum_stake(total)
 }
 
 // ── 6. citrate_getDagStats ───────────────────────────────────────────────

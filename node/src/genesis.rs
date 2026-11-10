@@ -1109,4 +1109,21 @@ mod tests {
         );
         assert_eq!(genesis_committee_set(None).expect("no genesis"), None);
     }
+
+    /// r1007 (R1007_GENESIS.md §3.3, integration item §5.2): the r1007 block 0
+    /// registers the same producers as r1006 (the validators file is shared),
+    /// so its epoch-0 committee is the same set. Without this arm r1007 votes
+    /// form only from the first registry snapshot S(1) = 800.
+    #[test]
+    fn r1007_genesis_committee_is_the_shared_validator_set() {
+        let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+        let r1007 = citrate_consensus::hardening::R1007_GENESIS;
+        let want = genesis_committee_set(Some(&r1006))
+            .expect("the r1006 validator file parses")
+            .expect("r1006 compiles a final producer set");
+        let got = genesis_committee_set(Some(&r1007))
+            .expect("the shared validator file parses")
+            .expect("r1007 compiles its epoch-0 committee");
+        assert_eq!(got, want);
+    }
 }

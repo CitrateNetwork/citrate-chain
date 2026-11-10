@@ -80,3 +80,41 @@ fn the_rendering_names_every_parameter_and_moves_with_each() {
     q.slot_duration_secs += 1;
     assert_ne!(q.render(), r);
 }
+
+/// Integration item §5.3 (R1007_GENESIS.md): the compiled r1007 parameters equal the
+/// constants the time-slots, mergeset and finality lanes run with. Each lane owns its
+/// constant; this test fails if a lane moves one without the genesis table.
+#[test]
+fn r1007_chain_params_bind_the_lane_constants() {
+    let p = R1007_CHAIN_PARAMS;
+    assert_eq!(
+        p.slot_duration_secs,
+        citrate_consensus::slots::SLOT_DURATION_SECS,
+        "SLOT_DURATION (G9)"
+    );
+    assert_eq!(
+        p.max_future_drift_secs,
+        citrate_consensus::slots::MAX_FUTURE_SLOT_DRIFT_SECS,
+        "future drift (G9, R12)"
+    );
+    assert_eq!(
+        p.include_gas_limit,
+        citrate_consensus::acceptance::INCLUDE_GAS_LIMIT,
+        "INCLUDE_GAS_LIMIT (D9)"
+    );
+    assert_eq!(
+        p.accept_gas_limit,
+        citrate_consensus::acceptance::ACCEPT_GAS_LIMIT,
+        "ACCEPT_GAS_LIMIT (D9)"
+    );
+    assert_eq!(
+        p.checkpoint_interval,
+        citrate_consensus::checkpoint::CHECKPOINT_INTERVAL,
+        "CHECKPOINT_INTERVAL (CV-8)"
+    );
+    assert_eq!(
+        p.committee_size,
+        citrate_consensus::checkpoint::CHECKPOINT_COMMITTEE_SIZE,
+        "CHECKPOINT_COMMITTEE_SIZE (06 §7.2)"
+    );
+}
