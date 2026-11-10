@@ -214,7 +214,7 @@ struct CatchupBehindState {
     refusing: bool,
     /// Applied tip observed at the previous evaluation; used to detect sync progress.
     last_applied_tip: u64,
-    /// When the applied tip last advanced (an advance resets the stall timer).
+    /// When the applied tip last moved (any move, up or down, resets the stall timer).
     last_progress: Instant,
     /// Set once a >`stall_alert_after` no-progress stall is detected; only the
     /// human-in-command override clears it (NEVER auto-resume after a stall).
@@ -1303,8 +1303,9 @@ impl ProduceCatchupGate {
             return Ok(());
         }
 
-        // Sync progress (the applied tip advanced) resets the stall timer.
-        if local_tip > st.last_applied_tip {
+        // Sync progress (ANY move of the applied tip, a reorg below it too) resets the
+        // stall timer; see f2_a_reorg_to_a_lower_applied_tip_is_progress_not_a_stall.
+        if local_tip != st.last_applied_tip {
             st.last_applied_tip = local_tip;
             st.last_progress = Instant::now();
         }
