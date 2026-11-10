@@ -24,11 +24,12 @@ import {FederatedRoundLedger} from "../../src/FederatedRoundLedger.sol";
 import {OrganizationSBT} from "../../src/cit_agent/OrganizationSBT.sol";
 import {AgentSBT} from "../../src/cit_agent/AgentSBT.sol";
 import {CitrateMemberSBT} from "../../src/core_membership/CitrateMemberSBT.sol";
+import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
 import {RoleLogArchive} from "./RoleHistoryHarness.sol";
 import {GovernanceWithNode, GateWithNode, BookCancellerChecks} from "./NodeChainIdHarness.sol";
 
-/// Test-only coordinator bond amounts. They are NOT the genesis values: those are pending the
-/// tokenomics decision, and the builder refuses to run without them being given explicitly.
+// Test-only coordinator bond amounts. They are NOT the genesis values: those are pending the
+// tokenomics decision, and the builder refuses to run without them being given explicitly.
 uint128 constant TEST_MIN_BOND = 3 ether;
 uint128 constant TEST_DEFAULT_BOND = 7 ether;
 
@@ -67,8 +68,8 @@ contract V060GenesisSpecTest is Test {
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
         vm.chainId(40204);
         govScript = new GovernanceWithNode();
-        gov = govScript.deployWith(
-            SENDER, _council(0xA000, 5, 3, 48 hours), _council(0xB000, 3, 2, 1 hours), false, false, false, true
+        gov = govScript.deployWithV060(
+            SENDER, _council(0xA000, 5, 3, 48 hours), _council(0xB000, 3, 2, 1 hours), false, false, _retired()
         );
         registryP1 = govScript.providerRegistry();
         // The block-0 contracts the 0.6.0 set reads (P2's AA stack, P3L's HUP registries, P4's
@@ -94,9 +95,20 @@ contract V060GenesisSpecTest is Test {
         c.proposalTtl = 14 days;
     }
 
-    function _inputs() internal view returns (DeployV060Genesis.Inputs memory i) {
+    /// Test-only stand-ins for the retired r1006 keys (D-K3). The real list is the owner's input.
+    function _retired() internal returns (address[] memory r) {
+        r = new address[](3);
+        r[0] = makeAddr("retired-r1006-treasury");
+        r[1] = makeAddr("retired-r1006-deployer");
+        r[2] = makeAddr("retired-r1006-grantor");
+    }
+
+    function _inputs() internal returns (DeployV060Genesis.Inputs memory i) {
         i.governanceTimelock = gov.governanceTimelock;
+        i.governanceMultisig = gov.governanceMultisig;
         i.guardianTimelock = gov.guardianTimelock;
+        i.guardianMultisig = gov.guardianMultisig;
+        i.retiredKeys = _retired();
         i.guardianCanceller = gov.guardianCanceller;
         i.federatedRoundLedger = address(frl);
         i.guardianRecoveryModule = address(recoveryV1);
@@ -390,10 +402,12 @@ contract V060GenesisSpecTest is Test {
         );
         DeployV060Genesis.Inputs memory i = _inputs();
         i.governanceTimelock = v1gov.governanceTimelock;
+        i.governanceMultisig = v1gov.governanceMultisig;
         i.guardianTimelock = v1gov.guardianTimelock;
+        i.guardianMultisig = v1gov.guardianMultisig;
         i.guardianCanceller = v1gov.guardianCanceller;
         DeployV060Genesis s = new DeployV060Genesis();
-        vm.expectRevert(bytes("ProviderRegistry: not live at its CREATE2 address for (GOVERNANCE, GUARDIAN); run P1 with GENESIS_CANCELLER_V2=1"));
+        vm.expectRevert(bytes("ProviderRegistry: not live at its CREATE2 address for (GOVERNANCE, GUARDIAN); run P1 with GENESIS_V060=1"));
         s.deployWith(SENDER, i);
     }
 
@@ -425,5 +439,99 @@ contract V060GenesisSpecTest is Test {
         (DeployV060Genesis s, DeployV060Genesis.Deployed memory d) = _build();
         DeployV060Genesis.Deployed memory again = s.deployWith(SENDER, _inputs());
         assertEq(abi.encode(again), abi.encode(d));
+    }
+
+    // ------------------------------------------------------------------ D-K3: rotated keys
+
+    /// The wiring names only the ceremony's parameters: the council owners given to P1, and
+    /// timelocks built from them. No 0.6.0 contract names the deployer or a retired key.
+    function test_wiring_names_only_the_ceremony_parameters_and_no_retired_key() public {
+        (, DeployV060Genesis.Deployed memory d) = _build();
+        DeployGenesisGovernance.Council memory g = _council(0xA000, 5, 3, 48 hours);
+        DeployGenesisGovernance.Council memory r = _council(0xB000, 3, 2, 1 hours);
+        assertEq(abi.encode(MultisigProposer(gov.governanceMultisig).owners()), abi.encode(g.owners));
+        assertEq(abi.encode(MultisigProposer(gov.guardianMultisig).owners()), abi.encode(r.owners));
+        WorkMarket m = WorkMarket(payable(d.workMarket));
+        address[8] memory named = [
+            m.governance(),
+            m.guardian(),
+            m.slashSink(),
+            ProviderRegistry(d.providerRegistry).guardian(),
+            ProviderRegistry(d.providerRegistry).governance(),
+            DatasetRegistry(d.datasetRegistry).governance(),
+            OrgBudgets(d.orgBudgets).governance(),
+            GuardianCancellerV2(d.guardianCancellerV2).guardian()
+        ];
+        address[] memory retired = _retired();
+        for (uint256 k = 0; k < named.length; k++) {
+            assertTrue(named[k] == gov.governanceTimelock || named[k] == gov.guardianTimelock, "only the councils");
+            assertTrue(named[k] != SENDER, "never the deployer");
+            for (uint256 j = 0; j < retired.length; j++) {
+                assertTrue(named[k] != retired[j], "never a retired key");
+            }
+        }
+    }
+
+    function test_p1_v060_refuses_without_the_retired_keys() public {
+        GovernanceWithNode g = new GovernanceWithNode();
+        uint64 nonceBefore = vm.getNonce(SENDER);
+        vm.expectRevert(bytes(V060GenesisSpec.PENDING_RETIRED_KEYS));
+        g.deployWithV060(
+            SENDER, _council(0xC000, 5, 3, 49 hours), _council(0xD000, 3, 2, 2 hours), false, false, new address[](0)
+        );
+        assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
+    }
+
+    function test_p1_v060_refuses_a_retired_council_owner_or_deployer() public {
+        GovernanceWithNode g = new GovernanceWithNode();
+        address[] memory retired = _retired();
+        DeployGenesisGovernance.Council memory gc = _council(0xC000, 5, 3, 49 hours);
+        DeployGenesisGovernance.Council memory rc = _council(0xD000, 3, 2, 2 hours);
+        address[] memory withOwner = new address[](retired.length + 1);
+        for (uint256 k = 0; k < retired.length; k++) {
+            withOwner[k] = retired[k];
+        }
+        withOwner[retired.length] = gc.owners[2];
+        vm.expectRevert(
+            bytes("GOVERNANCE owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
+        );
+        g.deployWithV060(SENDER, gc, rc, false, false, withOwner);
+        withOwner[retired.length] = rc.owners[0];
+        vm.expectRevert(
+            bytes("GUARDIAN owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
+        );
+        g.deployWithV060(SENDER, gc, rc, false, false, withOwner);
+        withOwner[retired.length] = SENDER;
+        vm.expectRevert(bytes("deployer is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one"));
+        g.deployWithV060(SENDER, gc, rc, false, false, withOwner);
+    }
+
+    function test_builder_refuses_without_the_retired_keys() public {
+        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        i.retiredKeys = new address[](0);
+        vm.expectRevert(bytes(V060GenesisSpec.PENDING_RETIRED_KEYS));
+        s.deployWith(SENDER, i);
+    }
+
+    /// The builder reads the councils' owners on chain, so a council built with a key that is
+    /// on the retired list (here: a list that names one of setUp's owners) is refused.
+    function test_builder_refuses_a_council_owner_or_deployer_on_the_retired_list() public {
+        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        i.retiredKeys = new address[](1);
+        i.retiredKeys[0] = address(uint160(0xA003));
+        vm.expectRevert(
+            bytes("GOVERNANCE owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
+        );
+        s.deployWith(SENDER, i);
+        i.retiredKeys[0] = address(uint160(0xB001));
+        vm.expectRevert(
+            bytes("GUARDIAN owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
+        );
+        s.deployWith(SENDER, i);
+        i.retiredKeys[0] = SENDER;
+        vm.expectRevert(bytes("deployer is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one"));
+        s.deployWith(SENDER, i);
     }
 }

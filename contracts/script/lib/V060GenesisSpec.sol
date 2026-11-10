@@ -32,6 +32,12 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/
 ///           WorkMarket slashSink            the GOVERNANCE timelock (owner 2026-11-09)
 ///           guardian seats at block 0       the GUARDIAN timelock, i.e. the guardian council (Q9 a)
 ///
+///         Keys (owner decision D-K3, 2026-11-10): every non-producer EVM key touched at the r1007
+///         ceremony is rotated. Nothing here names an account literally; the accounts the 0.6.0
+///         genesis names (the deployer and the council owners behind the GOVERNANCE and GUARDIAN
+///         timelocks) are ceremony inputs, and the scripts refuse to run without the list of
+///         retired r1006 keys (`PENDING_RETIRED_KEYS`) or with any of those accounts on it.
+///
 ///         Pending: the WorkMarket coordinator bonds (`minCoordinatorBond_`,
 ///         `defaultCoordinatorBond_`) wait on the tokenomics decision. There is no default here:
 ///         DeployV060Genesis refuses to build without both (`PENDING_COORDINATOR_BONDS`), and
@@ -58,6 +64,20 @@ library V060GenesisSpec {
 
     string internal constant PENDING_COORDINATOR_BONDS =
         "PENDING PARAMETER: the WorkMarket coordinator bonds wait on the tokenomics decision; set WORKMARKET_MIN_COORDINATOR_BOND and WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei, min > 0, default >= min)";
+
+    string internal constant PENDING_RETIRED_KEYS =
+        "PENDING PARAMETER: GENESIS_RETIRED_KEYS must list the r1006 non-producer EVM keys retired at the r1007 ceremony (D-K3, owner 2026-11-10)";
+
+    /// @notice Reverts when `who` is one of the retired r1006 keys (D-K3): every non-producer
+    ///         EVM account the 0.6.0 genesis names must be a new key.
+    function requireNotRetired(string memory role, address who, address[] memory retiredKeys) internal pure {
+        for (uint256 i = 0; i < retiredKeys.length; i++) {
+            require(
+                who != retiredKeys[i],
+                string.concat(role, " is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
+            );
+        }
+    }
 
     function providerRegistryInit(address governanceTimelock, address guardianTimelock)
         internal

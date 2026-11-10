@@ -972,6 +972,18 @@ expect "ceremony: an unknown phase is refused" 1 'must be one of' -- "${CEENV[@]
 # P0 checks. Negative controls on a copy of the tree: each kind of drift is caught.
 PI="$G/phase_inputs.py"
 expect "phase inputs tripwire: the tree's phase reads are all classified" 0 'phase_inputs: OK' -- python3 -I "$PI" check-spec
+# D-K3 (owner 2026-11-10): the 0.6.0 ceremony genesis (GENESIS_V060=1) needs the retired r1006
+# keys, and no address input, council owner or deployer of the run may be one of them.
+RK1=0x00000000000000000000000000000000000000a1
+NK1=0x00000000000000000000000000000000000000b1
+pf() { env -i PATH="$PATH" "$@" python3 -I "$PI" preflight --phases P1; }
+expect "phase inputs D-K3: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1
+expect "phase inputs D-K3: a retired TREASURY is refused" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" TREASURY="$RK1"
+expect "phase inputs D-K3: a retired council owner is refused" 3 'GRD_OWNERS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" GRD_OWNERS="$NK1,$RK1"
+expect "phase inputs D-K3: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" DEPLOYER_ADDRESS="$RK1"
+expect "phase inputs D-K3: a malformed retired key is refused" 3 "GENESIS_RETIRED_KEYS: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1,0xzz"
+expect "phase inputs D-K3: new keys pass (control)" 0 '' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" TREASURY="$NK1" GOV_OWNERS="$NK1" DEPLOYER_ADDRESS=0x00000000000000000000000000000000000000c1
+expect "phase inputs D-K3: the r1006/r1007 ceremony needs no retired list (control)" 0 '' -- pf
 TW="$T/pi-tree"
 mkdir -p "$TW/scripts/genesis" "$TW/scripts/ops" "$TW/contracts"
 cp "$G/genesis_ceremony.sh" "$TW/scripts/genesis/"

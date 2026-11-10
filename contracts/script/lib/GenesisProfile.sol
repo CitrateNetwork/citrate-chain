@@ -4,6 +4,9 @@ pragma solidity ^0.8.26;
 import "forge-std/Script.sol";
 import "./AdminChecks.sol";
 import {GuardianCanceller} from "../../src/genesis/GuardianCanceller.sol";
+import {GuardianCancellerV2} from "../../src/genesis/GuardianCancellerV2.sol";
+import {ProviderRegistry} from "../../src/amc/ProviderRegistry.sol";
+import {V060GenesisSpec} from "./V060GenesisSpec.sol";
 
 /// @title GenesisProfile: one chain-id source and one set of genesis floors for the C4 scripts
 /// @notice The genesis profile (chain 40204) is chosen from the chain id the NODE reports, not
@@ -156,6 +159,13 @@ abstract contract GenesisProfile is Script, AdminChecks {
     ///           - its runtime code is this build's GuardianCanceller for `govTl` (codehash
     ///             compared with a reference instance built here in simulation, never broadcast);
     ///           - it reads back governanceTimelock() == govTl and guardian() == GuardianTimelock;
+    ///           - in a 0.6.0 governance book (`params.guardianCancellerVersion` = 2), the seat is
+    ///             GuardianCancellerV2 instead: at its CREATE2 address under
+    ///             "Genesis.GuardianCancellerV2" for (GovernanceTimelock, GuardianTimelock, the
+    ///             book's ProviderRegistry), with this build's v2 code, and that registry at its
+    ///             own CREATE2 address ("Genesis.ProviderRegistry", init (GovernanceTimelock,
+    ///             GuardianTimelock, 24 h)) with this build's code. Any other version is refused,
+    ///             and a v2 seat in a book without the field fails the v1 checks (no downgrade);
     ///           - GuardianMultisig is the ceremony's MultisigProposer for the GuardianTimelock
     ///             (CREATE2 provenance under "Genesis.GuardianMultisig", incl. its proposal TTL),
     ///             and the GuardianTimelock's own complete holder sets are exactly {itself} as
@@ -183,19 +193,30 @@ abstract contract GenesisProfile is Script, AdminChecks {
         if (govTl.code.length == 0 || grdTl.code.length == 0) {
             return ("GuardianCanceller: a timelock it is wired to has no code", address(0));
         }
-        bytes memory init = abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(govTl, grdTl));
-        // The same CREATE2 provenance AdminChecks uses for the councils (`_ceremonyCreate2Address`).
-        address expected = _ceremonyCreate2Address(GUARDIAN_CANCELLER_SALT, init);
-        if (c != expected) {
-            return
-                (
+        uint256 version = 1;
+        if (vm.keyExistsJson(json, ".params.guardianCancellerVersion")) {
+            version = vm.parseJsonUint(json, ".params.guardianCancellerVersion");
+            if (version != V060GenesisSpec.CANCELLER_V2) {
+                return ("governance book names an unknown guardianCancellerVersion", address(0));
+            }
+        }
+        if (version == V060GenesisSpec.CANCELLER_V2) {
+            string memory v2Problem = _cancellerV2Problem(json, c, govTl, grdTl);
+            if (bytes(v2Problem).length != 0) return (v2Problem, address(0));
+        } else {
+            bytes memory init = abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(govTl, grdTl));
+            // The same CREATE2 provenance AdminChecks uses for the councils (`_ceremonyCreate2Address`).
+            address expected = _ceremonyCreate2Address(GUARDIAN_CANCELLER_SALT, init);
+            if (c != expected) {
+                return (
                     "GuardianCanceller is not at its CREATE2 address for (GovernanceTimelock, GuardianTimelock)",
                     address(0)
                 );
-        }
-        if (c.code.length == 0) return ("GuardianCanceller: no code", address(0));
-        if (c.codehash != address(new GuardianCanceller(govTl, grdTl)).codehash) {
-            return ("GuardianCanceller: runtime code is not this build's GuardianCanceller", address(0));
+            }
+            if (c.code.length == 0) return ("GuardianCanceller: no code", address(0));
+            if (c.codehash != address(new GuardianCanceller(govTl, grdTl)).codehash) {
+                return ("GuardianCanceller: runtime code is not this build's GuardianCanceller", address(0));
+            }
         }
         (bool okT, address t) = _readAddress(c, abi.encodeWithSignature("governanceTimelock()"));
         if (!okT || t != govTl) return ("GuardianCanceller cancels on another timelock", address(0));
@@ -209,6 +230,45 @@ abstract contract GenesisProfile is Script, AdminChecks {
         string memory grd = _timelockHolderProblem(grdTl, grdMs, new address[](0));
         if (bytes(grd).length != 0) return (string.concat("GuardianTimelock: ", grd), address(0));
         return ("", c);
+    }
+
+    /// @notice Empty when `c` is this build's GuardianCancellerV2 for (govTl, grdTl, the book's
+    ///         ProviderRegistry) at its CREATE2 address, and that registry is this build's
+    ///         ProviderRegistry for (govTl, grdTl, 24 h) at its own. Never reverts.
+    function _cancellerV2Problem(string memory json, address c, address govTl, address grdTl)
+        internal
+        returns (string memory)
+    {
+        if (!vm.keyExistsJson(json, ".contracts.ProviderRegistry")) {
+            return "GuardianCancellerV2 listed without its ProviderRegistry";
+        }
+        address registry = vm.parseJsonAddress(json, ".contracts.ProviderRegistry");
+        if (
+            registry
+                != _ceremonyCreate2Address(
+                    V060GenesisSpec.PROVIDER_REGISTRY, V060GenesisSpec.providerRegistryInit(govTl, grdTl)
+                )
+        ) return "ProviderRegistry is not at its CREATE2 address for (GovernanceTimelock, GuardianTimelock)";
+        if (registry.code.length == 0) return "ProviderRegistry: no code";
+        if (registry.codehash != address(new ProviderRegistry(govTl, grdTl, V060GenesisSpec.PROVIDER_VETO_WINDOW)).codehash)
+        {
+            return "ProviderRegistry: runtime code is not this build's ProviderRegistry";
+        }
+        if (
+            c
+                != _ceremonyCreate2Address(
+                    V060GenesisSpec.GUARDIAN_CANCELLER_V2, V060GenesisSpec.guardianCancellerV2Init(govTl, grdTl, registry)
+                )
+        ) {
+            return "GuardianCancellerV2 is not at its CREATE2 address for (GovernanceTimelock, GuardianTimelock, ProviderRegistry)";
+        }
+        if (c.code.length == 0) return "GuardianCancellerV2: no code";
+        if (c.codehash != address(new GuardianCancellerV2(govTl, grdTl, registry)).codehash) {
+            return "GuardianCancellerV2: runtime code is not this build's GuardianCancellerV2";
+        }
+        (bool okR, address r) = _readAddress(c, abi.encodeWithSignature("providerRegistry()"));
+        if (!okR || r != registry) return "GuardianCancellerV2 protects another registry";
+        return "";
     }
 
     function _readUint(address target, bytes memory cd) internal view returns (bool ok, uint256 value) {

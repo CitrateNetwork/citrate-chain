@@ -410,10 +410,48 @@ def preflight(spec, run_phases, started_after, deployer):
             seen_vals[k] = v.lower()
         elif t == "uint" and not re.fullmatch(r"[0-9]+", v):
             problems.append(f"{k} ({v}) is not an unsigned integer")
+    problems += retired_key_problems(inputs, env, dep)
     for g in spec.get("distinct", []):
         vals = [(k, seen_vals[k]) for k in g if k in seen_vals]
         if len({x for _, x in vals}) != len(vals):
             problems.append(f"{', '.join(g)} must be distinct addresses (got {', '.join(f'{k}={x}' for k, x in vals)})")
+    return problems
+
+
+def retired_key_problems(inputs, env, deployer):
+    """D-K3 (owner 2026-11-10): an entry with "required_with": K must be set when K=1, and in
+    a run that sets GENESIS_RETIRED_KEYS no address input of the run (whatever its phase), no
+    council owner and not the deployer may be one of the retired keys."""
+    problems = []
+    for k, e in sorted(inputs.items()):
+        w = e.get("required_with")
+        if w and env.get(w, "") == "1" and not env.get(k, "").strip():
+            problems.append(f"{k} is not set; {w}=1 requires it ({e['why']})")
+    raw = env.get("GENESIS_RETIRED_KEYS", "").strip()
+    if not raw:
+        return problems
+    retired = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if not ADDR.fullmatch(x) or int(x, 16) == 0:
+            problems.append(f"GENESIS_RETIRED_KEYS: {x!r} is not a nonzero address")
+            continue
+        retired.add(x.lower())
+    named = []
+    for k, e in sorted(inputs.items()):
+        v = env.get(k, "").strip()
+        if v and e.get("type", "address" if e.get("class") in ("p0", "late") else "") == "address":
+            named.append((k, v))
+    for k in ("GOV_OWNERS", "GRD_OWNERS"):
+        named += [(k, x.strip()) for x in env.get(k, "").split(",") if x.strip()]
+    for k in ("DEPLOYER_ADDRESS", "CEREMONY_DEPLOYER_ADDRESS"):
+        if env.get(k, "").strip():
+            named.append((k, env[k].strip()))
+    if deployer:
+        named.append(("the deployer", deployer))
+    for k, v in named:
+        if v.lower() in retired:
+            problems.append(f"{k} ({v}) is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
     return problems
 
 
