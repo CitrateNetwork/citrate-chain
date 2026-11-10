@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.26;
 
-import {ProviderRegistry} from "../../src/amc/ProviderRegistry.sol";
+import {V060GovernanceSpec} from "./V060GovernanceSpec.sol";
+
 import {UsageReceipts} from "../../src/amc/UsageReceipts.sol";
 import {OrgBudgets, IOrganizationSBT} from "../../src/amc/OrgBudgets.sol";
 import {WorkAttestations, IAgentSBT} from "../../src/amc/WorkAttestations.sol";
-import {GuardianCancellerV2} from "../../src/genesis/GuardianCancellerV2.sol";
 import {WorkMarket} from "../../src/work/WorkMarket.sol";
 import {FLRoundVerifier, IFederatedRoundLedgerReads} from "../../src/work/FLRoundVerifier.sol";
 import {TaskVerifier} from "../../src/work/TaskVerifier.sol";
@@ -13,6 +13,8 @@ import {DatasetRegistry} from "../../src/data/DatasetRegistry.sol";
 import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/recovery/GuardianRecoveryModuleV2.sol";
 
 /// @title V060GenesisSpec: the 0.6.0 ceremony-genesis contracts, their salts and their init code
+/// @notice ProviderRegistry and GuardianCancellerV2, which P1 deploys, are in V060GovernanceSpec,
+///         so P1 and the shared admin checks compile only those two contracts' closure.
 /// @notice One source for the deploy scripts (DeployGenesisGovernance in its v2-canceller mode,
 ///         DeployV060Genesis) of what each 0.6.0 genesis contract is built from. The ceremony
 ///         deploys every one with `new X{salt: Salts.salt(NAME)}(args)` through the Arachnid
@@ -44,8 +46,6 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/
 ///         WorkMarket's address is unknown until they are fixed, because they are in its init code.
 library V060GenesisSpec {
     // CREATE2 salt names (Salts.salt(name)). The "Genesis." prefix is the P1 convention.
-    string internal constant PROVIDER_REGISTRY = "Genesis.ProviderRegistry";
-    string internal constant GUARDIAN_CANCELLER_V2 = "Genesis.GuardianCancellerV2";
     string internal constant FL_ROUND_VERIFIER = "Genesis.FLRoundVerifier";
     string internal constant TASK_VERIFIER = "Genesis.TaskVerifier";
     string internal constant WORK_MARKET = "Genesis.WorkMarket";
@@ -56,48 +56,10 @@ library V060GenesisSpec {
     string internal constant WORK_ATTESTATIONS = "Genesis.WorkAttestations";
 
     uint64 internal constant TASK_REVIEW_WINDOW = 72 hours;
-    uint64 internal constant PROVIDER_VETO_WINDOW = 24 hours;
     uint32 internal constant USAGE_MAX_BACKFILL_DAYS = 90;
-
-    /// The governance book records which canceller generation holds GOVERNANCE's CANCELLER seat.
-    uint256 internal constant CANCELLER_V2 = 2;
 
     string internal constant PENDING_COORDINATOR_BONDS =
         "PENDING PARAMETER: the WorkMarket coordinator bonds wait on the tokenomics decision; set WORKMARKET_MIN_COORDINATOR_BOND and WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei, min > 0, default >= min)";
-
-    string internal constant PENDING_RETIRED_KEYS =
-        "PENDING PARAMETER: GENESIS_RETIRED_KEYS must list the r1006 non-producer EVM keys retired at the r1007 ceremony (D-K3, owner 2026-11-10)";
-
-    /// @notice Reverts when `who` is one of the retired r1006 keys (D-K3): every non-producer
-    ///         EVM account the 0.6.0 genesis names must be a new key.
-    function requireNotRetired(string memory role, address who, address[] memory retiredKeys) internal pure {
-        for (uint256 i = 0; i < retiredKeys.length; i++) {
-            require(
-                who != retiredKeys[i],
-                string.concat(role, " is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
-            );
-        }
-    }
-
-    function providerRegistryInit(address governanceTimelock, address guardianTimelock)
-        internal
-        pure
-        returns (bytes memory)
-    {
-        return abi.encodePacked(
-            type(ProviderRegistry).creationCode, abi.encode(governanceTimelock, guardianTimelock, PROVIDER_VETO_WINDOW)
-        );
-    }
-
-    function guardianCancellerV2Init(address governanceTimelock, address guardianTimelock, address registry)
-        internal
-        pure
-        returns (bytes memory)
-    {
-        return abi.encodePacked(
-            type(GuardianCancellerV2).creationCode, abi.encode(governanceTimelock, guardianTimelock, registry)
-        );
-    }
 
     function flRoundVerifierInit(address federatedRoundLedger) internal pure returns (bytes memory) {
         return abi.encodePacked(

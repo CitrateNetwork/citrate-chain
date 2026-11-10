@@ -972,18 +972,30 @@ expect "ceremony: an unknown phase is refused" 1 'must be one of' -- "${CEENV[@]
 # P0 checks. Negative controls on a copy of the tree: each kind of drift is caught.
 PI="$G/phase_inputs.py"
 expect "phase inputs tripwire: the tree's phase reads are all classified" 0 'phase_inputs: OK' -- python3 -I "$PI" check-spec
-# D-K3 (owner 2026-11-10): the 0.6.0 ceremony genesis (GENESIS_V060=1) needs the retired r1006
-# keys, and no address input, council owner or deployer of the run may be one of them.
+# Keys of the 0.6.0 ceremony genesis (GENESIS_V060=1; fed #467 section 0.6, D-K3): the r1007 key
+# inventory is an allowlist for every address input and council owner (a producer staker also
+# passes), the retired r1006 keys an extra denylist, and the GUARDIAN delay plus the owner's
+# veto margin must fit in the 24 h registry window.
 RK1=0x00000000000000000000000000000000000000a1
 NK1=0x00000000000000000000000000000000000000b1
+NK2=0x00000000000000000000000000000000000000b2
+DEP=0x00000000000000000000000000000000000000c1
+STAKER=$(jq -r '.validators[0].staker' "$G/../../core/economics/assets/r1006/validators.json")
 pf() { env -i PATH="$PATH" "$@" python3 -I "$PI" preflight --phases P1; }
-expect "phase inputs D-K3: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1
-expect "phase inputs D-K3: a retired TREASURY is refused" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" TREASURY="$RK1"
-expect "phase inputs D-K3: a retired council owner is refused" 3 'GRD_OWNERS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" GRD_OWNERS="$NK1,$RK1"
-expect "phase inputs D-K3: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" DEPLOYER_ADDRESS="$RK1"
-expect "phase inputs D-K3: a malformed retired key is refused" 3 "GENESIS_RETIRED_KEYS: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1,0xzz"
-expect "phase inputs D-K3: new keys pass (control)" 0 '' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" TREASURY="$NK1" GOV_OWNERS="$NK1" DEPLOYER_ADDRESS=0x00000000000000000000000000000000000000c1
-expect "phase inputs D-K3: the r1006/r1007 ceremony needs no retired list (control)" 0 '' -- pf
+V060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1,$NK2" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$DEP")
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_RETIRED_KEYS="$RK1"
+expect "phase inputs keys: a typo'd address input is refused" 3 'TREASURY \(0x0+b3\) is not in GENESIS_KEY_INVENTORY' -- pf "${V060[@]}" TREASURY=0x00000000000000000000000000000000000000b3
+expect "phase inputs keys: a stale key absent from the retired list is refused" 3 'GRD_OWNERS \(0x0+d1\) is not in GENESIS_KEY_INVENTORY' -- pf "${V060[@]}" GRD_OWNERS="$NK1,0x00000000000000000000000000000000000000d1"
+expect "phase inputs keys: an inventory omission is refused" 3 'GOV_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 GOV_OWNERS="$NK1,$NK2"
+expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${V060[@]}" TREASURY="$RK1"
+expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$RK1"
+expect "phase inputs keys: a malformed inventory entry is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1,0xzz" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${V060[@]}" GRD_MIN_DELAY=86000
+expect "phase inputs keys: a producer staker passes the allowlist" 0 '' -- pf "${V060[@]}" TREASURY="$STAKER"
+expect "phase inputs keys: inventory keys pass (control)" 0 '' -- pf "${V060[@]}" TREASURY="$NK1" GOV_OWNERS="$NK1,$NK2" GRD_MIN_DELAY=3600
+expect "phase inputs keys: the r1006/r1007 ceremony needs none of them (control)" 0 '' -- pf
 TW="$T/pi-tree"
 mkdir -p "$TW/scripts/genesis" "$TW/scripts/ops" "$TW/contracts"
 cp "$G/genesis_ceremony.sh" "$TW/scripts/genesis/"
@@ -1094,6 +1106,14 @@ printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)"
 printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
 expect "ceremony: P5 fails a deployer role held in the vesting output" 3 'DEPLOYER-ADMIN VestingAlice' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=VestingAlice bash "$CE" --simulate --only P5
 expect "ceremony: P5 fails a deployer role held in the dormant-ledger output" 3 'DEPLOYER-ADMIN PatronageLedger' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=PatronageLedger bash "$CE" --simulate --only P5
+# The 0.6.0 output (DeployV060Genesis) is swept in a GENESIS_V060=1 run, and refused outside one.
+V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=3600
+  GENESIS_KEY_INVENTORY="$(owners 11 12 13 14 15),$(owners 21 22 23),$(addr 61),$(addr 62),$(addr 63),$(addr 64),$(addr 65),$(addr 66),$(addr 67),$(addr 51),$(addr 90)")
+printf '{"deployer":"%s","contracts":{"WorkMarket":"%s"}}' "$DEP" "$(addr 83)" >"$GB/v060-genesis.json"
+expect "ceremony: P5 refuses a 0.6.0 book outside a 0.6.0 run" 3 'exists but GENESIS_V060 is not 1' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+expect "ceremony: P5 sweeps the 0.6.0 output in a 0.6.0 run" 3 'DEPLOYER-ADMIN WorkMarket' -- "${CEENV[@]}" "${V060_KEYS[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=WorkMarket bash "$CE" --simulate --only P5
+rm -f "$GB/v060-genesis.json"
+expect "ceremony: P5 in a 0.6.0 simulation without the 0.6.0 book notes it and passes" 0 'v060-genesis.json absent in a simulation' -- "${CEENV[@]}" "${V060_KEYS[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 expect "ceremony: P5 refuses an output from another deployer" 3 "names deployer '0x0+9', not this run's deployer" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "printf '{\"deployer\":\"%s\",\"contracts\":{\"VestingAlice\":\"%s\"}}' '$(addr 9)' '$(addr 71)' > '$GB/team-vesting.json'; bash '$CE' --simulate --only P5"
 printf '{"deployer":"%s","contracts":{"Alpha":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
 mk_manifest "$GB"

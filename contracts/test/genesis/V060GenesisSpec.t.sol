@@ -464,6 +464,7 @@ contract V060GenesisSpecTest is Test {
         i.guardianTimelock = v1gov.guardianTimelock;
         i.guardianMultisig = v1gov.guardianMultisig;
         i.guardianCanceller = v1gov.guardianCanceller;
+        i.keys = _keys(_council(0xC000, 5, 3, 49 hours), _council(0xD000, 3, 2, 2 hours));
         DeployV060Genesis s = _builder();
         vm.expectRevert(bytes("ProviderRegistry: not live at its CREATE2 address for (GOVERNANCE, GUARDIAN); run P1 with GENESIS_V060=1"));
         s.deployWith(SENDER, i);

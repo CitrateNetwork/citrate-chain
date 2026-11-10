@@ -418,25 +418,51 @@ def preflight(spec, run_phases, started_after, deployer):
     return problems
 
 
+PRODUCERS = os.path.normpath(os.path.join(HERE, "..", "..", "core", "economics", "assets", "r1006", "validators.json"))
+VETO_WINDOW = 24 * 3600
+
+
+def _address_list(raw, key, problems):
+    out = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if not ADDR.fullmatch(x) or int(x, 16) == 0:
+            problems.append(f"{key}: {x!r} is not a nonzero address")
+            continue
+        out.add(x.lower())
+    return out
+
+
+def producer_stakers(path=PRODUCERS):
+    """The producer stakers (fed #467 section 0.1: exposed and not rotated), from validators.json."""
+    try:
+        with open(path) as f:
+            return {v["staker"].lower() for v in json.load(f)["validators"]}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        die(f"cannot read the producer stakers from {path}: {e}")
+
+
 def retired_key_problems(inputs, env, deployer):
-    """D-K3 (owner 2026-11-10): an entry with "required_with": K must be set when K=1, and in
-    a run that sets GENESIS_RETIRED_KEYS no address input of the run (whatever its phase), no
-    council owner and not the deployer may be one of the retired keys."""
+    """Keys of the 0.6.0 ceremony genesis (fed #467 section 0.6; D-K3, owner 2026-11-10).
+
+    An entry with "required_with": K must be set when K=1. With GENESIS_V060=1, every address
+    input of the run (whatever its phase) and every council owner must be on
+    GENESIS_KEY_INVENTORY or be a producer staker (the allowlist), and none of them, nor the
+    deployer, may be on GENESIS_RETIRED_KEYS (the extra denylist). The deployer is the throwaway
+    ceremony key: it is not on the inventory, and it must end with no role and zero balance
+    (P5 and emit_alloc check that). GRD_MIN_DELAY plus GENESIS_GUARDIAN_VETO_MARGIN must fit in
+    the 24 h ProviderRegistry veto window."""
     problems = []
     for k, e in sorted(inputs.items()):
         w = e.get("required_with")
         if w and env.get(w, "") == "1" and not env.get(k, "").strip():
             problems.append(f"{k} is not set; {w}=1 requires it ({e['why']})")
-    raw = env.get("GENESIS_RETIRED_KEYS", "").strip()
-    if not raw:
+    if env.get("GENESIS_V060", "") != "1":
         return problems
-    retired = set()
-    for x in raw.split(","):
-        x = x.strip()
-        if not ADDR.fullmatch(x) or int(x, 16) == 0:
-            problems.append(f"GENESIS_RETIRED_KEYS: {x!r} is not a nonzero address")
-            continue
-        retired.add(x.lower())
+    retired = _address_list(env.get("GENESIS_RETIRED_KEYS", ""), "GENESIS_RETIRED_KEYS", problems) if env.get("GENESIS_RETIRED_KEYS", "").strip() else set()
+    raw_inv = env.get("GENESIS_KEY_INVENTORY", "").strip()
+    inventory = _address_list(raw_inv, "GENESIS_KEY_INVENTORY", problems) if raw_inv else None
+    stakers = producer_stakers()
     named = []
     for k, e in sorted(inputs.items()):
         v = env.get(k, "").strip()
@@ -444,14 +470,29 @@ def retired_key_problems(inputs, env, deployer):
             named.append((k, v))
     for k in ("GOV_OWNERS", "GRD_OWNERS"):
         named += [(k, x.strip()) for x in env.get(k, "").split(",") if x.strip()]
-    for k in ("DEPLOYER_ADDRESS", "CEREMONY_DEPLOYER_ADDRESS"):
-        if env.get(k, "").strip():
-            named.append((k, env[k].strip()))
+    deps = [(k, env[k].strip()) for k in ("DEPLOYER_ADDRESS", "CEREMONY_DEPLOYER_ADDRESS") if env.get(k, "").strip()]
     if deployer:
-        named.append(("the deployer", deployer))
-    for k, v in named:
+        deps.append(("the deployer", deployer))
+    for k, v in named + deps:
         if v.lower() in retired:
             problems.append(f"{k} ({v}) is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
+    if inventory is not None:
+        dep_set = {v.lower() for _, v in deps}
+        for k, v in named:
+            lv = v.lower()
+            if lv in inventory or lv in stakers:
+                continue
+            if lv in dep_set:
+                problems.append(f"{k} ({v}) is the deployer; the throwaway ceremony key may hold no other seat")
+                continue
+            problems.append(f"{k} ({v}) is not in GENESIS_KEY_INVENTORY (the r1007 key inventory) and is not a producer staker")
+    margin = env.get("GENESIS_GUARDIAN_VETO_MARGIN", "").strip()
+    delay = env.get("GRD_MIN_DELAY", "").strip()
+    if margin:
+        if not re.fullmatch(r"[0-9]+", margin) or int(margin) == 0:
+            problems.append(f"GENESIS_GUARDIAN_VETO_MARGIN ({margin}) must be an unsigned integer above zero")
+        elif re.fullmatch(r"[0-9]+", delay) and int(delay) + int(margin) > VETO_WINDOW:
+            problems.append(f"GRD_MIN_DELAY ({delay}) plus GENESIS_GUARDIAN_VETO_MARGIN ({margin}) exceeds the 24 h ProviderRegistry veto window")
     return problems
 
 

@@ -6,7 +6,7 @@ import "./AdminChecks.sol";
 import {GuardianCanceller} from "../../src/genesis/GuardianCanceller.sol";
 import {GuardianCancellerV2} from "../../src/genesis/GuardianCancellerV2.sol";
 import {ProviderRegistry} from "../../src/amc/ProviderRegistry.sol";
-import {V060GenesisSpec} from "./V060GenesisSpec.sol";
+import {V060GovernanceSpec} from "./V060GovernanceSpec.sol";
 
 /// @title GenesisProfile: one chain-id source and one set of genesis floors for the C4 scripts
 /// @notice The genesis profile (chain 40204) is chosen from the chain id the NODE reports, not
@@ -196,11 +196,11 @@ abstract contract GenesisProfile is Script, AdminChecks {
         uint256 version = 1;
         if (vm.keyExistsJson(json, ".params.guardianCancellerVersion")) {
             version = vm.parseJsonUint(json, ".params.guardianCancellerVersion");
-            if (version != V060GenesisSpec.CANCELLER_V2) {
+            if (version != V060GovernanceSpec.CANCELLER_V2) {
                 return ("governance book names an unknown guardianCancellerVersion", address(0));
             }
         }
-        if (version == V060GenesisSpec.CANCELLER_V2) {
+        if (version == V060GovernanceSpec.CANCELLER_V2) {
             string memory v2Problem = _cancellerV2Problem(json, c, govTl, grdTl);
             if (bytes(v2Problem).length != 0) return (v2Problem, address(0));
         } else {
@@ -246,18 +246,18 @@ abstract contract GenesisProfile is Script, AdminChecks {
         if (
             registry
                 != _ceremonyCreate2Address(
-                    V060GenesisSpec.PROVIDER_REGISTRY, V060GenesisSpec.providerRegistryInit(govTl, grdTl)
+                    V060GovernanceSpec.PROVIDER_REGISTRY, V060GovernanceSpec.providerRegistryInit(govTl, grdTl)
                 )
         ) return "ProviderRegistry is not at its CREATE2 address for (GovernanceTimelock, GuardianTimelock)";
         if (registry.code.length == 0) return "ProviderRegistry: no code";
-        if (registry.codehash != address(new ProviderRegistry(govTl, grdTl, V060GenesisSpec.PROVIDER_VETO_WINDOW)).codehash)
+        if (registry.codehash != address(new ProviderRegistry(govTl, grdTl, V060GovernanceSpec.PROVIDER_VETO_WINDOW)).codehash)
         {
             return "ProviderRegistry: runtime code is not this build's ProviderRegistry";
         }
         if (
             c
                 != _ceremonyCreate2Address(
-                    V060GenesisSpec.GUARDIAN_CANCELLER_V2, V060GenesisSpec.guardianCancellerV2Init(govTl, grdTl, registry)
+                    V060GovernanceSpec.GUARDIAN_CANCELLER_V2, V060GovernanceSpec.guardianCancellerV2Init(govTl, grdTl, registry)
                 )
         ) {
             return "GuardianCancellerV2 is not at its CREATE2 address for (GovernanceTimelock, GuardianTimelock, ProviderRegistry)";

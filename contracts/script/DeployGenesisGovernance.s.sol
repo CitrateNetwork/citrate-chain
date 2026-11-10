@@ -13,7 +13,7 @@ import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 import {GuardianCanceller} from "../src/genesis/GuardianCanceller.sol";
 import {GuardianCancellerV2} from "../src/genesis/GuardianCancellerV2.sol";
 import {ProviderRegistry} from "../src/amc/ProviderRegistry.sol";
-import {V060GenesisSpec} from "./lib/V060GenesisSpec.sol";
+import {V060GovernanceSpec} from "./lib/V060GovernanceSpec.sol";
 
 /// @title DeployGenesisGovernance: GOVERNANCE and GUARDIAN for the betanet genesis (C2 D5 / G3)
 /// @notice For each council: an OZ v5.7.0 `TimelockController` (the delay) fronted by a
@@ -98,10 +98,16 @@ import {V060GenesisSpec} from "./lib/V060GenesisSpec.sol";
 ///         seat), the registry as ProviderRegistry, and `params.guardianCancellerVersion` = 2.
 ///         Unset or 0 is the r1006/r1007 ceremony, byte for byte. Values other than 0 / 1 are
 ///         rejected.
-///         With GENESIS_V060=1, GENESIS_RETIRED_KEYS is required: the public addresses of the
-///         r1006 non-producer EVM keys the owner retired at the r1007 ceremony (D-K3, 2026-11-10),
-///         comma-separated. It has no default. The run refuses, before broadcasting, when it is
-///         unset or empty, or when the deployer or any council owner is one of them.
+///         With GENESIS_V060=1 three key parameters are required, none with a default
+///         (V060GovernanceSpec.KeyParams; fed #467 section 0.6, D-K3):
+///           GENESIS_KEY_INVENTORY         the r1007 key inventory (public addresses); every
+///                                         council owner must be on it (an allowlist)
+///           GENESIS_RETIRED_KEYS          the retired r1006 non-producer keys; no council owner
+///                                         and not the deployer may be on it (a denylist)
+///           GENESIS_GUARDIAN_VETO_MARGIN  seconds; GRD_MIN_DELAY plus this must fit inside the
+///                                         ProviderRegistry veto window (24 h)
+///         The run refuses all of this before broadcasting. The deployer is the throwaway
+///         ceremony key: it is not on the inventory, and it ends with no role.
 ///
 ///         Dry run:  forge script script/DeployGenesisGovernance.s.sol --rpc-url <rpc>
 ///         Then:     ADDRESS_BOOK=genesis/governance.json forge script script/CheckDeployedAdmins.s.sol --rpc-url <rpc>
@@ -152,6 +158,8 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
     bool public cancellerV2;
     /// @notice The block-0 ProviderRegistry GuardianCancellerV2 commits to (v2 mode only).
     address public providerRegistry;
+    /// @notice GENESIS_GUARDIAN_VETO_MARGIN of the last 0.6.0 run (recorded in the book).
+    uint256 public guardianVetoMargin;
 
     function run() external returns (Deployed memory d) {
         address deployer = deployerAddress();
@@ -164,8 +172,12 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         // Resolve the output path before broadcasting, so a missing one fails first.
         vm.envString("GENESIS_GOVERNANCE_OUT");
         if (v060) {
-            address[] memory retired = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
-            d = deployWithV060(deployer, gov, grd, allowShared, allowWeak, retired);
+            V060GovernanceSpec.KeyParams memory k = V060GovernanceSpec.KeyParams({
+                keyInventory: vm.envOr("GENESIS_KEY_INVENTORY", ",", new address[](0)),
+                retiredKeys: vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0)),
+                guardianVetoMargin: vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0))
+            });
+            d = deployWithV060(deployer, gov, grd, allowShared, allowWeak, k);
         } else {
             d = deployWith(deployer, gov, grd, allowShared, allowWeak, genesisProfile);
         }
@@ -191,30 +203,34 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         bool genesisProfile
     ) public returns (Deployed memory d) {
         cancellerV2 = false;
+        guardianVetoMargin = 0;
         return _deploy(deployer, gov, grd, allowShared, allowWeak, genesisProfile);
     }
 
     /// @notice The 0.6.0 ceremony genesis (GENESIS_V060=1): the genesis profile on any chain id,
     ///         and the v2 guardian veto (ProviderRegistry and GuardianCancellerV2 in place of
-    ///         GuardianCanceller v1). `retiredKeys` are the r1006 non-producer keys retired at the
-    ///         r1007 ceremony (D-K3); the run refuses without them, and refuses a deployer or a
-    ///         council owner among them. The override flags are refused, as on every genesis run.
+    ///         GuardianCanceller v1). `k` are the key parameters (KeyParams): every council owner
+    ///         must be on the key inventory and off the retired list, the deployer off the retired
+    ///         list, and the GUARDIAN delay plus the veto margin inside the registry's veto
+    ///         window. The override flags are refused, as on every genesis run.
     function deployWithV060(
         address deployer,
         Council memory gov,
         Council memory grd,
         bool allowShared,
         bool allowWeak,
-        address[] memory retiredKeys
+        V060GovernanceSpec.KeyParams memory k
     ) public returns (Deployed memory d) {
-        require(retiredKeys.length != 0, V060GenesisSpec.PENDING_RETIRED_KEYS);
-        V060GenesisSpec.requireNotRetired("deployer", deployer, retiredKeys);
+        V060GovernanceSpec.requireKeyParams(k);
+        V060GovernanceSpec.requireNotRetired("deployer", deployer, k.retiredKeys);
         for (uint256 i = 0; i < gov.owners.length; i++) {
-            V060GenesisSpec.requireNotRetired("GOVERNANCE owner", gov.owners[i], retiredKeys);
+            V060GovernanceSpec.requireKnownKey("GOVERNANCE owner", gov.owners[i], k);
         }
         for (uint256 i = 0; i < grd.owners.length; i++) {
-            V060GenesisSpec.requireNotRetired("GUARDIAN owner", grd.owners[i], retiredKeys);
+            V060GovernanceSpec.requireKnownKey("GUARDIAN owner", grd.owners[i], k);
         }
+        V060GovernanceSpec.requireVetoMargin(grd.minDelay, k.guardianVetoMargin);
+        guardianVetoMargin = k.guardianVetoMargin;
         cancellerV2 = true;
         return _deploy(deployer, gov, grd, allowShared, allowWeak, true);
     }
@@ -334,7 +350,11 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
             ',"proposalTtl":',
             vm.toString(grd.proposalTtl),
             '},"guardianCancelsGovernance":true,"guardianRemovalExemptFromVeto":true,',
-            v2 ? '"guardianCancellerVersion":2,' : "",
+            v2
+                ? string.concat(
+                    '"guardianCancellerVersion":2,"guardianVetoMargin":', vm.toString(guardianVetoMargin), ","
+                )
+                : "",
             _profileJson()
         );
         return _bookJson(deployer, names, addrs, params);
@@ -474,18 +494,18 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
     ///         GuardianCancellerV2(governance timelock, guardian timelock, that registry); each is
     ///         reused when live. The registry's guardian at block 0 is the guardian council (Q9 a).
     function _deployCancellerV2(address govTl, address grdTl) internal returns (address registry, address c) {
-        bytes memory regInit = V060GenesisSpec.providerRegistryInit(govTl, grdTl);
-        registry = _isLive(V060GenesisSpec.PROVIDER_REGISTRY, regInit)
-            ? _create2Address(V060GenesisSpec.PROVIDER_REGISTRY, regInit)
+        bytes memory regInit = V060GovernanceSpec.providerRegistryInit(govTl, grdTl);
+        registry = _isLive(V060GovernanceSpec.PROVIDER_REGISTRY, regInit)
+            ? _create2Address(V060GovernanceSpec.PROVIDER_REGISTRY, regInit)
             : address(
-                new ProviderRegistry{salt: Salts.salt(V060GenesisSpec.PROVIDER_REGISTRY)}(
-                    govTl, grdTl, V060GenesisSpec.PROVIDER_VETO_WINDOW
+                new ProviderRegistry{salt: Salts.salt(V060GovernanceSpec.PROVIDER_REGISTRY)}(
+                    govTl, grdTl, V060GovernanceSpec.PROVIDER_VETO_WINDOW
                 )
             );
-        bytes memory init = V060GenesisSpec.guardianCancellerV2Init(govTl, grdTl, registry);
-        c = _isLive(V060GenesisSpec.GUARDIAN_CANCELLER_V2, init)
-            ? _create2Address(V060GenesisSpec.GUARDIAN_CANCELLER_V2, init)
-            : address(new GuardianCancellerV2{salt: Salts.salt(V060GenesisSpec.GUARDIAN_CANCELLER_V2)}(govTl, grdTl, registry));
+        bytes memory init = V060GovernanceSpec.guardianCancellerV2Init(govTl, grdTl, registry);
+        c = _isLive(V060GovernanceSpec.GUARDIAN_CANCELLER_V2, init)
+            ? _create2Address(V060GovernanceSpec.GUARDIAN_CANCELLER_V2, init)
+            : address(new GuardianCancellerV2{salt: Salts.salt(V060GovernanceSpec.GUARDIAN_CANCELLER_V2)}(govTl, grdTl, registry));
     }
 
     /// @notice Hand `tl` to `ms` (and, when `canceller` is nonzero, CANCELLER only to it), then

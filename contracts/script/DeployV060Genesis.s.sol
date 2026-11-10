@@ -6,7 +6,9 @@ import "./ScriptEnv.sol";
 import "./Salts.sol";
 import "./lib/Create2Deploy.sol";
 import "./lib/GenesisBook.sol";
+import "./lib/GenesisProfile.sol";
 import {V060GenesisSpec} from "./lib/V060GenesisSpec.sol";
+import {V060GovernanceSpec} from "./lib/V060GovernanceSpec.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {GuardianCanceller} from "../src/genesis/GuardianCanceller.sol";
 import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
@@ -20,6 +22,8 @@ import {FLRoundVerifier, IFederatedRoundLedgerReads} from "../src/work/FLRoundVe
 import {TaskVerifier} from "../src/work/TaskVerifier.sol";
 import {DatasetRegistry} from "../src/data/DatasetRegistry.sol";
 import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../src/aa/recovery/GuardianRecoveryModuleV2.sol";
+import {GuardianRecoveryModule} from "../src/aa/recovery/GuardianRecoveryModule.sol";
+import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 
 /// @title DeployV060Genesis: the 0.6.0 contracts of the ceremony genesis (V60-GEN)
 /// @notice The ceremony step that adds the 0.6.0 contract set to the ceremony state, after P4
@@ -44,10 +48,21 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../src/aa/rec
 ///         CREATE2 address, the governance book's canceller seat is v2 for that registry and
 ///         holds CANCELLER, and v1's CREATE2 address holds none.
 ///
-///         Every input is checked before anything is broadcast: each contract the set reads has
-///         code, OrganizationSBT and AgentSBT are owned by GOVERNANCE and AgentSBT reads that
-///         OrganizationSBT, and the GUARDIAN timelock's delay is shorter than the registry's
-///         24 h veto window (else the council could never veto a listing in time).
+///         Every input is checked before anything is broadcast, on the genesis profile (the node
+///         must report chain id 40204 or the profile is forced; GenesisProfile):
+///           - the two councils pass the governance-book provenance checks: genesis floors,
+///             GovernanceMultisig is the ceremony's MultisigProposer for its timelock, the
+///             GOVERNANCE timelock's complete holder sets are its council plus the v2 seat, and
+///             the v2 seat, its registry and the GUARDIAN council verify as in
+///             GenesisProfile `_bookGuardianCanceller`;
+///           - the FederatedRoundLedger and the V1 GuardianRecoveryModule are this build's
+///             instances at their own CREATE2 addresses ("FederatedRoundLedger",
+///             "GuardianRecoveryModule"), not only "some code";
+///           - OrganizationSBT and AgentSBT are owned by GOVERNANCE and AgentSBT reads that
+///             OrganizationSBT;
+///           - the GUARDIAN delay plus the owner's veto margin fits in the registry's window.
+///         After the broadcast, `verify` re-reads every contract on chain; it is also a
+///         standalone step (`--sig "verifyBook()"`) over the step's own output book.
 ///
 ///         PENDING PARAMETER: the WorkMarket coordinator bonds wait on the tokenomics decision.
 ///         They have no default anywhere. Without WORKMARKET_MIN_COORDINATOR_BOND and
@@ -55,14 +70,14 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../src/aa/rec
 ///         refuses before reading anything else. They are in WorkMarket's init code, so its
 ///         address is unknown until they are decided.
 ///
-///         Keys (owner decision D-K3, 2026-11-10): every non-producer EVM key touched at the r1007
-///         ceremony is rotated. GENESIS_RETIRED_KEYS (pending, no default) lists the retired r1006
-///         keys' public addresses. The step refuses without it, and refuses when the deployer or
-///         any owner of the GOVERNANCE or GUARDIAN council (read on chain) is one of them.
+///         Keys (fed #467 section 0.6; D-K3): GENESIS_KEY_INVENTORY (allowlist),
+///         GENESIS_RETIRED_KEYS (denylist) and GENESIS_GUARDIAN_VETO_MARGIN, none with a default
+///         (V060GovernanceSpec.KeyParams). Every owner of both councils, read on chain, must be on
+///         the inventory and off the retired list; the deployer off the retired list.
 ///
 ///         Inputs:
 ///           WORKMARKET_MIN_COORDINATOR_BOND, WORKMARKET_DEFAULT_COORDINATOR_BOND  (pending, above)
-///           GENESIS_RETIRED_KEYS  the retired r1006 keys (pending, above)
+///           GENESIS_KEY_INVENTORY, GENESIS_RETIRED_KEYS, GENESIS_GUARDIAN_VETO_MARGIN  (above)
 ///           V060_INPUT_BOOK    the merged ceremony book so far (P1-P4): GovernanceTimelock,
 ///                              GovernanceMultisig, GuardianTimelock, GuardianMultisig,
 ///                              GuardianCanceller, FederatedRoundLedger,
@@ -71,7 +86,7 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../src/aa/rec
 ///           V060_GENESIS_OUT   book-shaped output (under ./genesis)
 ///           CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS   (must be the forge signer)
 ///         The deployer gets no role: every contract here names GOVERNANCE or no admin at all.
-contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
+contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
     string internal constant BOND_MIN_KEY = "WORKMARKET_MIN_COORDINATOR_BOND";
     string internal constant BOND_DEFAULT_KEY = "WORKMARKET_DEFAULT_COORDINATOR_BOND";
 
@@ -89,8 +104,8 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
         address agentSbt;
         uint128 minCoordinatorBond;
         uint128 defaultCoordinatorBond;
-        /// the r1006 non-producer EVM keys retired at the r1007 ceremony (D-K3)
-        address[] retiredKeys;
+        /// the key inventory, the retired keys and the veto margin (fed #467 section 0.6; D-K3)
+        V060GovernanceSpec.KeyParams keys;
     }
 
     struct Deployed {
@@ -109,8 +124,7 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
     function run() external returns (Deployed memory d) {
         // The pending parameter first: nothing else is read, checked or sent without it.
         (uint128 minBond, uint128 defaultBond) = _bondsFromEnv();
-        address[] memory retired = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
-        require(retired.length != 0, V060GenesisSpec.PENDING_RETIRED_KEYS);
+        V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
         address deployer = deployerAddress();
         string memory json = vm.readFile(vm.envString("V060_INPUT_BOOK"));
         // Resolve the output path before broadcasting, so a missing one fails first.
@@ -127,10 +141,63 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
             agentSbt: _bookAddr(json, "AgentSBT"),
             minCoordinatorBond: minBond,
             defaultCoordinatorBond: defaultBond,
-            retiredKeys: retired
+            keys: k
         });
         d = deployWith(deployer, i);
         _writeBook("V060_GENESIS_OUT", bookJson(deployer, d, i));
+    }
+
+    /// @notice The standalone on-chain verify step: re-reads the deployed 0.6.0 set named by the
+    ///         step's own output book (V060_GENESIS_OUT) against the inputs (V060_INPUT_BOOK and
+    ///         the bond and key parameters), without broadcasting anything.
+    function verifyBook() external {
+        (uint128 minBond, uint128 defaultBond) = _bondsFromEnv();
+        V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
+        string memory json = vm.readFile(vm.envString("V060_INPUT_BOOK"));
+        string memory out = vm.readFile(vm.envString("V060_GENESIS_OUT"));
+        Inputs memory i = Inputs({
+            governanceTimelock: _bookAddr(json, "GovernanceTimelock"),
+            governanceMultisig: _bookAddr(json, "GovernanceMultisig"),
+            guardianTimelock: _bookAddr(json, "GuardianTimelock"),
+            guardianMultisig: _bookAddr(json, "GuardianMultisig"),
+            guardianCanceller: _bookAddr(json, "GuardianCanceller"),
+            federatedRoundLedger: _bookAddr(json, "FederatedRoundLedger"),
+            guardianRecoveryModule: _bookAddr(json, "GuardianRecoveryModule"),
+            organizationSbt: _bookAddr(json, "OrganizationSBT"),
+            agentSbt: _bookAddr(json, "AgentSBT"),
+            minCoordinatorBond: minBond,
+            defaultCoordinatorBond: defaultBond,
+            keys: k
+        });
+        Deployed memory p = predict(i);
+        string[8] memory names = [
+            "FLRoundVerifier",
+            "TaskVerifier",
+            "WorkMarket",
+            "DatasetRegistry",
+            "GuardianRecoveryModuleV2",
+            "UsageReceipts",
+            "OrgBudgets",
+            "WorkAttestations"
+        ];
+        address[8] memory want = [
+            p.flRoundVerifier,
+            p.taskVerifier,
+            p.workMarket,
+            p.datasetRegistry,
+            p.guardianRecoveryModuleV2,
+            p.usageReceipts,
+            p.orgBudgets,
+            p.workAttestations
+        ];
+        for (uint256 n = 0; n < 8; n++) {
+            require(
+                _bookAddr(out, names[n]) == want[n],
+                string.concat(names[n], ": the output book is not where this build puts it")
+            );
+        }
+        verify(i, p);
+        console.log("V060 verify PASS: every 0.6.0 genesis contract re-read on chain");
     }
 
     /// @notice Where every 0.6.0 genesis contract lands for `i` (nothing is deployed). The
@@ -140,9 +207,9 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
         address gt = i.governanceTimelock;
         address rt = i.guardianTimelock;
         d.providerRegistry =
-            _create2Address(V060GenesisSpec.PROVIDER_REGISTRY, V060GenesisSpec.providerRegistryInit(gt, rt));
+            _create2Address(V060GovernanceSpec.PROVIDER_REGISTRY, V060GovernanceSpec.providerRegistryInit(gt, rt));
         d.guardianCancellerV2 = _create2Address(
-            V060GenesisSpec.GUARDIAN_CANCELLER_V2, V060GenesisSpec.guardianCancellerV2Init(gt, rt, d.providerRegistry)
+            V060GovernanceSpec.GUARDIAN_CANCELLER_V2, V060GovernanceSpec.guardianCancellerV2Init(gt, rt, d.providerRegistry)
         );
         d.flRoundVerifier = _create2Address(
             V060GenesisSpec.FL_ROUND_VERIFIER, V060GenesisSpec.flRoundVerifierInit(i.federatedRoundLedger)
@@ -164,7 +231,10 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
     /// @notice The step with explicit inputs (no env reads), for tests and callers.
     function deployWith(address deployer, Inputs memory i) public returns (Deployed memory d) {
         require(deployer != address(0), "deployer must be set");
+        V060GovernanceSpec.requireKeyParams(i.keys);
         Deployed memory p = predict(i);
+        // The 0.6.0 genesis always runs the genesis profile; the node must agree on the chain id.
+        _resolveChainProfile(true);
         _checkKeys(deployer, i);
         _checkInputs(i, p);
 
@@ -186,7 +256,7 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
         vm.stopBroadcast();
 
         require(keccak256(abi.encode(d)) == keccak256(abi.encode(p)), "a 0.6.0 genesis contract is not at its predicted address");
-        _assertWiring(i, d);
+        verify(i, d);
 
         console.log("FLRoundVerifier          :", d.flRoundVerifier);
         console.log("TaskVerifier             :", d.taskVerifier);
@@ -242,6 +312,13 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
         );
     }
 
+    function _keysFromEnv() internal view returns (V060GovernanceSpec.KeyParams memory k) {
+        k.keyInventory = vm.envOr("GENESIS_KEY_INVENTORY", ",", new address[](0));
+        k.retiredKeys = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
+        k.guardianVetoMargin = vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0));
+        V060GovernanceSpec.requireKeyParams(k);
+    }
+
     function _bondsFromEnv() internal view returns (uint128 minBond, uint128 defaultBond) {
         require(vm.envExists(BOND_MIN_KEY) && vm.envExists(BOND_DEFAULT_KEY), V060GenesisSpec.PENDING_COORDINATOR_BONDS);
         uint256 m = vm.envUint(BOND_MIN_KEY);
@@ -259,37 +336,70 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
         revert(string.concat(name, " is missing from V060_INPUT_BOOK"));
     }
 
-    function _readAddr(address target, bytes memory cd) internal view returns (bool ok, address a) {
-        (bool success, bytes memory ret) = target.staticcall(cd);
-        if (!success || ret.length != 32) return (false, address(0));
-        return (true, abi.decode(ret, (address)));
-    }
 
-    /// @notice D-K3: the retired r1006 keys are given, and neither the deployer nor any owner of
-    ///         the two councils (read on chain from the multisigs that front the timelocks) is
-    ///         one of them.
+    /// @notice Keys (fed #467 section 0.6; D-K3): the deployer is off the retired list, and every
+    ///         owner of both councils (read on chain from the multisigs that front the timelocks)
+    ///         is on the key inventory and off the retired list.
     function _checkKeys(address deployer, Inputs memory i) internal view {
-        require(i.retiredKeys.length != 0, V060GenesisSpec.PENDING_RETIRED_KEYS);
-        V060GenesisSpec.requireNotRetired("deployer", deployer, i.retiredKeys);
-        _checkCouncilKeys("GOVERNANCE", i.governanceMultisig, i.governanceTimelock, i.retiredKeys);
-        _checkCouncilKeys("GUARDIAN", i.guardianMultisig, i.guardianTimelock, i.retiredKeys);
+        V060GovernanceSpec.requireKeyParams(i.keys);
+        V060GovernanceSpec.requireNotRetired("deployer", deployer, i.keys.retiredKeys);
+        _checkCouncilKeys("GOVERNANCE", i.governanceMultisig, i.governanceTimelock, i.keys);
+        _checkCouncilKeys("GUARDIAN", i.guardianMultisig, i.guardianTimelock, i.keys);
     }
 
-    function _checkCouncilKeys(string memory name, address multisig, address timelock, address[] memory retired)
-        internal
-        view
-    {
+    function _checkCouncilKeys(
+        string memory name,
+        address multisig,
+        address timelock,
+        V060GovernanceSpec.KeyParams memory k
+    ) internal view {
         require(multisig.code.length != 0, string.concat(name, " multisig: no code"));
-        (bool okT, address fronted) = _readAddr(multisig, abi.encodeWithSignature("timelock()"));
+        (bool okT, address fronted) = _readAddress(multisig, abi.encodeWithSignature("timelock()"));
         require(okT && fronted == timelock, string.concat(name, " multisig does not front its timelock"));
         address[] memory owners = MultisigProposer(multisig).owners();
         require(owners.length != 0, string.concat(name, " multisig: no owners"));
-        for (uint256 k = 0; k < owners.length; k++) {
-            V060GenesisSpec.requireNotRetired(string.concat(name, " owner"), owners[k], retired);
+        for (uint256 n = 0; n < owners.length; n++) {
+            V060GovernanceSpec.requireKnownKey(string.concat(name, " owner"), owners[n], k);
         }
     }
 
-    function _checkInputs(Inputs memory i, Deployed memory p) internal view {
+    /// @notice The governance-book provenance checks on the two councils this step reads.
+    function _checkGovernance(Inputs memory i, Deployed memory p) internal {
+        _requireCouncilFloor("GOVERNANCE", i.governanceTimelock, i.governanceMultisig, true);
+        _requireCouncilFloor("GUARDIAN", i.guardianTimelock, i.guardianMultisig, false);
+        string memory ms = _multisigProposerProblem(
+            i.governanceMultisig, i.governanceTimelock, string.concat(GENESIS_SALT_PREFIX, "GovernanceMultisig")
+        );
+        require(bytes(ms).length == 0, string.concat("GovernanceMultisig: ", ms));
+        // The v2 seat, its registry and the GUARDIAN council, exactly as a 0.6.0 governance book.
+        (string memory seat, address canceller) = _bookGuardianCanceller(_governanceBook(i, p), i.governanceTimelock);
+        require(bytes(seat).length == 0, string.concat("governance book: ", seat));
+        address[] memory extra = new address[](1);
+        extra[0] = canceller;
+        string memory holders = _timelockHolderProblem(i.governanceTimelock, i.governanceMultisig, extra);
+        require(bytes(holders).length == 0, string.concat("GOVERNANCE timelock: ", holders));
+    }
+
+    /// @notice The governance book P1 writes in its 0.6.0 mode, for these inputs.
+    function _governanceBook(Inputs memory i, Deployed memory p) internal pure returns (string memory) {
+        return string.concat(
+            '{"contracts":{"GovernanceTimelock":"',
+            vm.toString(i.governanceTimelock),
+            '","GovernanceMultisig":"',
+            vm.toString(i.governanceMultisig),
+            '","GuardianTimelock":"',
+            vm.toString(i.guardianTimelock),
+            '","GuardianMultisig":"',
+            vm.toString(i.guardianMultisig),
+            '","GuardianCanceller":"',
+            vm.toString(i.guardianCanceller),
+            '","ProviderRegistry":"',
+            vm.toString(p.providerRegistry),
+            '"},"params":{"guardianCancellerVersion":2}}'
+        );
+    }
+
+    function _checkInputs(Inputs memory i, Deployed memory p) internal {
         require(i.governanceTimelock.code.length != 0, "GOVERNANCE timelock: no code");
         require(i.guardianTimelock.code.length != 0, "GUARDIAN timelock: no code");
 
@@ -312,20 +422,32 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
             )
         );
         require(!gt.hasRole(canceller, v1), "GuardianCanceller v1 holds CANCELLER on GOVERNANCE");
-        require(
-            TimelockController(payable(i.guardianTimelock)).getMinDelay() < V060GenesisSpec.PROVIDER_VETO_WINDOW,
-            "GUARDIAN timelock: minDelay must be shorter than the ProviderRegistry veto window (24 h)"
+        V060GovernanceSpec.requireVetoMargin(
+            TimelockController(payable(i.guardianTimelock)).getMinDelay(), i.keys.guardianVetoMargin
         );
+        _checkGovernance(i, p);
 
         require(i.federatedRoundLedger.code.length != 0, "FederatedRoundLedger: no code");
         require(i.guardianRecoveryModule.code.length != 0, "GuardianRecoveryModule (V1): no code");
+        // Identity, not only code: this build's instance at the address its phase deploys it to.
+        require(
+            i.federatedRoundLedger == _create2Address("FederatedRoundLedger", type(FederatedRoundLedger).creationCode)
+                && i.federatedRoundLedger.codehash == address(new FederatedRoundLedger()).codehash,
+            "FederatedRoundLedger: not this build's ledger at its CREATE2 address"
+        );
+        require(
+            i.guardianRecoveryModule
+                == _create2Address("GuardianRecoveryModule", type(GuardianRecoveryModule).creationCode)
+                && i.guardianRecoveryModule.codehash == address(new GuardianRecoveryModule()).codehash,
+            "GuardianRecoveryModule (V1): not this build's module at its CREATE2 address"
+        );
         require(i.organizationSbt.code.length != 0, "OrganizationSBT: no code");
         require(i.agentSbt.code.length != 0, "AgentSBT: no code");
-        (bool okO, address orgOwner) = _readAddr(i.organizationSbt, abi.encodeWithSignature("owner()"));
+        (bool okO, address orgOwner) = _readAddress(i.organizationSbt, abi.encodeWithSignature("owner()"));
         require(okO && orgOwner == i.governanceTimelock, "OrganizationSBT: owner is not the GOVERNANCE timelock");
-        (bool okA, address agentOwner) = _readAddr(i.agentSbt, abi.encodeWithSignature("owner()"));
+        (bool okA, address agentOwner) = _readAddress(i.agentSbt, abi.encodeWithSignature("owner()"));
         require(okA && agentOwner == i.governanceTimelock, "AgentSBT: owner is not the GOVERNANCE timelock");
-        (bool okR, address agentOrgs) = _readAddr(i.agentSbt, abi.encodeWithSignature("orgContract()"));
+        (bool okR, address agentOrgs) = _readAddress(i.agentSbt, abi.encodeWithSignature("orgContract()"));
         require(okR && agentOrgs == i.organizationSbt, "AgentSBT: reads another OrganizationSBT");
     }
 
@@ -411,7 +533,13 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
 
     // ------------------------------------------------------------------ postconditions
 
-    function _assertWiring(Inputs memory i, Deployed memory d) internal view {
+    /// @notice The on-chain verify step: re-reads every 0.6.0 genesis contract and its wiring
+    ///         (slashSink, verifier allowlist, bonds, time windows, governance and guardian seats,
+    ///         CANCELLER on GOVERNANCE held by v2 and not v1). Reverts on the first difference.
+    function verify(Inputs memory i, Deployed memory d) public view {
+        for (uint256 n = 0; n < 10; n++) {
+            require(_at(d, n).code.length != 0, "a 0.6.0 genesis contract has no code");
+        }
         address gt = i.governanceTimelock;
         address rt = i.guardianTimelock;
         require(address(FLRoundVerifier(d.flRoundVerifier).frl()) == i.federatedRoundLedger, "FLRoundVerifier: ledger");
@@ -441,10 +569,34 @@ contract DeployV060Genesis is ScriptEnv, Create2Deploy, GenesisBook {
         require(address(WorkAttestations(d.workAttestations).agents()) == i.agentSbt, "WorkAttestations: agents");
         ProviderRegistry reg = ProviderRegistry(d.providerRegistry);
         require(reg.governance() == gt && reg.guardian() == rt, "ProviderRegistry: governance or guardian");
+        require(reg.vetoWindow() == V060GovernanceSpec.PROVIDER_VETO_WINDOW, "ProviderRegistry: veto window");
         GuardianCancellerV2 c = GuardianCancellerV2(d.guardianCancellerV2);
         require(
             c.governanceTimelock() == gt && c.guardian() == rt && c.providerRegistry() == d.providerRegistry,
             "GuardianCancellerV2: wiring"
         );
+        TimelockController g = TimelockController(payable(gt));
+        bytes32 cancellerRole = g.CANCELLER_ROLE();
+        require(g.hasRole(cancellerRole, d.guardianCancellerV2), "GuardianCancellerV2 lacks CANCELLER on GOVERNANCE");
+        address v1 = _create2Address(
+            "Genesis.GuardianCanceller", abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(gt, rt))
+        );
+        require(!g.hasRole(cancellerRole, v1), "GuardianCanceller v1 holds CANCELLER on GOVERNANCE");
+    }
+
+    function _at(Deployed memory d, uint256 n) internal pure returns (address) {
+        address[10] memory all = [
+            d.providerRegistry,
+            d.guardianCancellerV2,
+            d.flRoundVerifier,
+            d.taskVerifier,
+            d.workMarket,
+            d.datasetRegistry,
+            d.guardianRecoveryModuleV2,
+            d.usageReceipts,
+            d.orgBudgets,
+            d.workAttestations
+        ];
+        return all[n];
     }
 }
