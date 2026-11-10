@@ -8,6 +8,7 @@ import {DeployGenesisGovernance} from "../../script/DeployGenesisGovernance.s.so
 import {DeployV060Genesis} from "../../script/DeployV060Genesis.s.sol";
 import {CheckDeployedAdmins} from "../../script/CheckDeployedAdmins.s.sol";
 import {V060GenesisSpec} from "../../script/lib/V060GenesisSpec.sol";
+import {V060GovernanceSpec} from "../../script/lib/V060GovernanceSpec.sol";
 import {GuardianCanceller} from "../../src/genesis/GuardianCanceller.sol";
 import {GuardianCancellerV2} from "../../src/genesis/GuardianCancellerV2.sol";
 import {ProviderRegistry} from "../../src/amc/ProviderRegistry.sol";
@@ -25,8 +26,26 @@ import {OrganizationSBT} from "../../src/cit_agent/OrganizationSBT.sol";
 import {AgentSBT} from "../../src/cit_agent/AgentSBT.sol";
 import {CitrateMemberSBT} from "../../src/core_membership/CitrateMemberSBT.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
-import {RoleLogArchive} from "./RoleHistoryHarness.sol";
-import {GovernanceWithNode, GateWithNode, BookCancellerChecks} from "./NodeChainIdHarness.sol";
+import {Salts} from "../../script/Salts.sol";
+import {AdminChecks} from "../../script/lib/AdminChecks.sol";
+import {RoleLogArchive, RecordedRoleHistory} from "./RoleHistoryHarness.sol";
+import {GovernanceWithNode, GateWithNode, BookCancellerChecks, NodeStub} from "./NodeChainIdHarness.sol";
+
+/// The builder over the test's recorded timelock role history, with a node stand-in that reports
+/// forge's chain id (forge test has no fork; see NodeChainIdHarness and RoleHistoryHarness).
+contract V060WithNode is DeployV060Genesis, RecordedRoleHistory, NodeStub {
+    function _timelockRoleHistory(address timelock)
+        internal
+        override(AdminChecks, RecordedRoleHistory)
+        returns (bool, string memory, RoleEvent[] memory)
+    {
+        return RecordedRoleHistory._timelockRoleHistory(timelock);
+    }
+
+    function _nodeChainId() internal view override returns (bool, uint256) {
+        return _stubNode();
+    }
+}
 
 // Test-only coordinator bond amounts. They are NOT the genesis values: those are pending the
 // tokenomics decision, and the builder refuses to run without them being given explicitly.
@@ -68,14 +87,17 @@ contract V060GenesisSpecTest is Test {
         vm.etch(P256_VERIFIER, hex"600160005260206000f3");
         vm.chainId(40204);
         govScript = new GovernanceWithNode();
-        gov = govScript.deployWithV060(
-            SENDER, _council(0xA000, 5, 3, 48 hours), _council(0xB000, 3, 2, 1 hours), false, false, _retired()
-        );
+        DeployGenesisGovernance.Council memory gc = _council(0xA000, 5, 3, 48 hours);
+        DeployGenesisGovernance.Council memory rc = _council(0xB000, 3, 2, 1 hours);
+        gov = govScript.deployWithV060(SENDER, gc, rc, false, false, _keys(gc, rc));
         registryP1 = govScript.providerRegistry();
-        // The block-0 contracts the 0.6.0 set reads (P2's AA stack, P3L's HUP registries, P4's
-        // ledger). Their own provenance is checked by their phases; here they only need code.
-        frl = new FederatedRoundLedger();
-        recoveryV1 = new GuardianRecoveryModule();
+        // The block-0 contracts the 0.6.0 set reads. The ledger (P4) and the V1 module (P2) are
+        // deployed as their phases deploy them, by CREATE2 under their own salts, because the
+        // builder checks their identity; P3L's HUP registries only need their owner and wiring.
+        vm.startBroadcast(SENDER);
+        frl = new FederatedRoundLedger{salt: Salts.salt("FederatedRoundLedger")}();
+        recoveryV1 = new GuardianRecoveryModule{salt: Salts.salt("GuardianRecoveryModule")}();
+        vm.stopBroadcast();
         memberSbt = new CitrateMemberSBT(gov.governanceTimelock);
         orgSbt = new OrganizationSBT(gov.governanceTimelock);
         agentSbt = new AgentSBT(gov.governanceTimelock, orgSbt, IERC721(address(memberSbt)));
@@ -103,12 +125,48 @@ contract V060GenesisSpecTest is Test {
         r[2] = makeAddr("retired-r1006-grantor");
     }
 
+    /// Test-only key parameters: the inventory is exactly the two councils' owners (the
+    /// deployer is the throwaway ceremony key, so it is not in it), the retired stand-ins, and a
+    /// 1 h veto margin. The real values are the owner's.
+    function _keys(DeployGenesisGovernance.Council memory gc, DeployGenesisGovernance.Council memory rc)
+        internal
+        returns (V060GovernanceSpec.KeyParams memory k)
+    {
+        k.keyInventory = new address[](gc.owners.length + rc.owners.length);
+        for (uint256 i = 0; i < gc.owners.length; i++) {
+            k.keyInventory[i] = gc.owners[i];
+        }
+        for (uint256 i = 0; i < rc.owners.length; i++) {
+            k.keyInventory[gc.owners.length + i] = rc.owners[i];
+        }
+        k.retiredKeys = _retired();
+        k.guardianVetoMargin = 1 hours;
+    }
+
+    function _setupKeys() internal returns (V060GovernanceSpec.KeyParams memory) {
+        return _keys(_council(0xA000, 5, 3, 48 hours), _council(0xB000, 3, 2, 1 hours));
+    }
+
+    function _builder() internal returns (DeployV060Genesis s) {
+        V060WithNode h = new V060WithNode();
+        h.useArchive(archive);
+        archive.absorb();
+        s = h;
+    }
+
+    /// `vm.expectRevert`, after moving the recorded logs into the archive from THIS frame (a
+    /// reverted call would roll back an absorb made inside it).
+    function _expectRevert(bytes memory reason) internal {
+        archive.absorb();
+        vm.expectRevert(reason);
+    }
+
     function _inputs() internal returns (DeployV060Genesis.Inputs memory i) {
         i.governanceTimelock = gov.governanceTimelock;
         i.governanceMultisig = gov.governanceMultisig;
         i.guardianTimelock = gov.guardianTimelock;
         i.guardianMultisig = gov.guardianMultisig;
-        i.retiredKeys = _retired();
+        i.keys = _setupKeys();
         i.guardianCanceller = gov.guardianCanceller;
         i.federatedRoundLedger = address(frl);
         i.guardianRecoveryModule = address(recoveryV1);
@@ -119,7 +177,7 @@ contract V060GenesisSpecTest is Test {
     }
 
     function _build() internal returns (DeployV060Genesis s, DeployV060Genesis.Deployed memory d) {
-        s = new DeployV060Genesis();
+        s = _builder();
         d = s.deployWith(SENDER, _inputs());
     }
 
@@ -231,7 +289,7 @@ contract V060GenesisSpecTest is Test {
 
     /// The prediction the genesis spec publishes (before any deploy) is where the build lands.
     function test_predicted_addresses_equal_the_deployed_ones() public {
-        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis s = _builder();
         DeployV060Genesis.Deployed memory p = s.predict(_inputs());
         DeployV060Genesis.Deployed memory d = s.deployWith(SENDER, _inputs());
         assertEq(abi.encode(p), abi.encode(d));
@@ -369,7 +427,7 @@ contract V060GenesisSpecTest is Test {
     // ------------------------------------------------------------------ refusals
 
     function test_builder_refuses_without_the_pending_coordinator_bonds() public {
-        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
         i.minCoordinatorBond = 0;
         i.defaultCoordinatorBond = 0;
@@ -389,7 +447,7 @@ contract V060GenesisSpecTest is Test {
 
     /// `run()` has no fallback: with the bond inputs unset it refuses before reading anything else.
     function test_run_refuses_when_the_bond_inputs_are_unset() public {
-        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis s = _builder();
         vm.expectRevert(bytes(V060GenesisSpec.PENDING_COORDINATOR_BONDS));
         s.run();
     }
@@ -406,13 +464,13 @@ contract V060GenesisSpecTest is Test {
         i.guardianTimelock = v1gov.guardianTimelock;
         i.guardianMultisig = v1gov.guardianMultisig;
         i.guardianCanceller = v1gov.guardianCanceller;
-        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis s = _builder();
         vm.expectRevert(bytes("ProviderRegistry: not live at its CREATE2 address for (GOVERNANCE, GUARDIAN); run P1 with GENESIS_V060=1"));
         s.deployWith(SENDER, i);
     }
 
     function test_builder_refuses_inputs_without_code_or_owned_elsewhere() public {
-        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
         i.federatedRoundLedger = makeAddr("no-code");
         vm.expectRevert(bytes("FederatedRoundLedger: no code"));
@@ -472,66 +530,227 @@ contract V060GenesisSpecTest is Test {
         }
     }
 
-    function test_p1_v060_refuses_without_the_retired_keys() public {
+    // P1 (0.6.0 mode) refusals, on a fresh pair of councils (other delays: other addresses).
+
+    function _p1(V060GovernanceSpec.KeyParams memory k, DeployGenesisGovernance.Council memory gc, DeployGenesisGovernance.Council memory rc) internal {
         GovernanceWithNode g = new GovernanceWithNode();
+        g.deployWithV060(SENDER, gc, rc, false, false, k);
+    }
+
+    function _gc() internal pure returns (DeployGenesisGovernance.Council memory) {
+        return _council(0xC000, 5, 3, 49 hours);
+    }
+
+    function _rc() internal pure returns (DeployGenesisGovernance.Council memory) {
+        return _council(0xD000, 3, 2, 2 hours);
+    }
+
+    function test_p1_v060_refuses_without_each_key_parameter() public {
         uint64 nonceBefore = vm.getNonce(SENDER);
-        vm.expectRevert(bytes(V060GenesisSpec.PENDING_RETIRED_KEYS));
-        g.deployWithV060(
-            SENDER, _council(0xC000, 5, 3, 49 hours), _council(0xD000, 3, 2, 2 hours), false, false, new address[](0)
-        );
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        k.keyInventory = new address[](0);
+        vm.expectRevert(bytes(V060GovernanceSpec.PENDING_KEY_INVENTORY));
+        this.p1(k, _gc(), _rc());
+        k = _keys(_gc(), _rc());
+        k.retiredKeys = new address[](0);
+        vm.expectRevert(bytes(V060GovernanceSpec.PENDING_RETIRED_KEYS));
+        this.p1(k, _gc(), _rc());
+        k = _keys(_gc(), _rc());
+        k.guardianVetoMargin = 0;
+        vm.expectRevert(bytes(V060GovernanceSpec.PENDING_VETO_MARGIN));
+        this.p1(k, _gc(), _rc());
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");
     }
 
-    function test_p1_v060_refuses_a_retired_council_owner_or_deployer() public {
-        GovernanceWithNode g = new GovernanceWithNode();
-        address[] memory retired = _retired();
-        DeployGenesisGovernance.Council memory gc = _council(0xC000, 5, 3, 49 hours);
-        DeployGenesisGovernance.Council memory rc = _council(0xD000, 3, 2, 2 hours);
-        address[] memory withOwner = new address[](retired.length + 1);
-        for (uint256 k = 0; k < retired.length; k++) {
-            withOwner[k] = retired[k];
+    function p1(V060GovernanceSpec.KeyParams memory k, DeployGenesisGovernance.Council memory gc, DeployGenesisGovernance.Council memory rc) external {
+        _p1(k, gc, rc);
+    }
+
+    /// A typo in a council owner: the inventory has the right key, the council input does not.
+    function test_p1_v060_refuses_a_typod_council_owner() public {
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        DeployGenesisGovernance.Council memory gc = _gc();
+        gc.owners[1] = address(uint160(0xC011)); // 0xC001 mistyped
+        vm.expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        this.p1(k, gc, _rc());
+    }
+
+    /// A stale r1006 key that the retired list forgot: the allowlist still refuses it.
+    function test_p1_v060_refuses_a_stale_key_absent_from_the_retired_list() public {
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        DeployGenesisGovernance.Council memory rc = _rc();
+        rc.owners[2] = makeAddr("r1006-guardian-owner-not-on-the-retired-list");
+        vm.expectRevert(bytes("GUARDIAN owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        this.p1(k, _gc(), rc);
+    }
+
+    /// An inventory that omits a council owner is refused.
+    function test_p1_v060_refuses_an_inventory_omission() public {
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        address[] memory inv = new address[](k.keyInventory.length - 1);
+        for (uint256 i = 0; i < inv.length; i++) {
+            inv[i] = k.keyInventory[i]; // drops the last guardian owner
         }
-        withOwner[retired.length] = gc.owners[2];
+        k.keyInventory = inv;
+        vm.expectRevert(bytes("GUARDIAN owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        this.p1(k, _gc(), _rc());
+    }
+
+    function test_p1_v060_refuses_a_retired_council_owner_or_deployer() public {
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        address[] memory retired = new address[](1);
+        k.retiredKeys = retired;
+        retired[0] = _gc().owners[2];
         vm.expectRevert(
             bytes("GOVERNANCE owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
         );
-        g.deployWithV060(SENDER, gc, rc, false, false, withOwner);
-        withOwner[retired.length] = rc.owners[0];
+        this.p1(k, _gc(), _rc());
+        retired[0] = _rc().owners[0];
         vm.expectRevert(
             bytes("GUARDIAN owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
         );
-        g.deployWithV060(SENDER, gc, rc, false, false, withOwner);
-        withOwner[retired.length] = SENDER;
+        this.p1(k, _gc(), _rc());
+        retired[0] = SENDER;
         vm.expectRevert(bytes("deployer is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one"));
-        g.deployWithV060(SENDER, gc, rc, false, false, withOwner);
+        this.p1(k, _gc(), _rc());
     }
 
-    function test_builder_refuses_without_the_retired_keys() public {
-        DeployV060Genesis s = new DeployV060Genesis();
+    /// The guardian-delay check lives in P1, with the owner's margin as a named parameter.
+    function test_p1_v060_refuses_a_guardian_delay_without_the_margin() public {
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        k.guardianVetoMargin = 22 hours + 1; // 2 h delay + this > 24 h
+        vm.expectRevert(bytes(V060GovernanceSpec.VETO_MARGIN_TOO_SMALL));
+        this.p1(k, _gc(), _rc());
+        k.guardianVetoMargin = 22 hours; // exactly fits: accepted
+        this.p1(k, _gc(), _rc());
+    }
+
+    function test_governance_book_records_the_veto_margin() public view {
+        string memory book =
+            govScript.bookJson(SENDER, gov, _council(0xA000, 5, 3, 48 hours), _council(0xB000, 3, 2, 1 hours));
+        assertEq(vm.parseJsonUint(book, ".params.guardianVetoMargin"), 1 hours);
+    }
+
+    // Builder refusals.
+
+    function test_builder_refuses_without_each_key_parameter() public {
+        DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
-        i.retiredKeys = new address[](0);
-        vm.expectRevert(bytes(V060GenesisSpec.PENDING_RETIRED_KEYS));
+        i.keys.keyInventory = new address[](0);
+        vm.expectRevert(bytes(V060GovernanceSpec.PENDING_KEY_INVENTORY));
+        s.deployWith(SENDER, i);
+        i = _inputs();
+        i.keys.retiredKeys = new address[](0);
+        vm.expectRevert(bytes(V060GovernanceSpec.PENDING_RETIRED_KEYS));
+        s.deployWith(SENDER, i);
+        i = _inputs();
+        i.keys.guardianVetoMargin = 0;
+        vm.expectRevert(bytes(V060GovernanceSpec.PENDING_VETO_MARGIN));
         s.deployWith(SENDER, i);
     }
 
-    /// The builder reads the councils' owners on chain, so a council built with a key that is
-    /// on the retired list (here: a list that names one of setUp's owners) is refused.
+    /// The builder reads the councils' owners on chain and holds them to the inventory.
+    function test_builder_refuses_an_on_chain_owner_missing_from_the_inventory() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        address[] memory inv = new address[](i.keys.keyInventory.length);
+        for (uint256 k = 0; k < inv.length; k++) {
+            inv[k] = i.keys.keyInventory[k];
+        }
+        inv[1] = address(uint160(0xA011)); // 0xA001 mistyped in the inventory
+        i.keys.keyInventory = inv;
+        vm.expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        s.deployWith(SENDER, i);
+    }
+
     function test_builder_refuses_a_council_owner_or_deployer_on_the_retired_list() public {
-        DeployV060Genesis s = new DeployV060Genesis();
+        DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
-        i.retiredKeys = new address[](1);
-        i.retiredKeys[0] = address(uint160(0xA003));
+        i.keys.retiredKeys = new address[](1);
+        i.keys.retiredKeys[0] = address(uint160(0xA003));
         vm.expectRevert(
             bytes("GOVERNANCE owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
         );
         s.deployWith(SENDER, i);
-        i.retiredKeys[0] = address(uint160(0xB001));
+        i.keys.retiredKeys[0] = address(uint160(0xB001));
         vm.expectRevert(
             bytes("GUARDIAN owner is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
         );
         s.deployWith(SENDER, i);
-        i.retiredKeys[0] = SENDER;
+        i.keys.retiredKeys[0] = SENDER;
         vm.expectRevert(bytes("deployer is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one"));
         s.deployWith(SENDER, i);
+    }
+
+    function test_builder_rechecks_the_veto_margin_on_chain() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        i.keys.guardianVetoMargin = 23 hours + 1; // the live GUARDIAN delay is 1 h
+        vm.expectRevert(bytes(V060GovernanceSpec.VETO_MARGIN_TOO_SMALL));
+        s.deployWith(SENDER, i);
+    }
+
+    // P2-2: the inputs are identified, not only "has code".
+
+    function test_builder_refuses_a_ledger_or_v1_module_that_is_not_the_ceremonys() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        i.federatedRoundLedger = address(new FederatedRoundLedger()); // plain CREATE, same code
+        vm.expectRevert(bytes("FederatedRoundLedger: not this build's ledger at its CREATE2 address"));
+        s.deployWith(SENDER, i);
+        i = _inputs();
+        i.guardianRecoveryModule = address(new GuardianRecoveryModule());
+        vm.expectRevert(bytes("GuardianRecoveryModule (V1): not this build's module at its CREATE2 address"));
+        s.deployWith(SENDER, i);
+    }
+
+    /// The governance-book provenance checks apply to the timelocks the builder reads: a rogue
+    /// extra proposer on GOVERNANCE (granted by the timelock itself) is refused.
+    function test_builder_refuses_a_governance_timelock_with_an_extra_holder() public {
+        TimelockController gt = TimelockController(payable(gov.governanceTimelock));
+        bytes32 proposer = gt.PROPOSER_ROLE();
+        vm.prank(gov.governanceTimelock);
+        gt.grantRole(proposer, makeAddr("rogue-proposer"));
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        try s.deployWith(SENDER, i) {
+            fail();
+        } catch Error(string memory reason) {
+            assertTrue(_startsWith(reason, "GOVERNANCE timelock: "), reason);
+        }
+    }
+
+    function _startsWith(string memory s_, string memory prefix) internal pure returns (bool) {
+        bytes memory a = bytes(s_);
+        bytes memory b = bytes(prefix);
+        if (a.length < b.length) return false;
+        for (uint256 k = 0; k < b.length; k++) {
+            if (a[k] != b[k]) return false;
+        }
+        return true;
+    }
+
+    // P2-1: the standalone on-chain verify step.
+
+    function test_verify_rereads_the_chain_and_catches_a_change() public {
+        (DeployV060Genesis s, DeployV060Genesis.Deployed memory d) = _build();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        s.verify(i, d);
+        vm.prank(gov.governanceTimelock);
+        WorkMarket(payable(d.workMarket)).setVerifierAllowed(d.taskVerifier, false);
+        vm.expectRevert(bytes("WorkMarket: verifier allowlist"));
+        s.verify(i, d);
+    }
+
+    // P3: an unknown canceller version fails closed.
+
+    function test_an_unknown_guardian_canceller_version_fails_closed() public {
+        string memory book = govScript.bookJson(SENDER, gov, _council(0xA000, 5, 3, 48 hours), _council(0xB000, 3, 2, 1 hours));
+        book = vm.replace(book, '"guardianCancellerVersion":2', '"guardianCancellerVersion":3');
+        BookCancellerChecks h = new BookCancellerChecks();
+        h.useArchive(archive);
+        archive.absorb();
+        (string memory p,) = h.problem(book, gov.governanceTimelock);
+        assertEq(p, "governance book names an unknown guardianCancellerVersion");
     }
 }
