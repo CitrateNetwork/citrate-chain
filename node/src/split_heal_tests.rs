@@ -1043,10 +1043,11 @@ impl Node {
     async fn on_new_block(&mut self, peer: &Arc<Peer>, pid: &PeerId, block: Block) {
         {
             let mut info = peer.info.write().await;
-            if block.header.height > info.head_height {
-                info.head_height = block.header.height;
-                info.head_hash = block.header.block_hash;
-            }
+            info.observe_gossiped_head(
+                block.header.height,
+                block.header.block_hash,
+                block.header.blue_score,
+            );
         }
         if self.adm.is_fully_admitted(&block.header.block_hash).await {
             return;

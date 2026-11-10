@@ -98,17 +98,28 @@ fn genesis_hash(storage: &StorageManager) -> Result<Option<String>, jsonrpc_core
 ///   reads) is above the applied tip (`BlockStore::get_applied_tip`).
 /// - `synced`: neither.
 ///
-/// `highestSeen` is `null` when no sync signal is wired.
+/// `highestSeen` is `null` when no sync signal is wired. `appliedBlueScore`
+/// is the applied tip's `header.blue_score` (CF_HEADERS), `null` when unknown.
 pub fn sync_state_json(
     storage: &StorageManager,
     highest_seen: Option<u64>,
 ) -> Result<Value, jsonrpc_core::Error> {
-    let applied = storage
+    let tip = storage
         .blocks
         .get_applied_tip()
-        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?
-        .map(|(_, h)| h)
-        .unwrap_or(0);
+        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?;
+    let applied = tip.as_ref().map(|(_, h)| *h).unwrap_or(0);
+    // CV-3: the applied tip's header-committed GHOSTDAG blue score (the unit of
+    // `net_peerInfo[].headBlueScore`). Source: CF_HEADERS[applied tip hash];
+    // `null` when no tip is recorded or its header is not stored.
+    let applied_blue_score = match tip {
+        Some((hash, _)) => storage
+            .blocks
+            .get_header(&hash)
+            .map_err(|e| internal_error(format!("applied tip header lookup failed: {e}")))?
+            .map(|h| h.blue_score),
+        None => None,
+    };
     let hex_hash = |h: &citrate_consensus::types::Hash| format!("0x{}", hex::encode(h.as_bytes()));
     let wedge = citrate_storage::chain::wedge::read(&storage.db)
         .map_err(|e| internal_error(format!("dead-branch marker unreadable: {e}")))?;
@@ -118,6 +129,7 @@ pub fn sync_state_json(
             "reason": w.reason,
             "forkDepth": w.fork_depth(),
             "appliedHeight": applied,
+            "appliedBlueScore": applied_blue_score,
             "highestSeen": highest_seen,
             "deadTip": { "hash": hex_hash(&w.dead_tip), "height": w.dead_tip_height },
             "forkPoint": { "hash": hex_hash(&w.fork_point), "height": w.fork_height },
@@ -139,6 +151,7 @@ pub fn sync_state_json(
         "reason": reason,
         "forkDepth": Value::Null,
         "appliedHeight": applied,
+        "appliedBlueScore": applied_blue_score,
         "highestSeen": highest_seen,
     }))
 }
@@ -180,15 +193,24 @@ pub fn node_identity_with_sync_json(
     }))
 }
 
-/// The `citrate_getDagStats` result.
+/// The `citrate_getDagStats` result (chain#317: no estimates).
 ///
-/// The node does not keep a blue/red classification count or a total block
-/// count, so `totalBlocks`, `blueBlocks` and `redBlocks` are `null` (they used
-/// to be estimated as height and height x 0.95, chain#317). A real blue/red
-/// tally needs the GhostDAG classification persisted per block, and a total
-/// is not knowable on a pruned store; until then `null` is the honest answer. `ghostdagParams` are the
-/// parameters the running `GhostDag` uses, or `null` if the embedding binary
-/// did not supply them.
+/// - `totalBlocks`: blocks in this node's chain store. Source: the maintained
+///   stored-block counter (`BlockStore::stored_block_count`, `CF_METADATA
+///   block_count_v1`, changed in the same batch as every block write or
+///   removal). `null` only if the counter could not be built on open. A
+///   pruned store counts what it still holds.
+/// - `selectedTip`: the applied tip and its persisted GHOSTDAG record
+///   (`CF_DAG_GHOSTDAG`). Its `blueScore` IS the number of blue blocks in the
+///   tip's past (GHOSTDAG's definition), a real count; `null` when the record
+///   is not held.
+/// - The former `blueBlocks` / `redBlocks` fields are removed: a store-wide
+///   blue/red tally is not a GHOSTDAG quantity (colour is relative to the
+///   selected chain and changes on a reorg) and the node keeps no red count.
+///   Per-block colour is `citrate_getGhostdagData`. Do not derive a red count
+///   from `totalBlocks - selectedTip.blueScore`: the two count different sets.
+/// - `ghostdagParams`: the parameters the running `GhostDag` uses, or `null`
+///   if the embedding binary did not supply them.
 pub fn dag_stats_json(
     storage: &Arc<StorageManager>,
     ghostdag_params: Option<&GhostDagParams>,
@@ -229,11 +251,34 @@ pub fn dag_stats_json(
         })
     });
 
+    // Source: the maintained stored-block counter (see the doc above).
+    let total = storage
+        .blocks
+        .stored_block_count()
+        .map_err(|e| internal_error(format!("stored block count: {e}")))?;
+
+    // Source: the applied tip (`BlockStore::get_applied_tip`) and its GHOSTDAG
+    // record (`CF_DAG_GHOSTDAG`).
+    let selected_tip = match storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?
+    {
+        None => Value::Null,
+        Some((hash, h)) => {
+            let record = crate::explorer_rpc::ghostdag_record(storage, &hash)?;
+            json!({
+                "hash": format!("0x{}", hex::encode(hash.as_bytes())),
+                "height": h,
+                "blueScore": record.as_ref().map(|r| r.blue_score),
+                "blueWork": record.as_ref().map(|r| format!("0x{:x}", r.blue_work)),
+            })
+        }
+    };
+
     Ok(json!({
-        // Not tracked by the node (no block counter, no blue/red tally).
-        "totalBlocks": Value::Null,
-        "blueBlocks": Value::Null,
-        "redBlocks": Value::Null,
+        "totalBlocks": total,
+        "selectedTip": selected_tip,
         "tipsCount": tips.len(),
         "maxBlueScore": max_blue_score,
         "currentTips": tips_hex,

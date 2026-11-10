@@ -168,6 +168,9 @@ fn node_identity_sync_state_reads_the_marker_and_the_sync_signal() {
     let s = st(&io);
     assert_eq!(s["state"], "synced", "{s}");
     assert_eq!(s["appliedHeight"], 1, "{s}");
+    // CV-3: the applied tip's header-committed blue score, the unit of
+    // net_peerInfo[].headBlueScore, next to its height.
+    assert_eq!(s["appliedBlueScore"], 1, "{s}");
     assert!(s["forkDepth"].is_null(), "{s}");
     highest.store(40, Ordering::Relaxed);
     let s = st(&io);
@@ -222,6 +225,9 @@ fn node_identity_is_null_where_unknown() {
 
 #[test]
 fn dag_stats_does_not_estimate_blue_red_or_total_counts() {
+    // S3-7 (chain#317): `totalBlocks` is now the maintained stored-block
+    // counter (genesis + 20), and the store-wide blue/red tallies, which the
+    // node cannot know, are gone rather than null.
     let (storage, _tmp, g) = storage_with_genesis();
     let mut parent = g;
     for h in 1..=20u64 {
@@ -232,9 +238,15 @@ fn dag_stats_does_not_estimate_blue_red_or_total_counts() {
     let io = node_io(storage, None);
     let v = call(&io, "citrate_getDagStats", "[]");
     let r = &v["result"];
-    assert!(r["totalBlocks"].is_null(), "no block counter is kept: {v}");
-    assert!(r["blueBlocks"].is_null(), "no blue tally is kept: {v}");
-    assert!(r["redBlocks"].is_null(), "no red tally is kept: {v}");
+    assert_eq!(r["totalBlocks"], 21, "the maintained block counter: {v}");
+    assert!(
+        r.get("blueBlocks").is_none(),
+        "no blue tally is reported: {v}"
+    );
+    assert!(
+        r.get("redBlocks").is_none(),
+        "no red tally is reported: {v}"
+    );
     assert_eq!(r["height"], 20, "{v}");
     assert!(
         r["ghostdagParams"].is_null(),

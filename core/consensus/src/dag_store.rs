@@ -249,6 +249,29 @@ fn ghostdag_record_tag(hash: &Hash, encoded: &[u8]) -> [u8; 8] {
     tag
 }
 
+/// The stored value of a GhostdagData record (`DAG_GHOSTDAG[hash]`):
+/// an 8-byte tag binding `hash` and the encoding, then the bincode encoding.
+/// `None` if the record does not encode.
+pub fn encode_ghostdag_record(hash: &Hash, data: &crate::types::GhostdagData) -> Option<Vec<u8>> {
+    let encoded = bincode::serialize(data).ok()?;
+    let mut value = Vec::with_capacity(encoded.len().saturating_add(8));
+    value.extend_from_slice(&ghostdag_record_tag(hash, &encoded));
+    value.extend_from_slice(&encoded);
+    Some(value)
+}
+
+/// Decode a stored `DAG_GHOSTDAG[hash]` value. `None` for a torn or corrupt
+/// value, or one whose tag does not bind this hash and these bytes. A
+/// read-only accessor: the RPC (`citrate_getGhostdagData`) reads the records
+/// the node persisted through this, never a value from another source.
+pub fn decode_ghostdag_record(hash: &Hash, raw: &[u8]) -> Option<crate::types::GhostdagData> {
+    let (tag, encoded) = raw.split_first_chunk::<8>()?;
+    if *tag != ghostdag_record_tag(hash, encoded) {
+        return None;
+    }
+    bincode::deserialize(encoded).ok()
+}
+
 /// Column family names for persistent DAG storage
 pub mod cf {
     pub const DAG_BLOCKS: &str = "dag_blocks";
@@ -744,12 +767,11 @@ impl DagStore {
     pub fn get_ghostdag_data(&self, hash: &Hash) -> Option<crate::types::GhostdagData> {
         let kv = self.persistent.as_ref()?;
         let raw = kv.kv_get(cf::DAG_GHOSTDAG, hash.as_bytes()).ok()??;
-        let (tag, encoded) = raw.split_first_chunk::<8>()?;
-        if *tag != ghostdag_record_tag(hash, encoded) {
+        let decoded = decode_ghostdag_record(hash, &raw);
+        if decoded.is_none() {
             debug!("GHOSTDAG record for {} does not bind it; ignored", hash);
-            return None;
         }
-        bincode::deserialize(encoded).ok()
+        decoded
     }
 
     /// Drop the persisted record of `hash` — used by `prune` so a pruned

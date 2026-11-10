@@ -2180,25 +2180,21 @@ impl RpcServer {
             }
         });
 
-        // net_peerInfo: detailed peer info (id, addr, direction)
+        // net_peerInfo: per-peer id, addr, direction, state, and the last-known
+        // head (height + tip hash) the sync scoring reads (S3-7, core#605).
+        // Data source: PeerManager → PeerInfo (see NetworkApi::get_peer_info).
         let peers_info_mgr = peer_manager.clone();
         io_handler.add_sync_method("net_peerInfo", move |_params: Params| {
             rpc_request("net_peerInfo");
-            let peers = peers_info_mgr.get_all_peers();
-            let mut arr = Vec::new();
-            for p in peers {
-                let info = block_on(p.info.read());
-                let dir = match info.direction {
-                    citrate_network::peer::Direction::Inbound => "inbound",
-                    citrate_network::peer::Direction::Outbound => "outbound",
-                };
-                arr.push(serde_json::json!({
-                    "id": info.id.to_string(),
-                    "addr": info.addr.to_string(),
-                    "direction": dir,
-                }));
+            let api = NetworkApi::new(peers_info_mgr.clone(), chain_id);
+            match block_on(api.get_peer_info()) {
+                Ok(arr) => Ok(Value::Array(arr)),
+                Err(e) => Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::InternalError,
+                    message: format!("peer info unavailable: {e}"),
+                    data: None,
+                }),
             }
-            Ok(Value::Array(arr))
         });
 
         // citrate_getModel

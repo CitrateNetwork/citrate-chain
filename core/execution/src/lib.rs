@@ -55,6 +55,7 @@ pub mod precompiles;
 pub mod revm_adapter;
 pub mod state;
 pub mod tensor;
+pub mod trace;
 pub mod types;
 
 // Multi-Version Concurrency Control (MVCC) primitives. Unconditional

@@ -3779,10 +3779,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // at that height, so bump it.
                         if let Some(p) = pm_for_rx.get_peer(&pid) {
                             let mut info = p.info.write().await;
-                            if block.header.height > info.head_height {
-                                info.head_height = block.header.height;
-                                info.head_hash = block.header.block_hash;
-                            }
+                            info.observe_gossiped_head(
+                                block.header.height,
+                                block.header.block_hash,
+                                block.header.blue_score,
+                            );
                         }
                         // SYNC-S1 / D2: gossip runs its own validation (structure,
                         // signature, peer scoring, relay) and then hands the block to the

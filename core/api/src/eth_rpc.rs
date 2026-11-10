@@ -116,7 +116,7 @@ pub fn parse_reward_percentiles(v: Option<&Value>) -> Result<Vec<f64>, jsonrpc_c
 /// CHAIN-B-D002: reject a caller-supplied gas limit above the RPC gas cap.
 /// Extracted as a seam so the bound is unit-testable without standing up a
 /// full RPC server + executor.
-fn enforce_rpc_gas_cap(gas_limit: u64) -> Result<(), jsonrpc_core::Error> {
+pub(crate) fn enforce_rpc_gas_cap(gas_limit: u64) -> Result<(), jsonrpc_core::Error> {
     if gas_limit > RPC_GAS_CAP {
         return Err(jsonrpc_core::Error::invalid_params(format!(
             "gas limit {} exceeds the node RPC gas cap of {}",
@@ -579,6 +579,9 @@ pub fn register_eth_methods_with_options(
 ) {
     let finalized: FinalizedTagSource = finalized.into();
     let state_tags = options.state_tags;
+    // S3-7: verified full states after past blocks (historical eth_call), shared
+    // by the state-read handlers registered here.
+    let historical = Arc::new(crate::historical_state::HistoricalStates::new());
     // eth_blockNumber - Returns the latest block number
     let storage_bn = storage.clone();
     io_handler.add_sync_method("eth_blockNumber", move |_params: Params| {
@@ -1032,7 +1035,10 @@ pub fn register_eth_methods_with_options(
         let tag = crate::state_tag::finality_tag_str(params.get(1));
         let latest_height = block_on(ChainApi::new(storage_bal.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_bal, &storage_bal, latest_height)?;
-        crate::state_tag::require_executed_head_state(params.get(1), &storage_bal, state_tags)?;
+        // S3-7: a block of the applied chain below the head is served from the
+        // undo records (historical_state); every other tag keeps chain#425.
+        let read =
+            crate::historical_state::resolve_state_read(params.get(1), &storage_bal, state_tags)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -1056,6 +1062,28 @@ pub fn register_eth_methods_with_options(
                 ))
             }
         };
+
+        if let crate::historical_state::StateRead::At { hash, height } = read {
+            crate::rate_limit::check_method_budget(
+                crate::historical_state::HISTORICAL_POINT_READ_COST,
+            )?;
+            match crate::historical_state::account_at(
+                &storage_bal,
+                (hash, height),
+                &Address(addr_bytes),
+            ) {
+                Ok(account) => {
+                    let balance = account.map(|a| a.balance).unwrap_or_default();
+                    return Ok(Value::String(format!("0x{:x}", balance)));
+                }
+                Err(e) => crate::historical_state::fall_back_to_head_rule(
+                    e,
+                    params.get(1),
+                    &storage_bal,
+                    state_tags,
+                )?,
+            }
+        }
 
         match block_on(state_api.get_balance(Address(addr_bytes))) {
             Ok(balance) => Ok(Value::String(format!("0x{:x}", balance))),
@@ -1084,7 +1112,9 @@ pub fn register_eth_methods_with_options(
         let tag = crate::state_tag::finality_tag_str(params.get(1));
         let latest_height = block_on(ChainApi::new(storage_code.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_code, &storage_code, latest_height)?;
-        crate::state_tag::require_executed_head_state(params.get(1), &storage_code, state_tags)?;
+        // S3-7: historical code from the undo records (historical_state).
+        let read =
+            crate::historical_state::resolve_state_read(params.get(1), &storage_code, state_tags)?;
 
         let addr_str = match arg(&params, 0).as_str() {
             Some(a) if a.starts_with("0x") => a.get(2..).unwrap_or_default(),
@@ -1108,6 +1138,25 @@ pub fn register_eth_methods_with_options(
                 ))
             }
         };
+
+        if let crate::historical_state::StateRead::At { hash, height } = read {
+            crate::rate_limit::check_method_budget(
+                crate::historical_state::HISTORICAL_POINT_READ_COST,
+            )?;
+            match crate::historical_state::code_at(
+                &storage_code,
+                (hash, height),
+                &Address(addr_bytes),
+            ) {
+                Ok(code) => return Ok(Value::String(format!("0x{}", hex::encode(code)))),
+                Err(e) => crate::historical_state::fall_back_to_head_rule(
+                    e,
+                    params.get(1),
+                    &storage_code,
+                    state_tags,
+                )?,
+            }
+        }
 
         match block_on(state_api.get_code(Address(addr_bytes))) {
             Ok(code) => Ok(Value::String(format!("0x{}", hex::encode(code)))),
@@ -1166,7 +1215,32 @@ pub fn register_eth_methods_with_options(
         let latest_height =
             block_on(ChainApi::new(storage_nonce.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(raw_tag, &finalized_nonce, &storage_nonce, latest_height)?;
-        crate::state_tag::require_executed_head_state(params.get(1), &storage_nonce, state_tags)?;
+        // S3-7: historical nonce from the undo records (historical_state).
+        let read =
+            crate::historical_state::resolve_state_read(params.get(1), &storage_nonce, state_tags)?;
+        if let crate::historical_state::StateRead::At { hash, height } = read {
+            crate::rate_limit::check_method_budget(
+                crate::historical_state::HISTORICAL_POINT_READ_COST,
+            )?;
+            match crate::historical_state::account_at(
+                &storage_nonce,
+                (hash, height),
+                &Address(addr_bytes),
+            ) {
+                Ok(account) => {
+                    return Ok(Value::String(format!(
+                        "0x{:x}",
+                        account.map(|a| a.nonce).unwrap_or_default()
+                    )))
+                }
+                Err(e) => crate::historical_state::fall_back_to_head_rule(
+                    e,
+                    params.get(1),
+                    &storage_nonce,
+                    state_tags,
+                )?,
+            }
+        }
         let tag = raw_tag.unwrap_or("latest");
 
         let base_nonce = block_on(state_api.get_nonce(Address(addr_bytes))).unwrap_or_default();
@@ -1336,6 +1410,7 @@ pub fn register_eth_methods_with_options(
     let executor_call = executor.clone();
     let storage_call = storage.clone();
     let finalized_call = finalized.clone();
+    let historical_call = historical.clone();
     io_handler.add_sync_method("eth_call", move |params: Params| {
         // WP-I.4: eth_call costs 10 budget units
         crate::rate_limit::check_method_budget(10)?;
@@ -1361,7 +1436,43 @@ pub fn register_eth_methods_with_options(
         let tag = crate::state_tag::finality_tag_str(params.get(1));
         let latest_height = block_on(ChainApi::new(storage_call.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_call, &storage_call, latest_height)?;
-        crate::state_tag::require_executed_head_state(params.get(1), &storage_call, state_tags)?;
+        // S3-7: a block of the applied chain below the head runs on its verified
+        // rebuilt state (historical_state); every other tag keeps chain#425.
+        let read =
+            crate::historical_state::resolve_state_read(params.get(1), &storage_call, state_tags)?;
+        let historical_at = match read {
+            crate::historical_state::StateRead::At { hash, height } => {
+                crate::rate_limit::check_method_budget(
+                    crate::historical_state::HISTORICAL_FULL_STATE_COST,
+                )?;
+                match historical_call.executor_at(&storage_call, &exec, (hash, height)) {
+                    Ok(replay) => {
+                        let timestamp = storage_call
+                            .blocks
+                            .get_header(&hash)
+                            .ok()
+                            .flatten()
+                            .map(|h| h.timestamp)
+                            .unwrap_or_default();
+                        Some((Arc::new(replay), height, timestamp))
+                    }
+                    Err(e) => {
+                        crate::historical_state::fall_back_to_head_rule(
+                            e,
+                            params.get(1),
+                            &storage_call,
+                            state_tags,
+                        )?;
+                        None
+                    }
+                }
+            }
+            crate::historical_state::StateRead::Head => None,
+        };
+        let exec = match &historical_at {
+            Some((replay, _, _)) => replay.clone(),
+            None => exec,
+        };
 
         // call object
         let obj = match &arg(&params, 0) {
@@ -1464,7 +1575,12 @@ pub fn register_eth_methods_with_options(
 
         // Build the simulation block context AT THE CANONICAL TIP (CBF-S1 WP-2),
         // so `block.number` / `block.timestamp` are real inside the EVM.
-        let (sim_height, sim_timestamp) = simulation_block_context(&storage_call);
+        // A historical call runs in the context of the named block (height and
+        // timestamp of that block, as geth does).
+        let (sim_height, sim_timestamp) = match &historical_at {
+            Some((_, height, timestamp)) => (*height, *timestamp),
+            None => simulation_block_context(&storage_call),
+        };
         let blk = citrate_consensus::types::BlockBuilder::new()
             .base_fee_per_gas(1_000_000_000)
             .height(sim_height)
@@ -2802,7 +2918,9 @@ pub fn register_eth_methods_with_options(
         let tag = crate::state_tag::finality_tag_str(parsed.get(2));
         let latest_height = block_on(ChainApi::new(storage_gsat.clone()).get_height()).unwrap_or(0);
         require_serviceable_finality_tag(tag, &finalized_gsat, &storage_gsat, latest_height)?;
-        crate::state_tag::require_executed_head_state(parsed.get(2), &storage_gsat, state_tags)?;
+        // S3-7: historical slot from the undo records (historical_state).
+        let read =
+            crate::historical_state::resolve_state_read(parsed.get(2), &storage_gsat, state_tags)?;
 
         // address (required, 20 bytes)
         let addr_str = arg(&parsed, 0)
@@ -2842,10 +2960,36 @@ pub fn register_eth_methods_with_options(
         let mut slot_key = vec![0u8; 32usize.saturating_sub(slot_bytes.len())];
         slot_key.append(&mut slot_bytes);
 
-        // The 3rd param (blockTag) was checked above: only a tag naming the
-        // executed head is served (chain#425).
-
-        match block_on(state_api.get_storage(address, slot_key)) {
+        // The 3rd param (blockTag) was resolved above: the executed head, or a
+        // block of the applied chain below it (S3-7); anything else was refused.
+        let value = match read {
+            crate::historical_state::StateRead::At { hash, height } => {
+                crate::rate_limit::check_method_budget(
+                    crate::historical_state::HISTORICAL_POINT_READ_COST,
+                )?;
+                match crate::historical_state::storage_at(
+                    &storage_gsat,
+                    (hash, height),
+                    &address,
+                    &slot_key,
+                ) {
+                    Ok(v) => Ok(v.unwrap_or_default()),
+                    Err(e) => {
+                        crate::historical_state::fall_back_to_head_rule(
+                            e,
+                            parsed.get(2),
+                            &storage_gsat,
+                            state_tags,
+                        )?;
+                        block_on(state_api.get_storage(address, slot_key))
+                    }
+                }
+            }
+            crate::historical_state::StateRead::Head => {
+                block_on(state_api.get_storage(address, slot_key))
+            }
+        };
+        match value {
             Ok(value) => {
                 // Always return left-padded 32-byte hex.
                 // Left-pad the last (up to) 32 bytes.
@@ -3298,6 +3442,16 @@ pub fn register_eth_methods_with_options(
             }))
         });
     }
+
+    // S3-7 (CNV-RPC): the read-only explorer methods and the tracers, served
+    // wherever eth_* is (02 §3, spec 06 §5).
+    crate::explorer_rpc::register_explorer_methods(
+        io_handler,
+        storage.clone(),
+        finalized.clone(),
+        chain_id,
+    );
+    crate::trace_rpc::register_trace_methods(io_handler, storage, executor, historical, state_tags);
 }
 
 /// Positional JSON-RPC argument `i`, or `null` when absent, so a short params
