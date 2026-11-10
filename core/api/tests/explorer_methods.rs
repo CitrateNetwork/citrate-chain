@@ -15,7 +15,7 @@
 use citrate_api::eth_rpc::register_eth_methods_with_finality;
 use citrate_api::state_tag::HISTORICAL_STATE_CODE;
 use citrate_api::FilterRegistry;
-use citrate_consensus::checkpoint::{Checkpoint, CheckpointStatus};
+use citrate_consensus::checkpoint::{Checkpoint, CheckpointStatus, VoteBinding};
 use citrate_consensus::hardening::PbaHardening;
 use citrate_consensus::types::{
     Block, BlockBuilder, GhostdagData, Hash, PublicKey, Signature, Transaction, VrfProof,
@@ -160,6 +160,7 @@ async fn produce(
         coinbase: COINBASE,
         prevrandao: *draft.header.vrf_reveal.output.as_bytes(),
         block_hashes: HashMap::new(),
+        gas_limit: None,
     });
     let mut receipts = Vec::new();
     for t in &draft.transactions {
@@ -806,10 +807,18 @@ fn dag_fixture() -> Dag {
         .take(3)
         .map(|k| (*k, Signature::new([7u8; 64])))
         .collect();
+    // The v2 certificate (r1007 S3-5): the vote binding and each member's
+    // stake (#185: the quorum counts stake).
     let cp = Checkpoint {
         height: 2,
         block_hash: a2,
+        binding: VoteBinding {
+            epoch: 0,
+            state_root: Hash::new([0x51; 32]),
+            accepted_root: Hash::new([0x52; 32]),
+        },
         committee,
+        stakes: vec![10, 20, 30, 40],
         votes,
         status: CheckpointStatus::Finalized,
     };
@@ -995,13 +1004,16 @@ fn finality_status_reports_the_stored_certificate_not_depth() {
         pending.contains(&"stateRoot") && pending.contains(&"votedStake"),
         "{r}"
     );
-    assert_eq!(r["votingPinned"], false);
+    // r1007 (ADR CV-8): voting is on from block 0 in this build; enforcement
+    // is on for no (chain id, genesis) pair until the soak (G5).
+    assert_eq!(r["votingPinned"], true, "{r}");
+    assert_eq!(r["enforcementPinned"], false, "{r}");
 
     // The keys the explorer (citrate-explorer#51, src/lib/citrate/r1007.ts)
     // and the finality lane's handler share: a view is always available from
     // storage, so `published` is true; `finalized.blockHash` names the anchor.
     assert_eq!(r["published"], true, "{r}");
-    assert_eq!(r["voting"], false, "{r}");
+    assert_eq!(r["voting"], true, "{r}");
     assert_eq!(r["finalized"]["blockHash"], hx(&h(0xA0, 0)), "{r}");
     assert!(r["quorumRule"].is_string(), "{r}");
     assert!(r["dataSource"].is_string(), "{r}");

@@ -183,9 +183,9 @@ block-depth estimate (CV-8).
   - the compiled pins (`CHECKPOINT_VOTING_PINS`, `CHECKPOINT_ENFORCEMENT_PINS`).
 
 ```json
-← {"published":true,"voting":false,"mode":null,
+← {"published":true,"voting":true,"mode":null,
    "quorumRule":"vote count: Checkpoint::effective_quorum of the committee (not stake-weighted on this base)",
-   "chainId":"0x9d0c","votingPinned":false,"enforcementPinned":false,"enforcement":false,
+   "chainId":"0x9d0c","votingPinned":true,"enforcementPinned":false,"enforcement":false,
    "finalizedSource":"height-handle",
    "finalized":{"height":"0x0","hash":"0x…genesis","blockHash":"0x…genesis"},
    "latestCertificate":{"height":"0x2","blockHash":"0x…","committeeSize":4,"voters":3,
@@ -203,7 +203,9 @@ The fields listed in `pendingFinalityLane` are `null` on this base.
   `src/lib/citrate/r1007.ts`, gates every finality figure on `published`):
   - `published` is `true`: this view is read from storage on every call, so one always
     exists;
-  - `voting` is the compiled voting pin (`votingPinned`);
+  - `voting` is the compiled voting switch (`votingPinned`), on from block 0 in an r1007
+    build (`CHECKPOINT_VOTING_FROM_GENESIS`); `enforcementPinned` reads
+    `CHECKPOINT_ENFORCEMENT_GENESES` for this chain id and this store's block 0;
   - `mode` is `"enforced"` when verified certificates feed the finalized tag, and
     otherwise `null`, because this base cannot tell the lane's `legacy` from `observed`;
   - `quorumRule` names the count rule this base's certificates use;

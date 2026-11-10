@@ -521,15 +521,17 @@ fn latest_certificate(
 ///   genesis);
 /// - `latestCertificate`: the highest `checkpoint:{height}` record in
 ///   `CF_DAG_METADATA` (committee size, votes collected), as stored;
-/// - `votingPinned` / `enforcementPinned`: the compiled per-chain switches
-///   (`checkpoint_gadget::CHECKPOINT_VOTING_PINS`, `CHECKPOINT_ENFORCEMENT_PINS`);
+/// - `votingPinned` / `enforcementPinned`: the compiled switches
+///   (`checkpoint_gadget::CHECKPOINT_VOTING_FROM_GENESIS`, on from block 0 on
+///   r1007, and `CHECKPOINT_ENFORCEMENT_GENESES`, keyed by chain id and this
+///   store's block 0);
 /// - `interval`: `CheckpointConfig::default().interval`, `voteDepth`:
 ///   `checkpoint::DEFAULT_VOTE_DEPTH`.
 ///
 /// Key set shared with the finality lane's handler (`r1007/s3-finality-voting`
 /// `finality_status.rs`) and read by citrate-explorer#51: `published` is
 /// `true` (this view is read from storage on every call, so one always
-/// exists), `voting` is the compiled voting pin, `mode` is `"enforced"` when
+/// exists), `voting` is the compiled voting switch, `mode` is `"enforced"` when
 /// verified certificates feed the finalized tag and otherwise `null` (this
 /// base cannot tell the lane's `legacy` from `observed`), `quorumRule` names
 /// the count rule this base's certificates use (`Checkpoint::effective_quorum`),
@@ -555,16 +557,25 @@ pub fn finality_status_json(
     let config = citrate_consensus::checkpoint::CheckpointConfig::default();
     let enforced = matches!(finalized, FinalizedTagSource::Verified(_));
     let finalized_hex = finalized_hash.as_ref().map(hx);
+    // The enforcement table is keyed by (chain id, genesis): r1006 and r1007
+    // share chain id 40204. The genesis is this store's canonical block 0; a
+    // store without one is enforced for no chain.
+    let genesis = storage
+        .blocks
+        .get_canonical_block_by_height(0)
+        .map_err(internal)?
+        .unwrap_or_default();
+    let voting = citrate_consensus::checkpoint_gadget::checkpoint_voting_active();
     Ok(json!({
         "published": true,
-        "voting": citrate_consensus::checkpoint_gadget::checkpoint_voting_pinned(chain_id),
+        "voting": voting,
         "mode": if enforced { json!("enforced") } else { Value::Null },
         "quorumRule": "vote count: Checkpoint::effective_quorum of the committee (not \
                        stake-weighted on this base)",
         "chainId": qty(chain_id),
-        "votingPinned": citrate_consensus::checkpoint_gadget::checkpoint_voting_pinned(chain_id),
+        "votingPinned": voting,
         "enforcementPinned":
-            citrate_consensus::checkpoint_gadget::checkpoint_enforcement_pinned(chain_id),
+            citrate_consensus::checkpoint_gadget::checkpoint_enforcement_pinned(chain_id, &genesis),
         "enforcement": enforced,
         "finalizedSource": source,
         "finalized": {
