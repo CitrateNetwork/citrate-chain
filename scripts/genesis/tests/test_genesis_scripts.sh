@@ -976,25 +976,25 @@ expect "phase inputs tripwire: the tree's phase reads are all classified" 0 'pha
 # inventory is an allowlist for every address input and council owner (a producer staker also
 # passes), the retired r1006 keys an extra denylist, and the GUARDIAN delay plus the owner's
 # veto margin must fit in the 24 h registry window.
-RK1=0x00000000000000000000000000000000000000a1
-NK1=0x00000000000000000000000000000000000000b1
-NK2=0x00000000000000000000000000000000000000b2
-DEP=0x00000000000000000000000000000000000000c1
-STAKER=$(jq -r '.validators[0].staker' "$G/../../core/economics/assets/r1006/validators.json")
+KRK1=0x00000000000000000000000000000000000000a1
+KNK1=0x00000000000000000000000000000000000000b1
+KNK2=0x00000000000000000000000000000000000000b2
+KDEP=0x00000000000000000000000000000000000000c1
+KSTAKER=$(jq -r '.validators[0].staker' "$G/../../core/economics/assets/r1006/validators.json")
 pf() { env -i PATH="$PATH" "$@" python3 -I "$PI" preflight --phases P1; }
-V060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1,$NK2" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$DEP")
-expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
-expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
-expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_RETIRED_KEYS="$RK1"
-expect "phase inputs keys: a typo'd address input is refused" 3 'TREASURY \(0x0+b3\) is not in GENESIS_KEY_INVENTORY' -- pf "${V060[@]}" TREASURY=0x00000000000000000000000000000000000000b3
-expect "phase inputs keys: a stale key absent from the retired list is refused" 3 'GRD_OWNERS \(0x0+d1\) is not in GENESIS_KEY_INVENTORY' -- pf "${V060[@]}" GRD_OWNERS="$NK1,0x00000000000000000000000000000000000000d1"
-expect "phase inputs keys: an inventory omission is refused" 3 'GOV_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 GOV_OWNERS="$NK1,$NK2"
-expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${V060[@]}" TREASURY="$RK1"
-expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$RK1"
-expect "phase inputs keys: a malformed inventory entry is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$NK1,0xzz" GENESIS_RETIRED_KEYS="$RK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
-expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${V060[@]}" GRD_MIN_DELAY=86000
-expect "phase inputs keys: a producer staker passes the allowlist" 0 '' -- pf "${V060[@]}" TREASURY="$STAKER"
-expect "phase inputs keys: inventory keys pass (control)" 0 '' -- pf "${V060[@]}" TREASURY="$NK1" GOV_OWNERS="$NK1,$NK2" GRD_MIN_DELAY=3600
+KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,$KNK2" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$KDEP")
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_RETIRED_KEYS="$KRK1"
+expect "phase inputs keys: a typo'd address input is refused" 3 'TREASURY \(0x0+b3\) is not in GENESIS_KEY_INVENTORY' -- pf "${KV060[@]}" TREASURY=0x00000000000000000000000000000000000000b3
+expect "phase inputs keys: a stale key absent from the retired list is refused" 3 'GRD_OWNERS \(0x0+d1\) is not in GENESIS_KEY_INVENTORY' -- pf "${KV060[@]}" GRD_OWNERS="$KNK1,0x00000000000000000000000000000000000000d1"
+expect "phase inputs keys: an inventory omission is refused" 3 'GOV_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 GOV_OWNERS="$KNK1,$KNK2"
+expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
+expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$KRK1"
+expect "phase inputs keys: a malformed inventory entry is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,0xzz" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${KV060[@]}" GRD_MIN_DELAY=86000
+expect "phase inputs keys: a producer staker passes the allowlist" 0 '' -- pf "${KV060[@]}" TREASURY="$KSTAKER"
+expect "phase inputs keys: inventory keys pass (control)" 0 '' -- pf "${KV060[@]}" TREASURY="$KNK1" GOV_OWNERS="$KNK1,$KNK2" GRD_MIN_DELAY=3600
 expect "phase inputs keys: the r1006/r1007 ceremony needs none of them (control)" 0 '' -- pf
 TW="$T/pi-tree"
 mkdir -p "$TW/scripts/genesis" "$TW/scripts/ops" "$TW/contracts"
