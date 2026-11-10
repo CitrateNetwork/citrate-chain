@@ -17,9 +17,13 @@
 // concurrently with the producer's own execute→persist (a snapshot could
 // capture, and a restore roll back, the producer's in-flight state). A single
 // `Arc<Mutex<AppliedTip>>` serializes ALL state-advancing operations: the
-// receive path goes through `apply_received` (which locks internally) and the
-// producer holds the SAME lock (via `advance_lock()`) across its build critical
-// section, updating the tip inline before releasing it.
+// node's drain task (`drive_drain`, woken by admission through
+// `request_drain`) and the producer, which holds the SAME lock (via
+// `advance_lock()`) across its build critical section, updating the tip inline
+// before releasing it. Received blocks are never executed on the P2P message
+// loop (r1007 devnet, 2026-11-08: one slow apply there shed NewBlock and
+// tripped the stall watchdog); `apply_received` remains for callers that apply
+// one block directly (tools, tests).
 //
 // Reward reproducibility: a receiver can only reproduce a block's `state_root`
 // if it credits the exact same block rewards the producer did. The enhanced
@@ -209,6 +213,23 @@ pub(crate) mod test_receipt_chunk {
         CHUNK.with(|c| c.get())
     }
 }
+
+/// RC-1c (r1007 devnet, gf-p1-k1000-1, 2026-11-10): block execution is
+/// synchronous CPU work inside an async task, and the apply loops (forward drain,
+/// reorg re-apply, spine replay) had no await between blocks. A 425-block reorg
+/// after a partition heal held one runtime worker for minutes, and the P2P
+/// message loop, queued on that worker, did not run until the stall watchdog
+/// exited the node. Every apply loop yields after each block, so no task waits
+/// longer than one block's execution for its worker.
+async fn yield_between_blocks() {
+    tokio::task::yield_now().await;
+}
+
+/// RC-6: how far above the applied tip fork choice's head may be for the producer
+/// to advance to it under its own lock before building. One drain pass behind is
+/// one or two heights; the F2 gate refuses to seal beyond `CATCHUP_REFUSE_GAP` (3)
+/// anyway, so a larger gap is the drain task's to close.
+pub(crate) const PRODUCER_ADVANCE_MAX_HEIGHTS: u64 = 4;
 
 /// Treasury address that receives the treasury slice of each block reward.
 /// Mirrors the producer's `settle_block_rewards` basic-credit list and
@@ -836,6 +857,13 @@ pub struct CanonicalApplicator {
     /// blocks that the winning branch did not execute are re-injected here
     /// (`reinject_abandoned`). `None`: no pool (tests, tools).
     mempool: Option<Arc<citrate_sequencer::mempool::Mempool>>,
+    /// Wakes the drain task ([`Self::drive_drain`]'s loop in `start_node`) when
+    /// admission has stored a block (`request_drain`). Admission never executes:
+    /// execution held the P2P message loop for the whole apply (r1007 devnet,
+    /// 2026-11-08), so one slow apply shed every peer's NewBlock and tripped
+    /// the stall watchdog. `Notify` coalesces: blocks admitted while a pass is
+    /// running are covered by one more pass toward the then-current head.
+    drain_wake: Arc<tokio::sync::Notify>,
 }
 
 impl CanonicalApplicator {
@@ -966,7 +994,67 @@ impl CanonicalApplicator {
             refused_rebuild_head: parking_lot::Mutex::new(None),
             dead_branch: Arc::new(AtomicBool::new(dead_branch)),
             mempool: None,
+            drain_wake: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// RC-6: the producer's catch-up, run under the advance lock it holds for its
+    /// build (`state` is that lock's contents). Moves the applied tip to fork choice's
+    /// head (an extension or a shallow switch, via [`Self::reorg_to`]) when the head is
+    /// at most [`PRODUCER_ADVANCE_MAX_HEIGHTS`] above the applied tip; anything further
+    /// is left to the drain task, and the producer's F2 gate refuses meanwhile.
+    /// Returns whether the applied tip moved. Never fails the build: a declined or
+    /// out-of-window reorg leaves the tip as it was.
+    pub async fn advance_to_head_locked(&self, state: &mut AppliedState) -> bool {
+        let Some(fc) = &self.fork_choice else {
+            return false;
+        };
+        let Some(best) = fc().await else {
+            return false;
+        };
+        if best == state.tip.hash {
+            return false;
+        }
+        let head_height = match read_block(&self.storage, &best) {
+            Ok(Some(b)) => b.header.height,
+            _ => return false,
+        };
+        if head_height
+            > state
+                .tip
+                .height
+                .saturating_add(PRODUCER_ADVANCE_MAX_HEIGHTS)
+        {
+            return false;
+        }
+        match self.reorg_to(state, best).await {
+            ReorgOutcome::Reorged {
+                new_tip,
+                height,
+                reverted,
+                applied,
+            } => {
+                debug!(
+                    "producer: advanced to fork-choice head {new_tip} @ {height} before building (reverted {reverted}, applied {applied})"
+                );
+                self.publish_applied_height(state);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Admission stored a block: wake the drain task, which applies it (with
+    /// every other block admitted since its last pass) and follows fork choice.
+    /// Never waits; the caller is the P2P message loop.
+    pub fn request_drain(&self) {
+        self.drain_wake.notify_one();
+    }
+
+    /// The wake [`Self::request_drain`] signals. The node's drain task waits on
+    /// it alongside its 1 s tick.
+    pub fn drain_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.drain_wake.clone()
     }
 
     /// Wire the genesis world state + block hash used by the RUNTIME reorg fallback
@@ -1901,6 +1989,9 @@ impl CanonicalApplicator {
                     }
                     // VALIDATOR-S1: re-sync the selector if this crossed a snapshot boundary.
                     self.maybe_sync_registry(height).await;
+                    // RC-1c: one block's execution is the most this task holds its
+                    // runtime worker for (see `yield_between_blocks`).
+                    yield_between_blocks().await;
                 }
                 Err(ExecutionError::StateRootMismatch { expected, got }) => {
                     warn!(
@@ -2407,6 +2498,9 @@ impl CanonicalApplicator {
                 .executor
                 .apply_block_no_persist_with_receipts(block, block.header.coinbase, &reward)
                 .await;
+            // RC-1c: a reorg re-applies up to the undo window (10,000 blocks) under
+            // the advance lock; give the runtime a turn after each one.
+            yield_between_blocks().await;
             match apply_result {
                 Ok((_, receipts)) => {
                     win_index.extend(ReceiptIndexBatch::for_block(block, &receipts));
@@ -3474,6 +3568,8 @@ impl CanonicalApplicator {
                         &block.state_root,
                     );
                     self.maybe_sync_registry(block.header.height).await;
+                    // RC-1c: a spine replay can be tens of thousands of blocks.
+                    yield_between_blocks().await;
                 }
                 Err(e) => {
                     warn!(
@@ -4632,6 +4728,68 @@ pub(crate) mod tests {
         assert_eq!(
             storage.blocks.get_applied_tip().expect("read tip"),
             Some((c[2].header.block_hash, 3))
+        );
+    }
+
+    /// Counts how often a task that yields in a loop gets polled while `work` runs
+    /// on the same single-threaded runtime: 0 when `work` never yields.
+    async fn polls_of_another_task_during<F: std::future::Future>(work: F) -> (F::Output, u64) {
+        let ticks = Arc::new(AtomicU64::new(0));
+        let t = ticks.clone();
+        let other = tokio::spawn(async move {
+            loop {
+                t.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        let out = work.await;
+        let polled = ticks.load(Ordering::Relaxed);
+        other.abort();
+        (out, polled)
+    }
+
+    /// RED (r1007 devnet gf-p1-k1000-1, 2026-11-10, RC-1c). With execution moved
+    /// to the drain task, the P2P message loop still stopped for 60 s on three
+    /// nodes the moment the drain began a 425-block reorg after a partition heal,
+    /// and the watchdog exited them mid-reorg. The drain's apply loops have no
+    /// await between blocks, so a long drain holds its runtime worker for the
+    /// whole run (at ~1.2 s per block, minutes), and a task waiting on that
+    /// worker (tokio's LIFO slot is not stolen) does not run. The drain must give
+    /// the runtime a turn after every block it applies.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_forward_drain_yields_between_blocks() {
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let c = chain(6);
+        for b in &c {
+            persist(&storage, b);
+        }
+        let (applied, polled) = polls_of_another_task_during(app.drive_drain()).await;
+        assert_eq!(applied, 6, "fixture: the drain applies the whole chain");
+        assert!(
+            polled >= 5,
+            "another task ran {polled} time(s) while the drain applied 6 blocks: the drain \
+             holds the runtime for its whole run"
+        );
+    }
+
+    /// RED (RC-1c), the reorg half: re-applying the winning branch also yields
+    /// after every block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reorg_yields_between_reapplied_blocks() {
+        let (exec, storage, _dir) = fresh();
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        let (_a1, _a2, _b2, b3) = setup_fork(&app, &storage).await; // tip = a2 @ 2
+        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        let (_, polled) = polls_of_another_task_during(app.drive_drain()).await;
+        assert_eq!(
+            app.applied_tip().await.hash,
+            b3.header.block_hash,
+            "fixture: the drain reorgs to the heavier branch"
+        );
+        assert!(
+            polled >= 2,
+            "another task ran {polled} time(s) while the reorg re-applied 2 blocks"
         );
     }
 

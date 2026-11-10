@@ -2888,8 +2888,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // more pass, not a back-to-back burst competing with the
                 // producer for the advance lock.
                 let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
+                // Admission wakes this task for every stored block
+                // (`request_drain`); it is the node's only executor of
+                // received blocks, so the P2P message loop never waits on
+                // execution. Wakes during a pass coalesce into one more pass.
+                let wake = app.drain_wake();
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = wake.notified() => {}
+                    }
                     app.drive_drain().await;
                 }
             });
@@ -3993,6 +4001,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // and are never integrated into the DAG.
                         let mut pending = sync_for_rx.drain_validated_blocks().await;
                         let answer_top = pending.iter().map(|b| b.header.height).max();
+                        // sync_rejoin.rs: the highest validated block served, held or not.
+                        let answer_highest = pending
+                            .iter()
+                            .max_by_key(|b| b.header.height)
+                            .map(|b| (b.header.block_hash, b.header.height));
                         // sync_rejoin.rs: is this the asked peer's answer to the
                         // anchor the sync tick asked for? Judged on the blocks that
                         // passed validation (their hashes recompute).
@@ -4211,11 +4224,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // sync_rejoin.rs: steer the next anchor on this answer.
                             let mut search_gave_up = false;
                             if let Some(anchor_height) = answers_rejoin {
-                                let answer = sync_rejoin::classify(
+                                let answer = sync_rejoin::classify_answer(
                                     answer_hashes.is_empty(),
                                     newly_admitted,
                                     fixpoint_highest,
                                     deferred_from_answer,
+                                    answer_highest,
                                 );
                                 let transition =
                                     rejoin_for_rx
@@ -4960,7 +4974,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // execute→persist never races the receive-path applier, and each sealed block
         // advances the applied tip. Present iff execute-on-receive (v2) is enabled.
         if let Some(app) = &canonical_applicator {
-            producer_instance = producer_instance.with_applied_tip_lock(app.advance_lock());
+            // RC-6: and advance the applied tip to fork choice's head under that lock
+            // before each build (the drain task may be one pass behind).
+            producer_instance = producer_instance.with_applicator(app.clone());
             // #126 (producer catch-up gate): refuse to seal while this node is rebuilding
             // its applied state from genesis or has not yet hydrated its DAG after a
             // restart, so a lagging/replaying node never forks the fleet by sealing on a

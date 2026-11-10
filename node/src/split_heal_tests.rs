@@ -427,7 +427,7 @@ impl Node {
         )
         .await
         .with_v2_headers(true)
-        .with_applied_tip_lock(app.advance_lock())
+        .with_applicator(app.clone())
         .with_equivocation_vote_config(EquivocationVoteConfig {
             chain_id: CHAIN_ID,
             registry: REG,
@@ -868,6 +868,8 @@ impl Fleet {
                 let relay = fresh && node.relayed.insert(hash);
                 let t = std::time::Instant::now();
                 node.on_new_block(&peer, &pid, block.clone()).await;
+                // Admission's cost plus the apply it hands the drain task.
+                node.run_woken_drain().await;
                 let spent = t.elapsed();
                 if fresh {
                     self.admit_cost.push((self.slot_no, spent));
@@ -884,7 +886,10 @@ impl Fleet {
                     }
                 }
             }
-            NetworkMessage::Blocks { blocks } => node.on_blocks(&peer, &pid, blocks).await,
+            NetworkMessage::Blocks { blocks } => {
+                node.on_blocks(&peer, &pid, blocks).await;
+                node.run_woken_drain().await;
+            }
             _ => {}
         }
     }
@@ -1106,12 +1111,30 @@ impl Node {
         .await;
     }
 
+    /// The node's drain task (`start_node`): admission never executes, it
+    /// wakes this task (`CanonicalApplicator::request_drain`), which applies
+    /// what was stored and follows fork choice. The harness runs it right
+    /// after the message that woke it.
+    async fn run_woken_drain(&self) {
+        let wake = self.app.drain_wake();
+        if tokio::time::timeout(std::time::Duration::ZERO, wake.notified())
+            .await
+            .is_ok()
+        {
+            self.app.drive_drain().await;
+        }
+    }
+
     /// main.rs `NetworkMessage::Blocks` arm.
     async fn on_blocks(&mut self, peer: &Arc<Peer>, pid: &PeerId, blocks: Vec<Block>) {
         let answer_hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash).collect();
         let _ = self.sync.handle_blocks(pid, blocks).await;
         let mut pending = self.sync.drain_validated_blocks().await;
         let answer_top = pending.iter().map(|b| b.header.height).max();
+        let answer_highest = pending
+            .iter()
+            .max_by_key(|b| b.header.height)
+            .map(|b| (b.header.block_hash, b.header.height));
         let verified: HashSet<Hash> = pending.iter().map(|b| b.header.block_hash).collect();
         let answers_rejoin = self
             .rejoin
@@ -1196,11 +1219,12 @@ impl Node {
         let _ = peer;
         let mut gave_up = false;
         if let Some(anchor_height) = answers_rejoin {
-            let answer = sync_rejoin::classify(
+            let answer = sync_rejoin::classify_answer(
                 answer_hashes.is_empty(),
                 newly_admitted,
                 highest,
                 deferred_from_answer,
+                answer_highest,
             );
             let t = self.rejoin.lock().on_answer(answer, gap > 0, anchor_height);
             gave_up = matches!(t, Some(sync_rejoin::Transition::GaveUp { .. }));
@@ -2075,8 +2099,13 @@ mod tests {
             "tip_reask_for_rx.lock().note_answer(",
             "tip_reask_for_loop.lock().hold(",
             "|h| held_heads.contains(h)",
-            "sync_rejoin::classify(",
+            "sync_rejoin::classify_answer(",
             "sel.record_serve(",
+            // The drain task applies what admission stored, woken by it.
+            "let wake = app.drain_wake();",
+            "_ = wake.notified() => {}",
+            // The producer advances to fork choice's head under its lock (RC-6).
+            "producer_instance.with_applicator(app.clone())",
             // Serving plane (ADR CV-6).
             "peer_manager.set_serve_sink(serve_tx)",
             "serve_plane::spawn(storage.clone(), peer_manager.clone(), serve_rx)",

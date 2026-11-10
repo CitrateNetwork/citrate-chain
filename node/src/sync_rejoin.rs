@@ -171,6 +171,11 @@ pub enum Answer {
     Unconnected,
     /// Nothing new and nothing unconnected: every served block was already held.
     Known,
+    /// As [`Answer::Known`], with the highest served block (all held). The node
+    /// can hold a middle stretch of a branch it cannot apply yet (stored from
+    /// gossip and missing-parent walks while the parts above and below were
+    /// not); in a follow, `Held` above the cursor moves the cursor past it.
+    Held { highest: (Hash, u64) },
 }
 
 /// Classify an answer from what admission did with it.
@@ -187,6 +192,25 @@ pub fn classify(
         Some(highest) if newly_admitted > 0 => Answer::Progress { highest },
         _ if empty || deferred > 0 => Answer::Unconnected,
         _ => Answer::Known,
+    }
+}
+
+/// [`classify`], given also the highest block served in the answer (validated,
+/// held or not): an answer with nothing new and nothing unconnected is
+/// [`Answer::Held`] when it served any block.
+pub fn classify_answer(
+    empty: bool,
+    newly_admitted: usize,
+    highest_admitted: Option<(Hash, u64)>,
+    deferred: usize,
+    highest_served: Option<(Hash, u64)>,
+) -> Answer {
+    match (
+        classify(empty, newly_admitted, highest_admitted, deferred),
+        highest_served,
+    ) {
+        (Answer::Known, Some(highest)) => Answer::Held { highest },
+        (answer, _) => answer,
     }
 }
 
@@ -544,6 +568,17 @@ impl RejoinTracker {
         anchor_height: u64,
     ) -> Option<Transition> {
         let from = self.answered_by.take();
+        // A follow that meets a stretch of blocks it already holds moves on to the
+        // highest one served (`block_serve` serves by height, every branch), so
+        // it reaches the missing blocks above the stretch; anywhere else, or when
+        // the answer reaches no higher than the cursor, held is Known.
+        let answer = match (&self.mode, answer) {
+            (Mode::Follow { cursor }, Answer::Held { highest }) if highest.1 > cursor.1 => {
+                Answer::Progress { highest }
+            }
+            (_, Answer::Held { .. }) => Answer::Known,
+            (_, other) => other,
+        };
         let behind = behind || self.target_behind || self.split;
         if !behind {
             self.give_ups = 0;
@@ -553,7 +588,9 @@ impl RejoinTracker {
             return self.reset("caught up");
         }
         match (self.mode.clone(), answer) {
-            (Mode::Tip { .. }, Answer::Progress { .. }) | (Mode::Tip { .. }, Answer::Known) => {
+            (Mode::Tip { .. }, Answer::Progress { .. })
+            | (Mode::Tip { .. }, Answer::Known)
+            | (Mode::Tip { .. }, Answer::Held { .. }) => {
                 // Only the striking peer's own answer clears its strikes.
                 if self.strike_peer == from {
                     self.mode = Mode::Tip { strikes: 0 };
@@ -1256,6 +1293,8 @@ mod tests {
         };
         let fx = n.admission.admit_to_fixpoint(own.to_vec(), |_, _| {}).await;
         assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
+        // The node's drain task, woken by admission, applies them.
+        n.app.drive_drain().await;
         assert_eq!(
             n.applied(),
             own.last().map(|b| (h(b), b.header.height)),
@@ -1297,6 +1336,10 @@ mod tests {
             .expect("validate");
         let mut pending = node.sync.drain_validated_blocks().await;
         let verified: HashSet<Hash> = pending.iter().map(h).collect();
+        let highest_served = pending
+            .iter()
+            .max_by_key(|b| b.header.height)
+            .map(|b| (h(b), b.header.height));
         let answered = tracker.take_answer(from, &received, &verified);
         let reprocessed = !pending.is_empty();
         if reprocessed {
@@ -1304,6 +1347,8 @@ mod tests {
             pending = bound_orphan_buffer(pending);
         }
         let fx = node.admission.admit_to_fixpoint(pending, |_, _| {}).await;
+        // The node's drain task, woken by admission, applies what was admitted.
+        node.app.drive_drain().await;
         let deferred = fx
             .deferred
             .iter()
@@ -1315,11 +1360,12 @@ mod tests {
         node.app.drive_drain().await;
         let applied_now = node.applied().expect("applied tip").1;
         if let Some(ah) = answered {
-            let verdict = classify(
+            let verdict = classify_answer(
                 received.is_empty(),
                 fx.newly_admitted,
                 fx.highest_admitted,
                 deferred,
+                highest_served,
             );
             tracker.on_answer(verdict, network_height > applied_now, ah);
         }
@@ -2250,6 +2296,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(
             fx.newly_admitted,
             net.main.len(),
@@ -2282,6 +2329,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2310,6 +2358,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2344,6 +2393,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2400,6 +2450,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let dead_tip = net.side.last().expect("side");
@@ -2830,6 +2881,77 @@ mod tests {
             Some(Transition::Finished { from: "follow" })
         );
         assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+    }
+
+    /// RED (r1007 devnet gf-p2-k0-1, 2026-11-10): after a 600 s singleton
+    /// partition at knob 0, p2's split pull found the fork point (~26,805) and
+    /// then stopped 10-60 blocks above it on an answer of blocks it already held,
+    /// every time, while the hole it needed sat at ~27,078-27,101: more than the
+    /// missing-parent walk's window below the applied tip (`BeyondWindow`). The
+    /// branches never reconverged. A follow that meets a held stretch must
+    /// move past it to the highest block served, not end.
+    #[test]
+    fn follow_moves_past_a_held_stretch() {
+        let mut t = RejoinTracker::new();
+        t.on_answer(Answer::Unconnected, true, 10);
+        t.on_answer(Answer::Unconnected, true, 10);
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(5), 20),
+            },
+            true,
+            9,
+        );
+        assert_eq!(
+            t.on_answer(
+                Answer::Held {
+                    highest: (hx(7), 52)
+                },
+                true,
+                20
+            ),
+            None,
+            "the follow ended on a held stretch below the branch it pulls"
+        );
+        assert_eq!(
+            t.mode(),
+            &Mode::Follow {
+                cursor: (hx(7), 52)
+            }
+        );
+        assert_eq!(t.anchor((hx(1), 10), |_| None), (hx(7), 52));
+        // At the top of what the peer holds the answer reaches no higher: done.
+        assert_eq!(
+            t.on_answer(
+                Answer::Held {
+                    highest: (hx(7), 52)
+                },
+                true,
+                52
+            ),
+            Some(Transition::Finished { from: "follow" })
+        );
+    }
+
+    #[test]
+    fn classify_answers_with_the_highest_served_block() {
+        assert_eq!(
+            classify_answer(false, 0, None, 0, Some((hx(3), 40))),
+            Answer::Held {
+                highest: (hx(3), 40)
+            }
+        );
+        assert_eq!(classify_answer(false, 0, None, 0, None), Answer::Known);
+        assert_eq!(
+            classify_answer(false, 0, None, 2, Some((hx(3), 40))),
+            Answer::Unconnected
+        );
+        assert_eq!(
+            classify_answer(false, 1, Some((hx(2), 38)), 0, Some((hx(3), 40))),
+            Answer::Progress {
+                highest: (hx(2), 38)
+            }
+        );
     }
 
     #[test]
