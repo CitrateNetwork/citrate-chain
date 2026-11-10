@@ -23,6 +23,7 @@ pub mod crypto;
 pub mod dag_store;
 pub mod ecvrf;
 pub mod finality;
+pub mod genesis_params;
 pub mod ghostdag;
 pub mod hardening;
 pub mod native_sig;

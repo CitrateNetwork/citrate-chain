@@ -685,6 +685,25 @@ pub fn initialize_shared_genesis_state(
 ) -> Result<[u8; 32], GenesisError> {
     config.validate()?;
 
+    // r1007 (S3-6, CV-14): block 0 is rooted under the MPT state root rule. A caller that
+    // has not published the rule from 0 (a GUI or light node building the profile
+    // directly) would build a different block 0 under the legacy root, so it is refused.
+    // Data source: the process-wide activation height `citrate_execution::mpt_state_root`.
+    if crate::r1007::is_r1007_config(config)
+        && citrate_execution::mpt_state_root::mpt_state_root_height() != Some(0)
+    {
+        return Err(GenesisError::Invalid(format!(
+            "the r1007 genesis is rooted under the MPT state root rule from block 0, but this \
+             process has it {}. Publish it before building the genesis \
+             (citrate_execution::mpt_state_root::init_for_genesis(40204, \
+             Some(&R1007_GENESIS), None), or the node's genesis build)",
+            match citrate_execution::mpt_state_root::mpt_state_root_height() {
+                Some(h) => format!("from height {h}"),
+                None => "unset".to_string(),
+            }
+        )));
+    }
+
     // 1. Initialize genesis accounts
     for account in &config.accounts {
         executor.set_balance(&account.address, account.balance);

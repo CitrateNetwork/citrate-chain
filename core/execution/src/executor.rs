@@ -764,6 +764,35 @@ pub trait StateStoreTrait: Send + Sync {
     }
 
     // ------------------------------------------------------------------------
+    // CV-14: the MPT trie-node store. A CACHE of the state tries: a store that
+    // keeps none (these defaults, in-memory test stores) only makes a restart
+    // rebuild the trie from state; it never changes a root. `StateStore`
+    // (RocksDB) overrides them.
+    // ------------------------------------------------------------------------
+
+    /// A trie node's RLP by its keccak256 hash.
+    fn get_trie_node(&self, _hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Store `nodes` (hash, RLP) and record `root` as the state root of the
+    /// applied block at `height`. Records above `height` (an abandoned longer
+    /// branch) are dropped.
+    fn put_trie_nodes(
+        &self,
+        _height: u64,
+        _root: &Hash,
+        _nodes: &[([u8; 32], Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The state root recorded for the applied block at `height`.
+    fn trie_root_at(&self, _height: u64) -> anyhow::Result<Option<Hash>> {
+        Ok(None)
+    }
+
+    // ------------------------------------------------------------------------
     // Sprint P950-A-4 WP-A.4.3: MVCC account-version persistence.
     //
     // All methods have default no-op implementations so stores that don't
@@ -1327,6 +1356,11 @@ impl Executor {
                 )?;
             }
 
+            // CV-14: the applied block's trie nodes, after its state.
+            if let Some((_, height)) = applied_tip {
+                self.persist_trie_nodes_at(store.as_ref(), height);
+            }
+
             // Commit state DB (clears dirty tracking)
             self.state_db.commit();
             Ok(count)
@@ -1708,7 +1742,33 @@ impl Executor {
                 undo,
             )?;
         }
+        // CV-14: the winning tip's trie nodes, after its state.
+        if let Some((_, height)) = applied_tip {
+            self.persist_trie_nodes_at(store.as_ref(), height);
+        }
         Ok(())
+    }
+
+    /// CV-14: hand the current state's new trie nodes to `store`, recorded as
+    /// the root of the applied block at `height` (only under the MPT rule).
+    /// The node store is a cache (see `StateStoreTrait::get_trie_node`), so a
+    /// failed write is logged and the block stays committed: a restart then
+    /// rebuilds the trie from state.
+    fn persist_trie_nodes_at(&self, store: &dyn StateStoreTrait, height: u64) {
+        if !crate::mpt_state_root::mpt_state_root_active(height) {
+            return;
+        }
+        let mut write =
+            |root: &Hash, nodes: &[([u8; 32], Vec<u8>)]| store.put_trie_nodes(height, root, nodes);
+        match self.state_db.persist_trie_nodes(&mut write) {
+            Ok((root, n)) => debug!(
+                "trie nodes persisted: height {height}, root {}, {n} new node(s)",
+                hex::encode(&root.as_bytes()[..8])
+            ),
+            Err(e) => {
+                warn!("trie nodes not persisted at height {height} (restart will rebuild): {e}")
+            }
+        }
     }
 
     /// EXECUTE-ON-RECEIVE — the verified, revertible state-application atom.

@@ -21,6 +21,7 @@ pub mod genesis;
 pub mod governance;
 pub mod institutional;
 pub mod r1006;
+pub mod r1007;
 pub mod revenue_sharing;
 pub mod rewards;
 pub mod slashing;

@@ -1,0 +1,30 @@
+{
+  "schema": "r1007-fleet/1",
+  "note": "The r1007 fleet: the same 7 producers as r1006 (same keys, owner Q-3), the 3 discovery boots and rpc-1. Public data only. Keys never leave their host: each node's r1007 data dir gets a HOST-LOCAL copy of its own r1006 noise.key (all roles) and proposer.key (producers), made by node_agent.py seed-keys. The 1Password items are the offline backups of those files; their names are recorded here for the operator and nothing reads them. Producer peer ids are filled by `ceremony.py collect` (read-only host-identity on each host) before render.",
+  "chain_id": 40204,
+  "transport": "ssh",
+  "ssh_user": "root",
+  "p2p_port": 30303,
+  "layout": {
+    "r1006": {"etc": "/etc/citrate", "data": "/var/lib/citrate/data", "bin": "/usr/local/bin/citrate-node", "unit": "/etc/systemd/system/citrate-node.service"},
+    "slots": {"etc": "/etc/citrate/gen", "data": "/var/lib/citrate/gen", "bin": "/usr/local/lib/citrate-gen"},
+    "active": "/etc/citrate/active"
+  },
+  "key_refs": {
+    "noise": {"path_r1006": "/var/lib/citrate/data/noise.key", "op_item": "PENDING OWNER: 1Password item name for <host> noise.key backup"},
+    "proposer": {"path_r1006": "/var/lib/citrate/data/proposer.key", "op_item": "PENDING OWNER: 1Password item name for <host> proposer.key backup (producers only)"}
+  },
+  "hosts": [
+    {"name": "citrate-boot-1", "role": "boot", "ssh": "citrate-boot-1", "p2p_host": "boot1.citrate.ai", "peer_id": "noise_f356d3ebb07371eaad371b3960272f9d58fc457cde409c34549ef03776b78141"},
+    {"name": "citrate-boot-2", "role": "boot", "ssh": "citrate-boot-2", "p2p_host": "boot2.citrate.ai", "peer_id": "noise_4ed281386422f6a65b92d8760d24baa82bb1b476e9dd3e21d5a070d026802c07"},
+    {"name": "citrate-boot-3", "role": "boot", "ssh": "citrate-boot-3", "p2p_host": "boot3.citrate.ai", "peer_id": "noise_2b4924671e0babc9f52eb1695c72141a9c639e17ad95a2a2d2a715eae34a420e"},
+    {"name": "citrate-prod-1", "role": "producer", "ssh": "citrate-prod-1", "p2p_host": "206.189.35.49", "peer_id": null, "serve_recent_state_tags": 1024},
+    {"name": "citrate-prod-2", "role": "producer", "ssh": "citrate-prod-2", "p2p_host": "174.138.78.16", "peer_id": null},
+    {"name": "citrate-prod-3", "role": "producer", "ssh": "citrate-prod-3", "p2p_host": "137.184.174.123", "peer_id": null},
+    {"name": "citrate-prod-4", "role": "producer", "ssh": "citrate-prod-4", "p2p_host": "134.209.61.197", "peer_id": null},
+    {"name": "citrate-prod-5", "role": "producer", "ssh": "citrate-prod-5", "p2p_host": "68.183.40.230", "peer_id": null},
+    {"name": "citrate-prod-6", "role": "producer", "ssh": "citrate-prod-6", "p2p_host": "159.223.14.97", "peer_id": null},
+    {"name": "citrate-prod-7", "role": "producer", "ssh": "citrate-prod-7", "p2p_host": "207.154.238.90", "peer_id": null},
+    {"name": "citrate-rpc-1", "role": "rpc", "ssh": "citrate-rpc-1", "p2p_host": "rpc.citrate.ai", "peer_id": "noise_6ee549718d522c9ccc122585dfedef72aea8df24f4a2bb0264e7658a91118b4a", "indexer": true}
+  ]
+}

@@ -587,10 +587,8 @@ async fn main() -> Result<()> {
                     .and_then(|st| st.blocks.get_block_by_height(0).ok().flatten())
                     .map(|h| *h.as_bytes())
             });
-            let cmd_genesis: Option<[u8; 32]> = from_data_dir.or_else(|| {
-                (profile.as_deref() == Some(genesis::R1006_PROFILE))
-                    .then_some(citrate_consensus::hardening::R1006_GENESIS)
-            });
+            let cmd_genesis: Option<[u8; 32]> =
+                from_data_dir.or_else(|| genesis::compiled_genesis_for_profile(profile.as_deref()));
             let g = cmd_genesis.as_ref();
             // Publish every height exactly as start_node does, then report the ONE
             // manifest a node reports (ConsensusManifest::for_node).
@@ -622,6 +620,14 @@ async fn main() -> Result<()> {
                 storage_root_configured,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::mpt_state_root::init_for_genesis(
+                chain_id,
+                g,
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.chain.mpt_state_root_height),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             let manifest = consensus_manifest::ConsensusManifest::for_node(profile.as_deref(), g);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
@@ -639,6 +645,13 @@ async fn main() -> Result<()> {
                         serde_json::Value::String(format!(
                             "0x{}",
                             hex::encode(citrate_consensus::hardening::R1006_GENESIS)
+                        )),
+                    );
+                    obj.insert(
+                        "r1007_genesis".into(),
+                        serde_json::Value::String(format!(
+                            "0x{}",
+                            hex::encode(citrate_consensus::hardening::R1007_GENESIS)
                         )),
                     );
                 }
@@ -909,9 +922,17 @@ async fn main() -> Result<()> {
         };
 
         let genesis_profile = config.chain.genesis_profile.as_deref();
-        if genesis_profile == Some(genesis::R1006_PROFILE) {
+        // r1007 is built from the r1006 ceremony state, so it is bootable exactly when r1006 is.
+        if genesis_profile == Some(genesis::R1006_PROFILE)
+            || genesis_profile == Some(genesis::R1007_PROFILE)
+        {
             genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
         }
+        publish_mpt_rule_for_genesis_build(
+            config.chain.chain_id,
+            genesis_profile,
+            config.chain.mpt_state_root_height,
+        )?;
         genesis::initialize_genesis_state_with_profile(
             probe_storage,
             executor,
@@ -1143,6 +1164,30 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
     Ok(())
 }
 
+/// CV-14, r1007 genesis rule (lead decision 2026-11-09): activation 0 roots
+/// block 0 itself under the MPT state root, so the rule is published before a
+/// genesis is BUILT. It is resolved exactly as start_node resolves it, for the
+/// block 0 the build is meant to produce: the profile's compiled genesis when
+/// this release pins one (`genesis::compiled_genesis_for_profile`), else an
+/// unknown genesis (the env or config value decides; on a release chain id with
+/// no genesis known a per-node height is refused). start_node then re-resolves
+/// for the block 0 it loads and publishes the same value.
+fn publish_mpt_rule_for_genesis_build(
+    chain_id: u64,
+    profile: Option<&str>,
+    configured: Option<u64>,
+) -> Result<()> {
+    let genesis = genesis::compiled_genesis_for_profile(profile);
+    let (height, source) =
+        citrate_execution::mpt_state_root::init_for_genesis(chain_id, genesis.as_ref(), configured)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match height {
+        Some(h) => info!("Genesis build: MPT state root active from height {h} (source: {source})"),
+        None => info!("Genesis build: MPT state root not scheduled (source: {source})"),
+    }
+    Ok(())
+}
+
 async fn init_chain(chain_id: u64) -> Result<()> {
     info!("Initializing new chain with ID {}", chain_id);
 
@@ -1166,6 +1211,7 @@ async fn init_chain(chain_id: u64) -> Result<()> {
         ..Default::default()
     };
 
+    publish_mpt_rule_for_genesis_build(chain_id, None, None)?;
     let genesis_hash = initialize_genesis_state(storage.clone(), executor, &genesis_config).await?;
 
     info!(
@@ -1234,6 +1280,11 @@ async fn run_devnet(
                 ..Default::default()
             };
 
+            publish_mpt_rule_for_genesis_build(
+                config.chain.chain_id,
+                Some("default"),
+                config.chain.mpt_state_root_height,
+            )?;
             initialize_genesis_state_with_profile(
                 storage,
                 executor,
@@ -1580,6 +1631,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?,
         genesis::r1006_rehearsal_from_env(),
     )?;
+    genesis::r1007_boot_guard(
+        config.chain.chain_id,
+        config.chain.genesis_profile.as_deref(),
+        running_genesis.as_ref(),
+        &citrate_economics::r1007::readiness()
+            .map_err(|e| anyhow::anyhow!("invalid r1007 genesis: {e}"))?,
+        genesis::r1006_rehearsal_from_env(),
+    )?;
+    // r1007 (S3-6): the chain parameters compiled for this block 0; the node's
+    // [checkpoint] section may only repeat them. Data source: GENESIS_CHAIN_PARAMS.
+    let genesis_params = running_genesis.and_then(|g| {
+        citrate_consensus::genesis_params::chain_params_for_genesis(config.chain.chain_id, &g)
+    });
+    genesis::check_checkpoint_params(genesis_params.as_ref(), &config.checkpoint)?;
+    if let Some(p) = &genesis_params {
+        info!("Genesis chain parameters: {}", p.render());
+    }
     let on_demand = producer::check_mine_on_demand(
         std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
         config.chain.genesis_profile.as_deref(),
@@ -1706,6 +1774,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         None => info!(
             "Storage root hardening fork not scheduled (source: {}); legacy rules",
             storage_root_source
+        ),
+    }
+    // CV-14: the standard, incremental MPT state root (an r1007 genesis rule),
+    // published before state is hydrated and before any root is computed.
+    let (mpt_root_height, mpt_root_source) = citrate_execution::mpt_state_root::init_for_genesis(
+        config.chain.chain_id,
+        running_genesis.as_ref(),
+        config.chain.mpt_state_root_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match mpt_root_height {
+        Some(h) => info!(
+            "MPT state root ACTIVE from height {} (source: {})",
+            h, mpt_root_source
+        ),
+        None => info!(
+            "MPT state root not scheduled (source: {}); legacy state root",
+            mpt_root_source
         ),
     }
 
@@ -2145,13 +2231,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // On the r1006 genesis with its producer set filled, the registry and the activation
     // height are compiled into the genesis profile (genesis::resolve_validator_registry);
     // the env may only repeat them. On any other chain the env decides, as before.
-    let compiled_validator_set =
-        if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
-            citrate_economics::r1006::validator_set_binding()
-                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
-        } else {
-            None
-        };
+    let compiled_validator_set = genesis::compiled_validator_set(running_genesis.as_ref())?;
     let validator_registry: Option<([u8; 20], u64)> = genesis::resolve_validator_registry(
         compiled_validator_set,
         std::env::var("CITRATE_VALIDATOR_REGISTRY").ok().as_deref(),
