@@ -74,6 +74,23 @@ def fake_binary(tmp: Path, *, params: str | None = None, genesis: str | None = N
     return b
 
 
+class _Stack:
+    """Enter several context managers as one."""
+
+    def __init__(self, *cms):
+        self.cms = cms
+
+    def __enter__(self):
+        for c in self.cms:
+            c.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        for c in reversed(self.cms):
+            c.__exit__(*exc)
+        return False
+
+
 def run(argv: list[str]) -> tuple[int, str]:
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -257,6 +274,103 @@ class PlanAndGuards(unittest.TestCase):
         go = {"ceremony": "r1007", "genesis": SRC["r1007_genesis"], "approved_by": "owner", "approved_at": "x", "steps": ["prepare"]}
         with self.assertRaises(C.Refuse):
             C.Transport(fleet, go).agent(h, "stop", step="cut")
+
+    # fed #495: the cut stops the explorer indexer first, and the indexer step backs the
+    # explorer DB up as a managed-cluster fork from the operator machine, never a pg_dump on
+    # rpc-1's disk.
+    def _ssh_fleet(self, steps):
+        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        go = {"ceremony": "r1007", "genesis": SRC["r1007_genesis"], "approved_by": "owner", "approved_at": "x", "steps": steps}
+        return fleet, C.Transport(fleet, go)
+
+    def _record(self, forks_listed=()):
+        calls = []
+        def agent(_self, h, *args, mutating=True, step=""):
+            if mutating:
+                _self.require_go(step, h)
+            calls.append(("agent", h["name"], args))
+            return {}
+        def ssh_run(t, h, cmd, step):
+            t.require_go(step, h)
+            calls.append(("host", h["name"], cmd))
+        def operator_run(argv):
+            calls.append(("operator", "", " ".join(argv)))
+            if argv[:3] == ["doctl", "databases", "list"]:
+                listed = [{"name": n, "id": "fork-" + n, "status": "online"} for n in forks_listed]
+                if any(c[0] == "operator" and " fork " in f" {c[2]} " for c in calls):
+                    listed.append({"name": C.INDEXER_FORK_NAME, "id": "fork-new", "status": "online"})
+                return json.dumps(listed)
+            return ""
+        return calls, agent, ssh_run, operator_run
+
+    def _patched(self, agent, ssh_run, operator_run):
+        """Recorders for every way a step can reach a host or the cloud. subprocess.run is
+        blocked too: these tests use the committed ssh fleet, and a real ssh from a test
+        would reach the production hosts."""
+        from unittest import mock
+        block = mock.patch.object(C.subprocess, "run", side_effect=AssertionError("a test step tried a real subprocess"))
+        return (_Stack(mock.patch.object(C.Transport, "agent", agent), block),
+                mock.patch.object(C, "ssh_run", ssh_run, create=True),
+                mock.patch.object(C, "operator_run", operator_run, create=True))
+
+    def _args(self, **kw):
+        import types
+        base = {"db_cluster_id": "3d4c6713-5987-404c-8ea5-e58afa94adad", "db_fork_rule": "ip_addr:203.0.113.7",
+                "gate_minutes": 0.01, "state": tempfile.mkdtemp()}
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_cut_stops_the_indexer_before_any_node(self):
+        fleet, t = self._ssh_fleet(["cut"])
+        calls, agent, ssh_run, operator_run = self._record()
+        p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            C.step_cut(self._args(), fleet, t, SRC)
+        self.assertTrue(calls, "the cut did nothing")
+        first = calls[0]
+        self.assertEqual(first[0], "host", f"the first cut action is not on the indexer host: {first}")
+        self.assertEqual(first[1], "citrate-rpc-1")
+        self.assertIn("systemctl stop citratescan-indexer", first[2])
+        self.assertIn("is-active", first[2], "the stop is not confirmed")
+        self.assertTrue(any(c[0] == "agent" and c[2] == ("stop",) for c in calls[1:]))
+
+    def test_indexer_step_forks_the_cluster_and_writes_no_dump_on_the_host(self):
+        fleet, t = self._ssh_fleet(["indexer"])
+        calls, agent, ssh_run, operator_run = self._record()
+        p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            C.step_indexer(self._args(), fleet, t, SRC)
+        text = "\n".join(c[2] for c in calls)
+        self.assertNotIn("pg_dump", text)
+        self.assertNotIn("/var/backups", text)
+        ops = [c[2] for c in calls if c[0] == "operator"]
+        fork = [i for i, c in enumerate(calls) if c[0] == "operator" and c[2].startswith("doctl databases fork ")]
+        self.assertEqual(len(fork), 1, ops)
+        self.assertIn("--restore-from-cluster-id 3d4c6713-5987-404c-8ea5-e58afa94adad", calls[fork[0]][2])
+        self.assertIn("--wait", calls[fork[0]][2])
+        self.assertTrue(any(c.startswith("doctl databases firewalls append fork-new --rule ip_addr:203.0.113.7") for c in ops), ops)
+        confirm = [i for i, c in enumerate(calls) if c[0] == "host" and "--confirm" in c[2]]
+        self.assertEqual(len(confirm), 1)
+        self.assertLess(fork[0], confirm[0], "the reset runs before the backup fork exists")
+
+    def test_indexer_step_refuses_without_a_cluster_id_or_fork_rule(self):
+        for kw in ({"db_cluster_id": None}, {"db_cluster_id": "not-a-uuid"}, {"db_fork_rule": None}, {"db_fork_rule": "0.0.0.0/0"}):
+            fleet, t = self._ssh_fleet(["indexer"])
+            calls, agent, ssh_run, operator_run = self._record()
+            p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+            with p1, p2, p3, redirect_stdout(io.StringIO()):
+                with self.assertRaises(C.Refuse, msg=str(kw)):
+                    C.step_indexer(self._args(**kw), fleet, t, SRC)
+            self.assertEqual(calls, [], kw)
+
+    def test_indexer_step_refuses_a_stale_fork_of_the_same_name(self):
+        fleet, t = self._ssh_fleet(["indexer"])
+        calls, agent, ssh_run, operator_run = self._record(forks_listed=["citratescan-r1007-precut"])
+        p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            with self.assertRaises(C.Refuse):
+                C.step_indexer(self._args(), fleet, t, SRC)
+        self.assertFalse(any(c[0] == "host" and "indexer:reset" in c[2] for c in calls))
 
     def test_an_owner_go_for_another_genesis_is_refused(self):
         with tempfile.TemporaryDirectory() as t:
