@@ -175,7 +175,7 @@ class TestProfiles(unittest.TestCase):
     def test_live_profile_is_ready_and_consistent_with_repo(self):
         p = pl.load_profile("40204-r1005")
         repo = HERE.parents[2]
-        book = json.loads((repo / "contracts/addresses/40204.json").read_text())
+        book = json.loads((repo / "contracts/addresses/r1005/40204.json").read_text())
         self.assertEqual(p["validator_registry"].lower(), book["contracts"]["ValidatorRegistry"].lower())
         beta = (repo / "node/config/testnet-beta.toml").read_text()
         for b in p["bootstrap_nodes"]:

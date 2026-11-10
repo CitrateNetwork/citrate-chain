@@ -6,7 +6,7 @@
 #      non-empty output dir, dirty inputs without --allow-dirty, online without --expect-genesis
 #   3. online against the stub: happy path records height + genesis; RPC chain id mismatch and
 #      genesis mismatch refuse and leave no bundle; a governance address with no code, or whose
-#      minDelay() read fails, refuses
+#      getMinDelay() read fails, refuses
 #   4. provenance, in a throwaway local clone: a modified verification script, wrapper or
 #      offline fixture refuses without --allow-dirty and is recorded with it
 set -euo pipefail
@@ -55,9 +55,11 @@ check "refusals leave no bundle" '[ ! -e "$tmp/r1" ] && [ ! -e "$tmp/r2" ] && [ 
 check "allow-dirty: recorded in the manifest" '[ "$(jq ".source.inputs_differ_from_head | length" "$tmp/dirty/MANIFEST.json")" -ge 1 ]'
 
 # ── 3. online against the stub ──
-G0=0x$(printf '0%.0s' $(seq 64))
+# The stub serves the book's block 0 (check_address_code.py refuses an RPC on another network).
+G0=$(jq -r '.genesisHash // empty' contracts/addresses/40204.json)
+[ -n "$G0" ] || G0=0x$(printf '0%.0s' $(seq 64))
 stub() {  # port chain-id-hex
-  STUB_CHAIN_ID=$2 python3 -I scripts/ui-truth/stub_rpc.py "$1" 500200 0 & STUB=$!
+  STUB_GENESIS_HASH=${STUB_GENESIS_HASH:-$G0} STUB_CHAIN_ID=$2 python3 -I scripts/ui-truth/stub_rpc.py "$1" 500200 0 & STUB=$!
   for _ in $(seq 50); do curl -fsS -o /dev/null -X POST -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}' "http://127.0.0.1:$1" 2>/dev/null && break; sleep 0.1; done
 }
 stub 18621 0x9d0c
@@ -75,7 +77,13 @@ kill "$STUB"; wait "$STUB" 2>/dev/null || true
 stub 18622 0x1
 refuses "RPC chain id mismatch" "RPC http://127.0.0.1:18622 serves 1" --rpc http://127.0.0.1:18622 --expect-genesis "$G0" --out "$tmp/r7"
 kill "$STUB"; wait "$STUB" 2>/dev/null || true
-check "online refusals leave no bundle" '[ ! -e "$tmp/r6" ] && [ ! -e "$tmp/r7" ]'
+# An RPC on another network (block 0 differs from the book's genesisHash), even one the operator
+# named with --expect-genesis, fails the address-code gate.
+GX=0x$(printf 'c%.0s' $(seq 64))
+STUB_GENESIS_HASH=$GX stub 18625 0x9d0c
+refuses "RPC block 0 is not the book's genesisHash" "block-0 hash $GX != book genesisHash" --rpc http://127.0.0.1:18625 --expect-genesis "$GX" --out "$tmp/r10"
+kill "$STUB"; wait "$STUB" 2>/dev/null || true
+check "online refusals leave no bundle" '[ ! -e "$tmp/r6" ] && [ ! -e "$tmp/r7" ] && [ ! -e "$tmp/r10" ]'
 
 # Governance addresses take part in the live gates.
 govs=$(python3 -I - <<'PY'
@@ -93,7 +101,7 @@ STUB_CODELESS=${GRD,,} stub 18623 0x9d0c
 refuses "governance address without code" "address-code check failed" --rpc http://127.0.0.1:18623 --expect-genesis "$G0" --out "$tmp/r8"
 kill "$STUB"; wait "$STUB" 2>/dev/null || true
 STUB_CALL_FAIL=$GOV stub 18624 0x9d0c
-refuses "governance minDelay() read failed" "governance_min_delay_s failed" --rpc http://127.0.0.1:18624 --expect-genesis "$G0" --out "$tmp/r9"
+refuses "governance getMinDelay() read failed" "governance_min_delay_s failed" --rpc http://127.0.0.1:18624 --expect-genesis "$G0" --out "$tmp/r9"
 kill "$STUB"; wait "$STUB" 2>/dev/null || true
 check "governance refusals leave no bundle" '[ ! -e "$tmp/r8" ] && [ ! -e "$tmp/r9" ]'
 

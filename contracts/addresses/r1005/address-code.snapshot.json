@@ -1,0 +1,9 @@
+{
+  "chainId": 40204,
+  "block": 750,
+  "probed_at": "2026-10-06T05:45:23Z",
+  "book_deployedAt": "2026-10-06T05:43:04Z",
+  "with_code_count": 102,
+  "codeless": [],
+  "precompiles_codeless_by_design": 21
+}

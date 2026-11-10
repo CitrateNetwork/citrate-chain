@@ -134,6 +134,23 @@ contract PBA_L2_002_Fixed is Test {
         c.check('{"contracts":{},"aaStack":{}}', false);
     }
 
+    /// A book key that contains a dot (the r1006 post-genesis `Quorum.AnchorRegistry`) is one
+    /// entry: the sweep reads it, and still classifies it, instead of reverting on a nested path.
+    function test_L2_002_checkDeployedAdmins_readsDottedKeys() public {
+        vm.etch(0xc2b78104907F722DABAc4C69f826a522B2754De4, hex"600160005260206000f3");
+        StillDeployerGoverned stale = new StillDeployerGoverned(deployer);
+        StillDeployerGoverned handed = new StillDeployerGoverned(intended);
+
+        CheckDeployedAdmins c = new CheckDeployedAdmins();
+        c.check(_book(string.concat('"Quorum.AnchorRegistry":"', vm.toString(address(handed)), '"')), false);
+        assertEq(c.deployerAdmin(), 0);
+        assertEq(c.noCode(), 0);
+
+        CheckDeployedAdmins c2 = new CheckDeployedAdmins();
+        vm.expectRevert(bytes("CheckDeployedAdmins: deployer EOA holds a privileged slot (see log)"));
+        c2.check(_book(string.concat('"Quorum.AnchorRegistry":"', vm.toString(address(stale)), '"')), false);
+    }
+
     function _book(string memory contractsBody) internal view returns (string memory) {
         return
             string.concat('{"deployer":"', vm.toString(deployer), '","contracts":{', contractsBody, '},"aaStack":{}}');

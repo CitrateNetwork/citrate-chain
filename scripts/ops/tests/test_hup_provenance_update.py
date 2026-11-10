@@ -17,7 +17,7 @@ hpu = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hpu)
 hbu = hpu.hbu
 
-REAL_LEDGER = HERE.parent.parent.parent / "contracts" / "addresses" / "40204.provenance.json"
+REAL_LEDGER = HERE.parent.parent.parent / "contracts" / "addresses" / "r1005" / "40204.provenance.json"
 DEPLOYER = "0x" + "d3" * 20
 OTHER = "0x" + "0e" * 20
 GENESIS = "0x" + "9e" * 32

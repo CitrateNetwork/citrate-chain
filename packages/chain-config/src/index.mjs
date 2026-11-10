@@ -9,8 +9,10 @@ export const rpcUrl = book.rpcUrl
 export const explorerUrl = book.explorerUrl
 export const deployer = book.deployer
 export const deployedAt = book.deployedAt
+/** block-0 hash of the network this book describes: compare with eth_getBlockByNumber(0x0).hash at boot */
+export const genesisHash = book.genesisHash
 
-/** name -> address, the 53 core contracts */
+/** name -> address, every deployed contract (genesis and post-genesis) */
 export const contracts = book.contracts
 /** ERC-4337 stack (EntryPoint, CitrateWallet, factory, paymaster, validators, guardian) */
 export const aaStack = book.aaStack
