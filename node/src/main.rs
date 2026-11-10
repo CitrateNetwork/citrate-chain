@@ -2849,6 +2849,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // a few times in case an early fork-choice view was still partial.
                 let ghostdag_rec = shared_ghostdag.clone();
                 let latest_stored = storage.blocks.get_latest_height().unwrap_or(0);
+                let storage_rec = storage.clone();
                 tokio::spawn(async move {
                     let mut aborted = 0u32;
                     for _ in 0..600u32 {
@@ -2862,6 +2863,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // rebuild toward a partially-loaded head.
                         let head_h = ghostdag_rec.get_block_height(&head).await.unwrap_or(0);
                         if head_h < latest_stored {
+                            continue;
+                        }
+                        // RC-10: GhostDAG admits a block, so fork choice can name
+                        // it, a moment before its header is written. Wait for the
+                        // head to be stored before the same-chain and rebuild
+                        // checks, which read it from the block store. A read error
+                        // is not "stored".
+                        if !storage_rec.blocks.has_block(&head).unwrap_or(false) {
                             continue;
                         }
                         let cur = app.applied_tip().await;

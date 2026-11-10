@@ -549,6 +549,11 @@ pub enum RebuildRefusal {
     /// The head's ancestry has a block this node does not hold before it meets
     /// the applied chain. A missing (or pruned) ancestor is not divergence.
     MissingAncestor { missing: Hash },
+    /// The head itself is not in the block store yet: GhostDAG admits a block
+    /// (so fork choice can select it) a moment before its header is written
+    /// (RC-10). Nothing is concluded; the caller retries on its next poll. Not
+    /// a refusal.
+    HeadNotStored { head: Hash },
     /// Fork choice does not rank the head above the applied tip (higher score;
     /// on equal scores fork choice's ForkChoiceKey, r1007 G8), or does not
     /// score the head at all:
@@ -572,6 +577,9 @@ impl std::fmt::Display for RebuildRefusal {
                 f,
                 "the head's ancestry is missing block {missing} before it meets the applied chain"
             ),
+            Self::HeadNotStored { head } => {
+                write!(f, "the head {head} is not in the block store yet")
+            }
             Self::NotHeavier { head, tip } => write!(
                 f,
                 "the head (weight {head}) does not outrank the applied tip (weight {tip})"
@@ -1713,6 +1721,12 @@ impl CanonicalApplicator {
             }
             let header = match self.storage.blocks.get_header(&cursor) {
                 Ok(Some(h)) => h,
+                // RC-10: fork choice can name a block whose header is still
+                // being written. That is "not known yet", never a missing
+                // ancestor.
+                Ok(None) if cursor == head => {
+                    return Err(RebuildRefusal::HeadNotStored { head: cursor })
+                }
                 Ok(None) => return Err(RebuildRefusal::MissingAncestor { missing: cursor }),
                 Err(e) => return Err(unreadable(format!("header {cursor}: {e}"))),
             };
@@ -3333,6 +3347,14 @@ impl CanonicalApplicator {
         // only looks like divergence, and not a branch fork choice ranks below it.
         let plan = match self.rebuild_target(&state, head, genesis_hash).await {
             Ok(plan) => plan,
+            // RC-10: the head is admitted but not stored yet. No refusal is
+            // recorded or logged; the next poll sees it stored.
+            Err(RebuildRefusal::HeadNotStored { .. }) => {
+                debug!(
+                    "canonical recovery: fork-choice head {head} is not in the block store yet; retrying on the next poll"
+                );
+                return Ok(false);
+            }
             Err(why) => {
                 if expected.is_some() {
                     self.refuse_rebuild(head, &why.to_string(), state.tip);
@@ -6001,6 +6023,54 @@ pub(crate) mod tests {
             None,
             "a head whose header is not stored yet was logged as a refused rebuild (NOT rebuilding)"
         );
+    }
+
+    /// RC-10 (3): the head is stored but an ancestor deeper in is not. That is a
+    /// genuinely missing ancestor, and the rebuild is still refused (and the
+    /// refusal recorded), as before the RC-10 fix.
+    #[tokio::test]
+    async fn startup_recovery_still_refuses_a_head_whose_deeper_ancestor_is_missing() {
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, _winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        let r = roots(2);
+        // A branch off genesis: x1 is never stored, x2 (the head) is.
+        let x1 = mk_block_scored(1, genesis.header.block_hash, r[0], 1, [0x6C; 32]);
+        let x2 = mk_block_scored(2, x1.header.block_hash, r[1], 2, [0x6D; 32]);
+        persist(&storage, &x2);
+        assert!(
+            storage
+                .blocks
+                .get_header(&x1.header.block_hash)
+                .expect("read")
+                .is_none(),
+            "fixture: the head's parent is not stored"
+        );
+        let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        app.fork_choice = Some(fork_choice_returning(x2.header.block_hash));
+        app.fork_weight = Some(weights(&[
+            (x2.header.block_hash, 2),
+            (loser.header.block_hash, 1),
+        ]));
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, x2.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "rebuilt over a missing ancestor");
+        assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
+        assert_eq!(
+            *app.refused_rebuild_head.lock(),
+            Some(x2.header.block_hash),
+            "a missing ancestor below the head is still a recorded refusal"
+        );
+        assert!(matches!(
+            app.rebuild_target(
+                &*app.lock.lock().await,
+                x2.header.block_hash,
+                genesis.header.block_hash
+            )
+            .await,
+            Err(RebuildRefusal::MissingAncestor { missing }) if missing == x1.header.block_hash
+        ));
     }
 
     /// rvHH: a restarted tie-loser whose applied tip is STORED in the DAG but

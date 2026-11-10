@@ -1534,6 +1534,8 @@ mod tests {
             "attested_for_rx.observe_deferred(&block)",
             "with_initial_sync_gate(initial_sync_done.clone())",
             "sync_recovery::initial_sync_complete(",
+            // RC-10: the startup recovery waits for the head to be stored.
+            "storage_rec.blocks.has_block(&head)",
             // Both give-up sites: the sync tick (no answer) and the receive loop
             // (after the serve credit, which would otherwise clear the count).
             "sync_peers_for_loop.lock().await.record_give_up(&pid.0)",
