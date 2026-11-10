@@ -7474,6 +7474,60 @@ mod tests {
         );
     }
 
+    /// TEST 6c — a reorg that lowers the applied tip is sync progress. After a partition
+    /// heal the minority side re-applies the winning branch in one drain pass (devnet
+    /// fin-p1-k1000-1, p7: reverted 458, applied 426 over 525 s at knob 1000), and the
+    /// winning branch can be heavier but SHORTER, so the applied tip lands below where it
+    /// was (25,864 -> 25,832). The producer, waiting on the advance lock for that whole
+    /// pass, evaluates next with the stall window long expired. A height that only counts
+    /// upward moves read that as "no progress" and latched production off until a human
+    /// override (p7 and p5 never sealed again). Any move of the applied tip is the
+    /// applicator doing sync work; only an applied tip that does not move at all stalls.
+    #[test]
+    fn f2_a_reorg_to_a_lower_applied_tip_is_progress_not_a_stall() {
+        let attested = Arc::new(AtomicU64::new(25_878)); // 14 ahead of tip 25,864
+        let gate = f2_gate(attested.clone(), Duration::from_millis(120));
+        let alert = gate.stall_alert.clone();
+
+        // Behind: refuse, no alert.
+        assert!(gate.evaluate_network_height(25_864).is_err());
+        assert!(!alert.load(Ordering::SeqCst));
+
+        // The drain's reorg runs longer than the stall window; it lands on the
+        // winning branch at a lower height, still behind the network.
+        std::thread::sleep(Duration::from_millis(180));
+        attested.store(25_928, Ordering::SeqCst);
+        let err = gate
+            .evaluate_network_height(25_832)
+            .expect_err("still behind after the reorg: keep refusing");
+        assert!(
+            !alert.load(Ordering::SeqCst),
+            "a reorg that moved the applied tip is sync progress, not a stall: {err}"
+        );
+        assert!(
+            !err.to_string().contains("override"),
+            "no human override may be demanded after a reorg, got: {err}"
+        );
+
+        // It then catches up and resumes by itself.
+        assert!(gate.evaluate_network_height(25_900).is_err());
+        assert!(
+            gate.evaluate_network_height(25_928).is_ok(),
+            "resume once caught up, no override"
+        );
+
+        // An applied tip that does not move at all still latches (the wedge the
+        // latch exists for).
+        attested.store(25_940, Ordering::SeqCst);
+        assert!(gate.evaluate_network_height(25_928).is_err());
+        std::thread::sleep(Duration::from_millis(180));
+        let err = gate
+            .evaluate_network_height(25_928)
+            .expect_err("a tip that never moves while behind stalls");
+        assert!(alert.load(Ordering::SeqCst), "the wedge still latches");
+        assert!(err.to_string().contains("override"), "got: {err}");
+    }
+
     /// TEST 7 — revert-check. The F2 gate must stay WIRED: `produce_block` calls
     /// `evaluate_network_height`, and that check reads the attested watermark
     /// (never `head_height` / `target_height`). Deleting the gate call or the
