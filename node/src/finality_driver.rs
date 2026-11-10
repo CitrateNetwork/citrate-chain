@@ -8,7 +8,7 @@
 // its selected-parent chain down through the block store
 // (`StorageManager.blocks.get_header`), and for every checkpoint boundary height
 // H that is now buried at least `vote_depth` blocks below the tip (§3: never vote
-// at the tip) hands `(H, hash_at_H, header.vrf_reveal.output)` to the gadget,
+// at the tip) hands `(H, hash_at_H)` to the gadget,
 // which proposes, signs (if this node is a committee member) and replays early
 // votes. The resulting votes are broadcast as `NetworkMessage::CheckpointVote`.
 //
@@ -73,7 +73,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use citrate_consensus::checkpoint::CheckpointVote;
+use citrate_api::finality_status::{CheckpointView, FinalityStatusCell, FinalityStatusView};
+use citrate_consensus::checkpoint::{Checkpoint, CheckpointVote};
 use citrate_consensus::checkpoint_gadget::{
     FinalityGadget, FinalizeRetryOutcome, SignRefusal, SkipReason, EARLY_VOTE_HORIZON_BLOCKS,
 };
@@ -85,6 +86,7 @@ use citrate_storage::StorageManager;
 use tracing::{debug, info, warn};
 
 use crate::canonical_apply::CanonicalApplicator;
+use crate::finality_floor::FloorMode;
 
 /// How many boundary heights one pass may process. Bounds the selected-parent
 /// walk after a pause (e.g. a long catch-up): older boundaries are skipped, not
@@ -299,17 +301,88 @@ pub fn gate_outbound(
     Vec::new()
 }
 
-/// A canonical checkpoint block buried at least `vote_depth` deep.
+/// The checkpoint configuration the node runs (main.rs). The interval and the
+/// committee size are consensus constants (spec 06 §1.2: `CHECKPOINT_INTERVAL`,
+/// `CHECKPOINT_COMMITTEE_SIZE`): a `[checkpoint]` file value that differs is
+/// ignored with a warning, since nodes that disagree on either derive different
+/// committees. Chain id, genesis and vote depth are the node's; the legacy
+/// `quorum_threshold` is carried for reference only (finalization uses the
+/// stake quorum).
+pub fn node_checkpoint_config(
+    file: &crate::config::CheckpointNodeConfig,
+    chain_id: u64,
+    genesis_hash: Hash,
+) -> citrate_consensus::checkpoint::CheckpointConfig {
+    use citrate_consensus::checkpoint::{
+        CheckpointConfig, CHECKPOINT_COMMITTEE_SIZE, CHECKPOINT_INTERVAL,
+    };
+    if file.interval != CHECKPOINT_INTERVAL {
+        warn!(
+            "[checkpoint] interval = {} ignored: r1007 checkpoints are every {} heights \
+             (consensus constant, aligned with the pruning point)",
+            file.interval, CHECKPOINT_INTERVAL
+        );
+    }
+    if file.committee_size != CHECKPOINT_COMMITTEE_SIZE {
+        warn!(
+            "[checkpoint] committee_size = {} ignored: checkpoint committees have {} seats \
+             (consensus constant; nodes that disagree on it derive different committees)",
+            file.committee_size, CHECKPOINT_COMMITTEE_SIZE
+        );
+    }
+    CheckpointConfig {
+        interval: CHECKPOINT_INTERVAL,
+        committee_size: CHECKPOINT_COMMITTEE_SIZE,
+        quorum_threshold: file.quorum_threshold,
+        chain_id,
+        genesis_hash,
+        vote_depth: file.vote_depth,
+    }
+}
+
+/// The finality gadget the node runs (main.rs), over `manager`. Committee sources:
+///
+/// - `registry_selector`: the shared epoch-snapshot proposer selector (filled by
+///   `registry_sync` from `ValidatorRegistry.activeSet()` at each S(E)); `None` when no
+///   ValidatorRegistry is configured for this chain;
+/// - the genesis validator set compiled with the genesis `running_genesis` runs
+///   (`genesis::genesis_committee_set`): epoch 0, which governs every checkpoint no
+///   registry snapshot governs (at or below S(1) = 800, or every height without a
+///   registry).
+///
+/// The switch is the compiled constant (`FinalityGadget::new`).
+pub fn node_finality_gadget(
+    manager: Arc<citrate_consensus::checkpoint::CheckpointManager>,
+    registry_selector: Option<Arc<citrate_consensus::vrf::VrfProposerSelector>>,
+    running_genesis: Option<&[u8; 32]>,
+) -> anyhow::Result<FinalityGadget> {
+    let gadget = FinalityGadget::new(manager, registry_selector);
+    Ok(
+        match crate::genesis::genesis_committee_set(running_genesis)? {
+            Some(set) => {
+                info!(
+                    "checkpoint finality: epoch-0 committee from the genesis validator set ({} \
+                 validators)",
+                    set.len()
+                );
+                gadget.with_genesis_committee(set)
+            }
+            None => gadget,
+        },
+    )
+}
+
+/// A canonical checkpoint block buried at least `vote_depth` deep. Its committee
+/// is a function of its height's epoch snapshot, not of the block
+/// (`FinalityGadget::committee_for`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuriedCheckpoint {
     pub height: u64,
     pub hash: Hash,
-    /// The block's ECVRF beacon (`header.vrf_reveal.output`): the committee seed.
-    pub seed: Hash,
 }
 
-/// The header fields the walk needs: (height, selected parent, VRF output).
-pub type HeaderView = (u64, Hash, Hash);
+/// The header fields the walk needs: (height, selected parent).
+pub type HeaderView = (u64, Hash);
 
 /// The highest boundary height buried at least `depth` blocks below `tip_height`
 /// (i.e. `<= tip_height - depth`), or `None` if there is none yet. `depth` is
@@ -368,14 +441,13 @@ where
     let mut steps_left = tip_height.saturating_sub(lowest).saturating_add(1);
     while steps_left > 0 {
         steps_left = steps_left.saturating_sub(1);
-        let Some((height, parent, seed)) = lookup(&cursor)? else {
+        let Some((height, parent)) = lookup(&cursor)? else {
             return Err(format!("canonical walk: header {cursor} missing"));
         };
         if want.contains(&height) {
             found.push(BuriedCheckpoint {
                 height,
                 hash: cursor,
-                seed,
             });
         }
         if height <= lowest || height == 0 {
@@ -391,6 +463,7 @@ fn to_message(vote: &CheckpointVote) -> NetworkMessage {
     NetworkMessage::CheckpointVote {
         height: vote.height,
         block_hash: vote.block_hash,
+        binding: vote.binding,
         voter_pubkey: vote.voter.as_bytes().to_vec(),
         signature: vote.signature.as_bytes().to_vec(),
     }
@@ -414,6 +487,8 @@ pub fn spawn(
     storage: Arc<StorageManager>,
     peers: Arc<PeerManager>,
     signer: Option<Ed25519SigningKey>,
+    status: Arc<FinalityStatusCell>,
+    mode: FloorMode,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = gadget.manager().config().interval;
@@ -435,7 +510,7 @@ pub fn spawn(
             storage
                 .blocks
                 .get_header(h)
-                .map(|o| o.map(|hd| (hd.height, hd.selected_parent_hash, hd.vrf_reveal.output)))
+                .map(|o| o.map(|hd| (hd.height, hd.selected_parent_hash)))
                 .map_err(|e| e.to_string())
         };
         loop {
@@ -459,12 +534,63 @@ pub fn spawn(
             // engaged; this node's own already-signed votes are held and
             // re-broadcast after it clears.
             let outbound = gate_outbound(&gadget, signer.as_ref(), &mut retries, outbound);
+            // `citrate_getFinalityStatus`: what the manager holds after this pass.
+            status.publish(status_view(&gadget, mode).await);
             if outbound.is_empty() {
                 continue;
             }
             broadcast_votes(&peers, &outbound).await;
         }
     })
+}
+
+/// One checkpoint as `citrate_getFinalityStatus` reports it.
+fn checkpoint_view(cp: &Checkpoint) -> CheckpointView {
+    CheckpointView {
+        height: cp.height,
+        block_hash: cp.block_hash,
+        epoch: cp.binding.epoch,
+        state_root: cp.binding.state_root,
+        accepted_root: cp.binding.accepted_root,
+        committee_size: cp.committee.len(),
+        voters: cp.votes.len(),
+        voted_stake: cp.voted_stake(),
+        total_stake: cp.total_stake(),
+    }
+}
+
+/// The finality status this node reports over RPC. Data source: the
+/// gadget's `CheckpointManager` (latest finalized certificate, from memory or
+/// `DAG_METADATA` `checkpoint:{height}`; pending checkpoints and their votes),
+/// the gadget's switch and safety stop, and the floor mode from the compiled
+/// switches.
+pub async fn status_view(gadget: &FinalityGadget, mode: FloorMode) -> FinalityStatusView {
+    let mgr = gadget.manager();
+    let finalized = mgr
+        .latest_finalized_certificate()
+        .await
+        .map(|cp| checkpoint_view(&cp));
+    let pending = mgr
+        .pending_snapshot()
+        .await
+        .iter()
+        .map(checkpoint_view)
+        .collect();
+    FinalityStatusView {
+        voting: gadget.enabled(),
+        enforcement: mode.raises_floor(),
+        mode: match mode {
+            FloorMode::Legacy => "legacy",
+            FloorMode::Observed => "observed",
+            FloorMode::Enforced => "enforced",
+        }
+        .to_string(),
+        interval: mgr.config().interval,
+        vote_depth: mgr.config().vote_depth,
+        finalized,
+        pending,
+        halted: gadget.halted(),
+    }
 }
 
 /// Finalization retry step of the driver tick: re-attempt, with capped
@@ -563,7 +689,7 @@ async fn report(
     retries: &mut OwnVoteRetries,
 ) -> Followup {
     let out = gadget
-        .on_buried_checkpoint(cp.height, cp.hash, &cp.seed, signer)
+        .on_buried_checkpoint(cp.height, cp.hash, signer)
         .await;
     if let Some(reason) = &out.skipped {
         debug!("checkpoint {}: not proposed ({:?})", cp.height, reason);
@@ -676,6 +802,81 @@ mod tests {
         Hash::new([n; 32])
     }
 
+    /// Epoch 0 (lead decision 1, 2026-11-09), as the node wires it: on a
+    /// genesis that compiles its validator set (r1006), the gadget main.rs
+    /// builds derives a committee for the first checkpoint (50) from that set,
+    /// with or without a ValidatorRegistry selector (`CITRATE_VALIDATOR_REGISTRY`
+    /// unset): voting starts at the first checkpoint. Below S(1) = 800 a
+    /// registry chain's committee is the genesis set too. A genesis without a
+    /// compiled set derives none, as before.
+    #[tokio::test]
+    async fn node_gadget_has_a_committee_from_the_first_checkpoint() {
+        use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::vrf::VrfProposerSelector;
+        let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+        let mgr = || {
+            Arc::new(CheckpointManager::new(
+                CheckpointConfig {
+                    genesis_hash: Hash::new(r1006),
+                    ..CheckpointConfig::default()
+                },
+                Arc::new(DagStore::new()),
+            ))
+        };
+        let no_registry = node_finality_gadget(mgr(), None, Some(&r1006)).expect("gadget");
+        let c = no_registry
+            .committee_for(50)
+            .await
+            .expect("epoch-0 committee without a registry");
+        assert_eq!((c.epoch, c.len()), (0, 7));
+        let registry = Arc::new(VrfProposerSelector::production().with_snapshot_schedule(
+            crate::registry_sync::EPOCH,
+            crate::registry_sync::SNAPSHOT_LAG,
+        ));
+        let with_registry =
+            node_finality_gadget(mgr(), Some(registry), Some(&r1006)).expect("gadget");
+        for h in [50u64, 800] {
+            let c = with_registry
+                .committee_for(h)
+                .await
+                .expect("epoch-0 committee below S(1)");
+            assert_eq!((c.epoch, c.len()), (0, 7), "height {h}");
+        }
+        let other = node_finality_gadget(mgr(), None, Some(&[0x42; 32])).expect("gadget");
+        assert_eq!(other.committee_for(50).await, None);
+    }
+
+    /// Lead decision 2 (2026-11-09): the committee size is a consensus
+    /// parameter, like the interval. Nodes whose `[checkpoint]` sections differ
+    /// (team-testnet ships committee_size = 10, the others 100) used to derive
+    /// different committees for the same checkpoint; the node's checkpoint
+    /// config now takes both from the compiled constants and ignores the file.
+    #[test]
+    fn node_checkpoint_config_pins_the_consensus_parameters() {
+        use citrate_consensus::checkpoint::{CHECKPOINT_COMMITTEE_SIZE, CHECKPOINT_INTERVAL};
+        let team = crate::config::CheckpointNodeConfig {
+            committee_size: 10,
+            interval: 7,
+            ..crate::config::CheckpointNodeConfig::default()
+        };
+        let a = node_checkpoint_config(&team, 40204, h(1));
+        let b =
+            node_checkpoint_config(&crate::config::CheckpointNodeConfig::default(), 40204, h(1));
+        assert_eq!(CHECKPOINT_COMMITTEE_SIZE, 100);
+        assert_eq!(a.committee_size, CHECKPOINT_COMMITTEE_SIZE);
+        assert_eq!(
+            a.committee_size, b.committee_size,
+            "one committee size fleet-wide"
+        );
+        assert_eq!(a.interval, CHECKPOINT_INTERVAL);
+        assert_eq!(
+            (a.chain_id, a.genesis_hash, a.vote_depth),
+            (40204, h(1), team.vote_depth),
+            "node-local values are still the node's"
+        );
+    }
+
     #[test]
     fn never_votes_at_the_tip() {
         // depth 3, interval 2: tip 10 => buried 7 => boundary 6.
@@ -709,12 +910,9 @@ mod tests {
         let mut headers: HashMap<Hash, HeaderView> = HashMap::new();
         for n in 0u8..=12 {
             let parent = if n == 0 { Hash::default() } else { h(n) };
-            headers.insert(
-                h(n.saturating_add(1)),
-                (u64::from(n), parent, h(n.saturating_add(100))),
-            );
+            headers.insert(h(n.saturating_add(1)), (u64::from(n), parent));
         }
-        headers.insert(h(200), (6, h(6), h(201))); // orphan sibling at height 6
+        headers.insert(h(200), (6, h(6))); // orphan sibling at height 6
         let found = canonical_at_heights(h(13), 12, &[6, 8], |x| Ok(headers.get(x).copied()))
             .expect("walk");
         assert_eq!(
@@ -723,12 +921,10 @@ mod tests {
                 BuriedCheckpoint {
                     height: 6,
                     hash: h(7),
-                    seed: h(106)
                 },
                 BuriedCheckpoint {
                     height: 8,
                     hash: h(9),
-                    seed: h(108)
                 },
             ]
         );
@@ -737,9 +933,9 @@ mod tests {
     #[test]
     fn walk_errors_on_missing_header_and_skips_stepped_over_heights() {
         let headers: HashMap<Hash, HeaderView> = HashMap::from([
-            (h(10), (10, h(7), h(1))),
-            (h(7), (7, h(5), h(2))), // selected parent jumps from 10 to 7
-            (h(5), (5, h(4), h(3))),
+            (h(10), (10, h(7))),
+            (h(7), (7, h(5))), // selected parent jumps from 10 to 7
+            (h(5), (5, h(4))),
         ]);
         let found = canonical_at_heights(h(10), 10, &[8, 6], |x| Ok(headers.get(x).copied()))
             .expect("walk");
@@ -843,6 +1039,12 @@ mod tests {
         let vote = |height: u64| CheckpointVote {
             height,
             block_hash: h(9),
+            binding: citrate_consensus::checkpoint::VoteBinding {
+                epoch: 1,
+                state_root: Hash::default(),
+                accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+            },
+
             voter: PublicKey::new([3; 32]),
             signature: Signature::new([4; 64]),
         };
@@ -921,6 +1123,7 @@ mod tests {
                 committee_size: 100,
                 quorum_threshold: 67,
                 chain_id: CHAIN,
+                genesis_hash: Hash::default(),
                 vote_depth: 3,
             }
         }
@@ -940,7 +1143,7 @@ mod tests {
                     .parent(parent)
                     .build_unhashed();
                 let hash = b.hash();
-                headers.insert(hash, (u64::from(i), parent, Hash::new([7; 32])));
+                headers.insert(hash, (u64::from(i), parent));
                 hashes.push(hash);
                 parent = hash;
                 dag.store_block(b).await.expect("store test block");
@@ -1168,9 +1371,7 @@ mod tests {
             {
                 // Earlier run: signed (4, a4).
                 let g = gadget_over(dag.clone(), &storage, &ks).await;
-                let out = g
-                    .on_buried_checkpoint(4, a4, &Hash::new([7; 32]), Some(me))
-                    .await;
+                let out = g.on_buried_checkpoint(4, a4, Some(me)).await;
                 assert!(out.signed_own_vote);
             }
             // Restart on branch B, halted before boundary 4 is reported.
@@ -1190,12 +1391,7 @@ mod tests {
             assert_eq!(retries.len(), 0, "a permanent refusal is not revisited");
             // Direct confirmation of the refusal reason.
             let again = g
-                .on_buried_checkpoint(
-                    4,
-                    b.get(4).copied().expect("b4"),
-                    &Hash::new([7; 32]),
-                    Some(me),
-                )
+                .on_buried_checkpoint(4, b.get(4).copied().expect("b4"), Some(me))
                 .await;
             assert_eq!(
                 again.sign_refused,
@@ -1210,6 +1406,12 @@ mod tests {
         let v = CheckpointVote {
             height: 42,
             block_hash: h(9),
+            binding: citrate_consensus::checkpoint::VoteBinding {
+                epoch: 1,
+                state_root: Hash::default(),
+                accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+            },
+
             voter: PublicKey::new([3; 32]),
             signature: Signature::new([4; 64]),
         };
@@ -1217,10 +1419,12 @@ mod tests {
             NetworkMessage::CheckpointVote {
                 height,
                 block_hash,
+                binding,
                 voter_pubkey,
                 signature,
             } => {
                 assert_eq!(height, 42);
+                assert_eq!(binding, v.binding);
                 assert_eq!(block_hash, h(9));
                 assert_eq!(voter_pubkey, vec![3u8; 32]);
                 assert_eq!(signature, vec![4u8; 64]);

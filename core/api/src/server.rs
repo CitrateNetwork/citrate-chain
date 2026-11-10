@@ -2851,6 +2851,17 @@ impl RpcServer {
 
     /// Spawn the RPC server on a dedicated OS thread and return a CloseHandle and JoinHandle.
     /// If startup fails (e.g., port already in use), returns an error instead of panicking.
+    /// Register `citrate_getFinalityStatus` (spec 06 §5.5) over the view the
+    /// node's finality driver publishes into `cell` (data source:
+    /// `CheckpointManager`, see [`crate::finality_status`]).
+    pub fn with_finality_status(
+        mut self,
+        cell: Arc<crate::finality_status::FinalityStatusCell>,
+    ) -> Self {
+        crate::finality_status::register_finality_status(&mut self.io_handler, cell);
+        self
+    }
+
     pub fn spawn(self) -> Result<(CloseHandle, std::thread::JoinHandle<()>)> {
         let listen_addr = self.config.listen_addr;
         let threads = self.config.threads;

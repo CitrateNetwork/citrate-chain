@@ -312,6 +312,35 @@ pub fn validator_set_binding() -> Result<Option<([u8; 20], u64)>, GenesisError> 
     )))
 }
 
+/// One genesis validator: `(proposer public key, stake in wei)`.
+pub type GenesisValidator = ([u8; 32], u128);
+
+/// The genesis validator set of the compiled r1006 genesis: each producer the
+/// ValidatorRegistry registers at block 0, as `(proposer public key, stake in wei)`, in
+/// file order. It is the epoch-0 checkpoint committee's input (spec 06 §7): the
+/// committee for every checkpoint no registry snapshot governs. `None` while the producer
+/// set is a placeholder (status not `final`). Data source: `assets/r1006/validators.json`,
+/// the same file the block-0 registry state is built from.
+pub fn genesis_validator_set() -> Result<Option<Vec<GenesisValidator>>, GenesisError> {
+    let v = parse_validators()?;
+    if v.status != "final" {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(v.validators.len());
+    for e in &v.validators {
+        let key = word(&e.proposer_pubkey, "proposer_pubkey")?;
+        let stake = decimal(&e.stake_wei, "stake_wei")?;
+        if stake.is_zero() || stake > U256::from(u128::MAX) {
+            return Err(invalid(format!(
+                "validators.json: stake_wei {} of {} is not a positive u128",
+                e.stake_wei, e.proposer_pubkey
+            )));
+        }
+        out.push((key, stake.low_u128()));
+    }
+    Ok(Some(out))
+}
+
 /// What the compiled r1006 genesis still waits for.
 pub fn readiness() -> Result<Readiness, GenesisError> {
     let (f, accounts) = parse_alloc()?;

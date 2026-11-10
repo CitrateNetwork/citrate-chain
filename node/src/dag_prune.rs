@@ -91,15 +91,49 @@ pub fn configured_retain() -> Option<u64> {
 /// `prune()` removes blocks strictly BELOW the pruning point, so this returns
 /// the floor of the retained range. Pure function so the policy is unit-testable
 /// without a store.
+///
+/// Spec 06 G11: a node MUST NOT prune at or above `pruning_point(applied tip)`.
+/// The point is `applied - retain` rounded DOWN to a checkpoint height, so it
+/// is never above the tip's G11 pruning point (`retain >= PRUNING_DEPTH`) and
+/// the tip's committed pruning point block stays in the DAG store.
 pub fn pruning_point_height(applied_height: u64, retain: u64) -> Option<u64> {
     let retain = retain.max(MIN_RETAIN_BLOCKS);
-    let point = applied_height.checked_sub(retain)?;
+    let interval = citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
+    let unaligned = applied_height.checked_sub(retain)?;
+    let point = unaligned
+        .checked_div(interval)
+        .unwrap_or(0)
+        .saturating_mul(interval);
     // point == 0 would make `prune()` a no-op (nothing is below height 0) and
     // would also target genesis itself; skip until the chain is deep enough.
     if point == 0 {
         return None;
     }
     Some(point)
+}
+
+/// G11 (spec 06 §2): the chain store as the [`AncestryHeaders`] source of the
+/// pruning-point walk. DAG pruning drops blocks from the DAG store only; the
+/// chain store keeps their headers (`CF_HEADERS`), so a pruned node validates
+/// the pruning point of a late or side-branch block inside the undo window the
+/// same way an unpruned node does. Data source: `BlockStore::get_header`.
+///
+/// [`AncestryHeaders`]: citrate_consensus::ghostdag::AncestryHeaders
+pub struct ChainStoreHeaders(pub Arc<StorageManager>);
+
+impl citrate_consensus::ghostdag::AncestryHeaders for ChainStoreHeaders {
+    fn header(
+        &self,
+        hash: &citrate_consensus::types::Hash,
+    ) -> Option<citrate_consensus::types::BlockHeader> {
+        match self.0.blocks.get_header(hash) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("dag-prune: chain-store header {hash} unreadable for the G11 walk: {e}");
+                None
+            }
+        }
+    }
 }
 
 /// The height below which DAG pruning has dropped blocks from `dag_store`
@@ -248,8 +282,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -345,7 +382,36 @@ mod tests {
     #[test]
     fn prunes_below_the_retained_window() {
         assert_eq!(pruning_point_height(11_000, 10_000), Some(1_000));
-        assert_eq!(pruning_point_height(67_441, 10_000), Some(57_441));
+        // G11: rounded down to a checkpoint height (57,441 -> 57,400).
+        assert_eq!(pruning_point_height(67_441, 10_000), Some(57_400));
+    }
+
+    /// Spec 06 G11: "a node MUST NOT prune at or above pruning_point(applied
+    /// tip)". The DAG prune point is a checkpoint height (so the tip's own
+    /// committed pruning point stays in the DAG store) and never above the
+    /// tip's G11 pruning point, and the retained range still covers `retain`.
+    #[test]
+    fn prune_floor_never_rises_above_the_tips_g11_pruning_point() {
+        use citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
+        use citrate_consensus::ghostdag::pruning_point_height as g11_pp_height;
+        for retain in [MIN_RETAIN_BLOCKS, MIN_RETAIN_BLOCKS + 37, 25_000] {
+            for applied in (0..=40_000u64).step_by(7) {
+                let Some(p) = pruning_point_height(applied, retain) else {
+                    continue;
+                };
+                assert_eq!(
+                    p % CHECKPOINT_INTERVAL,
+                    0,
+                    "prune point {p} (applied {applied}, retain {retain}) is a checkpoint height"
+                );
+                assert!(
+                    p <= g11_pp_height(applied),
+                    "prune point {p} above the tip's pruning point {} (applied {applied})",
+                    g11_pp_height(applied)
+                );
+                assert!(applied - p >= retain, "retains at least {retain}");
+            }
+        }
     }
 
     /// An operator typo must never be able to prune inside the revertible-reorg
@@ -399,8 +465,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -546,8 +615,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -657,8 +729,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -808,8 +883,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -899,8 +977,11 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -952,6 +1033,8 @@ mod tests {
         merge.header.blue_score = N + 3;
         merge.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 3);
         merge.header.block_hash = merge.compute_hash();
+        // The score fields changed after `mk` sealed it: record the final hash.
+        crate::g11_test_seal::record(&merge);
         for blk in [&a, &b, &merge] {
             for (dag, gd) in [(&pruned_dag, &pruned), (&full_dag, &full)] {
                 dag.store_block(blk.clone()).await.expect("dag");
@@ -983,6 +1066,7 @@ mod tests {
         child.header.blue_score = N + 4;
         child.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 4);
         child.header.block_hash = child.compute_hash();
+        crate::g11_test_seal::record(&child);
         pruned_dag.store_block(child.clone()).await.expect("dag");
         pruned
             .add_block(&child)

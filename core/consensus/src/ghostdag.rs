@@ -60,6 +60,16 @@ pub enum GhostDagError {
     #[error("Header blue_work {claimed} != GHOSTDAG blue_work {expected}")]
     BlueWorkMismatch { claimed: u128, expected: u128 },
 
+    /// G11: the header's pruning_point is not `chain_ancestor(B, pp_h(B))`.
+    #[error(
+        "Header pruning_point {claimed} != the chain block at pruning height {height} ({expected})"
+    )]
+    PruningPointMismatch {
+        claimed: Hash,
+        expected: Hash,
+        height: u64,
+    },
+
     /// G2: one parent is in the past of another.
     #[error("Parents are not an antichain: {ancestor} is in the past of {descendant}")]
     ParentsNotAntichain { ancestor: Hash, descendant: Hash },
@@ -121,6 +131,23 @@ pub const MERGE_SCORE_WINDOW: u64 = 2 * MERGE_PARENT_MAX_DEPTH;
 /// Spec name for [`MERGE_SCORE_WINDOW`].
 pub const GHOSTDAG_WINDOW: u64 = MERGE_SCORE_WINDOW;
 
+/// §1.2 `PRUNING_DEPTH` (G11), in chain blocks: a block's committed pruning
+/// point sits at least this far below it. Today's `CITRATE_DAG_PRUNE_RETAIN`
+/// default, promoted to a consensus constant (owner O7 open: 10,000).
+pub const PRUNING_DEPTH: u64 = 10_000;
+
+/// G11 `pp_h(B) = max(0, ⌊(height(B) − PRUNING_DEPTH) / CHECKPOINT_INTERVAL⌋ ·
+/// CHECKPOINT_INTERVAL)`: always a checkpoint height, so a finalized
+/// checkpoint there certifies the state a pruned node resumes from (spec §7).
+pub fn pruning_point_height(height: u64) -> u64 {
+    let interval = crate::checkpoint::CHECKPOINT_INTERVAL;
+    height
+        .saturating_sub(PRUNING_DEPTH)
+        .checked_div(interval)
+        .unwrap_or(0)
+        .saturating_mul(interval)
+}
+
 /// Height from which merge-depth limits apply: 0, and fixed.
 ///
 /// r1007 is a new genesis with every rule active from block 0 (ADR CV-2), so
@@ -144,6 +171,22 @@ pub fn merge_depth_activation_height() -> u64 {
 const MAX_GHOSTDAG_CACHE_ENTRIES: usize = 65_536;
 
 /// GhostDAG consensus engine
+/// Where the G11 pruning-point walk reads a selected-chain header that the
+/// DAG store no longer holds (spec 06 §2 G11, CV-7a).
+///
+/// At a boundary height `h` the expected pruning point is the chain ancestor at
+/// `h - PRUNING_DEPTH`. For a block below the tip (a late block, or a side
+/// branch forked inside the undo window, both of which a node must admit) that
+/// ancestor lies below the DAG prune floor. The node's chain store keeps every
+/// admitted header beyond that floor, so the walk reads it there. A header is
+/// content-addressed by its hash, so its source cannot change the result: it
+/// only decides whether the walk can finish. A header found nowhere still
+/// fails closed (`MissingParent`).
+pub trait AncestryHeaders: Send + Sync {
+    /// The header of `hash`, if this source holds it.
+    fn header(&self, hash: &Hash) -> Option<BlockHeader>;
+}
+
 pub struct GhostDag {
     /// Consensus parameters
     params: GhostDagParams,
@@ -183,6 +226,10 @@ pub struct GhostDag {
     /// authoritative after a restart. The applicator's runtime deep-fork rebuild
     /// gates on this instead of a block-height heuristic. See `dag_hydrated_handle`.
     dag_hydrated: Arc<AtomicBool>,
+
+    /// Fallback header source for the G11 pruning-point walk (see
+    /// [`AncestryHeaders`]); `None` reads the DAG store only.
+    ancestry: Option<Arc<dyn AncestryHeaders>>,
 }
 
 /// One entry of `GhostDag::validated`.
@@ -263,7 +310,15 @@ impl GhostDag {
             tips: Arc::new(RwLock::new(HashSet::new())),
             keys: Arc::new(RwLock::new(HashMap::new())),
             dag_hydrated: Arc::new(AtomicBool::new(false)),
+            ancestry: None,
         }
+    }
+
+    /// G11: read selected-chain headers the DAG store has pruned from
+    /// `source` (the node's chain store) during the pruning-point walk.
+    pub fn with_ancestry_headers(mut self, source: Arc<dyn AncestryHeaders>) -> Self {
+        self.ancestry = Some(source);
+        self
     }
 
     /// Override the PBA-R2 hardening activation (tests / isolated devnets).
@@ -1038,7 +1093,71 @@ impl GhostDag {
                 expected: data.blue_work,
             });
         }
+
+        // G11: the committed pruning point is the chain ancestor at pp_h(B).
+        let expected_pp = self.expected_pruning_point(&sp_hash, header.height).await?;
+        if header.pruning_point != expected_pp {
+            return Err(GhostDagError::PruningPointMismatch {
+                claimed: header.pruning_point,
+                expected: expected_pp,
+                height: pruning_point_height(header.height),
+            });
+        }
         Ok(data)
+    }
+
+    /// G11: the pruning point a block at `height` whose selected parent is
+    /// `selected_parent` must commit: `chain_ancestor(B, pp_h(B))`, encoded as
+    /// the zero hash while `pp_h(B) = 0` (no pruning point yet; the genesis
+    /// block is implied, and genesis hashes are per network).
+    ///
+    /// O(1) between boundaries: SP's committed value (validated when SP was
+    /// admitted) is B's whenever `pp_h(SP) = pp_h(B)`. When the boundary moves
+    /// (`(height − PRUNING_DEPTH)` a multiple of the interval), it walks SP's
+    /// selected chain down to `pp_h(B)`, `PRUNING_DEPTH − 1` header reads. For a
+    /// block at or above the tip those headers are at or above the tip's
+    /// pruning point, which the node never prunes (G11 floor). For a block
+    /// below the tip (late, or on a branch inside the undo window) they reach
+    /// below the DAG prune floor and come from the [`AncestryHeaders`] source.
+    /// A header the walk needs and finds nowhere fails closed
+    /// (`MissingParent`). The producer seals with the same function.
+    pub async fn expected_pruning_point(
+        &self,
+        selected_parent: &Hash,
+        height: u64,
+    ) -> Result<Hash, GhostDagError> {
+        let target = pruning_point_height(height);
+        if target == 0 {
+            return Ok(Hash::default());
+        }
+        let sp = self.header_of(selected_parent).await?;
+        if pruning_point_height(sp.height) == target {
+            return Ok(sp.pruning_point);
+        }
+        let mut cur = sp;
+        loop {
+            if cur.height == target {
+                return Ok(cur.block_hash);
+            }
+            if cur.height < target || cur.selected_parent_hash == Hash::default() {
+                return Err(GhostDagError::InvalidLinkage(format!(
+                    "selected chain of {selected_parent} does not reach pruning height {target}"
+                )));
+            }
+            cur = self.chain_header_of(&cur.selected_parent_hash).await?;
+        }
+    }
+
+    /// A selected-chain header for the G11 walk: the DAG store, else the
+    /// [`AncestryHeaders`] source, else `MissingParent` (fail closed).
+    async fn chain_header_of(&self, hash: &Hash) -> Result<BlockHeader, GhostDagError> {
+        match self.header_of(hash).await {
+            Ok(h) => Ok(h),
+            Err(e) => match self.ancestry.as_ref().and_then(|a| a.header(hash)) {
+                Some(h) if h.block_hash == *hash => Ok(h),
+                _ => Err(e),
+            },
+        }
     }
 
     pub async fn add_block(&self, block: &Block) -> Result<(), GhostDagError> {

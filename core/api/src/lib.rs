@@ -21,6 +21,7 @@ pub mod eth_rpc;
 pub mod eth_subscriptions;
 pub mod eth_tx_decoder;
 pub mod filter;
+pub mod finality_status;
 pub mod finalized_tag;
 pub mod inference_auth;
 pub mod methods;

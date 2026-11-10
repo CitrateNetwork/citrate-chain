@@ -33,12 +33,18 @@ fn make_signed_vote_for_chain(
 
     // RM-B1 / WP-B2.2 (H-02): use the canonical helper so tests
     // sign exactly the bytes the verifier checks.
-    let message =
-        citrate_consensus::checkpoint::canonical_vote_message(chain_id, height, &block_hash);
+    let message = citrate_consensus::checkpoint::canonical_vote_message(
+        chain_id,
+        &citrate_consensus::types::Hash::default(),
+        height,
+        &block_hash,
+        &tb(),
+    );
 
     let sig = signing_key.sign(&message);
 
     CheckpointVote {
+        binding: tb(),
         height,
         block_hash,
         voter: PublicKey::new(pubkey_bytes),
@@ -88,7 +94,13 @@ async fn test_checkpoint_quorum_requires_threshold() {
         .collect();
 
     // Height must be multiple of interval (5)
-    mgr.propose(50, hash_for(50), committee).await.unwrap();
+    mgr.propose(
+        50,
+        hash_for(50),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     // Submit 3 votes — quorum is 4, so NOT reached
     for (i, key) in keys.iter().enumerate().take(3) {
@@ -122,7 +134,13 @@ async fn test_checkpoint_quorum_reached_with_enough_votes() {
         .map(|k| PublicKey::new(k.verifying_key().to_bytes()))
         .collect();
 
-    mgr.propose(50, hash_for(50), committee).await.unwrap();
+    mgr.propose(
+        50,
+        hash_for(50),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     // Submit 4 votes — quorum reached at 4th
     for (i, key) in keys.iter().enumerate().take(3) {
@@ -147,7 +165,13 @@ async fn test_checkpoint_duplicate_vote_rejected() {
 
     let key = test_key(20);
     let committee = vec![PublicKey::new(key.verifying_key().to_bytes())];
-    mgr.propose(50, hash_for(50), committee).await.unwrap();
+    mgr.propose(
+        50,
+        hash_for(50),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     let vote = make_signed_vote(&key, 50, hash_for(50));
     mgr.submit_vote(vote).await.unwrap();
@@ -170,7 +194,13 @@ async fn test_checkpoint_non_committee_vote_rejected() {
     let committee_key = test_key(30);
     let outsider_key = test_key(31);
     let committee = vec![PublicKey::new(committee_key.verifying_key().to_bytes())];
-    mgr.propose(50, hash_for(50), committee).await.unwrap();
+    mgr.propose(
+        50,
+        hash_for(50),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     // Outsider tries to vote
     let vote = make_signed_vote(&outsider_key, 50, hash_for(50));
@@ -246,4 +276,15 @@ async fn test_total_ordering_deterministic() {
     let order1 = ordering.get_total_order(hash_for(400)).await.unwrap();
     let order2 = ordering.get_total_order(hash_for(400)).await.unwrap();
     assert_eq!(order1, order2, "Total ordering must be deterministic");
+}
+
+/// S3-5 (spec 06 §7): the binding a vote for a test block carries: epoch 0,
+/// the default state root test blocks have, the empty accepted root.
+#[allow(dead_code)]
+fn tb() -> citrate_consensus::checkpoint::VoteBinding {
+    citrate_consensus::checkpoint::VoteBinding {
+        epoch: 0,
+        state_root: citrate_consensus::types::Hash::default(),
+        accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+    }
 }

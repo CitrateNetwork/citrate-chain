@@ -118,7 +118,13 @@ fn make_pubkey(id: u8) -> PublicKey {
 /// match the verifier's expectation byte-for-byte.
 fn sign_vote(height: u64, block_hash: &Hash, signing_key: &ed25519_dalek::SigningKey) -> Signature {
     use ed25519_dalek::Signer;
-    let message = citrate_consensus::checkpoint::canonical_vote_message(40204, height, block_hash);
+    let message = citrate_consensus::checkpoint::canonical_vote_message(
+        40204,
+        &citrate_consensus::types::Hash::default(),
+        height,
+        block_hash,
+        &tb(),
+    );
     let sig = signing_key.sign(&message);
     Signature::new(sig.to_bytes())
 }
@@ -127,6 +133,7 @@ fn sign_vote(height: u64, block_hash: &Hash, signing_key: &ed25519_dalek::Signin
 fn make_signed_vote(id: u8, height: u64, block_hash: &Hash) -> CheckpointVote {
     let sk = make_signing_key(id);
     CheckpointVote {
+        binding: tb(),
         height,
         block_hash: *block_hash,
         voter: make_pubkey(id),
@@ -942,7 +949,13 @@ async fn test_checkpoint_status_finalized() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..4u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -964,7 +977,13 @@ async fn test_checkpoint_status_pending() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         mgr.checkpoint_status(5).await,
@@ -991,7 +1010,13 @@ async fn test_pending_vote_count_with_votes() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..2u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -1009,7 +1034,13 @@ async fn test_pending_vote_count_zero_votes() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(mgr.pending_vote_count(5).await, Some(0));
 }
@@ -1052,10 +1083,18 @@ fn test_committee_selector_single_validator() {
 
 #[test]
 fn test_committee_selector_zero_stake_validators() {
+    // #185: the quorum counts stake, so a zero-stake validator can never
+    // contribute to one and is not selected (it used to be, at weight 1).
     let validators: Vec<(PublicKey, u128)> = (0..5).map(|i| (make_pubkey(i), 0)).collect();
     let seed = Hash::new([7; 32]);
     let committee = CommitteeSelector::select(&validators, 50, &seed, 3);
-    assert_eq!(committee.len(), 3);
+    assert!(committee.is_empty());
+    let mut mixed = validators.clone();
+    mixed.push((make_pubkey(9), 5));
+    assert_eq!(
+        CommitteeSelector::select(&mixed, 50, &seed, 3),
+        vec![make_pubkey(9)]
+    );
 }
 
 #[test]
@@ -1079,7 +1118,9 @@ fn test_checkpoint_has_quorum() {
     let cp = Checkpoint {
         height: 50,
         block_hash: Hash::new([1; 32]),
+        binding: tb(),
         committee: vec![],
+        stakes: vec![],
         votes,
         status: CheckpointStatus::Pending,
     };
@@ -1098,7 +1139,9 @@ fn test_checkpoint_vote_count() {
     let cp = Checkpoint {
         height: 50,
         block_hash: Hash::new([1; 32]),
+        binding: tb(),
         committee: vec![],
+        stakes: vec![],
         votes,
         status: CheckpointStatus::Pending,
     };
@@ -1145,7 +1188,13 @@ async fn test_propose_not_checkpoint_boundary() {
     let blocks = build_checkpoint_chain(&dag, 4).await;
     let mgr = CheckpointManager::new(config, dag);
 
-    let result = mgr.propose(3, blocks[3].hash(), vec![]).await;
+    let result = mgr
+        .propose(
+            3,
+            blocks[3].hash(),
+            citrate_consensus::checkpoint::Committee::equal_stake(0, vec![]),
+        )
+        .await;
     assert!(matches!(
         result,
         Err(CheckpointError::NotCheckpointBoundary)
@@ -1158,7 +1207,13 @@ async fn test_propose_block_not_found() {
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag);
 
-    let result = mgr.propose(5, Hash::new([0xAA; 32]), vec![]).await;
+    let result = mgr
+        .propose(
+            5,
+            Hash::new([0xAA; 32]),
+            citrate_consensus::checkpoint::Committee::equal_stake(0, vec![]),
+        )
+        .await;
     assert!(matches!(result, Err(CheckpointError::BlockNotFound(_))));
 }
 
@@ -1170,11 +1225,21 @@ async fn test_propose_already_exists() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee.clone())
-        .await
-        .unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee.clone()),
+    )
+    .await
+    .unwrap();
 
-    let result = mgr.propose(5, blocks[5].hash(), committee).await;
+    let result = mgr
+        .propose(
+            5,
+            blocks[5].hash(),
+            citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+        )
+        .await;
     assert!(matches!(result, Err(CheckpointError::AlreadyExists(5))));
 }
 
@@ -1188,7 +1253,13 @@ async fn test_finalize_checkpoint_without_quorum_rejected() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..2u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -1218,10 +1289,17 @@ async fn test_submit_vote_wrong_block_hash() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     let wrong_hash = Hash::new([0xDE; 32]);
     let vote = CheckpointVote {
+        binding: tb(),
         height: 5,
         block_hash: wrong_hash,
         voter: make_pubkey(0),
@@ -1244,7 +1322,13 @@ async fn test_latest_finalized_height_and_get_checkpoint() {
     assert_eq!(mgr.latest_finalized_height().await, 0);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..4u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -1338,4 +1422,15 @@ fn test_chain_state_default_values() {
     };
     assert_eq!(state.tip, Hash::new([0; 32]));
     assert!(state.selected_chain.is_empty());
+}
+
+/// S3-5 (spec 06 §7): the binding a vote for a test block carries: epoch 0,
+/// the default state root test blocks have, the empty accepted root.
+#[allow(dead_code)]
+fn tb() -> citrate_consensus::checkpoint::VoteBinding {
+    citrate_consensus::checkpoint::VoteBinding {
+        epoch: 0,
+        state_root: citrate_consensus::types::Hash::default(),
+        accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+    }
 }

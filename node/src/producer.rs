@@ -2896,6 +2896,22 @@ impl BlockProducer {
             })?;
             (score, citrate_consensus::types::blue_work_for_score(score))
         };
+        // r1007 G11 (spec 06 §2): the committed pruning point, derived by the
+        // same function admission checks it with (SP's value between
+        // boundaries; the chain block at pp_h(B) when the boundary moves).
+        let pruning_point = if selected_parent != Hash::default() {
+            self.ghostdag
+                .expected_pruning_point(&selected_parent, next_height)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "pruning point of the block on {selected_parent} unavailable: {e}. \
+                         Refusing to produce."
+                    )
+                })?
+        } else {
+            Hash::default()
+        };
 
         // Prove the block VRF FIRST, before selecting transactions or opening an executor
         // round. If proving fails this slot is skipped: no block is built, stored or
@@ -2996,7 +3012,7 @@ impl BlockProducer {
             height: next_height,
             blue_score,
             blue_work,
-            pruning_point: Hash::default(),
+            pruning_point,
             proposer_pubkey,
             vrf_reveal,
             // The §R' import rule requires the canonical base fee; the former inline

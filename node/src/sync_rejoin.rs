@@ -1072,6 +1072,8 @@ mod tests {
             .blue_score(height)
             .blue_work(blue_work_for_score(height))
             .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            // G11: the committed pruning point (zero below 10,050).
+            .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
             .build_unhashed();
         b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
             PbaHardening::off(),
@@ -1080,6 +1082,7 @@ mod tests {
         );
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
+        crate::g11_test_seal::record(&b);
         b
     }
 
@@ -1729,7 +1732,12 @@ mod tests {
         let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
         let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag load"));
         dag.set_configured_genesis(g.header.block_hash);
-        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        // As main.rs wires it: the G11 walk reads pruned headers from the chain store.
+        let ghostdag = Arc::new(
+            GhostDag::new(GhostDagParams::default(), dag.clone()).with_ancestry_headers(Arc::new(
+                crate::dag_prune::ChainStoreHeaders(storage.clone()),
+            )),
+        );
         let executor = Arc::new(Executor::with_storage_and_chain_id(
             Arc::new(StateDB::new()),
             Some(storage.state.clone()),
@@ -2549,9 +2557,21 @@ mod tests {
                 && stmt.contains(".with_dag_prune_floor(shared_dag_store.clone())"),
             "the applicator must be built with the DAG prune floor: {stmt}"
         );
+        let gd = src
+            .find("let shared_ghostdag = ")
+            .and_then(|at| src.get(at..))
+            .and_then(|t| t.find(';').and_then(|end| t.get(..end)))
+            .expect("shared_ghostdag statement");
         assert!(
-            src.contains("GhostDag::new(\n        GhostDagParams::default(),\n        shared_dag_store.clone(),"),
-            "fork choice and the prune floor must read the same DAG store"
+            gd.contains("GhostDag::new(GhostDagParams::default(), shared_dag_store.clone())"),
+            "fork choice and the prune floor must read the same DAG store: {gd}"
+        );
+        // G11: the pruning-point walk reads headers the DAG prune dropped
+        // from the chain store, so a pruned node admits what an unpruned does.
+        assert!(
+            gd.contains(".with_ancestry_headers(")
+                && gd.contains("ChainStoreHeaders(storage.clone())"),
+            "the shared GhostDag must read pruned ancestry from the chain store: {gd}"
         );
     }
 
@@ -3003,6 +3023,7 @@ mod tests {
             b.header.vrf_reveal.output = Hash::new(out);
             b.header.block_hash = b.compute_hash();
             b.signature = crypto::sign_block(&b.header.block_hash, key);
+            crate::g11_test_seal::record(&b);
             let key_of_b = citrate_consensus::types::ForkChoiceKey::of_header(&b.header);
             if key_of_b != than && (key_of_b > than) == wins {
                 return b;
@@ -3827,6 +3848,7 @@ mod tests {
             .blue_score(score)
             .blue_work(blue_work_for_score(score))
             .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            .pruning_point(crate::g11_test_seal::pruning_point(height, sp_hash))
             .build_unhashed();
         b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
             PbaHardening::off(),
@@ -3835,6 +3857,7 @@ mod tests {
         );
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
+        crate::g11_test_seal::record(&b);
         Some(b)
     }
 

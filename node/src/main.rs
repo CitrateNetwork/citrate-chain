@@ -74,6 +74,9 @@ mod dag_prune;
 mod finality_adversarial_tests;
 mod finality_driver;
 mod finality_floor;
+mod finality_sync;
+#[cfg(test)]
+mod g11_test_seal;
 mod genesis;
 mod hardening_rejoin;
 mod host_identity;
@@ -2299,27 +2302,44 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PIL-42's genesis DAG seed moved into `BlockAdmission::seed_genesis` (see
     // SYNC-S1 D2 below) so that every chain-store/DAG-store consistency concern
     // lives in one module under one set of rules.
-    let shared_ghostdag = Arc::new(GhostDag::new(
-        GhostDagParams::default(),
-        shared_dag_store.clone(),
-    ));
+    // G11: the pruning-point walk reads headers DAG pruning dropped from the
+    // chain store (a late or side-branch block inside the undo window).
+    let shared_ghostdag = Arc::new(
+        GhostDag::new(GhostDagParams::default(), shared_dag_store.clone())
+            .with_ancestry_headers(Arc::new(dag_prune::ChainStoreHeaders(storage.clone()))),
+    );
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
     let checkpoint_manager = {
-        use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+        use citrate_consensus::checkpoint::CheckpointManager;
         // Stage 0 checkpoint finality: build the consensus CheckpointConfig from the
         // node's `[checkpoint]` config instead of `default()`, and bind `chain_id`
         // to the node's chain config (NOT a hardcoded 40204) so a devnet (e.g. 1337)
         // signs/verifies vote messages for its own chain. `quorum_threshold` is
         // carried through for reference, but finalization derives the effective
         // quorum `floor(2n/3)+1` from the actual committee size (see checkpoint.rs).
-        let cp_config = CheckpointConfig {
-            interval: config.checkpoint.interval,
-            committee_size: config.checkpoint.committee_size,
-            quorum_threshold: config.checkpoint.quorum_threshold,
-            chain_id: config.chain.chain_id,
-            vote_depth: config.checkpoint.vote_depth,
+        // r1007 (spec 06 §1.2, §7): the checkpoint interval and the committee
+        // size are compiled consensus constants (the interval is aligned with
+        // the G11 pruning point; a per-node committee size would let nodes
+        // derive different committees); differing `[checkpoint]` values are
+        // ignored with a warning. Votes bind the genesis this node loaded
+        // (r1006 and r1007 share chain id 40204).
+        let genesis_hash = match storage.blocks.get_block_by_height(0) {
+            Ok(Some(g)) => g,
+            other => {
+                warn!(
+                    "checkpoint finality: genesis not readable at start-up ({:?}); votes \
+                     bind the zero genesis and will not verify on the network",
+                    other.err()
+                );
+                citrate_consensus::types::Hash::default()
+            }
         };
+        let cp_config = finality_driver::node_checkpoint_config(
+            &config.checkpoint,
+            config.chain.chain_id,
+            genesis_hash,
+        );
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
         Arc::new(CheckpointManager::with_persistence(
             cp_config,
@@ -2329,16 +2349,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     };
 
     // WP-S.3 Stage 1a: the checkpoint-finality producer path (propose / sign /
-    // broadcast / early-vote buffer / relay). Switched by the COMPILED pin for this
-    // chain (`checkpoint_gadget::CHECKPOINT_VOTING_PINS`, OFF for every chain in this
-    // release) — never by env or config. Committee source: the shared epoch-snapshot
+    // broadcast / early-vote buffer / relay). r1007 (ADR CV-8): ON from genesis in
+    // this build (`checkpoint_gadget::CHECKPOINT_VOTING_FROM_GENESIS`, no pin) —
+    // never by env or config. Committee source: the shared epoch-snapshot
     // proposer selector (`validator_selector`, filled by registry_sync from
     // `ValidatorRegistry.activeSet()` at each S(E)); `None` when no registry is
-    // configured, in which case no committee can be derived and nothing is proposed.
-    let finality_gadget = Arc::new(citrate_consensus::checkpoint_gadget::FinalityGadget::new(
+    // configured, in which case only the genesis validator set can form a committee.
+    // Epoch 0: checkpoints no registry snapshot governs (at or below S(1) = 800, or
+    // every height on a chain without a registry) draw their committee from the
+    // genesis validator set compiled with this node's block 0 (spec 06 §7): the
+    // genesis the checkpoint manager read above (on a fresh database the
+    // start-up probe ran before block 0 existed).
+    let checkpoint_genesis = *checkpoint_manager.config().genesis_hash.as_bytes();
+    let finality_gadget = Arc::new(finality_driver::node_finality_gadget(
         checkpoint_manager.clone(),
         validator_selector.clone(),
-    ));
+        Some(&checkpoint_genesis),
+    )?);
     let finality_voting_on = finality_gadget.enabled();
     // Finalized height as VERIFIED by the Stage 1c floor verifier while the
     // producer path runs; only ever advances to a certificate whose (height,
@@ -2352,6 +2379,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // by hash); stays `None` without a canonical applicator (tags then resolve
     // to genesis).
     let mut finality_rpc_handle: Option<citrate_api::FinalizedTagSource> = None;
+    // `citrate_getFinalityStatus` (spec 06 §5.5): the finality driver publishes
+    // the CheckpointManager's finalized and pending checkpoints here each pass;
+    // until it runs, the method reports `published: false`.
+    let finality_status = Arc::new(citrate_api::finality_status::FinalityStatusCell::default());
+    // WP-S.3 Stage 1b (spec §11.10): late-joiner checkpoint certificate sync.
+    // `None` in Legacy mode (voting pin OFF, every chain in this release) and
+    // without a canonical applicator: nothing is requested, served or accepted.
+    let mut certificate_sync: Option<Arc<finality_sync::CertificateSync>> = None;
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -2438,13 +2473,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // RPC tags frozen, CHECKPOINT FINALITY SAFETY STOP alarm + metrics).
             // Same compiled voting pin and chain id as `finality_gadget` (whose
             // manager was built with `config.chain.chain_id`).
-            let floor_mode = finality_floor::FloorMode::for_chain(config.chain.chain_id);
+            let floor_mode = finality_floor::FloorMode::for_genesis(
+                config.chain.chain_id,
+                &checkpoint_manager.config().genesis_hash,
+            );
             let floor_verifier = Arc::new(finality_floor::FloorVerifier::new(
                 floor_mode,
                 checkpoint_manager.clone(),
                 app.clone(),
                 finality_gadget.safety_stop(),
                 finality_observed.clone(),
+                // Every certificate (boot, poll, finalization, peer sync) is
+                // verified against the committee derived HERE (the height's epoch
+                // snapshot, rehydrated above, or the genesis set; its epoch seed).
+                finality_floor::CertificateCommittees::new(
+                    finality_gadget.clone(),
+                    storage.clone(),
+                ),
             ));
             // Enforced only (no-op in Legacy / Observed): installed before the
             // boot check and before the driver / vote handler can finalize.
@@ -2454,6 +2499,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // halts finality before it does anything else.
             let _ = floor_verifier.boot_check().await;
             finality_rpc_handle = Some(floor_verifier.rpc_finalized_handle());
+            // Stage 1b: peer certificates are verified against this node's own
+            // epoch committee and chain, then handed to this floor verifier.
+            // Enforced: installed only with the guard above in place, so a
+            // synced certificate goes through the same finalization path.
+            certificate_sync = finality_sync::CertificateSync::new(
+                finality_gadget.clone(),
+                app.clone(),
+                floor_verifier.clone(),
+            )
+            .map(Arc::new);
             let _ = floor_verifier.spawn();
             Some(app)
         } else {
@@ -3525,6 +3580,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // takes exactly the old submit_vote -> finalize path, or (switch ON) also
         // buffers early votes and returns accepted votes for one re-gossip.
         let finality_gadget_for_net = finality_gadget.clone();
+        // WP-S.3 Stage 1b: serves / accepts checkpoint certificates (`None`:
+        // compiled off, the two sync messages are ignored).
+        let certificate_sync_for_net = certificate_sync.clone();
         // #85: the success half of the sync-peer accounting (invariant I3) —
         // the tick task can only ever observe timeouts, so the peer that
         // actually answers has to be credited from the receive side.
@@ -4282,6 +4340,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     NetworkMessage::CheckpointVote {
                         height,
                         block_hash,
+                        binding,
                         voter_pubkey,
                         signature,
                     } => {
@@ -4303,6 +4362,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         let vote = CheckpointVote {
                             height,
                             block_hash,
+                            binding,
                             voter: PublicKey::new(voter_bytes),
                             signature: Signature::new(sig_bytes),
                         };
@@ -4364,6 +4424,41 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                         }
                     }
+                    // WP-S.3 Stage 1b (spec §11.10): a peer asks for a finalized
+                    // checkpoint certificate. Rate-limited per peer and size-bounded
+                    // inside `serve`; no answer when compiled off or none in range.
+                    NetworkMessage::GetCheckpoint { above, at_or_below } => {
+                        if let Some(cs) = &certificate_sync_for_net {
+                            if let Some(resp) = cs.serve(&pid.0, above, at_or_below).await {
+                                let _ = pm_for_rx
+                                    .send_to_peers(std::slice::from_ref(&pid), &resp)
+                                    .await;
+                            }
+                        }
+                    }
+                    // Stage 1b: only the answer to this node's outstanding request
+                    // is used; it is verified (epoch committee, quorum, signatures,
+                    // (height, hash) on this node's chain) off the message loop.
+                    NetworkMessage::CheckpointCertificate {
+                        height,
+                        block_hash,
+                        binding,
+                        signatures,
+                    } => match &certificate_sync_for_net {
+                        Some(cs) if cs.accept_response(&pid.0).await => {
+                            let cs = cs.clone();
+                            let peer = pid.0.clone();
+                            tokio::spawn(async move {
+                                let _ = cs
+                                    .process(&peer, height, block_hash, binding, signatures)
+                                    .await;
+                            });
+                        }
+                        _ => tracing::debug!(
+                            "Checkpoint certificate from peer {} not requested; ignored",
+                            pid.0
+                        ),
+                    },
                     _ => {
                         tracing::debug!("Unhandled message variant from peer {}", pid.0);
                     }
@@ -4613,7 +4708,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     ghostdag_params: Some(shared_ghostdag.params().clone()),
                 }
             }),
-        );
+        )
+        // ADR CV-8 / spec 06 §5.5: the real checkpoint state, for the explorer.
+        .with_finality_status(finality_status.clone());
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
         // to the RPC server. Until this commit, main.rs constructed
@@ -4736,7 +4833,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     storage.clone(),
                     peer_manager.clone(),
                     proposer_signing_key.clone(),
+                    finality_status.clone(),
+                    finality_floor::FloorMode::for_genesis(
+                        config.chain.chain_id,
+                        &checkpoint_manager.config().genesis_hash,
+                    ),
                 );
+                // Stage 1b: fetch finalized certificates from peers so a node that
+                // joined late or restarted behind gets its floor without waiting
+                // to take part in a live quorum.
+                if let Some(cs) = &certificate_sync {
+                    finality_sync::spawn_requester(cs.clone(), peer_manager.clone());
+                }
             }
             None => warn!(
                 "checkpoint finality: producer path ON but execute-on-receive is disabled — \
