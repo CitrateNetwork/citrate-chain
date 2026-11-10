@@ -366,6 +366,12 @@ pub async fn replay_block(
         coinbase: block.header.coinbase,
         prevrandao: *block.header.vrf_reveal.output.as_bytes(),
         block_hashes: std::collections::HashMap::new(),
+        // The single-block apply this replay models leaves GASLIMIT at REVM's
+        // default. A block whose own transactions were executed by the chain
+        // block that accepted it (r1007 S3-3b) has no receipt under itself, so
+        // the receipt check below refuses to trace it rather than report a
+        // replay on the wrong state.
+        gas_limit: None,
     });
     let mut out = Vec::new();
     for (j, tx) in block.transactions.iter().enumerate() {

@@ -285,7 +285,20 @@ pub struct Block {
     /// blocks and for nodes that have not yet been configured with the registry address.
     #[serde(default)]
     pub equivocation_vote: Option<Signature>,
+
+    /// r1007 S3-3b (spec 06 §3.9, CV-4a): commitment to the transactions this
+    /// block EXECUTED when it accepted its mergeset on post(SP): SHA3-256 over
+    /// `"CITRATE-ACCEPTED-V1" ‖ u64 count ‖ (tx_hash ‖ including_block_hash ‖
+    /// u8 status)*` in execution order (skipped occurrences excluded), computed
+    /// by `citrate_execution::acceptance::accepted_root`. Part of the block hash
+    /// whenever it is not the zero hash (see `compute_hash_for`); genesis
+    /// accepts nothing and keeps it zero.
+    #[serde(default)]
+    pub accepted_root: Hash,
 }
+
+/// Domain tag appended to the block-hash preimage ahead of `accepted_root`.
+pub const ACCEPTED_ROOT_COMMIT_DOMAIN: &[u8] = b"citrate:accepted-root:v1";
 
 impl Block {
     /// Get the block hash
@@ -367,6 +380,15 @@ impl Block {
         hasher.update(self.tx_root.as_bytes());
         hasher.update(self.receipt_root.as_bytes());
         hasher.update(self.artifact_root.as_bytes());
+        // r1007 S3-3b: the accepted-transactions commitment. Every block that
+        // accepts a mergeset commits a non-zero root (the empty list hashes
+        // to a non-zero value too), so only genesis and pre-r1007 fixtures
+        // keep the legacy preimage. Domain-separated and fixed-length, so the
+        // two preimage shapes cannot collide.
+        if self.accepted_root != Hash::default() {
+            hasher.update(ACCEPTED_ROOT_COMMIT_DOMAIN);
+            hasher.update(self.accepted_root.as_bytes());
+        }
         if hardening.active_at(self.header.height) {
             crate::block_sidecars::commit_into(&mut hasher, self);
         }
@@ -492,6 +514,7 @@ impl Block {
             && self.header.vrf_reveal.output == Hash::default()
             && self.header.coinbase == [0u8; 20]
             && self.header.gas_used == 0
+            && self.accepted_root == Hash::default()
             && self.signature.as_bytes().iter().all(|b| *b == 0)
     }
 }
@@ -902,6 +925,7 @@ impl BlockBuilder {
                 gradient_commitment: None,
                 learning_root: Hash::default(),
                 equivocation_vote: None,
+                accepted_root: Hash::default(),
             },
         }
     }
@@ -983,6 +1007,10 @@ impl BlockBuilder {
     }
     pub fn receipt_root(mut self, root: Hash) -> Self {
         self.block.receipt_root = root;
+        self
+    }
+    pub fn accepted_root(mut self, root: Hash) -> Self {
+        self.block.accepted_root = root;
         self
     }
     pub fn artifact_root(mut self, root: Hash) -> Self {

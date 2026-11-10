@@ -23,7 +23,6 @@ use citrate_consensus::types::{
     VrfProof,
 };
 use citrate_economics::{RewardCalculator, RewardConfig, UnifiedEconomicsManager};
-use citrate_execution::revm_adapter::BlockContext;
 use citrate_execution::Executor;
 use citrate_learning::orchestration::{LearningOrchestrator, PeerEmbedding, PeerProfileStore};
 use citrate_learning::profile::ProfileComputer;
@@ -1679,6 +1678,9 @@ pub struct BlockProducer {
     /// Producer-side circuit breaker for rounds that panic on the same
     /// mempool transaction (see [`PanicBreaker`]).
     panic_breaker: Mutex<PanicBreaker>,
+    /// r1007 S3-3b (spec 06 §3.7): the BLOCKHASH window of the last block
+    /// this producer sealed, so the next seal reads one new header.
+    recent_chain: crate::mergeset::RecentChain,
 
     /// ECVRF prover for the block VRF. Always [`real_vrf_prover`] outside tests.
     vrf_prover: VrfProver,
@@ -2000,6 +2002,7 @@ impl BlockProducer {
             applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
             slot_clock: default_slot_clock(),
             last_signed_slot: AtomicU64::new(0),
@@ -2070,6 +2073,7 @@ impl BlockProducer {
             applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
             slot_clock: default_slot_clock(),
             last_signed_slot: AtomicU64::new(0),
@@ -2139,6 +2143,7 @@ impl BlockProducer {
             applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
             slot_clock: default_slot_clock(),
             last_signed_slot: AtomicU64::new(0),
@@ -2287,6 +2292,7 @@ impl BlockProducer {
             applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
             slot_clock: default_slot_clock(),
             last_signed_slot: AtomicU64::new(0),
@@ -2456,6 +2462,7 @@ impl BlockProducer {
             applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
             slot_clock: default_slot_clock(),
             last_signed_slot: AtomicU64::new(0),
@@ -3170,7 +3177,7 @@ impl BlockProducer {
         // former `parent + 1` (a lower bound inside the old band) is gone with
         // the band: there is one unit, and a merge block's score counts its
         // blue mergeset.
-        let (blue_score, blue_work) = if selected_parent != Hash::default() {
+        let (blue_score, blue_work, ghostdag_data) = if selected_parent != Hash::default() {
             let data = self
                 .ghostdag
                 .compute_ghostdag(selected_parent, &merge_parents, next_height)
@@ -3181,12 +3188,16 @@ impl BlockProducer {
                          Refusing to produce."
                     )
                 })?;
-            (data.blue_score, data.blue_work)
+            (data.blue_score, data.blue_work, Some(data))
         } else {
             let score = parent_blue_score.checked_add(1).ok_or_else(|| {
                 anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
             })?;
-            (score, citrate_consensus::types::blue_work_for_score(score))
+            (
+                score,
+                citrate_consensus::types::blue_work_for_score(score),
+                None,
+            )
         };
         // r1007 G11 (spec 06 §2): the committed pruning point, derived by the
         // same function admission checks it with (SP's value between
@@ -3229,16 +3240,99 @@ impl BlockProducer {
             }
         };
 
+        // Every executor mutation below is rolled back if the round ends
+        // before its state is persisted (error or panic), so a failed round
+        // never leaves the executor ahead of the applied tip.
+        let round_state = self.executor.begin_production_round();
+
+        // Create block header with GhostDAG consensus data.
+        // EXECUTE-ON-RECEIVE: v2 headers commit the coinbase (reroll flag); v1 keep legacy hashing.
+        let mut header = BlockHeader {
+            version: if self.emit_v2_headers { 2 } else { 1 },
+            block_hash: Hash::default(), // Will be computed
+            selected_parent_hash: selected_parent,
+            merge_parent_hashes: merge_parents,
+            // r1007 G9: the first second of this block's slot, already clamped
+            // to the PBA-L1b-003 bounds by `round_slot` (never before the
+            // selected parent, never past the parent-relative bound).
+            timestamp: block_timestamp,
+            height: next_height,
+            blue_score,
+            blue_work,
+            pruning_point,
+            proposer_pubkey,
+            vrf_reveal,
+            // The §R' import rule requires the canonical base fee; the former inline
+            // "EIP-1559" computation used constant inputs (parent gas used = 0) and
+            // always evaluated to exactly this value.
+            base_fee_per_gas: citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
+            // r1007 S3-3b: the cumulative gas of the accepted mergeset (set
+            // below) under the per-accepting-block budget (spec 06 §3.6).
+            gas_used: 0,
+            gas_limit: citrate_consensus::acceptance::ACCEPT_GAS_LIMIT,
+            // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
+            // Hashed only for v2 (see compute_hash); harmless for v1.
+            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0u8; 20]),
+        };
+
+        // VALIDATOR-S1 §R': base fee is a REROLL CONSTANT under v2. The dynamic
+        // EIP-1559 block above already evaluates to exactly this (it never loads
+        // parent_gas_used), but pin it explicitly so the committed value is
+        // unambiguous and the importer's base-fee check (`settle_block_rewards`) is
+        // exact. See core/execution/src/block_rewards.rs::CANONICAL_BASE_FEE_PER_GAS.
+        if self.emit_v2_headers {
+            header.base_fee_per_gas = citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS;
+        }
+
+        // r1007 S3-3b (ADR CV-4a, spec 06 §3.1/§3.9): this block ACCEPTS its
+        // mergeset. Its header commits the result of executing Mergeset(B)
+        // (SP first, then Mergeset*(B) ascending by key) on post(SP), which is
+        // the state this node holds (MP-S1: SP == applied tip). Its OWN
+        // transactions are not executed now: the chain block that accepts B
+        // runs them. `execute_mergeset` sets the EVM block context (NUMBER /
+        // TIMESTAMP / COINBASE / PREVRANDAO of B, spec 06 §3.7) and settles
+        // emission and fees per recipient block, through the SAME function
+        // every applier runs.
+        let members = crate::mergeset::accepted_members(
+            &self.storage,
+            Some(&self.ghostdag),
+            &header,
+            ghostdag_data.as_ref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("mergeset of the block on {selected_parent}: {e}"))?;
+        let block_hashes = self
+            .recent_chain
+            .block_hashes(
+                &self.storage,
+                selected_parent,
+                next_height.saturating_sub(1),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let calc = &self.reward_calculator;
+        let emission =
+            |height: u64,
+             txs: &[Transaction],
+             receipts: &[citrate_execution::types::TransactionReceipt]| {
+                crate::canonical_apply::canonical_emission(calc, height, txs, receipts)
+            };
+        let mut accepted = self
+            .executor
+            .execute_mergeset(
+                &header,
+                &crate::mergeset::as_accepted(&members),
+                &emission,
+                block_hashes,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("mergeset execution failed: {e}"))?;
+        header.gas_used = accepted.gas_used;
+
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
         // Producer-side panic breaker: skip quarantined transactions and, after
         // a panicking round, narrow the candidates to find the culprit.
         let transactions = self.panic_breaker.lock().filter(transactions);
-
-        // Every executor mutation below is rolled back if the round ends
-        // before its state is persisted (error or panic), so a failed round
-        // never leaves the executor ahead of the applied tip.
-        let round_state = self.executor.begin_production_round();
 
         // VALIDATOR-S1 §R': under v2 (execute-on-receive), exclude EIP-1559-invalid
         // txs (`gas_price < canonical base fee`) so a produced block never trips the
@@ -3285,161 +3379,25 @@ impl BlockProducer {
             transactions
         };
 
-        // Create block header with GhostDAG consensus data.
-        // EXECUTE-ON-RECEIVE: v2 headers commit the coinbase (reroll flag); v1 keep legacy hashing.
-        let mut header = BlockHeader {
-            version: if self.emit_v2_headers { 2 } else { 1 },
-            block_hash: Hash::default(), // Will be computed
-            selected_parent_hash: selected_parent,
-            merge_parent_hashes: merge_parents,
-            // r1007 G9: the first second of this block's slot, already clamped
-            // to the PBA-L1b-003 bounds by `round_slot` (never before the
-            // selected parent, never past the parent-relative bound).
-            timestamp: block_timestamp,
-            height: next_height,
-            blue_score,
-            blue_work,
-            pruning_point,
-            proposer_pubkey,
-            vrf_reveal,
-            // The §R' import rule requires the canonical base fee; the former inline
-            // "EIP-1559" computation used constant inputs (parent gas used = 0) and
-            // always evaluated to exactly this value.
-            base_fee_per_gas: citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
-            gas_used: 0,           // Will be updated after execution
-            gas_limit: 30_000_000, // 30M gas default
-            // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
-            // Hashed only for v2 (see compute_hash); harmless for v1.
-            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0u8; 20]),
-        };
-
-        // VALIDATOR-S1 §R': base fee is a REROLL CONSTANT under v2. The dynamic
-        // EIP-1559 block above already evaluates to exactly this (it never loads
-        // parent_gas_used), but pin it explicitly so the committed value is
-        // unambiguous and the importer's base-fee check (`settle_block_rewards`) is
-        // exact. See core/execution/src/block_rewards.rs::CANONICAL_BASE_FEE_PER_GAS.
-        if self.emit_v2_headers {
-            header.base_fee_per_gas = citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS;
-        }
-
-        // WP-Z.3 / PIN-P1(d): Set block context with the consensus ECVRF
-        // randomness before executing transactions. `header.vrf_reveal.output`
-        // is the RFC 9381 ECVRF beacon for THIS block (`core/consensus/src/vrf.rs`),
-        // and feeding it here is what makes the standard EVM `block.prevrandao`
-        // opcode (0x44) return real consensus randomness in Solidity instead of
-        // the all-zeros default.
-        //
-        // Semantics: this exposes this block's OWN randomness. That is the
-        // idiomatic `block.prevrandao` contract — but a value derived from the
-        // block currently producing it is inherently grindable by the proposer.
-        // Grind-resistant challenge selection (committing now, then reading a
-        // FINALIZED/future block's prevrandao when the challenge resolves) is the
-        // CONSUMER CONTRACT's responsibility (PIN `IPFSIncentives v2`, step (e)).
-        // We intentionally do NOT attempt to solve finality at the VM layer.
-        self.executor.set_block_context(BlockContext {
-            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0; 20]),
-            prevrandao: *header.vrf_reveal.output.as_bytes(),
-            block_hashes: HashMap::new(),
-        });
-
-        // Execute transactions (state root computed after rewards below)
-        let (_pre_reward_root, executed_transactions, mut receipts) = self
-            .execute_block_transactions(&transactions, &header)
-            .await?;
+        // The block's own list, class-A clean (spec 06 §3.4): pre-checked
+        // against post(B) by the selection above (nonce and balance per
+        // sender), within INCLUDE_GAS_LIMIT by declared gas and the
+        // count/byte caps, so its chain child will execute it.
+        let executed_transactions = self.pack_own_transactions(&transactions);
         #[cfg(test)]
         self.inject_test_fault(&executed_transactions)?;
-        let total_gas_used: u64 = receipts.iter().map(|receipt| receipt.gas_used).sum();
-        header.gas_used = total_gas_used;
 
         let tx_root = self.calculate_tx_root(header.height, &executed_transactions);
-        let receipt_root = self.calculate_receipt_root(&receipts)?;
         let artifact_root = self.calculate_artifact_root(&executed_transactions)?;
-
-        // Apply block rewards BEFORE computing the final state root.
-        // Rewards modify the executor's in-memory state, so state_root must
-        // be computed after this step to include reward balances.
-        let validator_address =
-            citrate_execution::types::Address(self.coinbase.0[0..20].try_into().unwrap_or([0; 20]));
-
-        // SRP-S2 (reward/re-apply state-root purity — ADR-2026-07-21-reapply-reward-purity):
-        // the block reward MUST be a pure function of COMMITTED state, settled through the
-        // ONE shared `Executor::settle_block_rewards` path that the receiver / cold-sync /
-        // restart / reorg roles also use — so producer and receiver credit byte-identical
-        // state and the reward-settled root is reproducible on every node.
-        //
-        // The former node-local "enhanced" reward path (economics staking bonus, f64
-        // reputation, dynamic pricing credited straight to the validator, no treasury, no
-        // §R') was REMOVED here: it read non-consensus state a receiver can never reproduce
-        // and, whenever it was selected (it was gated on the transient `emit_v2_headers`
-        // flag), it poisoned the produced block — the block-2209 split-brain. `use_enhanced`
-        // and the enhanced branch are gone; block rewards NEVER read `economics_manager`.
-        // (economics_manager remains for RPC/telemetry only.)
-        //
-        // The reward reads only header.height, the transactions and (at/after the
-        // supply-hardening height) their executed `receipts` — never state_root — so
-        // this temp block is a safe reward-input carrier. `canonical_block_reward` is
-        // the same rule selection every receive path applies.
-        let temp_block = BlockBuilder::new()
-            .header(header.clone())
-            .tx_root(tx_root)
-            .receipt_root(receipt_root)
-            .artifact_root(artifact_root)
-            .ghostdag_params(self.ghostdag.params().clone())
-            .transactions(executed_transactions.clone())
-            .build_unhashed();
-        // PANIC-S1 D3: an uncomputable reward rejects the block (never panics/saturates).
-        let reward = crate::canonical_apply::canonical_block_reward(
-            &self.reward_calculator,
-            &temp_block,
-            &receipts,
-        )
-        .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
-        // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
-        // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
-        // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
-        // the basic reward; at/above it, §R' vests the priority-fee share on top.
-        let basic_credits = [
-            (validator_address, reward.validator_reward),
-            (
-                citrate_execution::types::Address([0x11; 20]),
-                reward.treasury_reward,
-            ),
-        ];
-        // Use the GUARDED settle: the producer calls settle WITHOUT the
-        // snapshot/restore that the receiver's `apply_block_inner` wraps it in,
-        // so a settle error (e.g. the absent-proposer reject arm, which fires
-        // AFTER step 1's basic credits are applied) would otherwise leak stray
-        // credits into shared state — and, since production runs with eager
-        // persistence, into the durable store. `settle_block_rewards_guarded`
-        // engages the persistence-defer guard + snapshots world state, so ANY
-        // error leaves both memory and store byte-identical; on success the
-        // credits stay dirty and are persisted by `persist_state_changes` below.
-        //
-        // SRP-S2 hard-fail: a producer that cannot settle from committed state produces
-        // NO block (the `?` aborts production) rather than a poisoned one — it can never
-        // silently diverge onto a node-local reward.
-        self.executor
-            .settle_block_rewards_guarded(
-                header.height,
-                header.coinbase,
-                *header.proposer_pubkey.as_bytes(),
-                header.base_fee_per_gas,
-                &executed_transactions,
-                &receipts,
-                &basic_credits,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("VALIDATOR-S1 §R' reward settlement failed: {e}"))?;
-
-        // NOW compute final state root — includes both tx effects and reward balances
-        let state_root = self.executor.calculate_state_root();
+        let state_root = accepted.state_root;
 
         // Create block with all computed data (hash + signature placeholders — computed next)
         let mut block = BlockBuilder::new()
             .header(header.clone())
             .state_root(state_root)
             .tx_root(tx_root)
-            .receipt_root(receipt_root)
+            .receipt_root(accepted.receipt_root)
+            .accepted_root(accepted.accepted_root)
             .artifact_root(artifact_root)
             .ghostdag_params(self.ghostdag.params().clone())
             .transactions(executed_transactions)
@@ -3469,10 +3427,7 @@ impl BlockProducer {
         // This must happen AFTER execution AND rewards so state_root is final.
         block.header.block_hash = block.compute_hash();
 
-        for receipt in &mut receipts {
-            receipt.block_hash = block.header.block_hash;
-            receipt.block_number = block.header.height;
-        }
+        accepted.stamp(block.header.block_hash, block.header.height);
 
         // WP-G.2: Sign the canonical block hash with the proposer's ed25519 key.
         // r1007 G10: record the slot first, so no later round signs another
@@ -3580,7 +3535,10 @@ impl BlockProducer {
             .executor
             .persist_state_changes_with_undo(
                 Some((block.header.block_hash, block.header.height)),
-                &citrate_execution::executor::ReceiptIndexBatch::default(),
+                // The receipts of the txs this block executed, under it.
+                &citrate_execution::executor::ReceiptIndexBatch::for_accepting_block(
+                    &block, &accepted,
+                ),
                 models_jobs.as_ref(),
             )
             .await?;
@@ -3621,31 +3579,52 @@ impl BlockProducer {
             });
         }
 
-        // Store transactions and receipts for RPC visibility
+        // r1007 S3-3b: the txs this block executed left the pool whichever
+        // block included them; skipped occurrences are offered back (a nonce
+        // gap or the gas budget can make them valid later).
+        for tx in &accepted.executed {
+            let _ = self.mempool.remove_included(&tx.hash).await;
+        }
+        let skipped: Vec<Transaction> = {
+            let executed: std::collections::HashSet<Hash> =
+                accepted.executed.iter().map(|t| t.hash).collect();
+            let skip_hashes: std::collections::HashSet<Hash> = accepted
+                .occurrences
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o.outcome,
+                        citrate_execution::acceptance::OccurrenceOutcome::Skipped(r)
+                            if r != citrate_execution::acceptance::SkipReason::Invalid
+                    )
+                })
+                .map(|o| o.tx_hash)
+                .collect();
+            members
+                .iter()
+                .flat_map(|(b, _)| b.transactions.iter())
+                .filter(|t| skip_hashes.contains(&t.hash) && !executed.contains(&t.hash))
+                .cloned()
+                .collect()
+        };
+        if !skipped.is_empty() {
+            let _ = self.mempool.reinject_transactions(skipped).await;
+        }
+
+        // Store this block's own transactions for RPC visibility: included,
+        // not yet executed (no receipt until its chain child accepts it).
         if !block.transactions.is_empty() {
-            // Store transactions
             self.storage
                 .transactions
                 .put_transactions(&block.transactions)?;
 
-            // Pair tx hashes with receipts and store
-            let pairs: Vec<(Hash, citrate_execution::types::TransactionReceipt)> = block
-                .transactions
-                .iter()
-                .zip(receipts.iter())
-                .map(|(tx, receipt)| (tx.hash, receipt.clone()))
-                .collect();
-            if !pairs.is_empty() {
-                self.storage.transactions.put_receipts(&pairs)?;
-            }
-
-            // Remove included transactions from mempool. Not evicted: if this
-            // block loses the slot the txs must be able to come back (the
-            // applicator re-injects them on the reorg; a wallet resend is
-            // accepted too). See `Mempool::remove_included`.
-            for tx in &block.transactions {
-                let _ = self.mempool.remove_included(&tx.hash).await;
-            }
+            // r1007 S3-3b: the block's own txs stay in the pool until a block
+            // that accepts them EXECUTES them (removed above, and by the
+            // applicator on every node). Until then neither the state nonce nor
+            // the pool would otherwise account for them, and a wallet asking
+            // for its `pending` nonce would be handed one already in use. The
+            // next block's selection, pre-checked against its post-state, never
+            // re-includes them once they have run.
 
             // Sprint EL-1 (Issue #20): Reconcile nonce map after removing
             // executed transactions. This ensures that if any txs were removed
@@ -4171,93 +4150,56 @@ impl BlockProducer {
         Ok(selected)
     }
 
-    /// Execute all transactions in a block
-    async fn execute_block_transactions(
-        &self,
-        transactions: &[Transaction],
-        header: &BlockHeader,
-    ) -> anyhow::Result<(
-        Hash,
-        Vec<Transaction>,
-        Vec<citrate_execution::types::TransactionReceipt>,
-    )> {
-        let mut executed_transactions = Vec::new();
-        let mut receipts = Vec::new();
-
-        // Create a temporary block for execution context
-        let temp_block = BlockBuilder::new()
-            .header(header.clone())
-            .ghostdag_params(self.ghostdag.params().clone())
-            .build_unhashed();
-
-        // PBA-L1a-004: meter ACTUAL gas. A candidate is admitted when its
-        // declared gas_limit fits what is left of the block; after it runs the
-        // meter is charged only what it used, so the rest of the block stays
-        // available. A deferred sender's later nonces are deferred with it
-        // (they would fail on the nonce gap otherwise) and stay in the mempool.
-        let mut meter = BlockGasMeter::new(PRODUCER_BLOCK_GAS_LIMIT);
-        let mut deferred_senders: std::collections::HashSet<PublicKey> =
+    /// r1007 S3-3b (spec 06 §3.4 class A, §9.3): the block's OWN list from the
+    /// selected candidates, which were pre-checked against post(B) (nonce and
+    /// balance per sender, `select_transactions_with_ai_priority` runs after
+    /// the mergeset execution). Nothing is executed here: B's chain child
+    /// executes B's list. The list fits INCLUDE_GAS_LIMIT by DECLARED gas (the
+    /// stateless rule every importer checks), the count and byte caps, and
+    /// repeats no tx hash and no (sender, nonce). A sender whose next
+    /// candidate does not fit is deferred with all its later nonces (they
+    /// would be skipped on the nonce gap) and stays in the pool.
+    fn pack_own_transactions(&self, candidates: &[Transaction]) -> Vec<Transaction> {
+        let mut out = Vec::new();
+        let mut declared: u64 = 0;
+        let mut deferred: std::collections::HashSet<PublicKey> = std::collections::HashSet::new();
+        let mut hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        let mut sender_nonces: std::collections::HashSet<(PublicKey, u64)> =
             std::collections::HashSet::new();
-        // Count and byte caps over EXECUTED transactions only.
-        let mut executed_window = CandidateWindow::new(MAX_BLOCK_TXS, MAX_BLOCK_BYTES, usize::MAX);
-
-        // Execute candidates in order. A candidate that does not fit what is
-        // left of the block is skipped (its sender's later nonces with it) and
-        // the next is tried, until the block is full.
-        for tx in transactions.iter().take(MAX_BLOCK_CANDIDATES) {
-            if executed_window.is_full() || !meter.fits(MIN_TX_GAS) {
+        let mut window = CandidateWindow::new(MAX_BLOCK_TXS, MAX_BLOCK_BYTES, usize::MAX);
+        for tx in candidates.iter().take(MAX_BLOCK_CANDIDATES) {
+            if window.is_full() {
                 break;
             }
-            if deferred_senders.contains(&tx.from)
-                || !meter.fits(tx.gas_limit)
-                || !executed_window.fits(tx)
+            if deferred.contains(&tx.from)
+                || hashes.contains(&tx.hash)
+                || sender_nonces.contains(&(tx.from, tx.nonce))
+                || !window.fits(tx)
             {
-                deferred_senders.insert(tx.from);
+                deferred.insert(tx.from);
                 continue;
             }
-            match self.executor.execute_transaction(&temp_block, tx).await {
-                Ok(receipt) => {
-                    // A failed transaction is charged its whole declared
-                    // gas (as the sender is); a successful one its use.
-                    meter.charge(if receipt.status {
-                        receipt.gas_used.min(tx.gas_limit)
-                    } else {
-                        tx.gas_limit
-                    });
-                    executed_window.record(tx);
-                    executed_transactions.push(tx.clone());
-                    receipts.push(receipt);
+            match declared.checked_add(tx.gas_limit) {
+                Some(next) if next <= citrate_consensus::acceptance::INCLUDE_GAS_LIMIT => {
+                    declared = next;
                 }
-                Err(e) => {
-                    error!("Failed to execute transaction {}: {}", tx.hash, e);
-
-                    // Sprint EL-1 (Issue #20): Remove failed tx from mempool
-                    // so the sender's nonce is not permanently blocked.
-                    let _ = self.mempool.remove_transaction(&tx.hash).await;
-                    // PBA-L1a-004: a failure before any receipt costs the
-                    // sender nothing on chain, so refuse the sender for a
-                    // while (mempool policy only; block validity unchanged).
-                    self.mempool
-                        .ban_sender(&tx.from, PRE_RECEIPT_FAILURE_BAN)
-                        .await;
-                    deferred_senders.insert(tx.from);
+                _ => {
+                    deferred.insert(tx.from);
+                    continue;
                 }
             }
+            window.record(tx);
+            hashes.insert(tx.hash);
+            sender_nonces.insert((tx.from, tx.nonce));
+            out.push(tx.clone());
         }
-
         debug!(
-            "executed {} txs using {} block gas ({} senders deferred)",
-            executed_transactions.len(),
-            meter.used(),
-            deferred_senders.len()
+            "packed {} own txs declaring {} gas ({} senders deferred)",
+            out.len(),
+            declared,
+            deferred.len()
         );
-
-        // WP-G.4: Compute state root from the executor's in-memory post-execution state.
-        // This uses the state trie that has been updated by transaction execution,
-        // NOT the storage-backed view which still reflects the previous block.
-        let state_root = self.executor.calculate_state_root();
-
-        Ok((state_root, executed_transactions, receipts))
+        out
     }
 
     /// Calculate transaction root. PBA-L1b-002: from the activation height the
@@ -4269,24 +4211,6 @@ impl BlockProducer {
             height,
             transactions,
         )
-    }
-
-    /// Calculate receipt root
-    fn calculate_receipt_root(
-        &self,
-        receipts: &[citrate_execution::types::TransactionReceipt],
-    ) -> anyhow::Result<Hash> {
-        use sha3::{Digest, Sha3_256};
-        let mut hasher = Sha3_256::new();
-
-        for receipt in receipts {
-            hasher.update(receipt.tx_hash.as_bytes());
-            hasher.update([if receipt.status { 1 } else { 0 }]);
-            hasher.update(receipt.gas_used.to_le_bytes());
-        }
-
-        let hash_array: [u8; 32] = hasher.finalize().into();
-        Ok(Hash::new(hash_array))
     }
 
     /// Calculate artifact root for AI models
@@ -4551,8 +4475,9 @@ impl BlockProducer {
 /// stop), (b) its nonce is the sender's next nonce against state (tracking the
 /// candidates already admitted from that sender), and (c) the sender's balance,
 /// net of the candidates already admitted, covers `gas_limit * gas_price + value`.
-/// Block gas itself is metered on actual use by [`BlockGasMeter`] during
-/// execution, so declared-but-unused gas never holds block space.
+/// r1007 S3-3b: the block's own list is then packed by DECLARED gas within
+/// INCLUDE_GAS_LIMIT (`pack_own_transactions`, the class-A rule importers
+/// check); it is executed by the block's chain child.
 /// Block gas limit the producer fills to (the chain's genesis constant).
 pub(crate) const PRODUCER_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
@@ -4566,15 +4491,8 @@ pub(crate) const MAX_BLOCK_BYTES: usize = 1_000_000;
 /// for a large pool).
 pub(crate) const MAX_BLOCK_CANDIDATES: usize = 20_000;
 
-/// No transaction runs on less gas than this (intrinsic transfer cost).
-pub(crate) const MIN_TX_GAS: u64 = 21_000;
-
 /// PBA-L1a-004: most transactions one sender may place in one block.
 pub(crate) const MAX_TXS_PER_SENDER_PER_BLOCK: usize = 64;
-
-/// PBA-L1a-004: how long a sender is refused after a transaction of theirs
-/// fails before a receipt exists.
-pub(crate) const PRE_RECEIPT_FAILURE_BAN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// PBA-L1a-004: count / byte / per-sender caps over ADMITTED candidates.
 pub(crate) struct CandidateWindow {
@@ -4620,32 +4538,6 @@ impl CandidateWindow {
 
 /// AI operations may declare at most a third of the block's gas.
 pub(crate) const MAX_AI_GAS_PER_BLOCK: u64 = PRODUCER_BLOCK_GAS_LIMIT / 3;
-
-/// PBA-L1a-004: block gas metered on ACTUAL use, like geth's gas pool.
-pub(crate) struct BlockGasMeter {
-    limit: u64,
-    used: u64,
-}
-
-impl BlockGasMeter {
-    pub(crate) fn new(limit: u64) -> Self {
-        Self { limit, used: 0 }
-    }
-
-    /// Whether a transaction declaring `gas_limit` may still run.
-    pub(crate) fn fits(&self, gas_limit: u64) -> bool {
-        gas_limit <= self.limit.saturating_sub(self.used)
-    }
-
-    /// Charge what a transaction actually used.
-    pub(crate) fn charge(&mut self, gas_used: u64) {
-        self.used = self.used.saturating_add(gas_used).min(self.limit);
-    }
-
-    pub(crate) fn used(&self) -> u64 {
-        self.used
-    }
-}
 
 /// PBA-N9 (security#134): the outcome of considering a candidate for selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5327,22 +5219,6 @@ mod tests {
         assert_eq!(MAX_AI_GAS_PER_BLOCK, 10_000_000);
     }
 
-    /// Block gas meter: admission against what is left, charge on actual use.
-    #[test]
-    fn producer_block_gas_meter_charges_actual_use() {
-        let mut m = BlockGasMeter::new(30_000_000);
-        assert!(m.fits(30_000_000));
-        assert!(!m.fits(30_000_001));
-        m.charge(700);
-        assert_eq!(m.used(), 700);
-        assert!(m.fits(29_999_300));
-        assert!(!m.fits(29_999_301));
-        m.charge(u64::MAX);
-        assert_eq!(m.used(), 30_000_000, "saturates at the limit");
-        assert!(m.fits(0));
-        assert!(!m.fits(1));
-    }
-
     /// Produce a real block from a funded high-declared-gas candidate plus a
     /// normal transfer; returns (transfer included, filler included).
     async fn producer_budget_case(filler_data: Vec<u8>, filler_price: u64) -> (bool, bool) {
@@ -5411,12 +5287,21 @@ mod tests {
         )
     }
 
-    /// PBA-L1a-004: declared-but-unused gas does not hold block space.
+    /// r1007 S3-3b (spec 06 §3.4 class A, §3.6): a block's own list is bounded
+    /// by DECLARED gas (Σ gas_limit ≤ INCLUDE_GAS_LIMIT), the stateless rule
+    /// every importer checks, because the producer no longer executes its own
+    /// list. The higher-fee filler declaring 29.99M is in; the transfer that
+    /// would take the declared sum past 30M waits for the next block. (This
+    /// replaces PBA-L1a-004's refill-after-actual-use, which needs execution
+    /// at seal time; see the spec finding on declared-gas block stuffing.)
     #[tokio::test]
     async fn producer_budget_refill_standard_candidate() {
         let (transfer_in, filler_in) = producer_budget_case(vec![], 101_000_000_000).await;
         assert!(filler_in, "the higher-fee candidate runs first");
-        assert!(transfer_in, "the block is refilled after actual gas use");
+        assert!(
+            !transfer_in,
+            "declared gas counts: the transfer would exceed INCLUDE_GAS_LIMIT"
+        );
     }
 
     /// PBA-L1a-004: a payload the executor runs as a plain call is not treated
@@ -5771,11 +5656,22 @@ mod tests {
         let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
-        assert!(
-            block.transactions.iter().any(|t| t.hash == honest_tx.hash),
-            "a transaction that fits the remaining gas is included"
+        // r1007 S3-3b (spec 06 §3.4 class A): the own list is bounded by
+        // DECLARED gas. The top filler declares the whole INCLUDE_GAS_LIMIT,
+        // so nothing else fits this block, the honest transfer included; the
+        // list never exceeds the limit (see the spec finding on declared-gas
+        // block stuffing, which this rule reopens against PBA-L1a-004).
+        let declared: u64 = block.transactions.iter().map(|t| t.gas_limit).sum();
+        assert!(declared <= citrate_consensus::acceptance::INCLUDE_GAS_LIMIT);
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "one 30M-declared filler fills it"
         );
-        assert!(block.header.gas_used <= PRODUCER_BLOCK_GAS_LIMIT);
+        assert!(
+            !block.transactions.iter().any(|t| t.hash == honest_tx.hash),
+            "the honest transfer does not fit the declared-gas limit"
+        );
     }
 
     /// A transaction that fails after a receipt exists pays for its whole
@@ -5995,7 +5891,9 @@ mod tests {
             "Only executed txs should be included"
         );
         assert_eq!(block.transactions[0].hash, good_tx.hash);
-        assert_eq!(block.header.gas_used, 21_000);
+        // r1007 S3-3b: the header commits the gas of its accepted mergeset
+        // (genesis carries nothing); its own tx runs in the next block.
+        assert_eq!(block.header.gas_used, 0);
         // PBA-L1b-002: the sealed root is the consensus rule's root for this
         // block (kills `calculate_tx_root -> Default::default()`).
         assert_eq!(
@@ -6008,13 +5906,21 @@ mod tests {
         );
         assert_ne!(block.tx_root, Hash::default());
 
+        assert!(storage
+            .transactions
+            .get_receipt(&good_tx.hash)
+            .unwrap()
+            .is_none());
+        let accepting_hash = producer.produce_block().await.unwrap();
+        let accepting = storage.blocks.get_block(&accepting_hash).unwrap().unwrap();
+        assert_eq!(accepting.header.gas_used, 21_000);
         let good_receipt = storage
             .transactions
             .get_receipt(&good_tx.hash)
             .unwrap()
             .expect("receipt for executed tx");
-        assert_eq!(good_receipt.block_hash, block_hash);
-        assert_eq!(good_receipt.block_number, block.header.height);
+        assert_eq!(good_receipt.block_hash, accepting_hash);
+        assert_eq!(good_receipt.block_number, accepting.header.height);
         assert!(good_receipt.status);
         assert_eq!(good_receipt.gas_used, 21_000);
 
@@ -6150,40 +6056,62 @@ mod tests {
             "canonical base fee (importer base-fee check must pass)"
         );
 
+        // r1007 S3-3b: block 1 accepts nothing rewarded (its parent is the
+        // zero hash); block 2 accepts block 1 and pays its coinbase R(2).
+        let block2_hash = producer.produce_block().await.expect("produce block 2");
+        let sealed2 = storage
+            .blocks
+            .get_block(&block2_hash)
+            .expect("read block")
+            .expect("block present");
+        assert_eq!(sealed2.header.selected_parent_hash, block_hash);
+
         // ── Receiver: independent executor, byte-identical genesis + policy, applying
-        //    the sealed block through the canonical committed-state reward path. ──
+        //    the sealed blocks through the canonical committed-state reward path. ──
         let receiver = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
         *receiver.reward_policy_handle().write() = Some(mk_policy());
         receiver.set_validator_activation_height(0);
         let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
             .calculate_reward(&sealed)
             .expect("canonical reward");
-        let basic_credits = [
-            (Address(sealed.header.coinbase), reward.validator_reward),
-            (Address(TREASURY), reward.treasury_reward),
-        ];
-
-        let got = receiver
-            .apply_block(
-                &sealed,
-                sealed.header.coinbase,
-                &citrate_execution::executor::fixed_reward(&basic_credits),
-            )
+        let calc = RewardCalculator::new(crate::canonical_apply::canonical_reward_config());
+        let emission =
+            |h: u64, t: &[Transaction], r: &[citrate_execution::types::TransactionReceipt]| {
+                crate::canonical_apply::canonical_emission(&calc, h, t, r)
+            };
+        let invariant =
+            "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
+                 canonical committed-state reward path MUST reproduce its state root (the \
+                 block-2209 split-brain was a node-local reward no receiver could reproduce).";
+        let (got, _) = receiver
+            .apply_accepting_block(&sealed, &[], &emission, Default::default(), false, true)
             .await
-            .expect(
-                "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
-                 canonical committed-state reward path MUST reproduce its state root. On `main` \
-                 the producer takes the node-local ENHANCED path (producer.rs `use_enhanced`), \
-                 crediting a reward no receiver can reproduce → StateRootMismatch → the block-2209 \
-                 split-brain.",
-            );
+            .expect(invariant);
         assert_eq!(
             got, sealed.state_root,
             "receiver's committed-state root MUST equal the producer's sealed root"
         );
+        let members = [citrate_execution::acceptance::AcceptedBlock {
+            block: &sealed,
+            color: citrate_consensus::acceptance::InclusionColor::SelectedParent,
+        }];
+        let (got2, _) = receiver
+            .apply_accepting_block(
+                &sealed2,
+                &members,
+                &emission,
+                [(sealed.header.height, *sealed.header.block_hash.as_bytes())]
+                    .into_iter()
+                    .collect(),
+                false,
+                true,
+            )
+            .await
+            .expect(invariant);
+        assert_eq!(got2, sealed2.state_root);
 
         // And the committed reward MUST be the canonical basic block reward (9 SALT to the
-        // validator, 1 SALT to treasury) — not the enhanced 0.01-SALT node-local credit.
+        // validator, 1 SALT to treasury per block) — not the enhanced node-local credit.
         assert_eq!(
             receiver.get_balance(&Address(VALIDATOR)),
             reward.validator_reward,
@@ -6191,8 +6119,8 @@ mod tests {
         );
         assert_eq!(
             receiver.get_balance(&Address(TREASURY)),
-            reward.treasury_reward,
-            "treasury must hold exactly the canonical treasury slice"
+            reward.treasury_reward * U256::from(2u64),
+            "treasury must hold exactly the canonical treasury slice of each block"
         );
     }
 
@@ -7215,15 +7143,32 @@ mod tests {
             .expect("read block")
             .expect("sealed block");
         assert_eq!(block.transactions.len(), 1);
+        // r1007 S3-3b: the tx runs when the next block accepts `block`; the
+        // receipt is stamped with that accepting block.
+        assert!(p_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .is_none());
+        let accepting = producer
+            .produce_block()
+            .await
+            .expect("produce the accepting block");
+        let acc_block = p_storage
+            .blocks
+            .get_block(&accepting)
+            .expect("read block")
+            .expect("sealed block");
+        let hash = accepting;
 
-        // Producer side: unchanged — its own receipt, stamped with the sealed block.
+        // Producer side: its receipt, stamped with the accepting block.
         let p_receipt = p_storage
             .transactions
             .get_receipt(&tx.hash)
             .expect("read")
             .expect("producer stored its receipt");
         assert_eq!(p_receipt.block_hash, hash);
-        assert_eq!(p_receipt.block_number, block.header.height);
+        assert_eq!(p_receipt.block_number, acc_block.header.height);
 
         // Follower: the real receive path (persist, DAG admit, apply).
         assert!(f_storage
@@ -7231,13 +7176,15 @@ mod tests {
             .get_receipt(&tx.hash)
             .expect("read")
             .is_none());
-        f_storage.blocks.put_block(&block).expect("persist");
-        f_dag.store_block(block.clone()).await.expect("dag");
-        f_ghostdag.add_block(&block).await.expect("ghostdag");
-        assert!(matches!(
-            f_app.apply_received(&block).await,
-            ApplyOutcome::Applied { .. }
-        ));
+        for b in [&block, &acc_block] {
+            f_storage.blocks.put_block(b).expect("persist");
+            f_dag.store_block(b.clone()).await.expect("dag");
+            f_ghostdag.add_block(b).await.expect("ghostdag");
+            assert!(matches!(
+                f_app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
 
         let f_receipt = f_storage
             .transactions
@@ -10218,7 +10165,11 @@ mod pba_l1b_001_producer_filter {
         let sel = src
             .find("let transactions = self.select_transactions_with_ai_priority().await?;")
             .expect("selection");
-        let hdr = src.find("let mut header = BlockHeader {").expect("header");
+        // r1007 S3-3b: selection runs after the mergeset execution (it is
+        // pre-checked against post(B)); the own list is fixed by the packing.
+        let hdr = src
+            .find("let executed_transactions = self.pack_own_transactions(&transactions);")
+            .expect("packing");
         let window = &src[sel..hdr];
         assert!(
             window.contains("tx_auth::verify_for_block(&t, chain_id)"),
@@ -10695,6 +10646,8 @@ mod producer_panic_breaker {
             }
         }
         assert!(mined, "the transaction is mined once the fault clears");
+        // r1007 S3-3b: the block that included it is accepted by the next.
+        assert!(matches!(n.round().await, RoundOutcome::Produced(_)));
         assert_eq!(
             n.executor.get_balance(&RECIPIENT),
             to_before + U256::from(5u64),

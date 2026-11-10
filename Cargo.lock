@@ -1528,6 +1528,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "citrate-mergeset-ref"
+version = "0.4.0"
+dependencies = [
+ "citrate-consensus",
+ "citrate-economics",
+ "citrate-execution",
+ "hex",
+ "primitive-types",
+ "revm",
+ "serde",
+ "serde_json",
+ "sha3 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "citrate-network"
 version = "0.4.0"
 dependencies = [
@@ -1577,6 +1593,7 @@ dependencies = [
  "citrate-execution",
  "citrate-learning",
  "citrate-mcp",
+ "citrate-mergeset-ref",
  "citrate-network",
  "citrate-replay-ref",
  "citrate-sequencer",
@@ -1628,6 +1645,7 @@ dependencies = [
  "citrate-consensus",
  "citrate-economics",
  "citrate-execution",
+ "citrate-mergeset-ref",
  "citrate-storage",
  "flate2",
  "hex",

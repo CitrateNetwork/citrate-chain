@@ -183,7 +183,11 @@ pub fn merge_depth_activation_height() -> u64 {
 /// it keeps every block.
 const MAX_GHOSTDAG_CACHE_ENTRIES: usize = 65_536;
 
-/// GhostDAG consensus engine
+/// Bound on the selected-chain walk from a disqualified tip to its first
+/// qualified ancestor (spec 06 §3.10). A disqualified run is as long as the
+/// branch built on a bad block; past this bound the tip is not a candidate.
+const MAX_DISQUALIFIED_WALK: u32 = 100_000;
+
 /// Where the G11 pruning-point walk reads a selected-chain header that the
 /// DAG store no longer holds (spec 06 §2 G11, CV-7a).
 ///
@@ -200,6 +204,7 @@ pub trait AncestryHeaders: Send + Sync {
     fn header(&self, hash: &Hash) -> Option<BlockHeader>;
 }
 
+/// GhostDAG consensus engine
 pub struct GhostDag {
     /// Consensus parameters
     params: GhostDagParams,
@@ -1292,6 +1297,97 @@ impl GhostDag {
             tips.remove(merge_parent);
         }
         tips.insert(block.hash());
+        drop(tips);
+
+        // Spec 06 §3.10: a block whose selected parent is disqualified from
+        // the chain is disqualified with it (it is still a DAG block).
+        if !block.is_genesis() && self.dag_store.is_disqualified(&block.selected_parent()) {
+            self.dag_store.mark_disqualified(&block.hash());
+        }
+    }
+
+    /// Spec 06 §3.10 (D11): whether `hash` is disqualified from the selected
+    /// chain (persisted with the DAG store).
+    pub fn is_disqualified(&self, hash: &Hash) -> bool {
+        self.dag_store.is_disqualified(hash)
+    }
+
+    /// Spec 06 §3.10 (D11): disqualify `hash` from the selected chain (its
+    /// commitments did not reproduce when the applied chain reached it), and
+    /// every held block whose selected chain passes through it. The block
+    /// stays in the DAG: it can still be merged, never be a chain block.
+    pub async fn disqualify(&self, hash: &Hash) {
+        let mut queue = vec![*hash];
+        while let Some(h) = queue.pop() {
+            if self.dag_store.is_disqualified(&h) && h != *hash {
+                continue;
+            }
+            self.dag_store.mark_disqualified(&h);
+            let mut children: HashSet<Hash> = self
+                .relations
+                .read()
+                .await
+                .get(&h)
+                .map(|r| r.children.iter().copied().collect())
+                .unwrap_or_default();
+            children.extend(self.dag_store.get_children(&h).await);
+            for c in children {
+                let sp = match self
+                    .relations
+                    .read()
+                    .await
+                    .get(&c)
+                    .map(|r| r.selected_parent)
+                {
+                    Some(sp) => Some(sp),
+                    None => self
+                        .dag_store
+                        .get_header(&c)
+                        .await
+                        .ok()
+                        .map(|hd| hd.selected_parent_hash),
+                };
+                if sp == Some(h) {
+                    queue.push(c);
+                }
+            }
+        }
+        warn!("block {} disqualified from the selected chain", hash);
+    }
+
+    /// The first block on `tip`'s selected chain that is not disqualified
+    /// (`tip` itself when it is not). `None` when the walk reaches genesis or
+    /// cannot read a header.
+    async fn first_qualified(&self, tip: Hash) -> Option<Hash> {
+        let mut c = tip;
+        let mut steps: u32 = 0;
+        while self.dag_store.is_disqualified(&c) {
+            steps = steps.saturating_add(1);
+            if steps > MAX_DISQUALIFIED_WALK {
+                return None;
+            }
+            let sp = match self
+                .relations
+                .read()
+                .await
+                .get(&c)
+                .map(|r| r.selected_parent)
+            {
+                Some(sp) => sp,
+                None => {
+                    self.dag_store
+                        .get_header(&c)
+                        .await
+                        .ok()?
+                        .selected_parent_hash
+                }
+            };
+            if sp == Hash::default() {
+                return None;
+            }
+            c = sp;
+        }
+        Some(c)
     }
 
     /// Register an EXISTING block (one this node admitted before, read back
@@ -1390,8 +1486,18 @@ impl GhostDag {
                 .copied()
                 .collect()
         };
-        let mut best: Option<ForkChoiceKey> = None;
+        // Spec 06 §3.10 (G8 amended): a disqualified tip competes through the
+        // first block on its selected chain that is not disqualified.
+        let mut candidates: Vec<Hash> = Vec::with_capacity(tips.len());
         for tip in tips {
+            if let Some(c) = self.first_qualified(tip).await {
+                if !candidates.contains(&c) {
+                    candidates.push(c);
+                }
+            }
+        }
+        let mut best: Option<ForkChoiceKey> = None;
+        for tip in candidates {
             if let Some(key) = self.fork_choice_key(&tip).await {
                 if best.is_none_or(|b| key > b) {
                     best = Some(key);
@@ -3694,5 +3800,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Spec 06 §3.10 (D11, as amended 2026-11-09): marking a block
+    /// disqualified marks every held block whose selected chain passes
+    /// through it; a block admitted later on a marked selected parent
+    /// inherits the mark; fork choice uses the first unmarked block on each
+    /// tip's selected chain; the mark is persisted with the DAG store.
+    #[tokio::test]
+    async fn disqualify_propagates_to_selected_parent_descendants() {
+        fn id(n: u8) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0] = n;
+            b[31] = 0xD5;
+            b
+        }
+        let kv = Arc::new(MemKv::default());
+        let store = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("persistent store"),
+        );
+        let gd = GhostDag::new(GhostDagParams::default(), store.clone());
+        let g = create_test_block_with_parents(id(1), Hash::default(), vec![], 0);
+        store.store_block(g.clone()).await.expect("store");
+        gd.add_block(&g).await.expect("genesis");
+        let mut chain = vec![g.hash()];
+        for n in 2..=4u8 {
+            let b = sealed(&gd, id(n), vec![*chain.last().expect("tip")]).await;
+            store.store_block(b.clone()).await.expect("store");
+            gd.add_block(&b).await.expect("admit");
+            chain.push(b.hash());
+        }
+        let (b1, x, y) = (chain[1], chain[2], chain[3]);
+        assert_eq!(gd.select_tip().await.expect("head"), y);
+        gd.disqualify(&x).await;
+        assert!(gd.is_disqualified(&x));
+        assert!(
+            gd.is_disqualified(&y),
+            "a held descendant is marked with it"
+        );
+        assert!(!gd.is_disqualified(&b1));
+        assert_eq!(
+            gd.select_tip().await.expect("head"),
+            b1,
+            "the first unmarked block on the tip's selected chain"
+        );
+        let z = sealed(&gd, id(5), vec![y]).await;
+        store.store_block(z.clone()).await.expect("store");
+        gd.add_block(&z)
+            .await
+            .expect("a child of a marked block is still a DAG block");
+        assert!(gd.is_disqualified(&z.hash()), "inherited at admission");
+        let reopened = DagStore::persistent_with_strict_vrf(kv, false).expect("reopen");
+        assert!(reopened.is_disqualified(&x) && reopened.is_disqualified(&z.hash()));
+        assert!(!reopened.is_disqualified(&b1));
+        let s = sealed(&gd, id(6), vec![b1]).await;
+        store.store_block(s.clone()).await.expect("store");
+        gd.add_block(&s).await.expect("sibling");
+        assert_eq!(
+            gd.select_tip().await.expect("head"),
+            s.hash(),
+            "a valid sibling wins"
+        );
     }
 }

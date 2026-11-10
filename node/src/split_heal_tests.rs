@@ -2557,8 +2557,8 @@ mod tests {
         /// at the given height changed.
         replays: Vec<(
             String,
-            citrate_replay_ref::Report,
-            citrate_replay_ref::Report,
+            citrate_mergeset_ref::Report,
+            citrate_mergeset_ref::Report,
             u64,
         )>,
         detail: String,
@@ -2658,7 +2658,11 @@ mod tests {
         }
         let mut replays = Vec::new();
         if pruned && rejoined_at.is_some() {
-            use citrate_replay_ref::{replay, SelectedChain};
+            // r1007 S3-3b: the independent mergeset reference
+            // (`citrate-mergeset-ref`), which recomputes GHOSTDAG, every
+            // accepted mergeset, settlement and the commitments from the
+            // recorded blocks alone (`replay-diff --mode mergeset`).
+            use citrate_replay_ref::replay_mergeset;
             let k = fork + 10;
             for i in side_b.iter().copied() {
                 let rec = fleet.record(i);
@@ -2668,12 +2672,12 @@ mod tests {
                     let path = std::path::Path::new(&out).join(format!("stopped-side-node{i}.rec"));
                     rec.write_to(&path).expect("write the recording");
                 }
-                let clean = replay(&rec, &SelectedChain).await.expect("replay");
+                let clean = replay_mergeset(&rec).expect("replay");
                 let mut bad = rec.clone();
                 if let Some(b) = bad.chain_block_mut(k) {
-                    b.header.coinbase = [0xEE; 20];
+                    b.state_root = Hash::new([0xEE; 32]);
                 }
-                let mutated = replay(&bad, &SelectedChain).await.expect("replay");
+                let mutated = replay_mergeset(&bad).expect("replay");
                 replays.push((format!("node {i}"), clean, mutated, k));
             }
         }
@@ -2805,6 +2809,10 @@ mod tests {
         for (name, clean, mutated, k) in &r.replays {
             assert_eq!(clean.divergence, None, "{name}: {clean:?}");
             assert_eq!(clean.matched, clean.tip_height, "{name}: {clean:?}");
+            assert!(
+                clean.lists_compared == 0 || clean.executed > 0,
+                "{name}: {clean:?}"
+            );
             assert_eq!(
                 mutated.divergence.as_ref().map(|d| d.height),
                 Some(*k),

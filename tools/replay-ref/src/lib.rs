@@ -30,19 +30,23 @@
 // 3. The `replay-diff <recording>` CLI (`src/bin/replay_diff.rs`), which prints
 //    the first divergence, and `replay-record` (`src/bin/replay_record.rs`).
 //
-// Ordering modes. Which blocks a chain block executes is an `OrderingMode`
-// (`reference::OrderingMode`). Today there is one, `SelectedChain`: a chain
-// block executes its own transactions (r1006 semantics). Mergeset execution
-// (S3-3b, spec 06 section 3: a chain block executes its mergeset in GHOSTDAG
-// total order) plugs in as a second mode that returns the ordered mergeset;
-// the recording already carries every DAG block it needs.
+// Modes. `selected-chain` (`reference::SelectedChain`): a chain block
+// executes its own transactions through the node's executor (r1006
+// semantics). `mergeset` (`mergeset::replay_mergeset`, r1007 S3-3b): the
+// recording goes through the INDEPENDENT reference `citrate-mergeset-ref`,
+// which shares no execution code with the node, and is compared on state
+// roots, receipt roots, accepted roots, gas and the accepted lists.
 
+pub mod mergeset;
 pub mod recorder;
 pub mod recording;
 pub mod reference;
 
+pub use mergeset::{reference_config, replay_mergeset};
 pub use recorder::{record_data_dir, record_db};
-pub use recording::{ChainEntry, RecordedRewardPolicy, Recording, ReplayConfig, FORMAT_VERSION};
+pub use recording::{
+    ChainEntry, RecordedEvmRules, RecordedRewardPolicy, Recording, ReplayConfig, FORMAT_VERSION,
+};
 pub use reference::{
     full_hash, reference_reward_config, replay, Divergence, Field, OrderingMode, Report,
     SelectedChain,

@@ -66,6 +66,7 @@ use citrate_execution::types::ExecutionError;
 use citrate_execution::Executor;
 use citrate_storage::chain::StoredReceipt;
 use citrate_storage::StorageManager;
+#[cfg(test)]
 use primitive_types::U256;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -303,6 +304,18 @@ fn read_receipt_index(
         .map_err(|e| anyhow::anyhow!("could not read the receipt index: {e}"))
 }
 
+/// r1007 S3-3b: the transactions an accepting block executed, from the
+/// receipt index (`t‖block‖tx` markers written with its receipts). A read
+/// error is an `Err`.
+fn read_executed_under(storage: &StorageManager, block: &Hash) -> anyhow::Result<Vec<Hash>> {
+    #[cfg(test)]
+    read_faults::check(read_faults::Site::ReceiptIndex, None)?;
+    storage
+        .transactions
+        .get_block_transactions(block)
+        .map_err(|e| anyhow::anyhow!("could not read the receipt index of {block}: {e}"))
+}
+
 fn read_applied_tip(storage: &StorageManager) -> anyhow::Result<Option<(Hash, u64)>> {
     #[cfg(test)]
     read_faults::check(read_faults::Site::AppliedTip, None)?;
@@ -432,6 +445,43 @@ pub fn canonical_block_reward_at(
             supply_hardening_height,
             block.header.height,
         ),
+    )
+}
+
+/// r1007 S3-3b (spec 06 §3.8 step 3): the emission R(h) of the accepting
+/// block at `height`: the canonical block reward for a block at that height
+/// whose executed list is `txs` (the bonus arms count executed transactions),
+/// as the validator part (attributed among the accepted blues by the
+/// executor) and the treasury part. The ONE rule the producer and every
+/// applier share.
+pub fn canonical_emission(
+    calculator: &RewardCalculator,
+    height: u64,
+    txs: &[citrate_consensus::types::Transaction],
+    receipts: &[citrate_execution::types::TransactionReceipt],
+) -> Result<citrate_execution::executor::Emission, ExecutionError> {
+    let virtual_block = citrate_consensus::types::BlockBuilder::new()
+        .height(height)
+        .transactions(txs.to_vec())
+        .build_unhashed();
+    let reward = canonical_block_reward(calculator, &virtual_block, receipts)
+        .map_err(|e| ExecutionError::RewardSettlement(e.to_string()))?;
+    Ok(citrate_execution::executor::Emission {
+        validator: reward.validator_reward,
+        treasury: citrate_execution::types::Address(TREASURY_ADDR),
+        treasury_amount: reward.treasury_reward,
+    })
+}
+
+/// Spec 06 §3.10: whether applying a chain block failed because of the
+/// block's own data, so it is disqualified from the chain: a commitment that
+/// did not reproduce. A node-local failure (`ApplyInputUnavailable`, storage,
+/// an unmaterialized reward policy) is never one.
+pub(crate) fn is_block_fault(e: &ExecutionError) -> bool {
+    matches!(
+        e,
+        ExecutionError::StateRootMismatch { .. }
+            | ExecutionError::AcceptanceCommitmentMismatch { .. }
     )
 }
 
@@ -864,6 +914,15 @@ pub struct CanonicalApplicator {
     /// the stall watchdog. `Notify` coalesces: blocks admitted while a pass is
     /// running are covered by one more pass toward the then-current head.
     drain_wake: Arc<tokio::sync::Notify>,
+    /// r1007 S3-3b: the GHOSTDAG engine that orders an accepting block's
+    /// mergeset (`mergeset::accepted_members`). Wired with `with_fork_choice`.
+    /// `None`: only blocks without merge parents can be applied (their
+    /// mergeset is their selected parent by definition); a merging block is
+    /// refused rather than executed in a guessed order.
+    ghostdag: Option<Arc<GhostDag>>,
+    /// r1007 S3-3b (spec 06 §3.7): the BLOCKHASH window of the last chain
+    /// block this applicator accepted, so the next one reads one header.
+    recent_chain: crate::mergeset::RecentChain,
 }
 
 impl CanonicalApplicator {
@@ -995,6 +1054,8 @@ impl CanonicalApplicator {
             dead_branch: Arc::new(AtomicBool::new(dead_branch)),
             mempool: None,
             drain_wake: Arc::new(tokio::sync::Notify::new()),
+            ghostdag: None,
+            recent_chain: crate::mergeset::RecentChain::default(),
         }
     }
 
@@ -1131,7 +1192,13 @@ impl CanonicalApplicator {
             match read_block(&self.storage, &cursor) {
                 Ok(Some(b)) => {
                     cursor = b.header.selected_parent_hash;
-                    abandoned.push(b.transactions);
+                    // r1007 S3-3b: an abandoned chain block un-accepts its
+                    // mergeset too; those blocks' txs return unless the new
+                    // branch executed them (`carried`, then the pool's own
+                    // nonce check against the new tip).
+                    let mut txs = self.member_txs(&b).await;
+                    txs.extend(b.transactions);
+                    abandoned.push(txs);
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -1159,6 +1226,7 @@ impl CanonicalApplicator {
 
     pub fn with_fork_choice(mut self, ghostdag: Arc<GhostDag>) -> Self {
         self.dag_hydrated = Some(ghostdag.dag_hydrated_handle());
+        self.ghostdag = Some(ghostdag.clone());
         let weights = ghostdag.clone();
         self.fork_weight = Some(Arc::new(move |h: Hash| {
             let g = weights.clone();
@@ -1831,35 +1899,128 @@ impl CanonicalApplicator {
         self.lock.lock().await.tip
     }
 
-    /// Deterministic reward credits for `block` given its EXECUTED `receipts` —
-    /// the SAME mints the producer applied on the basic reward path:
-    /// `[(coinbase, validator_reward), (treasury, treasury_reward)]`. `coinbase`
-    /// comes from the committed v2 header field (`block.header.coinbase`). The
-    /// rule in force at the block's height is chosen by
-    /// [`canonical_block_reward`].
-    ///
-    /// PANIC-S1 D3: a reward that cannot be computed (overflow / invalid config /
-    /// receipts that do not match the block) is an ERROR
-    /// (`ExecutionError::RewardSettlement`), never a panic or a saturated amount,
-    /// so the block is rejected (or the reorg aborted and rolled back) exactly
-    /// like any other execution failure.
-    fn reward_credits(
+    /// r1007 S3-3b: apply chain block `block` by executing its ordered
+    /// mergeset on the current state (post(SP(block))) and checking its
+    /// commitments (`Executor::apply_accepting_block`). `persist` commits state,
+    /// receipts and the applied tip atomically; `verify` false is the trusted
+    /// replay of a from-genesis rebuild (the final root is checked once).
+    /// Spec 06 §3.10 (D11): disqualify `hash` from the selected chain when
+    /// `e` is a fault of the block's own data, found by executing its mergeset:
+    /// a commitment that does not reproduce. Node-local failures (a missing
+    /// member body, storage, an unmaterialized reward policy) never
+    /// disqualify; the node retries. Returns whether it disqualified.
+    async fn disqualify_on(&self, hash: Hash, e: &ExecutionError) -> bool {
+        if !is_block_fault(e) {
+            return false;
+        }
+        match &self.ghostdag {
+            Some(g) => {
+                g.disqualify(&hash).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) async fn accept_block(
         &self,
         block: &Block,
-        receipts: &[citrate_execution::types::TransactionReceipt],
-    ) -> Result<Vec<(citrate_execution::types::Address, U256)>, ExecutionError> {
-        let reward = canonical_block_reward(&self.reward_calculator, block, receipts)
-            .map_err(|e| ExecutionError::RewardSettlement(e.to_string()))?;
-        Ok(vec![
-            (
-                citrate_execution::types::Address(block.header.coinbase),
-                reward.validator_reward,
-            ),
-            (
-                citrate_execution::types::Address(TREASURY_ADDR),
-                reward.treasury_reward,
-            ),
-        ])
+        persist: bool,
+        verify: bool,
+    ) -> Result<(Hash, citrate_execution::acceptance::MergesetExecution), ExecutionError> {
+        let members = crate::mergeset::accepted_members(
+            &self.storage,
+            self.ghostdag.as_deref(),
+            &block.header,
+            None,
+        )
+        .await
+        .map_err(ExecutionError::ApplyInputUnavailable)?;
+        let block_hashes = if block.header.selected_parent_hash == Hash::default() {
+            std::collections::HashMap::new()
+        } else {
+            self.recent_chain
+                .block_hashes(
+                    &self.storage,
+                    block.header.selected_parent_hash,
+                    block.header.height.saturating_sub(1),
+                )
+                .map_err(ExecutionError::ApplyInputUnavailable)?
+        };
+        let calc = &self.reward_calculator;
+        let emission =
+            |height: u64,
+             txs: &[citrate_consensus::types::Transaction],
+             receipts: &[citrate_execution::types::TransactionReceipt]| {
+                canonical_emission(calc, height, txs, receipts)
+            };
+        self.executor
+            .apply_accepting_block(
+                block,
+                &crate::mergeset::as_accepted(&members),
+                &emission,
+                block_hashes,
+                persist,
+                verify,
+            )
+            .await
+    }
+
+    /// r1007 S3-3b / spec 06 §9.4: after the applied chain executed `exec`,
+    /// drop every executed tx from the pool (whichever block included it) and
+    /// offer the skipped occurrences back (a nonce gap or the gas budget can
+    /// make them valid later; the pool re-validates each against the new tip).
+    async fn sync_mempool_after_accept(
+        &self,
+        members_txs: &[citrate_consensus::types::Transaction],
+        exec: &citrate_execution::acceptance::MergesetExecution,
+    ) {
+        let Some(mempool) = self.mempool.as_ref() else {
+            return;
+        };
+        for tx in &exec.executed {
+            let _ = mempool.remove_included(&tx.hash).await;
+        }
+        let skipped: std::collections::HashSet<Hash> = exec
+            .occurrences
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o.outcome,
+                    citrate_execution::acceptance::OccurrenceOutcome::Skipped(r)
+                        if r != citrate_execution::acceptance::SkipReason::Invalid
+                )
+            })
+            .map(|o| o.tx_hash)
+            .collect();
+        let executed: std::collections::HashSet<Hash> =
+            exec.executed.iter().map(|t| t.hash).collect();
+        let offer: Vec<citrate_consensus::types::Transaction> = members_txs
+            .iter()
+            .filter(|t| skipped.contains(&t.hash) && !executed.contains(&t.hash))
+            .cloned()
+            .collect();
+        if !offer.is_empty() {
+            let n = offer.len();
+            let pooled = mempool.reinject_transactions(offer).await;
+            debug!("mergeset: {n} skipped tx(s) offered back to the pool, {pooled} pooled");
+        }
+    }
+
+    /// The bodies' transactions of `block`'s accepted members (for the pool
+    /// re-offer of skipped occurrences). Read-only; a miss yields nothing.
+    async fn member_txs(&self, block: &Block) -> Vec<citrate_consensus::types::Transaction> {
+        match crate::mergeset::accepted_members(
+            &self.storage,
+            self.ghostdag.as_deref(),
+            &block.header,
+            None,
+        )
+        .await
+        {
+            Ok(m) => m.into_iter().flat_map(|(b, _)| b.transactions).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Persist the applied-tip pointer + this block's verified state root (crash
@@ -1960,15 +2121,12 @@ impl CanonicalApplicator {
             };
             let block_hash = block.header.block_hash;
             let height = block.header.height;
-            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
-                self.reward_credits(b, r)
-            };
-            let apply_result = self
-                .executor
-                .apply_block(&block, block.header.coinbase, &reward)
-                .await;
+            // r1007 S3-3b: the chain block executes its accepted mergeset.
+            let apply_result = self.accept_block(&block, true, true).await;
             match apply_result {
-                Ok(_root) => {
+                Ok((_root, exec)) => {
+                    let members_txs = self.member_txs(&block).await;
+                    self.sync_mempool_after_accept(&members_txs, &exec).await;
                     state.record(block_hash, height, self.executor.state_snapshot());
                     self.persist_applied(&block_hash, height, &block.state_root);
                     applied.push(block_hash);
@@ -1998,6 +2156,11 @@ impl CanonicalApplicator {
                         "execute-on-receive: REJECT block {} @ {} — state root mismatch (claimed {}, computed {})",
                         block_hash, height, expected, got
                     );
+                    self.disqualify_on(
+                        block_hash,
+                        &ExecutionError::StateRootMismatch { expected, got },
+                    )
+                    .await;
                     // SRP-S4: dump the injective per-account digest of the state that
                     // produced the DIVERGENT computed root, so a diff vs a healthy node's
                     // digest at this height NAMES the account (env-gated, diagnostic only).
@@ -2024,6 +2187,7 @@ impl CanonicalApplicator {
                         "execute-on-receive: REJECT block {} @ {} — execution error: {}",
                         block_hash, height, e
                     );
+                    self.disqualify_on(block_hash, &e).await;
                     return DrainOutcome {
                         applied,
                         rejected: Some((block_hash, format!("execution error: {e}"))),
@@ -2490,20 +2654,16 @@ impl CanonicalApplicator {
                 }
             };
             let block = &block;
-            carried.extend(block.transactions.iter().map(|t| t.hash));
-            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
-                self.reward_credits(b, r)
-            };
-            let apply_result = self
-                .executor
-                .apply_block_no_persist_with_receipts(block, block.header.coinbase, &reward)
-                .await;
+            // r1007 S3-3b: the winning chain block executes its accepted
+            // mergeset; what it executed is what the new branch carries.
+            let apply_result = self.accept_block(block, false, true).await;
             // RC-1c: a reorg re-applies up to the undo window (10,000 blocks) under
             // the advance lock; give the runtime a turn after each one.
             yield_between_blocks().await;
             match apply_result {
-                Ok((_, receipts)) => {
-                    win_index.extend(ReceiptIndexBatch::for_block(block, &receipts));
+                Ok((_, exec)) => {
+                    carried.extend(exec.executed.iter().map(|t| t.hash));
+                    win_index.extend(ReceiptIndexBatch::for_accepting_block(block, &exec));
                     let h = block.header.height;
                     let hh = block.header.block_hash;
                     tip = AppliedTip {
@@ -2589,6 +2749,9 @@ impl CanonicalApplicator {
                         "execute-on-receive: reorg to {} aborted at {} — {} (reverted to {})",
                         new_tip, block.header.block_hash, e, pre_tip.hash
                     );
+                    // Spec 06 §3.10: a branch block whose commitments do not
+                    // reproduce is disqualified, so fork choice stops naming it.
+                    self.disqualify_on(block.header.block_hash, &e).await;
                     return ReorgOutcome::Rejected(format!(
                         "reorg reapply failed at {}: {e}",
                         block.header.block_hash
@@ -3373,8 +3536,19 @@ impl CanonicalApplicator {
                         "C1-R: spine block {h} vanished during preparation (rebuild aborted)"
                     )
                 })?;
+            // r1007 S3-3b: the receipts the replay writes under this spine
+            // block are those of the txs its accepted mergeset executes, so
+            // every tx of its members may gain a receipt under it.
+            let members = crate::mergeset::accepted_members(
+                &self.storage,
+                self.ghostdag.as_deref(),
+                &block.header,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("C1-R: mergeset of spine block {h}: {e}"))?;
             let mut removals = Vec::new();
-            for tx in &block.transactions {
+            for tx in members.iter().flat_map(|(b, _)| b.transactions.iter()) {
                 let existing = read_receipt(&self.storage, &tx.hash).map_err(read_err)?;
                 if existing.map(|r| r.block_hash) != Some(*h) {
                     removals.push((*h, tx.hash));
@@ -3545,18 +3719,12 @@ impl CanonicalApplicator {
             // TRUSTED replay: skip the per-block full-trie root recompute (the ~O(N^2)
             // wall that made a from-genesis rebuild take hours). Correctness is
             // recovered by verifying the FINAL head root once, below.
-            let reward = |b: &Block, r: &[citrate_execution::types::TransactionReceipt]| {
-                self.reward_credits(b, r)
-            };
-            let apply_result = self
-                .executor
-                .apply_block_trusted(&block, block.header.coinbase, &reward)
-                .await;
+            let apply_result = self.accept_block(&block, true, false).await;
             match apply_result {
-                Ok(_) => {
+                Ok((_, exec)) => {
                     replayed = replayed.saturating_add(1);
                     if block.header.height > plan.fork.height {
-                        carried.extend(block.transactions.iter().map(|t| t.hash));
+                        carried.extend(exec.executed.iter().map(|t| t.hash));
                     }
                     // Record the block's CLAIMED root (trusted) in the ring; the ring
                     // snapshot is the executor state, which is correct regardless.
@@ -3731,9 +3899,11 @@ impl CanonicalApplicator {
                 );
             }
             walked = walked.saturating_add(1);
-            for tx in &block.transactions {
-                removals.removals.push((cursor, tx.hash));
-                if let Some(r) = read_receipt(&self.storage, &tx.hash)? {
+            // r1007 S3-3b: a chain block's receipts are those of the txs it
+            // EXECUTED (its accepted mergeset), indexed under it.
+            for tx in read_executed_under(&self.storage, &cursor)? {
+                removals.removals.push((cursor, tx));
+                if let Some(r) = read_receipt(&self.storage, &tx)? {
                     if r.block_hash == cursor {
                         restore.receipts.push(r);
                     }
@@ -3881,7 +4051,11 @@ impl CanonicalApplicator {
                     }
                     break;
                 };
-                out.extend(b.transactions.iter().map(|tx| (old_hash, tx.hash)));
+                out.extend(
+                    read_executed_under(storage, &old_hash)?
+                        .into_iter()
+                        .map(|tx| (old_hash, tx)),
+                );
                 if b.header.height == 0 {
                     break;
                 }
@@ -4439,7 +4613,7 @@ pub(crate) mod tests {
         state_root: Hash,
         vrf: [u8; 32],
     ) -> Block {
-        let mut b = BlockBuilder::new()
+        let b = BlockBuilder::new()
             .version(2)
             .height(height)
             .parent(parent)
@@ -4453,11 +4627,52 @@ pub(crate) mod tests {
             .transactions(vec![])
             .state_root(state_root)
             .build_unhashed();
+        finish_fixture(b)
+    }
+
+    /// The GHOSTDAG header values of a linear fixture block whose builder left
+    /// them unset: its selected parent's blue score + 1 (a parent at the zero
+    /// hash is a score-0 root), unit work. Explicitly scored blocks keep
+    /// theirs, as does a block whose parent no fixture registered.
+    fn set_linear_ghostdag(b: &mut Block) {
+        if b.header.height == 0 || b.header.blue_score != 0 {
+            return;
+        }
+        let sp = b.header.selected_parent_hash;
+        let parent_score = if sp == Hash::default() {
+            Some(0)
+        } else {
+            sealed_registry()
+                .lock()
+                .get(&sp)
+                .map(|p| p.header.blue_score)
+        };
+        if let Some(ps) = parent_score {
+            let score = ps + 1;
+            b.header.blue_score = score;
+            b.header.blue_work = citrate_consensus::types::blue_work_for_score(score);
+        }
+    }
+
+    /// r1007 S3-3b: a fixture block with the commitments of an accepted
+    /// mergeset that carries no transaction (the reward-only fixture chains),
+    /// the ACCEPT gas limit and its hash, registered for [`seal_mergeset`].
+    pub(crate) fn finish_fixture(mut b: Block) -> Block {
+        b.header.gas_limit = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
+        set_linear_ghostdag(&mut b);
+        b.accepted_root = citrate_execution::acceptance::accepted_root(&[]);
+        b.receipt_root = citrate_execution::acceptance::receipt_root(&[]);
         // r1007 G10: a proposer of its own (from its content), so honest siblings
-        // in one slot are not equivocation.
-        b.header.proposer_pubkey =
-            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
+        // in one slot are not equivocation. A fixture that names its proposer
+        // keeps it.
+        if b.header.proposer_pubkey == citrate_consensus::types::PublicKey::default() {
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
+        }
         b.header.block_hash = b.compute_hash();
+        sealed_registry()
+            .lock()
+            .insert(b.header.block_hash, b.clone());
         b
     }
 
@@ -4473,12 +4688,131 @@ pub(crate) mod tests {
         mk_block_vrf(height, parent, state_root, [0x5B; 32])
     }
 
-    /// Reward credits the driver applies, computed the same way it does internally.
-    fn reward_for(block: &Block) -> (U256, U256) {
+    /// r1007 S3-3b: every fixture block sealed by [`seal_mergeset`], by hash,
+    /// so a child can find its selected parent's body (its accepted mergeset).
+    pub(crate) fn sealed_registry(
+    ) -> &'static parking_lot::Mutex<std::collections::HashMap<Hash, Block>> {
+        static SEALED: std::sync::OnceLock<
+            parking_lot::Mutex<std::collections::HashMap<Hash, Block>>,
+        > = std::sync::OnceLock::new();
+        SEALED.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// r1007 S3-3b (ADR CV-4a): seal a fixture block the way the producer does.
+    /// `template` carries its own transactions (NOT executed now: its chain
+    /// child accepts them). On `exec`, which must hold post(SP), execute the
+    /// block's accepted mergeset (its selected parent, registered by an
+    /// earlier seal; nothing when the parent is the zero hash) through the
+    /// production `Executor::execute_mergeset` with the canonical emission,
+    /// then commit state_root, accepted_root, receipt_root, gas_used and the
+    /// ACCEPT gas limit, and rehash. Advances `exec` to post(block).
+    pub(crate) async fn seal_mergeset(exec: &Executor, template: Block) -> Block {
+        seal_mergeset_with(exec, template).await.0
+    }
+
+    /// [`seal_mergeset`], also returning the mergeset execution (receipts,
+    /// occurrences) the block committed.
+    pub(crate) async fn seal_mergeset_with(
+        exec: &Executor,
+        mut template: Block,
+    ) -> (Block, citrate_execution::acceptance::MergesetExecution) {
+        let sp = template.header.selected_parent_hash;
+        let members: crate::mergeset::Members = if sp == Hash::default() {
+            Vec::new()
+        } else {
+            let parent = sealed_registry()
+                .lock()
+                .get(&sp)
+                .cloned()
+                .unwrap_or_else(|| panic!("fixture parent {sp} was not sealed by seal_mergeset"));
+            vec![(
+                parent,
+                citrate_consensus::acceptance::InclusionColor::SelectedParent,
+            )]
+        };
+        assert!(
+            template.header.merge_parent_hashes.is_empty(),
+            "seal_mergeset seals linear fixture blocks only"
+        );
+        template.header.gas_limit = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
+        set_linear_ghostdag(&mut template);
+        let calc = RewardCalculator::new(canonical_reward_config());
+        let emission = |h: u64,
+                        t: &[citrate_consensus::types::Transaction],
+                        r: &[citrate_execution::types::TransactionReceipt]| {
+            canonical_emission(&calc, h, t, r)
+        };
+        // BLOCKHASH: the fixture chain's ancestors below the block (§3.7).
+        let mut block_hashes = std::collections::HashMap::new();
+        {
+            let reg = sealed_registry().lock();
+            let mut cursor = sp;
+            while let Some(b) = reg.get(&cursor) {
+                if template.header.height.saturating_sub(b.header.height) > 256 {
+                    break;
+                }
+                block_hashes.insert(b.header.height, *cursor.as_bytes());
+                if b.header.height == 0 {
+                    break;
+                }
+                cursor = b.header.selected_parent_hash;
+            }
+        }
+        let accepted = exec
+            .execute_mergeset(
+                &template.header,
+                &crate::mergeset::as_accepted(&members),
+                &emission,
+                block_hashes,
+            )
+            .await
+            .expect("fixture mergeset executes");
+        template.header.gas_used = accepted.gas_used;
+        template.state_root = accepted.state_root;
+        template.accepted_root = accepted.accepted_root;
+        template.receipt_root = accepted.receipt_root;
+        template.header.block_hash = template.compute_hash();
+        sealed_registry()
+            .lock()
+            .insert(template.header.block_hash, template.clone());
+        let mut accepted = accepted;
+        accepted.stamp(template.header.block_hash, template.header.height);
+        (template, accepted)
+    }
+
+    /// Re-seal the registered block `hash` on `exec` (a second producer
+    /// replaying a shared block): same template, same parent, so on the same
+    /// pre-state it reproduces the block exactly. Advances `exec`.
+    pub(crate) async fn replay_sealed(exec: &Executor, hash: Hash) -> Block {
+        let b = sealed_registry()
+            .lock()
+            .get(&hash)
+            .cloned()
+            .unwrap_or_else(|| panic!("block {hash} was not sealed by a fixture"));
+        let again = seal_mergeset(exec, b).await;
+        assert_eq!(
+            again.header.block_hash, hash,
+            "the replay reproduces the block"
+        );
+        again
+    }
+
+    /// Reward credits the driver applies for `block`: (validator part
+    /// credited to CB, treasury part). r1007 S3-3b (spec 06 §3.8): the
+    /// validator part of R(h) goes to the blue blocks of the accepted
+    /// mergeset that have a proposer, here the selected parent (every fixture
+    /// block's coinbase is CB); a block whose selected parent is the zero hash
+    /// accepts nothing, so its validator part is not minted.
+    pub(crate) fn reward_for(block: &Block) -> (U256, U256) {
         let r = RewardCalculator::new(canonical_reward_config())
             .calculate_reward(block)
             .expect("canonical reward");
-        (r.validator_reward, r.treasury_reward)
+        let validator = if block.header.selected_parent_hash == Hash::default() {
+            U256::zero()
+        } else {
+            r.validator_reward
+        };
+        (validator, r.treasury_reward)
     }
 
     /// S3-3c: the replay harness restates the block-reward rule so it never
@@ -4500,6 +4834,7 @@ pub(crate) mod tests {
             coinbase: CB,
             prevrandao: VRF_OUT,
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
         let (validator, treasury) = reward_for(block);
         for (addr, amt) in [(Address(CB), validator), (Address(TREASURY_ADDR), treasury)] {
@@ -4563,6 +4898,7 @@ pub(crate) mod tests {
                 coinbase: CB,
                 prevrandao: VRF_OUT,
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let tmpl = mk_block(h, parent, Hash::default());
             let (v, t) = reward_for(&tmpl);
@@ -4698,7 +5034,7 @@ pub(crate) mod tests {
         let (exec, storage, _dir) = fresh();
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
         let c = chain(3);
-        let (v, t) = reward_for(&c[0]); // identical per-block reward at these heights
+        let (v, t) = reward_for(&c[1]); // identical per-block reward at these heights
 
         // b3 arrives first — ahead of b1/b2 → deferred, tip stays at genesis.
         persist(&storage, &c[2]);
@@ -4727,7 +5063,8 @@ pub(crate) mod tests {
         assert_eq!(tip.hash, c[2].header.block_hash);
 
         // Three blocks' rewards accumulated; pointer persisted at the chain tip.
-        assert_eq!(exec.get_balance(&Address(CB)), v * U256::from(3u64));
+        // r1007 S3-3b: block 1 accepts no rewarded block (its parent is the zero hash), so CB earns R(h) from block 2 on.
+        assert_eq!(exec.get_balance(&Address(CB)), v * U256::from(2u64));
         assert_eq!(
             exec.get_balance(&Address(TREASURY_ADDR)),
             t * U256::from(3u64)
@@ -4904,7 +5241,8 @@ pub(crate) mod tests {
             "fork point retained"
         );
         drop(state);
-        assert_eq!(exec.get_balance(&Address(CB)), v * U256::from(3u64));
+        // r1007 S3-3b: block 1 accepts no rewarded block (its parent is the zero hash), so CB earns R(h) from block 2 on.
+        assert_eq!(exec.get_balance(&Address(CB)), v * U256::from(2u64));
         assert_eq!(
             exec.get_balance(&Address(TREASURY_ADDR)),
             t * U256::from(3u64)
@@ -5001,7 +5339,8 @@ pub(crate) mod tests {
             "height-2 snapshot still the A branch"
         );
         drop(state);
-        assert_eq!(exec.get_balance(&Address(CB)), v * U256::from(2u64));
+        // r1007 S3-3b: block 1 accepts no rewarded block (its parent is the zero hash), so CB earns R(h) from block 2 on.
+        assert_eq!(exec.get_balance(&Address(CB)), v);
         assert_eq!(
             exec.get_balance(&Address(TREASURY_ADDR)),
             t * U256::from(2u64)
@@ -5062,15 +5401,16 @@ pub(crate) mod tests {
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
         // tip advances to a2 (height 2); a1 (height 1) is an already-applied ancestor.
         let (a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
-        let (v, t) = reward_for(&a1);
+        let (v, t) = reward_for(&a2);
 
         // Balances + tip reflect TWO applied blocks before the (backwards) reorg attempt.
         let bal_cb_before = exec.get_balance(&Address(CB));
         let bal_tr_before = exec.get_balance(&Address(TREASURY_ADDR));
         assert_eq!(
+            // r1007 S3-3b: a1 accepts nothing rewarded, a2 accepts a1.
             bal_cb_before,
-            v * U256::from(2u64),
-            "two blocks of validator reward"
+            v,
+            "two blocks: one validator reward"
         );
         assert_eq!(
             bal_tr_before,
@@ -5246,7 +5586,7 @@ pub(crate) mod tests {
         blue_score: u64,
         vrf: [u8; 32],
     ) -> Block {
-        let mut b = BlockBuilder::new()
+        let b = BlockBuilder::new()
             .version(2)
             .height(height)
             .parent(parent)
@@ -5262,12 +5602,7 @@ pub(crate) mod tests {
             .blue_score(blue_score)
             .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
             .build_unhashed();
-        // r1007 G10: a proposer of its own (from its content), so honest siblings
-        // in one slot are not equivocation.
-        b.header.proposer_pubkey =
-            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
-        b.header.block_hash = b.compute_hash();
-        b
+        finish_fixture(b)
     }
 
     /// A block that reached the CHAIN store without a matching
@@ -6589,10 +6924,15 @@ pub(crate) mod tests {
             vec![transfer(ALICE, BOB, 1_000, 1)],
         )
         .await;
+        // r1007 S3-3b: a block's txs run when its chain child accepts it, so
+        // a3 (empty) executes a2's transfer to BOB.
+        let a3 = produce(&pa, a2.header.block_hash, 3, VRF_OUT, vec![]).await;
         persist(&storage, &a1);
         app.apply_received(&a1).await;
         persist(&storage, &a2);
         app.apply_received(&a2).await;
+        persist(&storage, &a3);
+        app.apply_received(&a3).await;
         assert_eq!(
             follower.get_balance(&Address(BOB)),
             U256::from(1_000u64),
@@ -6627,12 +6967,15 @@ pub(crate) mod tests {
             vec![transfer(ALICE, CAROL, 1_000, 2)],
         )
         .await;
+        // b4 (empty) accepts b3, so both CAROL transfers have executed.
+        let b4 = produce(&pb, b3.header.block_hash, 4, vrf_b, vec![]).await;
         persist(&storage, &b2);
         persist(&storage, &b3);
+        persist(&storage, &b4);
 
-        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
-        app.apply_received(&b3).await;
-        assert_eq!(app.applied_tip().await.height, 3, "reorged to B");
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
+        app.apply_received(&b4).await;
+        assert_eq!(app.applied_tip().await.height, 4, "reorged to B");
 
         // Simulated restart: a brand-new executor over the SAME store, cold cache.
         let restarted = store_backed(&storage);
@@ -6703,10 +7046,14 @@ pub(crate) mod tests {
             vec![transfer(ALICE, BOB, 1_000, 1)],
         )
         .await;
+        // r1007 S3-3b: a3 (empty) accepts a2, executing its transfer.
+        let a3 = produce(&pa, a2.header.block_hash, 3, VRF_OUT, vec![]).await;
         persist(&storage, &a1);
         app.apply_received(&a1).await;
         persist(&storage, &a2);
-        app.apply_received(&a2).await; // store has A: BOB = 2000
+        app.apply_received(&a2).await;
+        persist(&storage, &a3);
+        app.apply_received(&a3).await; // store has A: BOB = 2000
 
         // A B branch whose valid b2 is followed by a bad-root b3.
         let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
@@ -6728,25 +7075,35 @@ pub(crate) mod tests {
             vec![transfer(ALICE, CAROL, 1_000, 1)],
         )
         .await;
-        let b3_bad = mk_block_txs(
-            3,
+        let b3 = produce(
+            &pb,
             b2.header.block_hash,
-            Hash::new([0xFF; 32]),
+            3,
             vrf_b,
             vec![transfer(ALICE, CAROL, 1_000, 2)],
+        )
+        .await;
+        // The heavier B tip claims a bogus root.
+        let b4_bad = mk_block_txs(
+            4,
+            b3.header.block_hash,
+            Hash::new([0xFF; 32]),
+            vrf_b,
+            vec![],
         );
         persist(&storage, &b2);
-        persist(&storage, &b3_bad);
+        persist(&storage, &b3);
+        persist(&storage, &b4_bad);
 
-        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
-        app.apply_received(&b3_bad).await; // reorg reapplies b2 in-memory, b3_bad fails → abort
+        app.fork_choice = Some(fork_choice_returning(b4_bad.header.block_hash));
+        app.apply_received(&b4_bad).await; // reorg reapplies b2, b3 in-memory, b4_bad fails → abort
 
         // Applied tip stayed on A; the durable store was never written during reapply.
         assert_eq!(
             app.applied_tip().await,
             AppliedTip {
-                hash: a2.header.block_hash,
-                height: 2
+                hash: a3.header.block_hash,
+                height: 3
             }
         );
         let restarted = store_backed(&storage);
@@ -6852,7 +7209,7 @@ pub(crate) mod tests {
         vrf: [u8; 32],
         txs: Vec<Transaction>,
     ) -> Block {
-        let mut b = BlockBuilder::new()
+        let b = BlockBuilder::new()
             .version(2)
             .height(height)
             .parent(parent)
@@ -6865,13 +7222,13 @@ pub(crate) mod tests {
             .transactions(txs)
             .state_root(state_root)
             .build_unhashed();
-        b.header.block_hash = b.compute_hash();
-        b
+        finish_fixture(b)
     }
 
-    /// Produce a block on `exec` the way node/src/producer.rs does under v2:
-    /// set block context → execute txs → credit the basic reward → compute the
-    /// final state_root → seal. Advances `exec` to the post-block state.
+    /// Produce a block on `exec` the way node/src/producer.rs does (r1007
+    /// S3-3b): it carries `txs` and commits the execution of its accepted
+    /// mergeset (its parent's txs and the emission) on `exec`'s post(SP).
+    /// Advances `exec` to the post-block state.
     async fn produce(
         exec: &Executor,
         parent: Hash,
@@ -6879,32 +7236,11 @@ pub(crate) mod tests {
         vrf: [u8; 32],
         txs: Vec<Transaction>,
     ) -> Block {
-        exec.set_block_context(BlockContext {
-            coinbase: CB,
-            prevrandao: vrf,
-            block_hashes: std::collections::HashMap::new(),
-        });
-        // Reward calc reads only header.height + txs — a provisional block suffices.
-        let provisional = mk_block_txs(height, parent, Hash::default(), vrf, txs.clone());
-        for tx in &txs {
-            exec.execute_transaction(&provisional, tx)
-                .await
-                .expect("producer tx must execute");
-        }
-        let reward = RewardCalculator::new(canonical_reward_config())
-            .calculate_reward(&provisional)
-            .expect("canonical reward");
-        for (addr, amt) in [
-            (Address(CB), reward.validator_reward),
-            (Address(TREASURY_ADDR), reward.treasury_reward),
-        ] {
-            if amt > U256::zero() {
-                let bal = exec.get_balance(&addr);
-                exec.set_balance(&addr, bal + amt);
-            }
-        }
-        let root = exec.calculate_state_root();
-        mk_block_txs(height, parent, root, vrf, txs)
+        seal_mergeset(
+            exec,
+            mk_block_txs(height, parent, Hash::default(), vrf, txs),
+        )
+        .await
     }
 
     /// A funded producer executor + a funded follower (applicator over an
@@ -6959,6 +7295,7 @@ pub(crate) mod tests {
             coinbase: CB,
             prevrandao: VRF_OUT,
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
         let provisional = mk_block_txs(
             height,
@@ -7114,7 +7451,9 @@ pub(crate) mod tests {
             producer.get_balance(&Address(BOB)),
             follower.get_balance(&Address(BOB))
         );
-        assert_eq!(follower.get_balance(&Address(BOB)), U256::from(3_000u64));
+        // r1007 S3-3b: block h executes block h-1's transfer; block 3's is
+        // included, not yet executed.
+        assert_eq!(follower.get_balance(&Address(BOB)), U256::from(2_000u64));
         assert_eq!(app.applied_tip().await.height, 3);
     }
 
@@ -7163,6 +7502,14 @@ pub(crate) mod tests {
             ApplyOutcome::Applied { .. }
         ));
         assert_eq!(follower.calculate_state_root(), good.state_root);
+        // r1007 S3-3b: good's transfer runs when its child accepts it.
+        assert_eq!(follower.get_balance(&Address(BOB)), U256::zero());
+        let child = produce(&producer, good.header.block_hash, 2, VRF_OUT, vec![]).await;
+        persist(&storage, &child);
+        assert!(matches!(
+            app.apply_received(&child).await,
+            ApplyOutcome::Applied { .. }
+        ));
         assert_eq!(follower.get_balance(&Address(BOB)), U256::from(1_000u64));
     }
 
@@ -7320,7 +7667,7 @@ pub(crate) mod tests {
         vrf: [u8; 32],
         txs: Vec<Transaction>,
     ) -> Block {
-        let mut b = BlockBuilder::new()
+        let b = BlockBuilder::new()
             .version(2)
             .height(height)
             .parent(parent)
@@ -7336,12 +7683,11 @@ pub(crate) mod tests {
             .transactions(txs)
             .state_root(root)
             .build_unhashed();
-        b.header.block_hash = b.compute_hash();
-        b
+        finish_fixture(b)
     }
 
-    /// Produce a §R' block exactly as `apply_block_inner` settles it (set ctx →
-    /// execute txs → settle basic+§R' rewards → root), on `exec`'s current policy.
+    /// Produce a §R' block as the producer seals it (r1007 S3-3b): its accepted
+    /// mergeset executed and settled (basic + §R') on `exec`'s current policy.
     async fn produce_rprime(
         exec: &Executor,
         parent: Hash,
@@ -7349,40 +7695,7 @@ pub(crate) mod tests {
         vrf: [u8; 32],
         txs: Vec<Transaction>,
     ) -> Block {
-        exec.set_block_context(BlockContext {
-            coinbase: CB,
-            prevrandao: vrf,
-            block_hashes: std::collections::HashMap::new(),
-        });
-        let provisional = seal_rprime(height, parent, Hash::default(), vrf, txs.clone());
-        let mut receipts = Vec::new();
-        for tx in &txs {
-            receipts.push(
-                exec.execute_transaction(&provisional, tx)
-                    .await
-                    .expect("producer tx executes"),
-            );
-        }
-        let reward = RewardCalculator::new(canonical_reward_config())
-            .calculate_reward(&provisional)
-            .expect("canonical reward");
-        let basic = [
-            (Address(CB), reward.validator_reward),
-            (Address(TREASURY_ADDR), reward.treasury_reward),
-        ];
-        exec.settle_block_rewards(
-            height,
-            CB,
-            PROPOSER,
-            citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
-            &txs,
-            &receipts,
-            &basic,
-        )
-        .await
-        .expect("producer §R' settle");
-        let root = exec.calculate_state_root();
-        seal_rprime(height, parent, root, vrf, txs)
+        seal_mergeset(exec, seal_rprime(height, parent, Hash::default(), vrf, txs)).await
     }
 
     /// A cross-policy hook: reads a state MARKER (CAROL, a B-only recipient) to
@@ -7390,13 +7703,20 @@ pub(crate) mod tests {
     /// CAROL, else 2500. Simulates the registry-contract state differing per branch.
     fn cross_policy_hook(exec: Arc<Executor>) -> impl Fn() {
         move || {
-            let bps = if exec.get_balance(&Address(CAROL)) > U256::zero() {
-                5000
-            } else {
-                2500
-            };
+            let bps = if on_branch_b(&exec) { 5000 } else { 2500 };
             *exec.reward_policy_handle().write() = Some(rprime_policy(bps));
         }
+    }
+
+    /// The simulated per-branch registry state the cross-policy hooks read:
+    /// CAROL (a B-only recipient) has been paid, or the block the executor
+    /// last executed is a B block (B blocks carry the VRF output 0x5B..).
+    /// r1007 S3-3b: the boundary block's own transfer to CAROL now runs one
+    /// block later, so at the boundary only B's block context tells the
+    /// branches apart (both boundary blocks accept the same shared s799).
+    fn on_branch_b(exec: &Executor) -> bool {
+        exec.get_balance(&Address(CAROL)) > U256::zero()
+            || exec.get_block_context().prevrandao == [0x5B; 32]
     }
 
     /// SRP-S4 — reorg registry-storage purity GUARD (result: PASSES; REFUTES a hypothesis).
@@ -7804,7 +8124,7 @@ pub(crate) mod tests {
         pb.set_validator_activation_height(800);
         *pb.reward_policy_handle().write() = Some(rprime_policy(2500));
         // Replay the shared s799 so pb's state matches the fork point.
-        let _s = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let _s = replay_sealed(&pb, s799).await;
         let vrf_b = [0x5B; 32];
         let b800 =
             produce_rprime(&pb, s799, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0)]).await;
@@ -7905,7 +8225,7 @@ pub(crate) mod tests {
         pb.set_balance(&Address(ALICE), U256::from(FUND));
         pb.set_validator_activation_height(800);
         *pb.reward_policy_handle().write() = Some(rprime_policy(2500));
-        let _s = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let _s = replay_sealed(&pb, s799).await;
         let vrf_b = [0x5B; 32];
         let b800 =
             produce_rprime(&pb, s799, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0)]).await;
@@ -8274,7 +8594,7 @@ pub(crate) mod tests {
         pa.set_balance(&Address(ALICE), U256::from(FUND));
         pa.set_validator_activation_height(800);
         *pa.reward_policy_handle().write() = Some(rprime_policy(2500));
-        let _s = produce_rprime(&pa, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let _s = replay_sealed(&pa, s799).await;
         let a800 =
             produce_rprime(&pa, s799, 800, VRF_OUT, vec![prio_tx(ALICE, BOB, 0, 0xA0)]).await;
         let a801 = produce_rprime(
@@ -8296,7 +8616,7 @@ pub(crate) mod tests {
         pb.set_balance(&Address(ALICE), U256::from(FUND));
         pb.set_validator_activation_height(800);
         *pb.reward_policy_handle().write() = Some(rprime_policy(2500));
-        let _s = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let _s = replay_sealed(&pb, s799).await;
         let vrf_b = [0x5B; 32];
         let b800 =
             produce_rprime(&pb, s799, 800, vrf_b, vec![prio_tx(ALICE, CAROL, 0, 0xB0)]).await;
@@ -8575,7 +8895,7 @@ pub(crate) mod tests {
         pb.set_balance(&Address(ALICE), U256::from(FUND));
         pb.set_validator_activation_height(800);
         *pb.reward_policy_handle().write() = Some(rprime_policy(2500));
-        let _s = produce_rprime(&pb, Hash::default(), 809, VRF_OUT, vec![]).await;
+        let _s = replay_sealed(&pb, s809).await;
         let vrf_b = [0x5B; 32];
         let mut parent = s809;
         let mut b_blocks = Vec::new();
@@ -8610,7 +8930,7 @@ pub(crate) mod tests {
         pa2.set_balance(&Address(ALICE), U256::from(FUND));
         pa2.set_validator_activation_height(800);
         *pa2.reward_policy_handle().write() = Some(rprime_policy(2500));
-        let _s2 = produce_rprime(&pa2, Hash::default(), 809, VRF_OUT, vec![]).await;
+        let _s2 = replay_sealed(&pa2, s809).await;
         let a810 =
             produce_rprime(&pa2, s809, 810, VRF_OUT, vec![prio_tx(ALICE, BOB, 0, 0xA0)]).await;
         let a811 = produce_rprime(
@@ -8673,7 +8993,7 @@ pub(crate) mod tests {
         vrf: [u8; 32],
         coinbase: [u8; 20],
     ) -> Block {
-        let mut b = BlockBuilder::new()
+        let b = BlockBuilder::new()
             .version(2)
             .height(height)
             .parent(parent)
@@ -8687,17 +9007,12 @@ pub(crate) mod tests {
             .transactions(vec![])
             .state_root(state_root)
             .build_unhashed();
-        // r1007 G10: a proposer of its own (from its content), so honest siblings
-        // in one slot are not equivocation.
-        b.header.proposer_pubkey =
-            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
-        b.header.block_hash = b.compute_hash();
-        b
+        finish_fixture(b)
     }
 
-    /// Produce a reward-only block crediting `coinbase` (+ treasury), advancing
-    /// `exec` to the post-block state and sealing the honest root. Mirrors the
-    /// producer's basic-reward path (node/src/producer.rs) for a custom coinbase.
+    /// Produce a reward-only block with coinbase `coinbase`, advancing `exec`
+    /// to the post-block state (r1007 S3-3b: the emission of its height goes
+    /// to its accepted selected parent's coinbase).
     async fn produce_cb(
         exec: &Executor,
         parent: Hash,
@@ -8705,26 +9020,11 @@ pub(crate) mod tests {
         vrf: [u8; 32],
         coinbase: [u8; 20],
     ) -> Block {
-        exec.set_block_context(BlockContext {
-            coinbase,
-            prevrandao: vrf,
-            block_hashes: std::collections::HashMap::new(),
-        });
-        let provisional = mk_block_cb(height, parent, Hash::default(), vrf, coinbase);
-        let reward = RewardCalculator::new(canonical_reward_config())
-            .calculate_reward(&provisional)
-            .expect("canonical reward");
-        for (addr, amt) in [
-            (Address(coinbase), reward.validator_reward),
-            (Address(TREASURY_ADDR), reward.treasury_reward),
-        ] {
-            if amt > U256::zero() {
-                let bal = exec.get_balance(&addr);
-                exec.set_balance(&addr, bal + amt);
-            }
-        }
-        let root = exec.calculate_state_root();
-        mk_block_cb(height, parent, root, vrf, coinbase)
+        seal_mergeset(
+            exec,
+            mk_block_cb(height, parent, Hash::default(), vrf, coinbase),
+        )
+        .await
     }
 
     /// GENERIC (NON-§R') variant — proves the fix is NOT registry-specific. A plain
@@ -8768,6 +9068,14 @@ pub(crate) mod tests {
             matches!(app.apply_received(&a2).await, ApplyOutcome::Applied { .. }),
             "a2"
         );
+        // r1007 S3-3b: a block's coinbase is paid by the block that accepts
+        // it, so a3 (coinbase CB) pays a2's CBN.
+        let a3 = produce_cb(&pa, a2.header.block_hash, 3, VRF_OUT, CB).await;
+        persist(&storage, &a3);
+        assert!(
+            matches!(app.apply_received(&a3).await, ApplyOutcome::Applied { .. }),
+            "a3"
+        );
         let stale_cbn = follower.get_balance(&Address(CBN));
         assert!(
             stale_cbn > U256::zero(),
@@ -8780,6 +9088,7 @@ pub(crate) mod tests {
         let _b1 = produce_cb(&pb, Hash::default(), 1, VRF_OUT, CB).await; // identical to a1
         let b2 = produce_cb(&pb, a1.header.block_hash, 2, vrf_b, CBN).await;
         let b3 = produce_cb(&pb, b2.header.block_hash, 3, vrf_b, CBN).await;
+        let b4 = produce_cb(&pb, b3.header.block_hash, 4, vrf_b, CB).await;
         // Independent golden node to pin the honest convergence target.
         let gdir = tempfile::tempdir().expect("gdir");
         let gstorage =
@@ -8803,6 +9112,11 @@ pub(crate) mod tests {
             matches!(gapp.apply_received(&b3).await, ApplyOutcome::Applied { .. }),
             "golden b3"
         );
+        persist(&gstorage, &b4);
+        assert!(
+            matches!(gapp.apply_received(&b4).await, ApplyOutcome::Applied { .. }),
+            "golden b4"
+        );
         let golden_cbn = golden.get_balance(&Address(CBN));
         let golden_root = golden.calculate_state_root();
         assert!(
@@ -8813,8 +9127,9 @@ pub(crate) mod tests {
         // Victim reorgs A → B.
         persist(&storage, &b2);
         persist(&storage, &b3);
-        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
-        let outcome = app.apply_received(&b3).await;
+        persist(&storage, &b4);
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
+        let outcome = app.apply_received(&b4).await;
 
         assert!(
             matches!(outcome, ApplyOutcome::Applied { .. }),
@@ -8823,8 +9138,8 @@ pub(crate) mod tests {
         assert_eq!(
             app.applied_tip().await,
             AppliedTip {
-                hash: b3.header.block_hash,
-                height: 3
+                hash: b4.header.block_hash,
+                height: 4
             },
             "reorged to B tip"
         );
@@ -8899,7 +9214,7 @@ pub(crate) mod tests {
         p.set_balance(&Address(ALICE), U256::from(FUND));
         p.set_validator_activation_height(800);
         *p.reward_policy_handle().write() = Some(rprime_policy(2500));
-        let _s = produce_rprime(&p, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let _s = replay_sealed(&p, fork).await;
         let mut parent = fork;
         let mut nonce = 0u64;
         let mut sctr = seed_base;
@@ -9148,11 +9463,7 @@ pub(crate) mod tests {
 
     fn cross_policy_hook_p(exec: Arc<Executor>, pre: u64, post: u64) -> impl Fn() {
         move || {
-            let bps = if exec.get_balance(&Address(CAROL)) > U256::zero() {
-                post
-            } else {
-                pre
-            };
+            let bps = if on_branch_b(&exec) { post } else { pre };
             *exec.reward_policy_handle().write() = Some(rprime_policy(bps));
         }
     }
@@ -9241,7 +9552,7 @@ pub(crate) mod tests {
         pb.set_balance(&Address(ALICE), U256::from(FUND));
         pb.set_validator_activation_height(800);
         *pb.reward_policy_handle().write() = Some(rprime_policy(pre));
-        let _s = produce_rprime(&pb, Hash::default(), 799, VRF_OUT, vec![]).await;
+        let _s = replay_sealed(&pb, s799).await;
         let vrf_b = [0x5B; 32];
         let mut out = Vec::new();
         let b800 =
@@ -9400,7 +9711,9 @@ pub(crate) mod tests {
     async fn refuzz_abort_byte_identity_cold_store_vesting() {
         let mut seed = 0x7777_1111_2222_3333u64;
         for _ in 0..20 {
-            let da = 1 + splitmix64_rf(&mut seed) % 3; // losing vesting depth
+            // r1007 S3-3b: a block's fees vest when its chain child accepts it,
+            // so the losing branch needs two blocks before anything has vested.
+            let da = 2 + splitmix64_rf(&mut seed) % 3; // losing vesting depth
             let pre_depth = 1 + splitmix64_rf(&mut seed) % 3; // valid B prefix before the bad block
 
             // Victim follows + persists a VESTING losing branch A (nonzero REG in store).
@@ -9696,7 +10009,7 @@ pub(crate) mod tests {
         coinbase: [u8; 20],
         txs: Vec<Transaction>,
     ) -> Block {
-        let mut b = BlockBuilder::new()
+        let b = BlockBuilder::new()
             .version(2)
             .height(height)
             .parent(parent)
@@ -9712,13 +10025,13 @@ pub(crate) mod tests {
             .transactions(txs)
             .state_root(root)
             .build_unhashed();
-        b.header.block_hash = b.compute_hash();
-        b
+        finish_fixture(b)
     }
 
-    /// Produce a §R' block on `exec` exactly as `apply_block_inner` settles it
-    /// (set ctx → execute txs → settle basic + §R' rewards → root), with an explicit
-    /// proposer + coinbase. Advances `exec` to the post-block state.
+    /// Produce a §R' block on `exec` as the producer seals it (r1007 S3-3b),
+    /// with an explicit proposer + coinbase. Advances `exec` to the post-block
+    /// state.
+    #[allow(clippy::too_many_arguments)]
     async fn produce_fleet(
         exec: &Executor,
         parent: Hash,
@@ -9728,48 +10041,19 @@ pub(crate) mod tests {
         coinbase: [u8; 20],
         txs: Vec<Transaction>,
     ) -> Block {
-        exec.set_block_context(BlockContext {
-            coinbase,
-            prevrandao: vrf,
-            block_hashes: std::collections::HashMap::new(),
-        });
-        let provisional = seal_fleet(
-            height,
-            parent,
-            Hash::default(),
-            vrf,
-            proposer,
-            coinbase,
-            txs.clone(),
-        );
-        let mut receipts = Vec::new();
-        for tx in &txs {
-            receipts.push(
-                exec.execute_transaction(&provisional, tx)
-                    .await
-                    .expect("producer tx executes"),
-            );
-        }
-        let reward = RewardCalculator::new(canonical_reward_config())
-            .calculate_reward(&provisional)
-            .expect("canonical reward");
-        let basic = [
-            (Address(coinbase), reward.validator_reward),
-            (Address(TREASURY_ADDR), reward.treasury_reward),
-        ];
-        exec.settle_block_rewards(
-            height,
-            coinbase,
-            proposer,
-            citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
-            &txs,
-            &receipts,
-            &basic,
+        seal_mergeset(
+            exec,
+            seal_fleet(
+                height,
+                parent,
+                Hash::default(),
+                vrf,
+                proposer,
+                coinbase,
+                txs,
+            ),
         )
         .await
-        .expect("producer §R' settle");
-        let root = exec.calculate_state_root();
-        seal_fleet(height, parent, root, vrf, proposer, coinbase, txs)
     }
 
     /// After the producer seals block `h`, mirror the follower's post-apply registry
@@ -10649,8 +10933,27 @@ pub(crate) mod tests {
     ///
     /// C1-R: each transfer also gets a distinct hash (from, to, nonce), so the
     /// receipt index (keyed by tx hash) can be checked at every crash point.
-    fn v251_transfer(exec: &Executor, from: [u8; 20], to: [u8; 20], value: u128) -> Transaction {
-        let nonce = exec.get_nonce(&Address(from));
+    /// A transfer for the block built on `parent` by `exec`. r1007 S3-3b:
+    /// `exec` holds post(parent), which does not include `parent`'s own txs
+    /// (its child executes them), so `from`'s next nonce also counts those.
+    fn v251_transfer(
+        exec: &Executor,
+        parent: Hash,
+        from: [u8; 20],
+        to: [u8; 20],
+        value: u128,
+    ) -> Transaction {
+        let pending = sealed_registry()
+            .lock()
+            .get(&parent)
+            .map(|b| {
+                b.transactions
+                    .iter()
+                    .filter(|t| t.from == embedded(from))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        let nonce = exec.get_nonce(&Address(from)) + pending;
         c1r_hashed(transfer(from, to, value, nonce), from, to, nonce)
     }
 
@@ -10683,6 +10986,16 @@ pub(crate) mod tests {
         all: &[&Block],
         rebuild_prefix: &[Hash],
     ) -> Result<(), String> {
+        // r1007 S3-3b: a chain block's receipts are those of the txs it
+        // EXECUTED, its accepted mergeset; in these linear scenarios that is
+        // its selected parent's own list (nothing for a parent at the zero
+        // hash). The tip's own txs are included, not executed.
+        let executed_by = |b: &Block| -> Vec<Transaction> {
+            all.iter()
+                .find(|p| p.header.block_hash == b.selected_parent())
+                .map(|p| p.transactions.clone())
+                .unwrap_or_default()
+        };
         let mut applied: Vec<Hash> = Vec::new();
         let mut cursor = tip;
         while let Some(h) = cursor {
@@ -10700,14 +11013,18 @@ pub(crate) mod tests {
                 .transactions
                 .get_block_transactions(&h)
                 .map_err(|e| e.to_string())?;
+            let executed = executed_by(b);
             if applied.contains(&h) {
-                for tx in &b.transactions {
+                for tx in &executed {
                     let r = storage
                         .transactions
                         .get_receipt(&tx.hash)
                         .map_err(|e| e.to_string())?
                         .ok_or_else(|| {
-                            format!("GAP: no receipt for tx {} of applied {}", tx.hash, h)
+                            format!(
+                                "GAP: no receipt for tx {} executed by applied {}",
+                                tx.hash, h
+                            )
                         })?;
                     if r.block_hash != h || r.block_number != b.header.height {
                         return Err(format!(
@@ -10731,7 +11048,7 @@ pub(crate) mod tests {
                         h
                     ));
                 }
-                for tx in &b.transactions {
+                for tx in &executed {
                     if let Ok(Some(r)) = storage.transactions.get_receipt(&tx.hash) {
                         if r.block_hash != h {
                             return Err(format!(
@@ -10755,7 +11072,7 @@ pub(crate) mod tests {
                         markers.len()
                     ));
                 }
-                for tx in &b.transactions {
+                for tx in executed.iter().chain(b.transactions.iter()) {
                     if let Ok(Some(r)) = storage.transactions.get_receipt(&tx.hash) {
                         if r.block_hash == h {
                             return Err(format!(
@@ -10869,7 +11186,7 @@ pub(crate) mod tests {
             Hash::default(),
             1,
             vrf_c,
-            vec![v251_transfer(&pc, ALICE, CAROL, 1_000)],
+            vec![v251_transfer(&pc, Hash::default(), ALICE, CAROL, 1_000)],
         )
         .await;
         let c2 = produce(
@@ -10877,60 +11194,81 @@ pub(crate) mod tests {
             c1.header.block_hash,
             2,
             vrf_c,
-            vec![v251_transfer(&pc, ALICE, DAVE, 1_000)],
+            vec![v251_transfer(&pc, c1.header.block_hash, ALICE, DAVE, 1_000)],
         )
         .await;
         (c1, c2)
     }
 
     /// The deterministic blocks of the scenario (independent in-memory producers).
-    async fn v251_blocks() -> (Block, Block, Block, Block) {
+    ///
+    /// r1007 S3-3b: a block's txs are executed (and its receipts indexed) by
+    /// the chain block that accepts it, so the shared prefix is two blocks:
+    /// a0 (h1, ALICE→DAVE) and a1 (h2, ALICE→BOB), and a1 accepts a0, so the
+    /// shared prefix holds a receipt (a0's tx, under a1). Branch A: a2 (h3,
+    /// ALICE→BOB) accepts a1. Branch B (heavier): b2 (h3, ALICE→CAROL) accepts
+    /// a1, b3 (h4, ALICE→CAROL) accepts b2. Returns (a0, a1, a2, b2, b3).
+    async fn v251_blocks() -> (Block, Block, Block, Block, Block) {
         let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pa.set_balance(&Address(ALICE), U256::from(FUND));
-        let a1 = produce(
+        let a0 = produce(
             &pa,
             Hash::default(),
             1,
             VRF_OUT,
-            vec![v251_transfer(&pa, ALICE, DAVE, 1_000)],
+            vec![v251_transfer(&pa, Hash::default(), ALICE, DAVE, 1_000)],
         )
         .await;
-        let a2 = produce(
+        let a1 = produce(
             &pa,
-            a1.header.block_hash,
+            a0.header.block_hash,
             2,
             VRF_OUT,
-            vec![v251_transfer(&pa, ALICE, BOB, 1_000)],
+            vec![v251_transfer(&pa, a0.header.block_hash, ALICE, BOB, 1_000)],
         )
         .await;
         let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pb.set_balance(&Address(ALICE), U256::from(FUND));
-        let _b1 = produce(
-            &pb,
-            Hash::default(),
-            1,
+        let _ = replay_sealed(&pb, a0.header.block_hash).await;
+        let _ = replay_sealed(&pb, a1.header.block_hash).await;
+        let a2 = produce(
+            &pa,
+            a1.header.block_hash,
+            3,
             VRF_OUT,
-            vec![v251_transfer(&pb, ALICE, DAVE, 1_000)],
+            vec![v251_transfer(&pa, a1.header.block_hash, ALICE, BOB, 1_000)],
         )
         .await;
         let vrf_b = [0x5B; 32];
         let b2 = produce(
             &pb,
             a1.header.block_hash,
-            2,
+            3,
             vrf_b,
-            vec![v251_transfer(&pb, ALICE, CAROL, 1_000)],
+            vec![v251_transfer(
+                &pb,
+                a1.header.block_hash,
+                ALICE,
+                CAROL,
+                1_000,
+            )],
         )
         .await;
         let b3 = produce(
             &pb,
             b2.header.block_hash,
-            3,
+            4,
             vrf_b,
-            vec![v251_transfer(&pb, ALICE, CAROL, 1_000)],
+            vec![v251_transfer(
+                &pb,
+                b2.header.block_hash,
+                ALICE,
+                CAROL,
+                1_000,
+            )],
         )
         .await;
-        (a1, a2, b2, b3)
+        (a0, a1, a2, b2, b3)
     }
 
     /// CHILD body: the scenario, with every executor write going through the
@@ -10952,8 +11290,10 @@ pub(crate) mod tests {
         ));
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
+        persist(&storage, &a0);
+        app.apply_received(&a0).await;
         persist(&storage, &a1);
         app.apply_received(&a1).await;
         persist(&storage, &a2);
@@ -10973,19 +11313,21 @@ pub(crate) mod tests {
                 .await
                 .expect("recover_to_head");
             assert!(ok, "child: recovery reached b3");
-            assert_eq!(app2.applied_tip().await.height, 3, "child: recovered to B");
+            assert_eq!(app2.applied_tip().await.height, 4, "child: recovered to B");
         } else {
             app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
             app.apply_received(&b3).await;
-            assert_eq!(app.applied_tip().await.height, 3, "child: reorged to B");
+            assert_eq!(app.applied_tip().await.height, 4, "child: reorged to B");
         }
         println!("V251_TOTAL_WRITES={}", store.writes.load(Ordering::SeqCst));
     }
 
     /// Reopen `dir` like `start_node` and check the boot invariant.
     /// Returns (tip height or None, invariant holds, detail).
+    #[allow(clippy::too_many_arguments)]
     fn v251_check(
         dir: &std::path::Path,
+        a0: &Block,
         a1: &Block,
         a2: &Block,
         b2: &Block,
@@ -11020,7 +11362,7 @@ pub(crate) mod tests {
             // in production it is block 0, whose state_root is the genesis root).
             Some((_, 0)) => v251_genesis_root(),
             Some((h, _)) => {
-                let named = [a1, a2, b2, b3]
+                let named = [a0, a1, a2, b2, b3]
                     .iter()
                     .find(|b| b.header.block_hash == h)
                     .map(|b| b.state_root);
@@ -11036,7 +11378,7 @@ pub(crate) mod tests {
             }
         };
         let label = |h: &Hash| {
-            [("a1", a1), ("a2", a2), ("b2", b2), ("b3", b3)]
+            [("a0", a0), ("a1", a1), ("a2", a2), ("b2", b2), ("b3", b3)]
                 .iter()
                 .find(|(_, b)| b.header.block_hash == *h)
                 .map(|(n, _)| n.to_string())
@@ -11044,6 +11386,7 @@ pub(crate) mod tests {
         };
         let which_root = [
             ("genesis", v251_genesis_root()),
+            ("a0", a0.state_root),
             ("a1", a1.state_root),
             ("a2", a2.state_root),
             ("b2", b2.state_root),
@@ -11055,7 +11398,7 @@ pub(crate) mod tests {
         .unwrap_or_else(|| "UNKNOWN".to_string());
         // C1-R: the receipt index must describe exactly the durable applied chain.
         let receipts =
-            c1r_receipts_consistent_with(&storage, tip.map(|t| t.0), &[a1, a2, b2, b3], prefix);
+            c1r_receipts_consistent_with(&storage, tip.map(|t| t.0), &[a0, a1, a2, b2, b3], prefix);
         let detail = format!(
             "tip={} durable_state_is={} ok={} receipts={}",
             tip.map(|(h, n)| format!("{}@{n}", label(&h)))
@@ -11127,12 +11470,12 @@ pub(crate) mod tests {
             return;
         }
         let test = "canonical_apply::tests::verify251_child";
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let (c1, c2) = c1r_fork_c().await;
-        // C1-R: in the `recover` scenario a1 is the rebuild's common prefix (see
+        // C1-R: in the `recover` scenario a0, a1 are the rebuild's common prefix (see
         // `c1r_receipts_consistent_with`); the `reorg` scenario allows nothing ahead.
         let prefix: Vec<Hash> = if scenario == "recover" {
-            vec![a1.header.block_hash]
+            vec![a0.header.block_hash, a1.header.block_hash]
         } else {
             Vec::new()
         };
@@ -11161,7 +11504,7 @@ pub(crate) mod tests {
                     String::from_utf8_lossy(&out.stderr)
                 )
             });
-        let (_, ok, d) = v251_check(dry.path(), &a1, &a2, &b2, &b3, &prefix);
+        let (_, ok, d) = v251_check(dry.path(), &a0, &a1, &a2, &b2, &b3, &prefix);
         println!("V251 [{scenario}] dry run: total_writes={total} final: {d}");
         assert!(ok);
         let mut torn = Vec::new();
@@ -11183,7 +11526,7 @@ pub(crate) mod tests {
                 .find(|l| l.contains("V251 ABORT"))
                 .unwrap_or("?")
                 .to_string();
-            let (_, ok, d) = v251_check(dir.path(), &a1, &a2, &b2, &b3, &prefix);
+            let (_, ok, d) = v251_check(dir.path(), &a0, &a1, &a2, &b2, &b3, &prefix);
             println!("V251 [{scenario}] abort k={k:>2} [{what}] -> {d}");
             if !ok {
                 torn.push(format!("k={k} {what} {d}"));
@@ -11193,11 +11536,12 @@ pub(crate) mod tests {
             // which forks below the rebuild's shared prefix.
             let other = tempfile::tempdir().expect("dir");
             c1r_copy_dir(dir.path(), other.path());
-            if let Err(e) = c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3], &b3).await {
+            if let Err(e) = c1r_resume_and_check(dir.path(), &[&a0, &a1, &a2, &b2, &b3], &b3).await
+            {
                 torn.push(format!("k={k} {what} resume: {e}"));
             }
             if let Err(e) =
-                c1r_resume_and_check(other.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2).await
+                c1r_resume_and_check(other.path(), &[&a0, &a1, &a2, &b2, &b3, &c1, &c2], &c2).await
             {
                 torn.push(format!("k={k} {what} resume toward C: {e}"));
             }
@@ -11219,21 +11563,21 @@ pub(crate) mod tests {
         if std::env::var(V251_DIR).is_ok() {
             return;
         }
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let (c1, c2) = c1r_fork_c().await;
         let dir = tempfile::tempdir().expect("dir");
-        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
-        c1r_resume_and_check(dir.path(), &[&a1, &a2, &b2, &b3, &c1, &c2], &c2)
+        c1r_crash_after_rebuild_reset(dir.path(), &a0, &a1, &a2);
+        c1r_resume_and_check(dir.path(), &[&a0, &a1, &a2, &b2, &b3, &c1, &c2], &c2)
             .await
             .expect("restart converging on C leaves no receipt of the abandoned prefix");
         let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
         assert!(
             storage
                 .transactions
-                .get_receipt(&a1.transactions[0].hash)
+                .get_receipt(&a0.transactions[0].hash)
                 .expect("read")
                 .is_none(),
-            "a1 is not executed on C: its receipt is gone"
+            "a0 is not accepted on C: its receipt (under a1) is gone"
         );
         assert!(storage
             .transactions
@@ -11246,7 +11590,7 @@ pub(crate) mod tests {
     /// rebuild's reset batch (before the first replayed block), leaving the durable
     /// tip at genesis, a1's receipt above it and the rebuild marker at a2. Asserts
     /// that precondition.
-    fn c1r_crash_after_rebuild_reset(dir: &std::path::Path, a1: &Block, a2: &Block) {
+    fn c1r_crash_after_rebuild_reset(dir: &std::path::Path, a0: &Block, a1: &Block, a2: &Block) {
         let test = "canonical_apply::tests::verify251_child";
         // Find the rebuild's reset batch: the first reorg batch of the `recover`
         // scenario (the linear a1/a2 applies use the applied-tip batch).
@@ -11285,9 +11629,10 @@ pub(crate) mod tests {
         let storage = StorageManager::new(dir, PruningConfig::default()).expect("reopen");
         let tip = storage.blocks.get_applied_tip().expect("tip");
         assert_eq!(tip.map(|t| t.1), Some(0), "durable tip reset to genesis");
+        // r1007 S3-3b: a1 accepts a0, so a0's tx's receipt is indexed under a1.
         let r = storage
             .transactions
-            .get_receipt(&a1.transactions[0].hash)
+            .get_receipt(&a0.transactions[0].hash)
             .expect("read");
         assert_eq!(
             r.map(|r| r.block_hash),
@@ -11299,7 +11644,7 @@ pub(crate) mod tests {
                 .transactions
                 .get_receipt_reconcile_marker()
                 .expect("read"),
-            Some((a2.header.block_hash, 2)),
+            Some((a2.header.block_hash, 3)),
             "the reset batch recorded the old applied tip"
         );
     }
@@ -11317,10 +11662,10 @@ pub(crate) mod tests {
         if std::env::var(V251_DIR).is_ok() {
             return;
         }
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let (c1, c2) = c1r_fork_c().await;
         let dir = tempfile::tempdir().expect("dir");
-        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        c1r_crash_after_rebuild_reset(dir.path(), &a0, &a1, &a2);
 
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
@@ -11340,7 +11685,7 @@ pub(crate) mod tests {
             reorg_batches: AtomicU64::new(0),
         });
         let exec = Arc::new(Executor::with_storage(Arc::new(sdb), Some(store.clone())));
-        let all = [&a1, &a2, &b2, &b3, &c1, &c2];
+        let all = [&a0, &a1, &a2, &b2, &b3, &c1, &c2];
         for b in all {
             persist(&storage, b);
         }
@@ -11348,7 +11693,7 @@ pub(crate) mod tests {
             |s: &StorageManager| s.transactions.get_receipt_reconcile_marker().expect("read");
         let a1_receipt = |s: &StorageManager| {
             s.transactions
-                .get_receipt(&a1.transactions[0].hash)
+                .get_receipt(&a0.transactions[0].hash)
                 .expect("read")
                 .map(|r| r.block_hash)
         };
@@ -11357,7 +11702,7 @@ pub(crate) mod tests {
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
         assert_eq!(
             marker(&storage),
-            Some((a2.header.block_hash, 2)),
+            Some((a2.header.block_hash, 3)),
             "startup failure keeps the marker"
         );
         assert_eq!(a1_receipt(&storage), Some(a1.header.block_hash));
@@ -11376,7 +11721,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             marker(&storage),
-            Some((a2.header.block_hash, 2)),
+            Some((a2.header.block_hash, 3)),
             "the original marker is not replaced by the rebuild's own"
         );
         assert_eq!(app.applied_tip().await.height, 0, "applied tip unchanged");
@@ -11426,7 +11771,7 @@ pub(crate) mod tests {
             return;
         }
         let test = "canonical_apply::tests::verify251_child";
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let mut seed: u64 = 0x2510_2510_2510_2510;
         let mut torn = Vec::new();
         let rounds = 40;
@@ -11451,7 +11796,8 @@ pub(crate) mod tests {
                 println!("V251 sigkill r={r}: child had not started a run");
                 continue;
             }
-            let (_, ok, d) = v251_check(std::path::Path::new(&current), &a1, &a2, &b2, &b3, &[]);
+            let (_, ok, d) =
+                v251_check(std::path::Path::new(&current), &a0, &a1, &a2, &b2, &b3, &[]);
             println!("V251 sigkill r={r} after {wait_ms} ms -> {d}");
             if !ok {
                 torn.push(format!("r={r} {d}"));
@@ -11595,7 +11941,10 @@ pub(crate) mod tests {
             vec![xfer.clone(), deploy.clone()],
         )
         .await;
-        let bh = block.header.block_hash;
+        // r1007 S3-3b: `block` carries the txs; its child accepts and executes
+        // them, and the receipts and logs are indexed under the child.
+        let child = produce(&peer, block.header.block_hash, 2, VRF_OUT, vec![]).await;
+        let bh = child.header.block_hash;
 
         let io = Arc::new(c1r_rpc(storage.clone(), follower.clone()));
         persist(&storage, &block);
@@ -11614,6 +11963,21 @@ pub(crate) mod tests {
             app.apply_received(&block).await,
             ApplyOutcome::Applied { height: 1, .. }
         ));
+        let still = c1r_call(
+            &io,
+            "eth_getTransactionReceipt",
+            serde_json::json!([c1r_hex(&deploy.hash)]),
+        )
+        .await;
+        assert!(
+            still["result"].is_null(),
+            "included, not executed: no receipt ({still})"
+        );
+        persist(&storage, &child);
+        assert!(matches!(
+            app.apply_received(&child).await,
+            ApplyOutcome::Applied { height: 2, .. }
+        ));
 
         // Same store + format as the producer: CF_RECEIPTS by tx hash, block marker.
         for tx in [&xfer, &deploy] {
@@ -11623,7 +11987,7 @@ pub(crate) mod tests {
                 .expect("read receipt")
                 .expect("follower stored the receipt");
             assert_eq!(r.block_hash, bh);
-            assert_eq!(r.block_number, 1);
+            assert_eq!(r.block_number, 2);
             assert!(r.status, "tx {} succeeded", tx.hash);
             assert!(storage
                 .transactions
@@ -11648,7 +12012,11 @@ pub(crate) mod tests {
         .await;
         let rcpt = &rcpt["result"];
         assert_eq!(rcpt["blockHash"], c1r_hex(&bh), "{rcpt}");
-        assert_eq!(rcpt["blockNumber"], "0x1");
+        assert_eq!(rcpt["blockNumber"], "0x2");
+        assert_eq!(
+            rcpt["includingBlockHash"],
+            c1r_hex(&block.header.block_hash)
+        );
         assert_eq!(rcpt["status"], "0x1");
         assert_eq!(
             rcpt["logs"][0]["topics"][0],
@@ -11659,11 +12027,11 @@ pub(crate) mod tests {
         let logs = c1r_call(
             &io,
             "eth_getLogs",
-            serde_json::json!([{"fromBlock": "0x1", "toBlock": "0x1"}]),
+            serde_json::json!([{"fromBlock": "0x1", "toBlock": "0x2"}]),
         )
         .await;
         let logs = logs["result"].as_array().cloned().unwrap_or_default();
-        assert_eq!(logs.len(), 1, "one log in block 1: {logs:?}");
+        assert_eq!(logs.len(), 1, "one log, in the accepting block 2: {logs:?}");
         assert_eq!(logs[0]["blockHash"], c1r_hex(&bh));
         assert_eq!(logs[0]["transactionHash"], c1r_hex(&deploy.hash));
         assert_eq!(logs[0]["topics"][0], c1r_hex(&Hash::new(C1R_TOPIC)));
@@ -11700,26 +12068,38 @@ pub(crate) mod tests {
             ],
         )
         .await;
-        let (validator, treasury) = reward_for(&block);
-        let credits = [(Address(CB), validator), (Address(TREASURY_ADDR), treasury)];
-        let r_indexed = indexed
-            .apply_block(
-                &block,
-                CB,
-                &citrate_execution::executor::fixed_reward(&credits),
-            )
-            .await
-            .expect("indexed apply");
-        let r_plain = plain
-            .apply_block(
-                &block,
-                CB,
-                &citrate_execution::executor::fixed_reward(&credits),
-            )
-            .await
-            .expect("plain apply");
-        assert_eq!(r_indexed, block.state_root);
-        assert_eq!(r_plain, block.state_root);
+        // r1007 S3-3b: `child` accepts `block` and executes its txs.
+        let child = produce(&peer, block.header.block_hash, 2, VRF_OUT, vec![]).await;
+        let calc = RewardCalculator::new(canonical_reward_config());
+        let emission =
+            |h: u64, t: &[Transaction], r: &[citrate_execution::types::TransactionReceipt]| {
+                canonical_emission(&calc, h, t, r)
+            };
+        let members = [citrate_execution::acceptance::AcceptedBlock {
+            block: &block,
+            color: citrate_consensus::acceptance::InclusionColor::SelectedParent,
+        }];
+        for (exec, what) in [(&indexed, "indexed"), (&plain, "plain")] {
+            let (r1, _) = exec
+                .apply_accepting_block(&block, &[], &emission, Default::default(), true, true)
+                .await
+                .unwrap_or_else(|e| panic!("{what} apply of block: {e}"));
+            assert_eq!(r1, block.state_root, "{what}");
+            let (r2, _) = exec
+                .apply_accepting_block(
+                    &child,
+                    &members,
+                    &emission,
+                    [(block.header.height, *block.header.block_hash.as_bytes())]
+                        .into_iter()
+                        .collect(),
+                    true,
+                    true,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{what} apply of child: {e}"));
+            assert_eq!(r2, child.state_root, "{what}");
+        }
         assert_eq!(indexed.calculate_state_root(), plain.calculate_state_root());
         assert!(storage
             .transactions
@@ -11753,6 +12133,10 @@ pub(crate) mod tests {
         pa.set_balance(&Address(ALICE), U256::from(FUND));
         let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
         let a2 = produce(&pa, a1.header.block_hash, 2, VRF_OUT, vec![both.clone()]).await;
+        // r1007 S3-3b: a block's txs are executed (and indexed) by its chain
+        // child, so each branch ends with an empty block that accepts the last
+        // tx-carrying one.
+        let a3 = produce(&pa, a2.header.block_hash, 3, VRF_OUT, vec![]).await;
 
         let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pb.set_balance(&Address(ALICE), U256::from(FUND));
@@ -11760,35 +12144,37 @@ pub(crate) mod tests {
         let vrf_b = [0x5B; 32];
         let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![both.clone()]).await;
         let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![only_b.clone()]).await;
-        let b3_bad = mk_block_txs(
-            3,
-            b2.header.block_hash,
+        let b4 = produce(&pb, b3.header.block_hash, 4, vrf_b, vec![]).await;
+        let b4_bad = mk_block_txs(
+            4,
+            b3.header.block_hash,
             Hash::new([0xEE; 32]),
             [0x5C; 32],
-            vec![only_b.clone()],
+            vec![],
         );
 
-        for b in [&a1, &a2] {
+        for b in [&a1, &a2, &a3] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
                 ApplyOutcome::Applied { .. }
             ));
         }
-        let all = [&a1, &a2, &b2, &b3, &b3_bad];
-        c1r_receipts_consistent(&storage, Some(a2.header.block_hash), &all).expect("A applied");
+        let all = [&a1, &a2, &a3, &b2, &b3, &b4, &b4_bad];
+        c1r_receipts_consistent(&storage, Some(a3.header.block_hash), &all).expect("A applied");
 
-        // Aborted reorg: b2 reapplies in memory, b3_bad fails its root check.
+        // Aborted reorg: b2, b3 reapply in memory, b4_bad fails its root check.
         persist(&storage, &b2);
-        persist(&storage, &b3_bad);
-        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
-        app.apply_received(&b3_bad).await;
+        persist(&storage, &b3);
+        persist(&storage, &b4_bad);
+        app.fork_choice = Some(fork_choice_returning(b4_bad.header.block_hash));
+        app.apply_received(&b4_bad).await;
         assert_eq!(
             app.applied_tip().await.hash,
-            a2.header.block_hash,
+            a3.header.block_hash,
             "abort keeps A"
         );
-        c1r_receipts_consistent(&storage, Some(a2.header.block_hash), &all)
+        c1r_receipts_consistent(&storage, Some(a3.header.block_hash), &all)
             .expect("abort restored A's receipts");
         assert_eq!(
             storage
@@ -11796,47 +12182,50 @@ pub(crate) mod tests {
                 .get_receipt(&both.hash)
                 .expect("read")
                 .map(|r| r.block_hash),
-            Some(a2.header.block_hash)
+            Some(a3.header.block_hash)
         );
 
         // Successful reorg to the heavier B branch.
-        persist(&storage, &b3);
-        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
-        app.apply_received(&b3).await;
+        persist(&storage, &b4);
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
+        app.apply_received(&b4).await;
         assert_eq!(
             app.applied_tip().await.hash,
-            b3.header.block_hash,
+            b4.header.block_hash,
             "reorged to B"
         );
-        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+        c1r_receipts_consistent(&storage, Some(b4.header.block_hash), &all)
             .expect("receipts follow the executed chain");
         let r = storage
             .transactions
             .get_receipt(&both.hash)
             .expect("read")
             .expect("tx on both branches keeps a receipt");
-        assert_eq!((r.block_hash, r.block_number), (b2.header.block_hash, 2));
-        assert!(storage
-            .transactions
-            .get_block_transactions(&a2.header.block_hash)
-            .expect("markers")
-            .is_empty());
+        assert_eq!((r.block_hash, r.block_number), (b3.header.block_hash, 3));
+        for gone in [&a2, &a3] {
+            assert!(storage
+                .transactions
+                .get_block_transactions(&gone.header.block_hash)
+                .expect("markers")
+                .is_empty());
+        }
         assert_eq!(
             storage
                 .transactions
                 .get_receipt(&only_b.hash)
                 .expect("read")
                 .map(|r| r.block_hash),
-            Some(b3.header.block_hash)
+            Some(b4.header.block_hash)
         );
+        // The shared tx was executed by a2 on A; on B it is executed by b2.
         assert_eq!(
             storage
                 .transactions
                 .get_receipt(&shared.hash)
                 .expect("read")
                 .map(|r| r.block_hash),
-            Some(a1.header.block_hash),
-            "the common ancestor's receipt is untouched"
+            Some(b2.header.block_hash),
+            "the shared tx's receipt moved to the winning branch's accepting block"
         );
     }
 
@@ -11850,9 +12239,9 @@ pub(crate) mod tests {
         let exec = store_backed(&storage);
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a0, &a1, &a2] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -11872,8 +12261,12 @@ pub(crate) mod tests {
             .await
             .expect("recover"));
         assert_eq!(app2.applied_tip().await.hash, b3.header.block_hash);
-        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &[&a1, &a2, &b2, &b3])
-            .expect("receipts follow the rebuilt spine");
+        c1r_receipts_consistent(
+            &storage,
+            Some(b3.header.block_hash),
+            &[&a0, &a1, &a2, &b2, &b3],
+        )
+        .expect("receipts follow the rebuilt spine");
     }
 
     // ---------------------------------------------------------------------
@@ -11904,16 +12297,21 @@ pub(crate) mod tests {
         );
     }
 
-    /// The follower scenario: A = a1 ← a2 (a2 carries `both`, also on B, and
-    /// `only_a`), B = a1 ← b2 ← b3 (heavier). Returns the blocks and the txs.
-    async fn c1r_corrupt_scenario() -> (Block, Block, Block, Block, Transaction, Transaction) {
-        let shared = c1r_hashed(transfer(ALICE, DAVE, 1_000, 0), ALICE, DAVE, 0);
-        let both = c1r_hashed(transfer(ALICE, BOB, 1_000, 1), ALICE, BOB, 1);
-        let only_a = c1r_hashed(transfer(ALICE, CAROL, 2_000, 2), ALICE, CAROL, 2);
-        let only_b = c1r_hashed(transfer(ALICE, DAVE, 3_000, 2), ALICE, DAVE, 2);
+    /// The follower scenario. r1007 S3-3b: a block's receipts are those of
+    /// the txs its accepted mergeset carries (here its parent's), so each branch
+    /// ends with an empty block that accepts the last tx-carrying one.
+    /// A = a1 ← a2 ← a3: a2 carries `both` (also on B) and `only_a`, and a3
+    /// accepts a2 (holds their receipts). B = a1 ← b2 ← b3 ← b4 (heavier): b2
+    /// carries `both`, b3 `only_b`; b3 holds `both`'s receipt, b4 `only_b`'s.
+    /// a1 (the fork point) is empty, so the losing segment's receipts are
+    /// exactly a3's two. Returns [a1, a2, a3, b2, b3, b4] and the txs.
+    async fn c1r_corrupt_scenario() -> ([Block; 6], Transaction, Transaction) {
+        let both = c1r_hashed(transfer(ALICE, BOB, 1_000, 0), ALICE, BOB, 0);
+        let only_a = c1r_hashed(transfer(ALICE, CAROL, 2_000, 1), ALICE, CAROL, 1);
+        let only_b = c1r_hashed(transfer(ALICE, DAVE, 3_000, 1), ALICE, DAVE, 1);
         let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pa.set_balance(&Address(ALICE), U256::from(FUND));
-        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let a1 = produce(&pa, Hash::default(), 1, VRF_OUT, vec![]).await;
         let a2 = produce(
             &pa,
             a1.header.block_hash,
@@ -11922,22 +12320,24 @@ pub(crate) mod tests {
             vec![both.clone(), only_a.clone()],
         )
         .await;
+        let a3 = produce(&pa, a2.header.block_hash, 3, VRF_OUT, vec![]).await;
         let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pb.set_balance(&Address(ALICE), U256::from(FUND));
-        let _b1 = produce(&pb, Hash::default(), 1, VRF_OUT, vec![shared.clone()]).await;
+        let _ = replay_sealed(&pb, a1.header.block_hash).await;
         let vrf_b = [0x5B; 32];
         let b2 = produce(&pb, a1.header.block_hash, 2, vrf_b, vec![both.clone()]).await;
         let b3 = produce(&pb, b2.header.block_hash, 3, vrf_b, vec![only_b]).await;
-        (a1, a2, b2, b3, both, only_a)
+        let b4 = produce(&pb, b3.header.block_hash, 4, vrf_b, vec![]).await;
+        ([a1, a2, a3, b2, b3, b4], both, only_a)
     }
 
     /// The corrupt receipts are gone and the index matches the B chain.
     fn c1r_assert_corrupt_receipts_replaced(
         storage: &StorageManager,
         blocks: &[&Block],
-        a2: &Block,
-        b2: &Block,
+        a3: &Block,
         b3: &Block,
+        b4: &Block,
         both: &Transaction,
         only_a: &Transaction,
     ) {
@@ -11946,7 +12346,7 @@ pub(crate) mod tests {
             .get_receipt(&both.hash)
             .expect("the receipt of the tx on both branches decodes again")
             .expect("and is stored");
-        assert_eq!((r.block_hash, r.block_number), (b2.header.block_hash, 2));
+        assert_eq!((r.block_hash, r.block_number), (b3.header.block_hash, 3));
         assert!(
             storage
                 .transactions
@@ -11957,10 +12357,10 @@ pub(crate) mod tests {
         );
         assert!(storage
             .transactions
-            .get_block_transactions(&a2.header.block_hash)
+            .get_block_transactions(&a3.header.block_hash)
             .expect("markers")
             .is_empty());
-        c1r_receipts_consistent(storage, Some(b3.header.block_hash), blocks)
+        c1r_receipts_consistent(storage, Some(b4.header.block_hash), blocks)
             .expect("receipts follow the executed chain");
     }
 
@@ -11979,8 +12379,8 @@ pub(crate) mod tests {
             .await
             .expect("persist genesis");
         let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
-        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
-        for b in [&a1, &a2] {
+        let ([a1, a2, a3, b2, b3, b4], both, only_a) = c1r_corrupt_scenario().await;
+        for b in [&a1, &a2, &a3] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -11991,24 +12391,25 @@ pub(crate) mod tests {
         c1r_corrupt_receipt(&storage, &only_a.hash);
         persist(&storage, &b2);
         persist(&storage, &b3);
-        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
-        app.apply_received(&b3).await;
+        persist(&storage, &b4);
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
+        app.apply_received(&b4).await;
         assert_eq!(
             app.applied_tip().await.hash,
-            b3.header.block_hash,
+            b4.header.block_hash,
             "the node follows the heavier branch"
         );
         assert_eq!(
             storage.blocks.get_applied_tip().expect("tip"),
-            Some((b3.header.block_hash, 3)),
+            Some((b4.header.block_hash, 4)),
             "the durable tip follows it too"
         );
         c1r_assert_corrupt_receipts_replaced(
             &storage,
-            &[&a1, &a2, &b2, &b3],
-            &a2,
-            &b2,
+            &[&a1, &a2, &a3, &b2, &b3, &b4],
+            &a3,
             &b3,
+            &b4,
             &both,
             &only_a,
         );
@@ -12029,15 +12430,15 @@ pub(crate) mod tests {
             .await
             .expect("persist genesis");
         let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
-        let (a1, a2, b2, _b3, both, only_a) = c1r_corrupt_scenario().await;
-        let b3_bad = mk_block_txs(
-            3,
-            b2.header.block_hash,
+        let ([a1, a2, a3, b2, b3, _b4], both, only_a) = c1r_corrupt_scenario().await;
+        let b4_bad = mk_block_txs(
+            4,
+            b3.header.block_hash,
             Hash::new([0xEE; 32]),
             [0x5C; 32],
             vec![],
         );
-        for b in [&a1, &a2] {
+        for b in [&a1, &a2, &a3] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12046,13 +12447,14 @@ pub(crate) mod tests {
         }
         c1r_corrupt_receipt(&storage, &only_a.hash);
         persist(&storage, &b2);
-        persist(&storage, &b3_bad);
-        app.fork_choice = Some(fork_choice_returning(b3_bad.header.block_hash));
-        app.apply_received(&b3_bad).await;
-        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash);
+        persist(&storage, &b3);
+        persist(&storage, &b4_bad);
+        app.fork_choice = Some(fork_choice_returning(b4_bad.header.block_hash));
+        app.apply_received(&b4_bad).await;
+        assert_eq!(app.applied_tip().await.hash, a3.header.block_hash);
         assert_eq!(
             storage.blocks.get_applied_tip().expect("tip"),
-            Some((a2.header.block_hash, 2))
+            Some((a3.header.block_hash, 3))
         );
         assert_eq!(
             storage
@@ -12060,12 +12462,12 @@ pub(crate) mod tests {
                 .get_receipt(&both.hash)
                 .expect("read")
                 .map(|r| r.block_hash),
-            Some(a2.header.block_hash),
+            Some(a3.header.block_hash),
             "the readable receipt of the abandoned block is restored"
         );
         let markers = storage
             .transactions
-            .get_block_transactions(&a2.header.block_hash)
+            .get_block_transactions(&a3.header.block_hash)
             .expect("markers");
         assert!(markers.contains(&both.hash), "its marker is restored");
     }
@@ -12080,9 +12482,9 @@ pub(crate) mod tests {
         let exec = store_backed(&storage);
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        let ([a1, a2, a3, b2, b3, b4], both, only_a) = c1r_corrupt_scenario().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a1, &a2, &a3] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12091,11 +12493,12 @@ pub(crate) mod tests {
         }
         persist(&storage, &b2);
         persist(&storage, &b3);
+        persist(&storage, &b4);
         drop(app);
         c1r_corrupt_receipt(&storage, &both.hash);
         c1r_corrupt_receipt(&storage, &only_a.hash);
         let mut app2 = CanonicalApplicator::new(exec.clone(), storage.clone());
-        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app2.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
         let g = Executor::new(Arc::new(StateDB::new()));
         g.set_balance(&Address(ALICE), U256::from(FUND));
         let res = app2
@@ -12105,7 +12508,7 @@ pub(crate) mod tests {
             matches!(res, Ok(true)),
             "the rebuild converges on the heavier branch: {res:?}"
         );
-        assert_eq!(app2.applied_tip().await.hash, b3.header.block_hash);
+        assert_eq!(app2.applied_tip().await.hash, b4.header.block_hash);
         assert!(storage
             .transactions
             .get_receipt_reconcile_marker()
@@ -12113,10 +12516,10 @@ pub(crate) mod tests {
             .is_none());
         c1r_assert_corrupt_receipts_replaced(
             &storage,
-            &[&a1, &a2, &b2, &b3],
-            &a2,
-            &b2,
+            &[&a1, &a2, &a3, &b2, &b3, &b4],
+            &a3,
             &b3,
+            &b4,
             &both,
             &only_a,
         );
@@ -12144,7 +12547,7 @@ pub(crate) mod tests {
         Arc<StorageManager>,
         Arc<V251AbortStore>,
         Arc<Executor>,
-        [Block; 4],
+        [Block; 6],
         Transaction,
         Transaction,
     ) {
@@ -12164,9 +12567,9 @@ pub(crate) mod tests {
         ));
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, b2, b3, both, only_a) = c1r_corrupt_scenario().await;
+        let ([a1, a2, a3, b2, b3, b4], both, only_a) = c1r_corrupt_scenario().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a1, &a2, &a3] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12175,7 +12578,8 @@ pub(crate) mod tests {
         }
         persist(&storage, &b2);
         persist(&storage, &b3);
-        (storage, store, exec, [a1, a2, b2, b3], both, only_a)
+        persist(&storage, &b4);
+        (storage, store, exec, [a1, a2, a3, b2, b3, b4], both, only_a)
     }
 
     fn c1r_genesis() -> StateSnapshot {
@@ -12194,20 +12598,20 @@ pub(crate) mod tests {
         }
         let _chunk = ChunkGuard::set(1);
         let dir = tempfile::tempdir().expect("dir");
-        let (storage, _store, exec, [a1, a2, b2, b3], both, only_a) =
+        let (storage, _store, exec, [a1, a2, a3, b2, b3, b4], both, only_a) =
             c1r_chunk_follower(dir.path()).await;
         c1r_corrupt_receipt(&storage, &only_a.hash);
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
         let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
         assert!(matches!(res, Ok(true)), "{res:?}");
-        assert_eq!(app.applied_tip().await.hash, b3.header.block_hash);
+        assert_eq!(app.applied_tip().await.hash, b4.header.block_hash);
         c1r_assert_corrupt_receipts_replaced(
             &storage,
-            &[&a1, &a2, &b2, &b3],
-            &a2,
-            &b2,
+            &[&a1, &a2, &a3, &b2, &b3, &b4],
+            &a3,
             &b3,
+            &b4,
             &both,
             &only_a,
         );
@@ -12223,24 +12627,24 @@ pub(crate) mod tests {
         }
         let _chunk = ChunkGuard::set(1);
         let dir = tempfile::tempdir().expect("dir");
-        let (storage, store, exec, [a1, a2, b2, b3], _both, _only_a) =
+        let (storage, store, exec, [a1, a2, a3, b2, b3, b4], _both, _only_a) =
             c1r_chunk_follower(dir.path()).await;
-        let all = [&a1, &a2, &b2, &b3];
+        let all = [&a1, &a2, &a3, &b2, &b3, &b4];
         let before = c1r_durable_view(&storage, &all);
         let root_before = exec.calculate_state_root();
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
         store.fail_receipt_index.store(true, Ordering::SeqCst);
         let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
         assert!(res.is_err(), "a failed removal write aborts: {res:?}");
-        assert_eq!(app.applied_tip().await.hash, a2.header.block_hash, "tip");
+        assert_eq!(app.applied_tip().await.hash, a3.header.block_hash, "tip");
         assert_eq!(exec.calculate_state_root(), root_before, "memory");
         assert_eq!(c1r_durable_view(&storage, &all), before, "durable state");
 
         store.fail_receipt_index.store(false, Ordering::SeqCst);
         let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
         assert!(matches!(res, Ok(true)), "{res:?}");
-        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+        c1r_receipts_consistent(&storage, Some(b4.header.block_hash), &all)
             .expect("receipts follow B");
     }
 
@@ -12255,11 +12659,11 @@ pub(crate) mod tests {
         }
         let _chunk = ChunkGuard::set(1);
         let dir = tempfile::tempdir().expect("dir");
-        let (storage, store, exec, [a1, a2, b2, b3], both, only_a) =
+        let (storage, store, exec, [a1, a2, a3, b2, b3, b4], both, only_a) =
             c1r_chunk_follower(dir.path()).await;
-        let all = [&a1, &a2, &b2, &b3];
+        let all = [&a1, &a2, &a3, &b2, &b3, &b4];
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        app.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
         store.fail_receipt_index.store(true, Ordering::SeqCst);
         // Reorg batch +1 is the reset; +2 is the rollback, which fails too.
         store.fail_reorg_batch_at.store(
@@ -12269,8 +12673,8 @@ pub(crate) mod tests {
         let res = app.recover_to_head(c1r_genesis(), Hash::default()).await;
         assert!(res.is_err(), "{res:?}");
         drop(app);
-        // The emulated stop: tip at genesis, the marker names a2, and one of
-        // a2's two receipts is still stored.
+        // The emulated stop: tip at genesis, the marker names a3, and one of
+        // a3's two receipts is still stored.
         assert_eq!(
             storage.blocks.get_applied_tip().expect("tip").map(|t| t.1),
             Some(0)
@@ -12280,7 +12684,7 @@ pub(crate) mod tests {
                 .transactions
                 .get_receipt_reconcile_marker()
                 .expect("marker"),
-            Some((a2.header.block_hash, 2))
+            Some((a3.header.block_hash, 3))
         );
         let left = [&both, &only_a]
             .iter()
@@ -12290,7 +12694,7 @@ pub(crate) mod tests {
                     .get_receipt(&t.hash)
                     .expect("read")
                     .map(|r| r.block_hash)
-                    == Some(a2.header.block_hash)
+                    == Some(a3.header.block_hash)
             })
             .count();
         assert_eq!(left, 1, "precondition: one removal was still pending");
@@ -12311,7 +12715,7 @@ pub(crate) mod tests {
         assert!(
             storage
                 .transactions
-                .get_block_transactions(&a2.header.block_hash)
+                .get_block_transactions(&a3.header.block_hash)
                 .expect("markers")
                 .is_empty(),
             "the start-up cleanup removed the pending entry"
@@ -12323,14 +12727,14 @@ pub(crate) mod tests {
                     .get_receipt(&t.hash)
                     .expect("read")
                     .map(|r| r.block_hash),
-                Some(a2.header.block_hash)
+                Some(a3.header.block_hash)
             );
         }
-        app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
+        app2.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
         app2.set_genesis(c1r_genesis(), Hash::default());
         let res = app2.recover_to_head(c1r_genesis(), Hash::default()).await;
         assert!(matches!(res, Ok(true)), "{res:?}");
-        c1r_receipts_consistent(&storage, Some(b3.header.block_hash), &all)
+        c1r_receipts_consistent(&storage, Some(b4.header.block_hash), &all)
             .expect("receipts follow B");
     }
 
@@ -12346,9 +12750,9 @@ pub(crate) mod tests {
         let exec = store_backed(&storage);
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, _, _) = v251_blocks().await;
+        let (a0, a1, a2, _, _) = v251_blocks().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a0, &a1, &a2] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12359,21 +12763,22 @@ pub(crate) mod tests {
         let ghost_tx = Hash::new([0xAC; 32]);
         let mut ghost = storage
             .transactions
-            .get_receipt(&a1.transactions[0].hash)
+            .get_receipt(&a0.transactions[0].hash)
             .expect("read")
-            .expect("a1 receipt");
+            .expect("a1's receipt (of a0's tx)");
         ghost.tx_hash = ghost_tx;
         ghost.block_hash = ghost_block;
         storage
             .transactions
             .put_receipts(&[(ghost_tx, ghost)])
             .expect("ghost entry");
-        let a1_entries: Vec<(Hash, Hash)> = a1
+        // r1007 S3-3b: a1 indexes the receipts of a0's txs, a2 those of a1's.
+        let a1_entries: Vec<(Hash, Hash)> = a0
             .transactions
             .iter()
             .map(|t| (a1.header.block_hash, t.hash))
             .collect();
-        let a2_entries: Vec<(Hash, Hash)> = a2
+        let a2_entries: Vec<(Hash, Hash)> = a1
             .transactions
             .iter()
             .map(|t| (a2.header.block_hash, t.hash))
@@ -12383,19 +12788,19 @@ pub(crate) mod tests {
             v
         };
 
-        // Durable tip a1 @ 1: a1 stays; a2 (above) and the unstored block go.
-        let got = CanonicalApplicator::receipt_index_above(&storage, 1).expect("scan");
+        // Durable tip a1 @ 2: a1 stays; a2 (above) and the unstored block go.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 2).expect("scan");
         let mut want = a2_entries.clone();
         want.push((ghost_block, ghost_tx));
         assert_eq!(sorted(got.clone()), sorted(want));
         for e in &a1_entries {
             assert!(!got.contains(e), "the durable tip's own receipt is kept");
         }
-        // Durable tip a2 @ 2: only the unstored block goes.
-        let got = CanonicalApplicator::receipt_index_above(&storage, 2).expect("scan");
+        // Durable tip a2 @ 3: only the unstored block goes.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 3).expect("scan");
         assert_eq!(got, vec![(ghost_block, ghost_tx)]);
-        // Negative control: below a1 both blocks are above the tip.
-        let got = CanonicalApplicator::receipt_index_above(&storage, 0).expect("scan");
+        // Negative control: below a1 (tip a0 @ 1) both blocks are above the tip.
+        let got = CanonicalApplicator::receipt_index_above(&storage, 1).expect("scan");
         let mut want = a1_entries;
         want.extend(a2_entries);
         want.push((ghost_block, ghost_tx));
@@ -12473,9 +12878,9 @@ pub(crate) mod tests {
         let exec = store_backed(&storage);
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a0, &a1, &a2] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12484,7 +12889,7 @@ pub(crate) mod tests {
         }
         persist(&storage, &b2);
         persist(&storage, &b3);
-        let all = [&a1, &a2, &b2, &b3];
+        let all = [&a0, &a1, &a2, &b2, &b3];
         let before = c1r_durable_view(&storage, &all);
         let root_before = exec.calculate_state_root();
         let ring_before: Vec<(u64, Hash)> = app
@@ -12495,7 +12900,8 @@ pub(crate) mod tests {
             .iter()
             .map(|(h, (hh, _))| (*h, *hh))
             .collect();
-        let a2_tx = a2.transactions[0].hash;
+        // r1007 S3-3b: the receipt indexed under the abandoned a2 is a1's tx's.
+        let a2_tx = a1.transactions[0].hash;
 
         let cases = [
             (
@@ -12575,7 +12981,7 @@ pub(crate) mod tests {
         Arc<StorageManager>,
         Arc<Executor>,
         CanonicalApplicator,
-        [Block; 4],
+        [Block; 5],
         StateSnapshot,
     ) {
         let storage =
@@ -12583,9 +12989,9 @@ pub(crate) mod tests {
         let exec = store_backed(&storage);
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a0, &a1, &a2] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12599,7 +13005,13 @@ pub(crate) mod tests {
         app2.fork_choice = Some(fork_choice_returning(b3.header.block_hash));
         let g = Executor::new(Arc::new(StateDB::new()));
         g.set_balance(&Address(ALICE), U256::from(FUND));
-        (storage, exec, app2, [a1, a2, b2, b3], g.state_snapshot())
+        (
+            storage,
+            exec,
+            app2,
+            [a0, a1, a2, b2, b3],
+            g.state_snapshot(),
+        )
     }
 
     /// Rebuild: a read error in the preparation (marker, genesis block, spine,
@@ -12611,8 +13023,9 @@ pub(crate) mod tests {
     async fn c1r_rebuild_read_faults_change_nothing() {
         let _g = FaultGuard;
         let dir = tempfile::tempdir().expect("dir");
-        let (storage, exec, app, [a1, a2, b2, b3], genesis) = c1r_rebuild_setup(dir.path()).await;
-        let all = [&a1, &a2, &b2, &b3];
+        let (storage, exec, app, [a0, a1, a2, b2, b3], genesis) =
+            c1r_rebuild_setup(dir.path()).await;
+        let all = [&a0, &a1, &a2, &b2, &b3];
         let before = c1r_durable_view(&storage, &all);
         let root_before = exec.calculate_state_root();
         let tip_before = app.applied_tip().await;
@@ -12644,7 +13057,8 @@ pub(crate) mod tests {
             ),
             (
                 "abandoned receipt",
-                fault(Site::Receipt, Some(a2.transactions[0].hash), 0),
+                // r1007 S3-3b: the receipt indexed under a2 is a1's tx's.
+                fault(Site::Receipt, Some(a1.transactions[0].hash), 0),
                 true,
             ),
             ("rollback removals", fault(Site::Block, Some(b3h), 1), true),
@@ -12696,16 +13110,16 @@ pub(crate) mod tests {
             return;
         }
         let _g = FaultGuard;
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let dir = tempfile::tempdir().expect("dir");
-        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        c1r_crash_after_rebuild_reset(dir.path(), &a0, &a1, &a2);
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
-        for b in [&a1, &a2, &b2, &b3] {
+        for b in [&a0, &a1, &a2, &b2, &b3] {
             persist(&storage, b);
         }
         let exec = store_backed(&storage);
-        let all = [&a1, &a2, &b2, &b3];
+        let all = [&a0, &a1, &a2, &b2, &b3];
         let before = c1r_durable_view(&storage, &all);
         let g = Executor::new(Arc::new(StateDB::new()));
         g.set_balance(&Address(ALICE), U256::from(FUND));
@@ -12752,15 +13166,19 @@ pub(crate) mod tests {
             None,
             "marker cleared once the cleanup reads succeed"
         );
-        assert_eq!(
-            storage
-                .transactions
-                .get_receipt(&a2.transactions[0].hash)
-                .expect("read")
-                .map(|r| r.block_hash),
-            None,
-            "a2 is above the durable tip: its receipt is gone"
-        );
+        // r1007 S3-3b: a2 indexed a1's tx, a1 indexed a0's; both blocks are
+        // above the durable tip (genesis), so both receipts are gone.
+        for (tx, what) in [(&a1.transactions[0], "a2"), (&a0.transactions[0], "a1")] {
+            assert_eq!(
+                storage
+                    .transactions
+                    .get_receipt(&tx.hash)
+                    .expect("read")
+                    .map(|r| r.block_hash),
+                None,
+                "{what} is above the durable tip: its receipt is gone"
+            );
+        }
     }
 
     /// Reorg: the winning branch's store commit (one atomic batch) fails. The
@@ -12790,9 +13208,9 @@ pub(crate) mod tests {
         ));
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a0, &a1, &a2] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12801,7 +13219,7 @@ pub(crate) mod tests {
         }
         persist(&storage, &b2);
         persist(&storage, &b3);
-        let all = [&a1, &a2, &b2, &b3];
+        let all = [&a0, &a1, &a2, &b2, &b3];
         let before = c1r_durable_view(&storage, &all);
         let root_before = exec.calculate_state_root();
 
@@ -12843,19 +13261,20 @@ pub(crate) mod tests {
     // receipts; once the node moves to another chain, those receipts must go.
     // ---------------------------------------------------------------------
 
-    /// A follower that applied a1 ← a2, then restarted on a release whose block
-    /// rules start at height 2 (the purge removes a2), with a1 still stored.
+    /// A follower that applied a0 ← a1 ← a2, then restarted on a release whose
+    /// block rules start at height 3 (the purge removes a2), with a0, a1 still
+    /// stored (a1 holding the receipt of a0's tx).
     async fn c1r_purged_follower(
         dir: &std::path::Path,
-    ) -> (Arc<StorageManager>, Arc<Executor>, Block, Block) {
+    ) -> (Arc<StorageManager>, Arc<Executor>, Block, Block, Block) {
         let storage =
             Arc::new(StorageManager::new(dir, PruningConfig::default()).expect("storage"));
         let exec = store_backed(&storage);
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         exec.persist_state_changes().await.expect("persist genesis");
-        let (a1, a2, _, _) = v251_blocks().await;
+        let (a0, a1, a2, _, _) = v251_blocks().await;
         let app = CanonicalApplicator::new(exec.clone(), storage.clone());
-        for b in [&a1, &a2] {
+        for b in [&a0, &a1, &a2] {
             persist(&storage, b);
             assert!(matches!(
                 app.apply_received(b).await,
@@ -12863,17 +13282,17 @@ pub(crate) mod tests {
             ));
         }
         drop(app);
-        c1r_startup_purge(&storage, &a1, &a2);
-        (storage, exec, a1, a2)
+        c1r_startup_purge(&storage, &a0, &a1, &a2);
+        (storage, exec, a0, a1, a2)
     }
 
-    /// The real start-up purge with the rules active from height 2: a2 (and
-    /// anything above it) goes, a1 stays with its receipt, and the applied-tip
+    /// The real start-up purge with the rules active from height 3: a2 (and
+    /// anything above it) goes, a1 stays with its receipt (a0's tx), and the applied-tip
     /// pointer stays on a2. Asserts that precondition.
-    fn c1r_startup_purge(storage: &StorageManager, a1: &Block, a2: &Block) {
+    fn c1r_startup_purge(storage: &StorageManager, a0: &Block, a1: &Block, a2: &Block) {
         let report = crate::hardening_rejoin::purge_invalid_post_activation(
             storage,
-            citrate_consensus::hardening::PbaHardening::at(2),
+            citrate_consensus::hardening::PbaHardening::at(3),
             40204,
         )
         .expect("purge");
@@ -12887,7 +13306,7 @@ pub(crate) mod tests {
         assert_eq!(
             storage
                 .transactions
-                .get_receipt(&a1.transactions[0].hash)
+                .get_receipt(&a0.transactions[0].hash)
                 .expect("read")
                 .map(|r| r.block_hash),
             Some(a1.header.block_hash),
@@ -12904,7 +13323,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn c1r_rebuild_after_startup_purge_leaves_no_receipt_off_the_spine() {
         let dir = tempfile::tempdir().expect("dir");
-        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (storage, exec, a0, a1, a2) = c1r_purged_follower(dir.path()).await;
         let (c1, c2) = c1r_fork_c().await;
         // Sync fetches the canonical chain from upgraded peers.
         persist(&storage, &c1);
@@ -12924,12 +13343,12 @@ pub(crate) mod tests {
         let r = c1r_call(
             &io,
             "eth_getTransactionReceipt",
-            serde_json::json!([c1r_hex(&a1.transactions[0].hash)]),
+            serde_json::json!([c1r_hex(&a0.transactions[0].hash)]),
         )
         .await;
         assert!(
             r["result"].is_null(),
-            "a1 is not on the applied chain: its receipt must be null, got {r}"
+            "a0/a1 are not on the applied chain: the receipt a1 indexed must be null, got {r}"
         );
         let r = c1r_call(
             &io,
@@ -12939,11 +13358,15 @@ pub(crate) mod tests {
         .await;
         assert_eq!(
             r["result"]["blockHash"],
-            serde_json::json!(c1r_hex(&c1.header.block_hash)),
-            "c1's receipt is served: {r}"
+            serde_json::json!(c1r_hex(&c2.header.block_hash)),
+            "c1's receipt is served, under its accepting block c2: {r}"
         );
-        c1r_receipts_consistent(&storage, Some(c2.header.block_hash), &[&a1, &a2, &c1, &c2])
-            .expect("receipts follow C");
+        c1r_receipts_consistent(
+            &storage,
+            Some(c2.header.block_hash),
+            &[&a0, &a1, &a2, &c1, &c2],
+        )
+        .expect("receipts follow C");
         assert_eq!(
             storage
                 .transactions
@@ -12961,10 +13384,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn c1r_failed_rebuild_after_startup_purge_restores_receipts() {
         let dir = tempfile::tempdir().expect("dir");
-        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (storage, exec, a0, a1, a2) = c1r_purged_follower(dir.path()).await;
         let (c1, c2) = c1r_fork_c().await;
         persist(&storage, &c2);
-        let all = [&a1, &a2, &c1, &c2];
+        let all = [&a0, &a1, &a2, &c1, &c2];
         let before = c1r_durable_view(&storage, &all);
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
         let root_before = exec.calculate_state_root();
@@ -13000,14 +13423,14 @@ pub(crate) mod tests {
         if std::env::var(V251_DIR).is_ok() {
             return;
         }
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let (c1, c2) = c1r_fork_c().await;
         let dir = tempfile::tempdir().expect("dir");
-        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        c1r_crash_after_rebuild_reset(dir.path(), &a0, &a1, &a2);
         {
             let storage =
                 StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
-            c1r_startup_purge(&storage, &a1, &a2);
+            c1r_startup_purge(&storage, &a0, &a1, &a2);
             for b in [&b2, &b3] {
                 assert!(storage
                     .blocks
@@ -13016,17 +13439,17 @@ pub(crate) mod tests {
                     .is_none());
             }
         }
-        c1r_resume_and_check(dir.path(), &[&a1, &c1, &c2], &c2)
+        c1r_resume_and_check(dir.path(), &[&a0, &a1, &c1, &c2], &c2)
             .await
             .expect("restart converging on C leaves no receipt of a1");
         let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen");
         assert!(
             storage
                 .transactions
-                .get_receipt(&a1.transactions[0].hash)
+                .get_receipt(&a0.transactions[0].hash)
                 .expect("read")
                 .is_none(),
-            "a1 is not executed on C: its receipt is gone"
+            "a0 is not accepted on C: the receipt a1 indexed is gone"
         );
         assert!(storage
             .transactions
@@ -13047,11 +13470,11 @@ pub(crate) mod tests {
         let _g = FaultGuard;
         // Rebuild after the purge.
         let dir = tempfile::tempdir().expect("dir");
-        let (storage, exec, a1, a2) = c1r_purged_follower(dir.path()).await;
+        let (storage, exec, a0, a1, a2) = c1r_purged_follower(dir.path()).await;
         let (c1, c2) = c1r_fork_c().await;
         persist(&storage, &c1);
         persist(&storage, &c2);
-        let all = [&a1, &a2, &c1, &c2];
+        let all = [&a0, &a1, &a2, &c1, &c2];
         let before = c1r_durable_view(&storage, &all);
         let mut app = CanonicalApplicator::new(exec.clone(), storage.clone());
         app.fork_choice = Some(fork_choice_returning(c2.header.block_hash));
@@ -13062,7 +13485,7 @@ pub(crate) mod tests {
             ("index scan", fault(Site::ReceiptIndex, None, 0)),
             (
                 "scanned receipt",
-                fault(Site::Receipt, Some(a1.transactions[0].hash), 0),
+                fault(Site::Receipt, Some(a0.transactions[0].hash), 0),
             ),
         ] {
             read_faults::set(vec![f]);
@@ -13088,14 +13511,14 @@ pub(crate) mod tests {
             .expect("receipts follow C");
 
         // Start-up cleanup after an interrupted rebuild and a purge.
-        let (a1, a2, b2, b3) = v251_blocks().await;
+        let (a0, a1, a2, b2, b3) = v251_blocks().await;
         let dir = tempfile::tempdir().expect("dir");
-        c1r_crash_after_rebuild_reset(dir.path(), &a1, &a2);
+        c1r_crash_after_rebuild_reset(dir.path(), &a0, &a1, &a2);
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("reopen"));
-        c1r_startup_purge(&storage, &a1, &a2);
+        c1r_startup_purge(&storage, &a0, &a1, &a2);
         let exec = store_backed(&storage);
-        let all = [&a1, &a2, &b2, &b3];
+        let all = [&a0, &a1, &a2, &b2, &b3];
         let before = c1r_durable_view(&storage, &all);
         read_faults::set(vec![fault(Site::ReceiptIndex, None, 0)]);
         drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
@@ -13114,7 +13537,7 @@ pub(crate) mod tests {
                 .transactions
                 .get_receipt_reconcile_marker()
                 .expect("read"),
-            Some((a2.header.block_hash, 2)),
+            Some((a2.header.block_hash, 3)),
             "the marker survives a failed scan"
         );
         drop(CanonicalApplicator::new(exec.clone(), storage.clone()));
@@ -13127,7 +13550,7 @@ pub(crate) mod tests {
         );
         assert!(storage
             .transactions
-            .get_receipt(&a1.transactions[0].hash)
+            .get_receipt(&a0.transactions[0].hash)
             .expect("read")
             .is_none());
     }
@@ -13568,6 +13991,8 @@ pub(crate) mod tests {
                     transfer(BOB, ALICE, 1_000, 5),
                 ],
             ),
+            // r1007 S3-3b: block 8 accepts block 7, so its txs execute too.
+            (8, vec![]),
         ]
     }
 
@@ -13646,34 +14071,41 @@ pub(crate) mod tests {
 
     /// Per height: (state root, witness digest), recorded on the code before
     /// the supply-hardening height existed (citrate-chain 253d3287).
+    // r1007 S3-3b: re-recorded under mergeset acceptance (each block commits
+    // its accepted mergeset; block 8 accepts block 7). Execution semantics
+    // changed at the r1007 genesis, so the r1006 vectors no longer apply.
     const RP_RECORDED: &[(&str, &str)] = &[
         (
-            "c2cee92b39b8e7a3a3b55081ba9eb2e05bace34dba1f1b0a09f478dbed19f1f5",
-            "d5aaf722142b55e6641488a6193168b18111646aad2286bacf507873a4ef32e6",
+            "792df0182ad8f223798c88c7b8a1196b8666becc42e368d0c2b98d49c96d5921",
+            "546da4f7fe4fd7693bfc6ac0209442b0446d4e44e90d66e785a44d4c4d28467f",
         ),
         (
-            "937a24a6fff2d2db82fa31f25bf8e0219dc2a7c8f94df734f34766f1e8701cb1",
-            "95e4102ef80c72b334a187071813814a6b3167dbef1823aa3ca9f5d153a2cb21",
+            "b5dba512cc38009db82cfab0ac0b4ba8d2b8d264d10cad2135cc528711d59063",
+            "8644cbcda07e7a148c6b13644aa8c51bf19fc908279f0010b7e72aa9a1a7c9bd",
         ),
         (
-            "f14ae165ae04175e58ab0a213e593def361e83cdcd4434ed062c2e2b68c179b5",
-            "31fbe18aaf0e4ffb23b88558fdf8703a1c0c30fc5473ba7827ce070e06b35fd3",
+            "64894c7978b09a6b801e540ca611527f7b0241e520210aa63532bbf6ec70b565",
+            "6ff3059b01be0c02ec3e2f9965ccb94ec08db6b3bd8eb3cfb37894be55640da5",
         ),
         (
-            "b0069e5b96e012cab5650bb36df9697cc0adf145091d53dc92d8771eaf6986e5",
-            "ce7d04a2261a211c6b5520dba136250178e704384a89e5d9d4e03d0f991b9b9d",
+            "8ad94e027e9523201d89f5f7fa00125dd581cd8467df55ee1723a774a633ef35",
+            "4f819ef0ce0b817df9b4344a0053ca29fcada0dd4aeea59d0e233df3c6ad1d10",
         ),
         (
-            "7bd3fd1ca5227a2ef960692bed64d904577524b0e7811ea80186c16ee33b781f",
-            "72c865483670298bbcbeb67034e2c4e66fd8074c2a86472e410a2fbe35180e42",
+            "c5eb3e881a1d5fd976fc32090ea969a5e77908987463b5a4e7dbb1048b6d3c88",
+            "d7f5eb7110d971e9604016f0443b6be83159daa64a34b32cf37c09680a61f85d",
         ),
         (
-            "ee4d28a03156757980a3bd6976aaf1f4d578d7e004d975e355f9e1fd1ae8d131",
-            "7a9dafa81caa99346933fcf74468118a0b79cb9590012146dc7993a42d8c1023",
+            "20e3fedd70df3914afb7a110d5e89e4545f1ecb3ddf2871964d371f1ac1fc999",
+            "29fd1d0aaccef8f5da3036185f8ea9d0d7e8bb96c915ef377c725f643d1fd347",
         ),
         (
-            "966cb7af31be11b9654bb40f91cd3be3df5d434aa36b49d16286437ef7328b06",
-            "546a216b72fd8e19bdf39da08db976f3e49fff6b630efb7bcb329855671abf44",
+            "d0b997086f2ed2f2549bc022cda41b1898ff517b2c473d9752091cf35e0de63c",
+            "a2b1a0cf0fc33ad607961536813b86e4c755fbf02624fcb0a06b15a46a4bb0a3",
+        ),
+        (
+            "532b1bac6db6a2ef12521cb06f4f4d14d2e90b78fc38238beba1fa75b01bb43b",
+            "7be019a2cf47ff7966462486325fae1844beea78aaa1ac01afc5073b119b2d43",
         ),
     ];
 
@@ -13700,34 +14132,22 @@ pub(crate) mod tests {
         let mut parent = Hash::default();
         let mut got: Vec<(String, String)> = Vec::new();
         for (height, txs) in rp_range() {
-            producer.set_block_context(BlockContext {
-                coinbase: CB,
-                prevrandao: VRF_OUT,
-                block_hashes: std::collections::HashMap::new(),
-            });
-            let provisional = mk_block_txs(height, parent, Hash::default(), VRF_OUT, txs.clone());
-            let mut receipts = Vec::new();
-            for tx in &txs {
-                receipts.push(
-                    producer
-                        .execute_transaction(&provisional, tx)
-                        .await
-                        .expect("producer tx must execute"),
-                );
-            }
-            let reward =
-                canonical_block_reward(&calc, &provisional, &receipts).expect("canonical reward");
-            for (addr, amt) in [
-                (Address(CB), reward.validator_reward),
-                (Address(TREASURY_ADDR), reward.treasury_reward),
-            ] {
-                if amt > U256::zero() {
-                    let bal = producer.get_balance(&addr);
-                    producer.set_balance(&addr, bal + amt);
-                }
-            }
-            let root = producer.calculate_state_root();
-            let block = mk_block_txs(height, parent, root, VRF_OUT, txs);
+            // r1007 S3-3b: the block commits its accepted mergeset (its
+            // parent's txs); the witness covers what it executed.
+            let (block, accepted) = seal_mergeset_with(
+                &producer,
+                mk_block_txs(height, parent, Hash::default(), VRF_OUT, txs),
+            )
+            .await;
+            let root = block.state_root;
+            let receipts = accepted.receipts.clone();
+            let em = canonical_emission(&calc, height, &accepted.executed, &receipts)
+                .expect("canonical emission");
+            let reward = citrate_economics::BlockReward {
+                validator_reward: em.validator,
+                treasury_reward: em.treasury_amount,
+                total_reward: em.validator + em.treasury_amount,
+            };
 
             persist(&storage, &block);
             assert!(
@@ -14085,9 +14505,10 @@ pub(crate) mod tests {
             let mut snaps = Vec::new();
             let mut parent = parent;
             for h in first..first + n {
-                let mut txs = vec![v251_transfer(&exec, ALICE, to, 1_000)];
-                // The nonce after the transfer: the producer executes in order.
-                if let Some(tx) = extra(h, exec.get_nonce(&Address(ALICE)) + 1) {
+                let mut txs = vec![v251_transfer(&exec, parent, ALICE, to, 1_000)];
+                // The nonce after the transfer.
+                let next = txs[0].nonce + 1;
+                if let Some(tx) = extra(h, next) {
                     txs.push(tx);
                 }
                 let b = produce(&exec, parent, h, vrf, txs).await;
@@ -14412,13 +14833,14 @@ pub(crate) mod tests {
         /// S3-3c (spec 06 §8.3, I6): a node that switched a fork deeper than
         /// the snapshot ring from its undo records, then restarted and kept
         /// applying, is recorded from its data dir (read-only, while open)
-        /// and replayed by the independent reference path
-        /// (`tools/replay-ref`): every applied block's committed root matches
-        /// a plain linear replay from genesis. A recording with one block of
-        /// the winning branch changed is reported at exactly that height.
+        /// and replayed by the independent mergeset reference
+        /// (`tools/mergeset-ref` via `replay_mergeset`): every applied block's
+        /// commitments and accepted list match. A recording with one tx of
+        /// the winning branch changed is reported at the block that accepts
+        /// it (r1007 S3-3b; before mergeset execution it was that block).
         #[tokio::test]
         async fn a_deep_reorg_replays_with_zero_divergence() {
-            use citrate_replay_ref::{record_data_dir, replay, ReplayConfig, SelectedChain};
+            use citrate_replay_ref::{record_data_dir, ReplayConfig};
             let tip_height = 400u64;
             let fork = tip_height - 300;
             let (main, snaps) = rsr_main(tip_height).await;
@@ -14470,20 +14892,23 @@ pub(crate) mod tests {
             let top = head.header.height + 5;
             assert_eq!(rec.applied_tip.1, top);
             assert_eq!(rec.chain.len() as u64, top + 1, "genesis sentinel..=tip");
-            let report = replay(&rec, &SelectedChain).await.expect("replay");
+            // r1007 S3-3b: the independent mergeset reference.
+            let report = citrate_replay_ref::replay_mergeset(&rec).expect("replay");
             assert_eq!(report.divergence, None, "{report:?}");
             assert_eq!(report.matched, top);
             assert!(
-                report.committed_compared >= top - fork,
-                "every block of the winning branch has a committed root: {report:?}"
+                report.lists_compared >= top - fork,
+                "every block of the winning branch has its accepted list: {report:?}"
             );
+            // A changed tx in block k is executed (and caught) at k + 1, the
+            // block that accepts it.
             let k = fork + 150;
             let mut bad = rec.clone();
             bad.chain_block_mut(k).expect("block k").transactions[0].value += 1;
-            let report = replay(&bad, &SelectedChain).await.expect("replay");
+            let report = citrate_replay_ref::replay_mergeset(&bad).expect("replay");
             assert_eq!(
                 report.divergence.as_ref().map(|d| d.height),
-                Some(k),
+                Some(k + 1),
                 "{report:?}"
             );
         }

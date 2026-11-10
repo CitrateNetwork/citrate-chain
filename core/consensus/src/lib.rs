@@ -15,6 +15,7 @@
 )]
 // citrate/core/consensus/src/lib.rs
 
+pub mod acceptance;
 pub mod block_sidecars;
 pub mod chain_selection;
 pub mod checkpoint;
@@ -41,7 +42,10 @@ pub use dag_store::{DagStats, DagStore, DagStoreError, KvStore};
 pub use ecvrf::{EcvrfError, EcvrfProof};
 pub use finality::{FinalityConfig, FinalityError, FinalityEvent, FinalityStatus, FinalityTracker};
 pub use ghostdag::{GhostDag, GhostDagError};
-pub use ordering::{OrderedBlockRange, OrderingError, TotalOrdering, TransactionRef};
+pub use ordering::{
+    consensus_ordered_mergeset, OrderedBlockRange, OrderedMember, OrderingError, TotalOrdering,
+    TransactionRef,
+};
 pub use tip_selection::{ParentSelector, SelectionStrategy, TipSelectionError, TipSelector};
 pub use types::*;
 pub use vrf::{LeaderElection, Validator, VrfError, VrfProposerSelector};

@@ -1117,6 +1117,11 @@ mod tests {
             height,
             &b.transactions,
         );
+        // r1007 S3-3b: the commitments of an accepted mergeset with no
+        // transaction, under the ACCEPT gas limit.
+        b.header.gas_limit = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
+        b.accepted_root = citrate_execution::acceptance::accepted_root(&[]);
+        b.receipt_root = citrate_execution::acceptance::receipt_root(&[]);
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
         crate::g11_test_seal::record(&b);
@@ -1158,13 +1163,18 @@ mod tests {
                 coinbase: CB,
                 prevrandao: [0x5A; 32],
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let provisional = seal(key, height, Hash::default(), Hash::default());
             let r = rewards.calculate_reward(&provisional).expect("reward");
-            for (addr, amt) in [
-                (Address(CB), r.validator_reward),
-                (treasury, r.treasury_reward),
-            ] {
+            // r1007 S3-3b: R(h)'s validator part goes to the accepted blues
+            // with a proposer (all pay CB); block 1 accepts only genesis.
+            let validator = if height == 1 {
+                U256::zero()
+            } else {
+                r.validator_reward
+            };
+            for (addr, amt) in [(Address(CB), validator), (treasury, r.treasury_reward)] {
                 if amt > U256::zero() {
                     let bal = exec.get_balance(&addr);
                     exec.set_balance(&addr, bal + amt);
@@ -3983,6 +3993,11 @@ mod tests {
             height,
             &b.transactions,
         );
+        // r1007 S3-3b: the commitments of an accepted mergeset with no
+        // transaction, under the ACCEPT gas limit.
+        b.header.gas_limit = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
+        b.accepted_root = citrate_execution::acceptance::accepted_root(&[]);
+        b.receipt_root = citrate_execution::acceptance::receipt_root(&[]);
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
         crate::g11_test_seal::record(&b);

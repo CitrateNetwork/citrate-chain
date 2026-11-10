@@ -129,6 +129,8 @@ pub struct ExecutionContext {
     pub gas_limit: u64,
     pub gas_used: u64,
     pub gas_price: u64,
+    /// The transaction's value (r1007 T2: a deployment carries it).
+    pub value: u128,
     pub origin: Address,
     pub logs: Vec<Log>,
     pub output: Vec<u8>,
@@ -161,6 +163,7 @@ impl ExecutionContext {
             gas_limit: tx.gas_limit,
             gas_used: 0,
             gas_price: tx.gas_price,
+            value: tx.value,
             origin: crate::address_utils::normalize_address(&tx.from),
             logs: Vec::new(),
             output: Vec::new(),
@@ -196,6 +199,9 @@ impl ExecutionContext {
 
 /// Default chain ID for Citrate network
 pub const DEFAULT_CHAIN_ID: u64 = 40204;
+
+mod mergeset;
+pub use mergeset::{Emission, EmissionFn};
 
 /// Transaction executor
 pub struct Executor {
@@ -573,6 +579,29 @@ impl ReceiptIndexBatch {
             removals: Vec::new(),
             receipts,
             transactions: block.transactions.clone(),
+            reconcile_marker: None,
+        }
+    }
+
+    /// r1007 S3-3b: the index entries of one ACCEPTING block: the receipts of
+    /// the transactions its mergeset execution ran (keyed by tx hash, indexed
+    /// under the accepting block, carrying the including block), and those
+    /// transactions' bodies. Skipped occurrences have no receipt.
+    pub fn for_accepting_block(block: &Block, exec: &crate::acceptance::MergesetExecution) -> Self {
+        let receipts = exec
+            .receipts
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.block_hash = block.header.block_hash;
+                r.block_number = block.header.height;
+                r
+            })
+            .collect();
+        Self {
+            removals: Vec::new(),
+            receipts,
+            transactions: exec.executed.clone(),
             reconcile_marker: None,
         }
     }
@@ -1895,6 +1924,7 @@ impl Executor {
             coinbase,
             prevrandao: *block.header.vrf_reveal.output.as_bytes(),
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
 
         // Capture receipts so §R' can levy the priority fee on the EXACT gas each
@@ -2067,6 +2097,27 @@ impl Executor {
                     tx.hash
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// r1007 S3-3b: the structural part of the PBA body rule for a chain
+    /// block being applied: its tx root binds its own list. Its transactions'
+    /// signatures and chain id are checked where they run, when the block is
+    /// accepted (`execute_mergeset`), so each tx is authenticated once.
+    fn verify_block_body_structure(&self, block: &Block) -> Result<(), ExecutionError> {
+        let pba = self.pba_hardening();
+        let height = block.header.height;
+        if !pba.active_at(height) {
+            return Ok(());
+        }
+        let expected =
+            citrate_consensus::tx_auth::tx_root_for_height(pba, height, &block.transactions);
+        if block.tx_root != expected {
+            return Err(ExecutionError::InvalidBlockBody(format!(
+                "tx_root {} does not commit to the block's transactions (expected {expected})",
+                block.tx_root
+            )));
         }
         Ok(())
     }
@@ -2732,6 +2783,7 @@ impl Executor {
             eth_tx_type: tx.eth_tx_type,
             effective_gas_price: tx.gas_price,
             revert_reason,
+            acceptance: None,
         };
 
         info!(
@@ -3501,6 +3553,14 @@ impl Executor {
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
         context.use_gas(self.gas_schedule.create)?;
+        // r1007 T2 (spec 06 §3.12): under supply hardening the deployment's
+        // value moves to the created contract. Below the activation (r1006
+        // history) it is checked against the balance and never transferred.
+        let value = if crate::supply_hardening::supply_hardening_active(context.block_number) {
+            U256::from(context.value)
+        } else {
+            U256::zero()
+        };
 
         // Execute deployment bytecode using revm (battle-tested EVM)
         // Revm will calculate the correct CREATE address and create the account
@@ -3510,7 +3570,7 @@ impl Executor {
             self.state_db.clone(),
             from,
             code,
-            U256::zero(), // No value transfer during deployment
+            value,
             gas_remaining,
             U256::from(context.gas_price),
             self.chain_id,
@@ -3519,9 +3579,9 @@ impl Executor {
             self.get_block_context(),
             Some(context.writes_handle.clone()),
             Some(context.journal.clone()),
-            // Deployments carry no value on this path (see the U256::zero()
-            // above), but constructor code can still CALL out with value, so
-            // the same height gate applies.
+            // Constructor code can CALL out with value, and from supply
+            // hardening the deployment carries its own value, so the same
+            // height gate applies.
             crate::executor::value_semantics_at(context.block_number),
             // S3-7: `None` except on an RPC trace replay executor.
             self.call_tracer.as_ref(),
@@ -3654,11 +3714,19 @@ impl Executor {
         // with contract code about what lives at those addresses. Gated on
         // the hardening activation (40204 pins it at genesis on the reroll)
         // so pre-activation history replays unchanged.
+        //
+        // r1007 T1 (spec 06 §3.12): under supply hardening a call to an account
+        // without code runs in REVM like any other call, so its value moves and
+        // it pays EVM gas. Below the activation (r1006 history) nothing runs and
+        // no value moves, unchanged.
         let code_len = match &code_opt {
             Some(code) => Some(code.len()),
             None if crate::activation::pba_hardening_active(context.block_number)
                 && crate::revm_adapter::is_revm_precompile_at(&to, context.block_number) =>
             {
+                Some(0)
+            }
+            None if crate::supply_hardening::supply_hardening_active(context.block_number) => {
                 Some(0)
             }
             None => None,
@@ -4981,6 +5049,7 @@ mod tests {
                 coinbase: CB,
                 prevrandao: [0x5A; 32],
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let tx = create_test_tx(alice, Some(bob), 1000, 0);
             let blk = block_with(vec![tx.clone()], Hash::default());
@@ -5103,6 +5172,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: vrf_output,
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
 
         let block = create_test_block();

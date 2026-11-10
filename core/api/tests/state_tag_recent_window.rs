@@ -334,9 +334,18 @@ fn forge_script_session_replay_is_served_with_the_window() {
 fn forge_script_session_replay_is_refused_when_strict() {
     let f = fixture(0);
     let out = replay_forge_session(&f, &f.io);
+    // r1007 S3-3b (spec 06 §5.1): `latest` is the executed head, so the reads
+    // pinned to it are served while it is the head; once three more blocks
+    // execute, a strict node refuses every read still pinned to it.
+    let (before, after) = out.split_at(5);
     assert!(
-        out.iter()
+        before.iter().all(|v| v.get("error").is_none()),
+        "strict: reads pinned to the executed head are served: {before:?}"
+    );
+    assert!(
+        after
+            .iter()
             .all(|v| v["error"]["code"] == json!(HISTORICAL_STATE_CODE)),
-        "strict: latest names a stored block above the executed head, then the head moves: {out:?}"
+        "strict: the head moved, the pinned block is history: {after:?}"
     );
 }

@@ -385,3 +385,166 @@ fn mpt_state_root_replays_and_diffs_from_scratch_roots() {
         "{d}"
     );
 }
+
+/// The node's emission rule for the mergeset fixture: the reference reward
+/// config's R(h), split as the node splits it (validator part to the blues,
+/// treasury part).
+fn emission(
+    height: u64,
+    txs: &[Transaction],
+    receipts: &[TransactionReceipt],
+) -> Result<citrate_execution::executor::Emission, ExecutionError> {
+    let calc = citrate_economics::rewards::RewardCalculator::new(reference_reward_config());
+    let carrier = BlockBuilder::new()
+        .height(height)
+        .transactions(txs.to_vec())
+        .build_unhashed();
+    let rw = calc
+        .calculate_block_reward(&carrier, receipts, false)
+        .map_err(|e| ExecutionError::RewardSettlement(e.to_string()))?;
+    Ok(citrate_execution::executor::Emission {
+        validator: rw.validator_reward,
+        treasury: reference_reward_config().treasury_address,
+        treasury_amount: rw.treasury_reward,
+    })
+}
+
+/// r1007 S3-3b: a data dir as a mergeset node leaves it. Each block h commits
+/// the execution of its accepted mergeset {SP} (block h-1's transfer and the
+/// emission) and carries its own transfer, which block h+1 runs.
+async fn mergeset_node_dir() -> tempfile::TempDir {
+    use citrate_consensus::acceptance::{InclusionColor, ACCEPT_GAS_LIMIT};
+    use citrate_execution::acceptance::AcceptedBlock;
+    let dir = tempfile::tempdir().expect("dir");
+    {
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let exec = Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            CHAIN_ID,
+        );
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        exec.persist_state_changes().await.expect("genesis state");
+        let genesis = block(0, Hash::default(), exec.calculate_state_root(), vec![]);
+        storage.blocks.put_block(&genesis).expect("genesis");
+        storage
+            .blocks
+            .put_applied_tip(&genesis.header.block_hash, 0)
+            .expect("tip");
+        let mirror = Executor::with_chain_id(Arc::new(StateDB::new()), CHAIN_ID);
+        mirror.set_balance(&Address(ALICE), U256::from(FUND));
+        let mut prev = genesis.clone();
+        for h in 1..=N {
+            let mut to = [0u8; 20];
+            to[19] = h as u8;
+            let mut tmpl = block(
+                h,
+                prev.header.block_hash,
+                Hash::default(),
+                vec![transfer(to, 1_000 + u128::from(h), h - 1)],
+            );
+            tmpl.header.gas_limit = ACCEPT_GAS_LIMIT;
+            // A linear chain's GHOSTDAG values: every block adds its SP.
+            tmpl.header.blue_score = h;
+            tmpl.header.blue_work = citrate_consensus::types::blue_work_for_score(h);
+            let members = [AcceptedBlock {
+                block: &prev,
+                color: InclusionColor::SelectedParent,
+            }];
+            let hashes = [(prev.header.height, *prev.header.block_hash.as_bytes())]
+                .into_iter()
+                .collect();
+            let out = mirror
+                .execute_mergeset(&tmpl.header, &members, &emission, hashes)
+                .await
+                .expect("mirror seals");
+            tmpl.header.gas_used = out.gas_used;
+            tmpl.state_root = out.state_root;
+            tmpl.accepted_root = out.accepted_root;
+            tmpl.receipt_root = out.receipt_root;
+            tmpl.header.block_hash = tmpl.compute_hash();
+            let b = tmpl;
+            storage.blocks.put_block(&b).expect("put");
+            let hashes = [(prev.header.height, *prev.header.block_hash.as_bytes())]
+                .into_iter()
+                .collect();
+            let (root, accepted) = exec
+                .apply_accepting_block(&b, &members, &emission, hashes, true, true)
+                .await
+                .expect("node applies");
+            assert_eq!(accepted.receipts.len(), usize::from(h > 1));
+            storage
+                .state
+                .put_state_root(&b.header.block_hash, &root)
+                .expect("root");
+            storage
+                .blocks
+                .put_applied_tip(&b.header.block_hash, h)
+                .expect("tip");
+            prev = b;
+        }
+    }
+    dir
+}
+
+/// `replay-diff --mode mergeset` end to end: the mergeset-shaped data dir,
+/// recorded with `replay-record`, replays through the independent reference
+/// with no divergence (exit 0); a tx changed in block 17 diverges at 18, the
+/// block that accepts it (exit 1).
+#[test]
+fn the_mergeset_mode_cli_reports_the_accepting_block() {
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    let dir = rt.block_on(mergeset_node_dir());
+    let work = tempfile::tempdir().expect("work");
+    let alloc = work.path().join("alloc.json");
+    std::fs::write(
+        &alloc,
+        format!("{{\"0x{}\": \"{FUND}\"}}", hex::encode(ALICE)),
+    )
+    .expect("alloc");
+    let rec_path = work.path().join("node.replay");
+    let srh = citrate_execution::storage_root_hardening::storage_root_hardening_height();
+    let mut record = std::process::Command::new(env!("CARGO_BIN_EXE_replay-record"));
+    record
+        .arg(dir.path())
+        .arg(&rec_path)
+        .arg("--genesis-alloc")
+        .arg(&alloc);
+    if let Some(h) = srh {
+        record.arg("--storage-root-hardening").arg(h.to_string());
+    }
+    let out = record.output().expect("replay-record runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let diff = |path: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_replay-diff"))
+            .arg(path)
+            .arg("--mode")
+            .arg("mergeset")
+            .output()
+            .expect("replay-diff runs")
+    };
+    let out = diff(&rec_path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    println!("{stdout}");
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("no divergence"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("{N} chain block(s) matched")),
+        "{stdout}"
+    );
+
+    let mut rec = Recording::read_from(&rec_path).expect("read");
+    rec.chain_block_mut(17).expect("block 17").transactions[0].value += 1;
+    let bad = work.path().join("bad.replay");
+    rec.write_to(&bad).expect("write");
+    let out = diff(&bad);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    println!("{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("FIRST DIVERGENCE: height 18 "), "{stdout}");
+}

@@ -244,6 +244,21 @@ pub struct DagStore {
     /// (proposer, slot), loaded from and written to the DAG metadata. Never
     /// pruned: it is what the slashing path needs after the blocks are gone.
     equivocations: Arc<RwLock<EquivocationRecords>>,
+    /// Spec 06 §3.10 (D11): blocks disqualified from the selected chain.
+    /// A read-through cache of the persisted `disq:<hash>` marks.
+    disqualified: Arc<Mutex<HashSet<Hash>>>,
+}
+
+/// `DAG_METADATA` key prefix of a disqualified-from-chain mark (spec 06
+/// §3.10, the spec's `CF_DISQUALIFIED`). Metadata, not a column family of its
+/// own, so an older binary still opens the database.
+const DISQUALIFIED_PREFIX: &[u8] = b"disq:";
+
+fn disqualified_key(hash: &Hash) -> Vec<u8> {
+    let mut k = Vec::with_capacity(DISQUALIFIED_PREFIX.len().saturating_add(32));
+    k.extend_from_slice(DISQUALIFIED_PREFIX);
+    k.extend_from_slice(hash.as_bytes());
+    k
 }
 
 /// r1007 G10: stored non-genesis blocks by slot, each with its proposer.
@@ -340,6 +355,7 @@ impl DagStore {
             slot_origin: Arc::new(OnceLock::new()),
             slot_index: Arc::new(RwLock::new(BTreeMap::new())),
             equivocations: Arc::new(RwLock::new(BTreeMap::new())),
+            disqualified: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -564,6 +580,7 @@ impl DagStore {
             slot_origin: Arc::new(OnceLock::new()),
             slot_index: Arc::new(RwLock::new(BTreeMap::new())),
             equivocations: Arc::new(RwLock::new(BTreeMap::new())),
+            disqualified: Arc::new(Mutex::new(HashSet::new())),
         };
         store.load_from_persistent()?;
         Ok(store)
@@ -923,6 +940,47 @@ impl DagStore {
     /// Whether this store writes through to a persistent backend.
     pub fn is_persistent(&self) -> bool {
         self.persistent.is_some()
+    }
+
+    /// Spec 06 §3.10 (D11): mark `hash` disqualified from the selected chain,
+    /// persisted. Never cleared: the mark is a pure function of the block's
+    /// own data (its commitments do not reproduce), so it never changes.
+    pub fn mark_disqualified(&self, hash: &Hash) {
+        self.disqualified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(*hash);
+        if let Some(ref kv) = self.persistent {
+            if let Err(e) = kv.kv_put(cf::DAG_METADATA, &disqualified_key(hash), &[1]) {
+                warn!("Failed to persist the disqualified mark of {}: {}", hash, e);
+            }
+        }
+    }
+
+    /// Whether `hash` is disqualified from the selected chain (in memory, or
+    /// persisted by an earlier process).
+    pub fn is_disqualified(&self, hash: &Hash) -> bool {
+        if self
+            .disqualified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(hash)
+        {
+            return true;
+        }
+        let Some(ref kv) = self.persistent else {
+            return false;
+        };
+        match kv.kv_get(cf::DAG_METADATA, &disqualified_key(hash)) {
+            Ok(Some(_)) => {
+                self.disqualified
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(*hash);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// G12: persist the GhostdagData record of `hash` (`DAG_GHOSTDAG`).

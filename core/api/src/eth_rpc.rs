@@ -284,11 +284,28 @@ fn eth_block_json(
         // because it is a key, not an account. This is the value that registers
         // in the ValidatorRegistry and the one `validatorInfo(pubkey)` is keyed by.
         "proposerPubkey": format!("0x{}", block.proposer_pubkey),
-        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "mixHash": format!("0x{}", hex::encode(block.vrf_output.as_bytes())),
         "nonce": "0x0000000000000000",
         "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
         "logsBloom": EMPTY_LOGS_BLOOM,
-        "transactionsRoot": format!("0x{}", hex::encode(block.tx_root.as_bytes())),
+        // r1007 S3-3b: an accepting block's transaction list is what it
+        // executed, so its root is `accepted_root` (spec 06 §5.2).
+        "transactionsRoot": format!(
+            "0x{}",
+            hex::encode(
+                if block.accepted_root != Hash::default() {
+                    block.accepted_root
+                } else {
+                    block.tx_root
+                }
+                .as_bytes()
+            )
+        ),
+        "includedTransactions": block
+            .included_transactions
+            .iter()
+            .map(|h| format!("0x{}", hex::encode(h.as_bytes())))
+            .collect::<Vec<_>>(),
         "stateRoot": format!("0x{}", hex::encode(block.state_root.as_bytes())),
         "receiptsRoot": format!("0x{}", hex::encode(block.receipt_root.as_bytes())),
         "size": format!("0x{:x}", 1000),
@@ -731,6 +748,14 @@ pub fn register_eth_methods_with_options(
         };
 
         match block_on(api.get_block(crate::types::request::BlockId::Hash(Hash::new(hash_bytes)))) {
+            // r1007 S3-3b (spec 06 §5.1): the accepting view is the applied
+            // chain; a DAG block off it is served by the citrate_* DAG methods.
+            Ok(block)
+                if block.accepted_root != Hash::default()
+                    && !api.is_on_applied_chain(&block.hash, block.height) =>
+            {
+                Ok(Value::Null)
+            }
             Ok(block) => {
                 // Build transactions array based on includeTransactions flag
                 let transactions =
@@ -816,6 +841,18 @@ pub fn register_eth_methods_with_options(
                 // like it sat in genesis to explorers, wallets and audit tooling.
                 match mined_tx_location(&api, h) {
                     Some((block_hash, block_number, index)) => {
+                        // r1007 S3-3b (spec 06 §5.1): the block that INCLUDED
+                        // it, next to the accepting block above. Source: the
+                        // stored receipt's acceptance record.
+                        if let Ok(Some(a)) = block_on(api.get_receipt(h)).map(|r| r.acceptance) {
+                            obj.insert(
+                                "includingBlockHash".into(),
+                                json!(format!(
+                                    "0x{}",
+                                    hex::encode(a.including_block_hash.as_bytes())
+                                )),
+                            );
+                        }
                         obj.insert(
                             "blockHash".into(),
                             json!(format!("0x{}", hex::encode(block_hash.as_bytes()))),
@@ -960,23 +997,30 @@ pub fn register_eth_methods_with_options(
                     None
                 };
 
-                Ok(json!({
+                // r1007 S3-3b (spec 06 §3.11, §5.1): blockHash / blockNumber
+                // name the ACCEPTING block; cumulativeGasUsed and logIndex
+                // are within it; the including block is an extension field.
+                let (cumulative, first_log) = match &receipt.acceptance {
+                    Some(a) => (a.cumulative_gas_used, a.first_log_index),
+                    None => (receipt.gas_used, 0),
+                };
+                let mut out = json!({
                     "transactionHash": format!("0x{}", hex::encode(receipt.tx_hash.as_bytes())),
                     "transactionIndex": tx_index.clone(),
                     "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
                     "blockNumber": format!("0x{:x}", receipt.block_number),
                     "from": format!("0x{}", hex::encode(receipt.from.0)),
                     "to": receipt.to.as_ref().map(|t| format!("0x{}", hex::encode(t.0))),
-                    "cumulativeGasUsed": format!("0x{:x}", receipt.gas_used),
+                    "cumulativeGasUsed": format!("0x{:x}", cumulative),
                     "gasUsed": format!("0x{:x}", receipt.gas_used),
                     "contractAddress": contract_address,
-                    "logs": receipt.logs.iter().map(|log| json!({
+                    "logs": receipt.logs.iter().enumerate().map(|(i, log)| json!({
                         "address": format!("0x{}", hex::encode(log.address.0)),
                         "topics": log.topics.iter()
                             .map(|t| format!("0x{}", hex::encode(t.as_bytes())))
                             .collect::<Vec<_>>(),
                         "data": format!("0x{}", hex::encode(&log.data)),
-                        "logIndex": "0x0",
+                        "logIndex": format!("0x{:x}", first_log.saturating_add(i as u64)),
                         "transactionIndex": tx_index.clone(),
                         "transactionHash": format!("0x{}", hex::encode(receipt.tx_hash.as_bytes())),
                         "blockHash": format!("0x{}", hex::encode(receipt.block_hash.as_bytes())),
@@ -987,7 +1031,22 @@ pub fn register_eth_methods_with_options(
                     "logsBloom": EMPTY_LOGS_BLOOM,
                     "type": format!("0x{:x}", receipt.eth_tx_type),
                     "effectiveGasPrice": format!("0x{:x}", receipt.effective_gas_price)
-                }))
+                });
+                if let (Some(a), Some(obj)) = (&receipt.acceptance, out.as_object_mut()) {
+                    obj.insert(
+                        "includingBlockHash".into(),
+                        json!(format!(
+                            "0x{}",
+                            hex::encode(a.including_block_hash.as_bytes())
+                        )),
+                    );
+                    obj.insert(
+                        "includingBlockHeight".into(),
+                        json!(format!("0x{:x}", a.including_block_height)),
+                    );
+                    obj.insert("inclusionColor".into(), json!(a.inclusion_color.as_str()));
+                }
+                Ok(out)
             }
             Err(_) => Ok(Value::Null),
         }
@@ -3710,15 +3769,41 @@ fn push_block_logs(
     let block_hash = block.header.block_hash;
     let mut log_index_in_block = 0usize;
 
-    for (tx_index, tx) in block.transactions.iter().enumerate() {
+    // r1007 S3-3b: an accepting block's logs are those of the transactions it
+    // executed (its accepted list), in execution order; a pre-r1007 block's
+    // are those of its own list.
+    let executed: Vec<(
+        citrate_consensus::types::Transaction,
+        Option<citrate_execution::types::TransactionReceipt>,
+    )> = if block.accepted_root != Hash::default() {
+        crate::canonical_logs::executed_transactions(storage, &block)
+            .map_err(|e| crate::canonical_logs::LogIndexError::Unavailable(e).to_rpc_error())?
+            .into_iter()
+            .map(|(t, r)| (t, Some(r)))
+            .collect()
+    } else {
+        block
+            .transactions
+            .iter()
+            .map(|tx| {
+                let r = match storage.transactions.get_receipt(&tx.hash) {
+                    Ok(Some(r)) if r.block_hash == block_hash => Some(r),
+                    _ => None,
+                };
+                (tx.clone(), r)
+            })
+            .collect()
+    };
+
+    for (tx_index, (tx, receipt)) in executed.iter().enumerate() {
         // Only a receipt recorded for THIS block describes this execution; a
         // receipt naming another block (the same tx in a block this node
         // produced and then lost) is not served here, which keeps
         // blockHash/blockNumber identical to eth_getTransactionReceipt.
-        let receipt = match storage.transactions.get_receipt(&tx.hash) {
-            Ok(Some(r)) if r.block_hash == block_hash => r,
-            _ if policy == ReceiptPolicy::SkipMissing => continue,
-            _ => {
+        let receipt = match receipt {
+            Some(r) => r,
+            None if policy == ReceiptPolicy::SkipMissing => continue,
+            None => {
                 return Err(crate::canonical_logs::receipts_not_stored_error(
                     method,
                     block.header.height,
@@ -3758,6 +3843,14 @@ fn push_block_logs(
 /// when no receipt is stored (not mined, or not indexed by this node).
 fn mined_tx_location(api: &ChainApi, h: Hash) -> Option<(Hash, u64, Option<u64>)> {
     let receipt = block_on(api.get_receipt(h)).ok()?;
+    // r1007 S3-3b: the position in the accepting block's execution list.
+    if let Some(a) = &receipt.acceptance {
+        return Some((
+            receipt.block_hash,
+            receipt.block_number,
+            Some(a.transaction_index),
+        ));
+    }
     let index = block_on(api.get_block(crate::types::request::BlockId::Hash(receipt.block_hash)))
         .ok()
         .and_then(|b| b.transactions.iter().position(|t| t.hash == h))

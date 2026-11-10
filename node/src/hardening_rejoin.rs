@@ -336,7 +336,7 @@ impl LegacyFormatPeers {
 pub(crate) mod tests {
     use super::*;
     use crate::admission::{AdmitOutcome, BlockAdmission};
-    use crate::canonical_apply::{canonical_reward_config, AppliedTip, CanonicalApplicator};
+    use crate::canonical_apply::{AppliedTip, CanonicalApplicator};
     use crate::persistent_dag::RocksDbKvStore;
     use citrate_consensus::crypto;
     use citrate_consensus::dag_store::DagStore;
@@ -345,12 +345,9 @@ pub(crate) mod tests {
     use citrate_consensus::types::{
         blue_work_for_score, BlockBuilder, GhostDagParams, PublicKey, VrfProof,
     };
-    use citrate_economics::RewardCalculator;
-    use citrate_execution::revm_adapter::BlockContext;
     use citrate_execution::types::Address;
     use citrate_execution::{Executor, StateDB};
     use citrate_storage::pruning::PruningConfig;
-    use primitive_types::U256;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -388,8 +385,27 @@ pub(crate) mod tests {
         b
     }
 
-    /// Seal an empty block on `exec` the way the producer does: block
-    /// context, basic reward credits, then the state root.
+    /// r1007 S3-3b: seal `tmpl` the way the producer does, on `exec` (which
+    /// holds post(SP)): its accepted mergeset executed and settled through
+    /// the production `Executor::execute_mergeset`
+    /// (`canonical_apply::tests::seal_mergeset`), on a scoped thread with its
+    /// own runtime so these synchronous fixtures can call it.
+    pub(crate) fn seal_sync(exec: &Executor, tmpl: Block) -> Block {
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("fixture runtime")
+                    .block_on(crate::canonical_apply::tests::seal_mergeset(exec, tmpl))
+            })
+            .join()
+            .expect("fixture seal thread")
+        })
+    }
+
+    /// Seal an empty block on `exec` the way the producer does (r1007
+    /// S3-3b: committing the execution of its accepted mergeset).
     pub(crate) fn produce(
         exec: &Executor,
         pba: PbaHardening,
@@ -398,31 +414,15 @@ pub(crate) mod tests {
         coinbase: [u8; 20],
         vrf: u8,
     ) -> Block {
-        exec.set_block_context(BlockContext {
-            coinbase,
-            prevrandao: [vrf; 32],
-            block_hashes: HashMap::new(),
-        });
-        let tmpl = template(pba, height, parent, coinbase, vrf, vec![], Hash::default());
-        let r = RewardCalculator::new(canonical_reward_config())
-            .calculate_reward(&tmpl)
-            .expect("canonical reward");
-        for (addr, amt) in [
-            (Address(coinbase), r.validator_reward),
-            (Address([0x11; 20]), r.treasury_reward),
-        ] {
-            if amt > U256::zero() {
-                let bal = exec.get_balance(&addr);
-                exec.set_balance(&addr, bal + amt);
-            }
-        }
-        let root = exec.calculate_state_root();
-        template(pba, height, parent, coinbase, vrf, vec![], root)
+        seal_sync(
+            exec,
+            template(pba, height, parent, coinbase, vrf, vec![], Hash::default()),
+        )
     }
 
     pub(crate) fn genesis() -> Block {
         let root = Executor::new(Arc::new(StateDB::new())).calculate_state_root();
-        template(
+        let g = template(
             PbaHardening::off(),
             0,
             Hash::default(),
@@ -430,7 +430,11 @@ pub(crate) mod tests {
             0x5A,
             vec![],
             root,
-        )
+        );
+        crate::canonical_apply::tests::sealed_registry()
+            .lock()
+            .insert(g.header.block_hash, g.clone());
+        g
     }
 
     /// One node over a data directory, wired as `start_node` wires it:
@@ -569,6 +573,10 @@ pub(crate) mod tests {
         );
         b.header.timestamp = 1_000 + height * (MAX_BLOCK_TIMESTAMP_ADVANCE_SECS + 400);
         b.header.block_hash = b.compute_hash();
+        // Its child's seal finds this body by its final hash.
+        crate::canonical_apply::tests::sealed_registry()
+            .lock()
+            .insert(b.header.block_hash, b.clone());
         b
     }
 
@@ -589,39 +597,11 @@ pub(crate) mod tests {
         tx.hash = native_tx_id(&tx);
         let on = PbaHardening::at(H);
         let vrf = 0xB0 + height as u8;
-        exec.set_block_context(BlockContext {
-            coinbase: CB_STALE,
-            prevrandao: [vrf; 32],
-            block_hashes: HashMap::new(),
-        });
-        let tmpl = template(
-            on,
-            height,
-            parent,
-            CB_STALE,
-            vrf,
-            vec![tx.clone()],
-            Hash::default(),
-        );
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(exec.execute_transaction(&tmpl, &tx))
-                .expect("executes on the old rules")
-        });
-        let r = RewardCalculator::new(canonical_reward_config())
-            .calculate_reward(&tmpl)
-            .expect("canonical reward");
-        for (addr, amt) in [
-            (Address(CB_STALE), r.validator_reward),
-            (Address([0x11; 20]), r.treasury_reward),
-        ] {
-            if amt > U256::zero() {
-                let bal = exec.get_balance(&addr);
-                exec.set_balance(&addr, bal + amt);
-            }
-        }
-        let root = exec.calculate_state_root();
-        template(on, height, parent, CB_STALE, vrf, vec![tx], root)
+        // r1007 S3-3b: the block carries the tx; its chain child executes it.
+        seal_sync(
+            exec,
+            template(on, height, parent, CB_STALE, vrf, vec![tx], Hash::default()),
+        )
     }
 
     /// Current format, with block body fields set but hashed without them (as
@@ -639,6 +619,10 @@ pub(crate) mod tests {
         b.gradient_commitment = Some([7; 32]);
         b.learning_root = Hash::new([9; 32]);
         b.header.block_hash = b.compute_hash_for(PbaHardening::off());
+        // Its child's seal finds this body by its final hash.
+        crate::canonical_apply::tests::sealed_registry()
+            .lock()
+            .insert(b.header.block_hash, b.clone());
         b
     }
 
@@ -867,6 +851,7 @@ pub(crate) mod tests {
             eth_tx_type: 0,
             effective_gas_price: 0,
             revert_reason: None,
+            acceptance: None,
         }
     }
 

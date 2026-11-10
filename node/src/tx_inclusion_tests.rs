@@ -269,7 +269,12 @@ async fn sender_is_not_wedged_by_a_stale_pooled_nonce_after_a_peer_block() {
     let b1 = b.produce().await;
     assert!(b1.transactions.iter().any(|t| t.hash == t0.hash));
     a.receive(&b1).await;
-    assert_eq!(a.sender_nonce(), 1, "A applied B's block");
+    // r1007 S3-3b: b1 carries nonce 0; the block that accepts b1 executes it.
+    assert_eq!(
+        a.sender_nonce(),
+        0,
+        "A applied B's block (its tx included, not executed)"
+    );
 
     // Slot 2: nonce 1 reaches A only; A seals it, B receives the block.
     a.submit(&t1).await;
@@ -279,7 +284,8 @@ async fn sender_is_not_wedged_by_a_stale_pooled_nonce_after_a_peer_block() {
         "A includes nonce 1 on top of B's block"
     );
     b.receive(&a2).await;
-    assert_eq!(b.sender_nonce(), 2);
+    // a2 accepted b1 (nonce 0 executed); a2's own nonce 1 runs at its child.
+    assert_eq!(b.sender_nonce(), 1);
 
     // Slots 3..: nonce 2 reaches every pool; A seals.
     a.submit(&t2).await;
@@ -364,7 +370,12 @@ async fn producer_keeps_including_after_its_tx_block_loses_the_slot() {
     a.submit(&t0).await;
     let a1 = a.produce().await;
     assert!(a1.transactions.iter().any(|t| t.hash == t0.hash));
-    assert_eq!(a.sender_nonce(), 1, "A applied its own block");
+    // r1007 S3-3b: a1 carries the tx; its chain child would execute it.
+    assert_eq!(
+        a.sender_nonce(),
+        0,
+        "A applied its own block (the tx included)"
+    );
 
     // (2) It loses the slot: B's branch (which never held the tx) is heavier.
     let b1 = b.produce().await;
@@ -509,6 +520,9 @@ async fn deep_reorg_below_the_ring_reinjects_the_abandoned_txs() {
         "A includes the re-injected tx in its next block"
     );
     b.receive(&blk).await;
+    // r1007 S3-3b: blk's child accepts blk and executes the re-included tx.
+    let next = a.produce().await;
+    b.receive(&next).await;
     assert_eq!(a.sender_nonce(), 1);
     assert_eq!(b.sender_nonce(), 1);
 }
@@ -534,6 +548,9 @@ async fn from_genesis_rebuild_reinjects_the_abandoned_txs() {
         "A includes the re-injected tx in its next block"
     );
     b.receive(&blk).await;
+    // r1007 S3-3b: blk's child accepts blk and executes the re-included tx.
+    let next = a.produce().await;
+    b.receive(&next).await;
     assert_eq!(a.sender_nonce(), 1);
     assert_eq!(b.sender_nonce(), 1);
 }

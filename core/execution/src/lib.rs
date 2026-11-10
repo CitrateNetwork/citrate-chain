@@ -15,6 +15,7 @@
         clippy::string_slice
     )
 )]
+pub mod acceptance;
 pub mod activation;
 pub mod agent_fork;
 pub mod exact_code;

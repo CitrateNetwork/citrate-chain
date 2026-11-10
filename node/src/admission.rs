@@ -111,6 +111,14 @@ pub(crate) fn verify_block_body(
             return Err(format!("body: tx #{i} ({}): {e} (PBA-L1b-001)", tx.hash));
         }
     }
+    // r1007 S3-3b (spec 06 §3.4 class A, §3.6): the stateless list rules. The
+    // block's own list is executed later, by its accepting block, where a
+    // stateful failure is a skip; these make a block invalid outright.
+    citrate_consensus::acceptance::class_a_violation(
+        &block.transactions,
+        block.header.base_fee_per_gas,
+    )
+    .map_err(|e| format!("body: {e} (class A)"))?;
     Ok(())
 }
 
