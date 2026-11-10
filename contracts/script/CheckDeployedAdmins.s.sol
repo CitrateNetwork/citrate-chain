@@ -228,8 +228,15 @@ contract CheckDeployedAdmins is GenesisProfile {
         return "";
     }
 
+    /// @notice JSONPath of book entry `name` under `section` (".contracts", ".aaStack"). Bracket
+    ///         form, so a key that contains a dot (r1006 post-genesis keys such as
+    ///         `Quorum.AnchorRegistry`) is one key, not a nested path.
+    function _keyPath(string memory section, string memory name) internal pure returns (string memory) {
+        return string.concat(section, "['", name, "']");
+    }
+
     function _entry(string memory json, string memory name) internal view returns (bool, address) {
-        string memory key = string.concat(".contracts.", name);
+        string memory key = _keyPath(".contracts", name);
         if (!vm.keyExistsJson(json, key)) return (false, address(0));
         return (true, vm.parseJsonAddress(json, key));
     }
@@ -246,7 +253,7 @@ contract CheckDeployedAdmins is GenesisProfile {
     function _sweep(string memory json, string memory section, address deployer) internal {
         string[] memory names = vm.parseJsonKeys(json, section);
         for (uint256 i = 0; i < names.length; i++) {
-            address target = vm.parseJsonAddress(json, string.concat(section, ".", names[i]));
+            address target = vm.parseJsonAddress(json, _keyPath(section, names[i]));
             if (target.code.length == 0) {
                 console.log(string.concat("NO-CODE ", names[i]), target);
                 noCode++;
@@ -285,7 +292,7 @@ contract CheckDeployedAdmins is GenesisProfile {
             return "a timelock entry must be named <P>Timelock with a <P>Multisig beside it";
         }
         string memory multisigName = string.concat(string(_slice(n, 0, n.length - suffix.length)), "Multisig");
-        string memory key = string.concat(section, ".", multisigName);
+        string memory key = _keyPath(section, multisigName);
         if (!vm.keyExistsJson(json, key)) return "no paired <P>Multisig entry in the same section";
         address council = vm.parseJsonAddress(json, key);
         // Authenticate the paired council (chain#320 P1) as the ceremony's MultisigProposer for this
@@ -347,7 +354,7 @@ contract CheckDeployedAdmins is GenesisProfile {
             if (!vm.keyExistsJson(json, sections[s])) continue;
             string[] memory names = vm.parseJsonKeys(json, sections[s]);
             for (uint256 i = 0; i < names.length; i++) {
-                genesisKnown.push(vm.parseJsonAddress(json, string.concat(sections[s], ".", names[i])));
+                genesisKnown.push(vm.parseJsonAddress(json, _keyPath(sections[s], names[i])));
             }
         }
     }

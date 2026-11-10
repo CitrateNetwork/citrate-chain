@@ -20,7 +20,8 @@ ValidatorRegistry reads are ABI-encoded: two validators, one with actEpoch <= cu
 Environment (used by scripts/rehearsal/test-export-r1.sh): STUB_CHAIN_ID overrides the chain id
 (default 0x9d0c = 40204); eth_getCode returns non-empty code for every address except those in
 STUB_CODELESS (comma-separated, any case), which return "0x"; eth_call to an address in
-STUB_CALL_FAIL (comma-separated) returns a JSON-RPC error.
+STUB_CALL_FAIL (comma-separated) returns a JSON-RPC error; STUB_GENESIS_HASH, when set, is block
+0's hash (default: the block number as a 32-byte hash, like every other block).
 """
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -75,7 +76,8 @@ def answer(req):
                 return {"jsonrpc": "2.0", "id": req.get("id"), "error": {"code": -32000, "message": "stub: unavailable"}}
             return {"jsonrpc": "2.0", "id": req.get("id"), "result": None}
         ts = "a[$(touch " + MARKER + ")]" if BATCH_FAULT == "hostilets" else hex(2 * n)
-        res = {"number": hex(n), "hash": "0x" + f"{n:064x}", "timestamp": ts,
+        h = os.environ.get("STUB_GENESIS_HASH") if n == 0 else None
+        res = {"number": hex(n), "hash": h or "0x" + f"{n:064x}", "timestamp": ts,
                "baseFeePerGas": "0x3b9aca00", "proposerPubkey": "0x" + ("aa" if n % 2 else "bb") * 32}
     elif m == "eth_call":
         failing = {a.strip().lower() for a in os.environ.get("STUB_CALL_FAIL", "").split(",") if a.strip()}

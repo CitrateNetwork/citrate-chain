@@ -194,11 +194,11 @@ fx_chain=$(jq -r '.reads[] | select(.id == "chain_id") | .value' "$FX")
 if [ "$MODE" = online ]; then
   fx_gen=$(jq -r '.reads[] | select(.id == "genesis_hash") | .value' "$FX")
   [ "${fx_gen,,}" = "${GENESIS,,}" ] || die "fixture genesis_hash ($fx_gen) differs from the RPC genesis $GENESIS"
-  # The governance reads are required: a failed minDelay() means the address is not the
+  # The governance reads are required: a failed getMinDelay() means the address is not the
   # timelock the book claims.
   for id in governance_min_delay_s guardian_min_delay_s; do
     jq -e --arg id "$id" '[.reads[] | select(.id == $id)] | length == 1 and (.[0].value | type == "string")' "$FX" >/dev/null \
-      || die "fixture read $id failed or is missing: the governance address in the book did not answer minDelay()"
+      || die "fixture read $id failed or is missing: the governance address in the book did not answer getMinDelay()"
   done
 fi
 
@@ -236,7 +236,7 @@ jq -n --arg label "$LABEL" --arg mode "$MODE" --arg at "$(date -u +%Y-%m-%dT%H:%
                then ["RPC chain id matches the book", "RPC genesis matches --expect-genesis",
                      "verification/check_address_code.py --check (live, governance included)",
                      "every fixture contract (governance included) has code",
-                     "fixture genesis matches RPC", "fixture governance minDelay() reads succeeded"]
+                     "fixture genesis matches RPC", "fixture governance getMinDelay() reads succeeded"]
                else ["verification/check_address_code.py --offline"] end)),
     files: $files,
     consumers: ["citrate-core (MAC lane)", "design"]}' > "$STAGE/MANIFEST.json"

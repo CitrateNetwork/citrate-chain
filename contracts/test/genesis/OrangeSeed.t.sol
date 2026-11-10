@@ -320,7 +320,7 @@ contract OrangeSeedTest is OrangeSeedBase {
     /// the standard precompiles (0x01–0x11), the Citrate families (all addresses whose
     /// first 18 bytes are zero: 0x0100–0x013F, 0x0200–0x0209, 0x1000/0x1002/0x1003), the
     /// block-reward minter, the EIP-4788/2935 system contracts and the Arachnid factory,
-    /// and appear nowhere in the 40204 address book.
+    /// and appear in the 40204 address book only as its two genesis predeploys.
     function test_predeployAddresses_doNotCollide() public view {
         address[2] memory mine = [proxyAddr, implAddr];
         assertEq(proxyAddr, 0x000000000000000000000000000000c17A7e5EeD);
@@ -330,15 +330,23 @@ contract OrangeSeedTest is OrangeSeedBase {
             0x0000F90827F1C53a10cb7A02335B175320002935, // EIP-2935 history storage
             0x4e59b44847b379578588920cA78FbF26c0B4956C // Arachnid CREATE2 factory
         ];
-        string memory book = vm.toLowercase(vm.readFile("addresses/40204.json"));
+        // r1006 ships the seed in block 0, so the live book lists it exactly twice, as the genesis
+        // predeploys `genesis.OrangeSeed` (proxy) and `genesis.OrangeSeedV0` (implementation), and
+        // the seed range appears nowhere else in the book.
+        string memory raw = vm.readFile("addresses/40204.json");
+        assertEq(vm.parseJsonAddress(raw, ".genesis.OrangeSeed"), proxyAddr, "book genesis.OrangeSeed");
+        assertEq(vm.parseJsonAddress(raw, ".genesis.OrangeSeedV0"), implAddr, "book genesis.OrangeSeedV0");
+        string memory book = vm.toLowercase(raw);
+        book = vm.replace(book, string.concat('"orangeseed": "', vm.toLowercase(vm.toString(proxyAddr)), '"'), "");
+        book = vm.replace(book, string.concat('"orangeseedv0": "', vm.toLowercase(vm.toString(implAddr)), '"'), "");
         for (uint256 i = 0; i < 2; i++) {
             assertGt(uint160(mine[i]), 0xFFFF, "inside the precompile prefix (first 18 bytes zero)");
             for (uint256 j = 0; j < system.length; j++) {
                 assertTrue(mine[i] != system[j]);
             }
-            assertFalse(vm.contains(book, vm.toLowercase(vm.toString(mine[i]))), "address already in the book");
+            assertFalse(vm.contains(book, vm.toLowercase(vm.toString(mine[i]))), "address in the book outside genesis");
         }
-        assertFalse(vm.contains(book, "c17a7e5ee"), "book mentions the seed range");
+        assertFalse(vm.contains(book, "c17a7e5ee"), "book mentions the seed range outside genesis");
     }
 
     // ── local deploy script ─────────────────────────────────────────────────

@@ -196,7 +196,7 @@ jobs:
 
   sbom:
     name: Generate SBOM
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -227,7 +227,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [build, sbom]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write       # required to create/update a release
       id-token: write       # required for cosign keyless signing

@@ -7,6 +7,8 @@ export const rpcUrl: string
 export const explorerUrl: string
 export const deployer: Address
 export const deployedAt: string
+/** block-0 hash of the network this book describes */
+export const genesisHash: string
 
 export const contracts: AddressMap
 export const aaStack: AddressMap
@@ -23,6 +25,7 @@ export interface AddressBook {
   explorerUrl: string
   deployer: Address
   deployedAt: string
+  genesisHash: string
   contracts: AddressMap
   aaStack: AddressMap
   precompiles: AddressMap

@@ -11,8 +11,11 @@
 
 - **Chain-40204 contract addresses:** [`contracts/addresses/40204.json`](addresses/40204.json)
   (published as `packages/chain-config`, which the federation imports).
-- **DPF / governance suite:** [`contracts/addresses/dpf-40204.json`](addresses/dpf-40204.json)
-  (harvested from the `post-reroll-quorum-restore.sh` broadcast each reroll).
+- **DPF / governance suite:** on r1006 these registries are in the canonical book's `contracts`
+  section: 20 of the 24 r1005 DPF names come from the post-genesis book
+  [`addresses/r1006/40204.postgenesis.json`](addresses/r1006/40204.postgenesis.json), and the other 4
+  (AgentDecisionRegistryV2, ComputeVerifier, ComputeMarketplace, TEEAttestationRegistry) are genesis contracts.
+  The r1005 harvest is archived at [`addresses/r1005/dpf-40204.json`](addresses/r1005/dpf-40204.json).
 - **Deploy scripts (the deterministic set):** `contracts/script/*.s.sol`, salts in
   `contracts/script/Salts.sol`. Reroll runbook: `scripts/ceremony/I64S1_REROLL_RUNBOOK.md`;
   orchestrator: `scripts/ops/reroll-orchestrate.sh`.

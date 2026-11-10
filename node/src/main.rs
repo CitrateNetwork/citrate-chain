@@ -401,7 +401,7 @@ enum Commands {
 
     /// Smart contract deployment and interaction
     #[command(subcommand)]
-    Contract(citrate_cli::commands::contract::ContractCommands),
+    Contract(Box<citrate_cli::commands::contract::ContractCommands>),
 
     /// Network and node operations
     #[command(subcommand)]
@@ -772,7 +772,7 @@ async fn node_main() -> Result<()> {
         }
         Some(Commands::Contract(cmd)) => {
             let config = citrate_cli::config::Config::load(None, cli.rpc_addr.as_deref())?;
-            citrate_cli::commands::contract::execute(cmd, &config).await?;
+            citrate_cli::commands::contract::execute(*cmd, &config).await?;
             return Ok(());
         }
         Some(Commands::Network(cmd)) => {
