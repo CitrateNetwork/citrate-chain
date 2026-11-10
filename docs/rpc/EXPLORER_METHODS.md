@@ -180,24 +180,24 @@ block-depth estimate (CV-8).
   - the RPC's finalized-tag source: the verified pairs when enforcement is on, otherwise
     the height handle;
   - the highest `checkpoint:{height}` certificate in `CF_DAG_METADATA`;
-  - the compiled pins (`CHECKPOINT_VOTING_PINS`, `CHECKPOINT_ENFORCEMENT_PINS`).
+  - the compiled switches (`CHECKPOINT_VOTING_FROM_GENESIS`, `CHECKPOINT_ENFORCEMENT_GENESES`).
 
 ```json
 ← {"published":true,"voting":true,"mode":null,
-   "quorumRule":"vote count: Checkpoint::effective_quorum of the committee (not stake-weighted on this base)",
+   "quorumRule":"more than 2/3 of the committee stake",
    "chainId":"0x9d0c","votingPinned":true,"enforcementPinned":false,"enforcement":false,
    "finalizedSource":"height-handle",
    "finalized":{"height":"0x0","hash":"0x…genesis","blockHash":"0x…genesis"},
    "latestCertificate":{"height":"0x2","blockHash":"0x…","committeeSize":4,"voters":3,
-     "quorum":3,"epoch":null,"stateRoot":null,"acceptedRoot":null,
-     "votedStake":null,"totalStake":null,"quorumStake":null},
+     "quorum":3,"epoch":"0x0","stateRoot":"0x…","acceptedRoot":"0x…",
+     "votedStake":"60","totalStake":"100","quorumStake":"67"},
    "interval":"0x…","voteDepth":"0x3","pending":null,"halted":null,
-   "pendingFinalityLane":["epoch","stateRoot","acceptedRoot","votedStake","totalStake",
-                          "quorumStake","pending","halted"],
+   "pendingFinalityLane":["pending","halted"],
    "dataSource":"…"}
 ```
 
-The fields listed in `pendingFinalityLane` are `null` on this base.
+The fields listed in `pendingFinalityLane` are `null` here: they live only in the running
+node's finality driver.
 
 - **Keys shared with the finality lane and the explorer** (citrate-explorer#51,
   `src/lib/citrate/r1007.ts`, gates every finality figure on `published`):
@@ -207,19 +207,18 @@ The fields listed in `pendingFinalityLane` are `null` on this base.
     build (`CHECKPOINT_VOTING_FROM_GENESIS`); `enforcementPinned` reads
     `CHECKPOINT_ENFORCEMENT_GENESES` for this chain id and this store's block 0;
   - `mode` is `"enforced"` when verified certificates feed the finalized tag, and
-    otherwise `null`, because this base cannot tell the lane's `legacy` from `observed`;
-  - `quorumRule` names the count rule this base's certificates use;
+    otherwise `null`, because storage cannot tell the lane's `legacy` from `observed`;
+  - `quorumRule` names the stake rule (#185); `quorum` is the equal-stake head count
+    (`derived_quorum`), `quorumStake` the rule itself; stakes are decimal strings, as in
+    the lane's handler;
   - `finalized.blockHash` repeats `finalized.hash` under the lane's name.
 
-- **Where they come from:** branch `r1007/s3-finality-voting` (fbe06ac6, unreviewed)
-  adds the v2 vote message (epoch, state root, accepted root), the stake-weighted
-  quorum, and a `FinalityStatusCell` that the node's finality driver publishes, with
-  pending checkpoints and the halt flag.
-- **That branch registers its own `citrate_getFinalityStatus`** (with a `published` flag
-  and stake fields).
-- **When both land:** the finality lane's handler should replace this one. Its field
-  names match the ones here (`finalized.height`, `blockHash`, `committeeSize`,
-  `voters`), so explorer code written against this shape keeps working.
+- **On a node** the finality lane's handler (`core/api/src/finality_status.rs`, fed by the
+  `FinalityStatusCell` the finality driver publishes) is registered after the explorer
+  methods and serves `citrate_getFinalityStatus`. This storage view serves an RPC
+  handler without a finality cell. Its field names match the lane's (`finalized.height`,
+  `blockHash`, `committeeSize`, `voters`, the stake fields), so explorer code written
+  against one shape reads the other.
 
 ## `citrate_getDagStats` (fixed, chain#317)
 

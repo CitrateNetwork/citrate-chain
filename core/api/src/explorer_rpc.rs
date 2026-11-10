@@ -453,20 +453,12 @@ pub fn accepting_block_json(
 
 // ── citrate_getFinalityStatus ────────────────────────────────────────────
 
-/// Fields of the finality-lane response (`r1007/s3-finality-voting`,
-/// fbe06ac6) that this base cannot fill: they come from the v2 vote message
-/// (epoch, state root, accepted root) and the stake-weighted quorum, which
-/// that branch adds. Reported as `null` and listed in `pendingFinalityLane`.
-pub const FINALITY_LANE_FIELDS: &[&str] = &[
-    "epoch",
-    "stateRoot",
-    "acceptedRoot",
-    "votedStake",
-    "totalStake",
-    "quorumStake",
-    "pending",
-    "halted",
-];
+/// Fields of the finality lane's response that storage cannot fill: the
+/// driver's pending checkpoints and the halt flag live only in the running
+/// node (`finality_status::FinalityStatusCell`). Reported as `null` and listed
+/// in `pendingFinalityLane`. The v2 certificate fields (epoch, state root,
+/// accepted root, stakes) are read from the stored certificate.
+pub const FINALITY_LANE_FIELDS: &[&str] = &["pending", "halted"];
 
 /// The highest finalized certificate persisted in `CF_DAG_METADATA`
 /// (`checkpoint:{height}`, written by `CheckpointManager` when a checkpoint
@@ -570,8 +562,7 @@ pub fn finality_status_json(
         "published": true,
         "voting": voting,
         "mode": if enforced { json!("enforced") } else { Value::Null },
-        "quorumRule": "vote count: Checkpoint::effective_quorum of the committee (not \
-                       stake-weighted on this base)",
+        "quorumRule": "more than 2/3 of the committee stake",
         "chainId": qty(chain_id),
         "votingPinned": voting,
         "enforcementPinned":
@@ -588,13 +579,17 @@ pub fn finality_status_json(
             "blockHash": hx(&cp.block_hash),
             "committeeSize": cp.committee.len(),
             "voters": cp.votes.len(),
-            "quorum": cp.effective_quorum(),
-            "epoch": Value::Null,
-            "stateRoot": Value::Null,
-            "acceptedRoot": Value::Null,
-            "votedStake": Value::Null,
-            "totalStake": Value::Null,
-            "quorumStake": Value::Null,
+            // Head count for equal stakes (`derived_quorum`); the rule itself
+            // counts stake (`quorumStake`).
+            "quorum": citrate_consensus::checkpoint::derived_quorum(cp.committee.len()),
+            "epoch": qty(cp.binding.epoch),
+            "stateRoot": hx(&cp.binding.state_root),
+            "acceptedRoot": hx(&cp.binding.accepted_root),
+            // u128 stakes as decimal strings, as the finality lane's handler
+            // reports them (JSON numbers lose precision).
+            "votedStake": cp.voted_stake().to_string(),
+            "totalStake": cp.total_stake().to_string(),
+            "quorumStake": cp.effective_quorum().map(|q| q.to_string()),
         })),
         "interval": qty(config.interval),
         "voteDepth": qty(citrate_consensus::checkpoint::DEFAULT_VOTE_DEPTH),

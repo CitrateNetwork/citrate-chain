@@ -350,13 +350,21 @@ pub type GenesisCommittee = Vec<(PublicKey, u128)>;
 /// - r1006: the producer set `validators.json` registers in the ValidatorRegistry at
 ///   block 0 (`citrate_economics::r1006::genesis_validator_set`); `None` while that set
 ///   is a placeholder.
+/// - r1007: the same set. Its block 0 registers the r1006 producers from the shared
+///   validators file (R1007_GENESIS.md §3.3; producer keys are unchanged at r1007).
 /// - Any other genesis (or none known): `None`. Such a chain's committees come only from
-///   registry snapshots, from S(1) on. A new genesis (r1007, S3-6) adds its own arm here
-///   from its own compiled validator file.
+///   registry snapshots, from S(1) on. A new genesis adds its own arm here from its own
+///   compiled validator file.
 pub fn genesis_committee_set(
     running_genesis: Option<&[u8; 32]>,
 ) -> anyhow::Result<Option<GenesisCommittee>> {
-    if running_genesis != Some(&citrate_consensus::hardening::R1006_GENESIS) {
+    // r1007 registers the r1006 producers in its block 0 (the validators file
+    // is shared, R1007_GENESIS.md §3.3), so both geneses compile the same set.
+    let compiled = [
+        citrate_consensus::hardening::R1006_GENESIS,
+        citrate_consensus::hardening::R1007_GENESIS,
+    ];
+    if !running_genesis.is_some_and(|g| compiled.contains(g)) {
         return Ok(None);
     }
     let set = citrate_economics::r1006::genesis_validator_set()
