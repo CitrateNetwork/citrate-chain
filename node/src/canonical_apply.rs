@@ -5945,6 +5945,64 @@ pub(crate) mod tests {
         assert_eq!(app.applied_tip().await.hash, loser.header.block_hash);
     }
 
+    /// RC-10 (devnet fin-r2-k0-1 p1, 2026-11-10; also gf2's R3 roll and an O3 run): the startup
+    /// recovery loop (main.rs, `recover_automatic`) polls fork choice's head. GhostDAG admits a
+    /// block, so fork choice can select it, before its header reaches the block store; in that
+    /// window the head's own header is not stored. `rebuild_target` then reads the head itself as a
+    /// missing ancestor and the node logs `canonical recovery: NOT rebuilding from genesis toward
+    /// <head> ... the head's ancestry is missing block <head>`, which g4-counters counts, although
+    /// nothing is missing: the head arrives a moment later and descends from the applied tip (p1
+    /// was 39 headers behind). A head that is not stored yet is "not known yet", never a refusal:
+    /// no refusal is recorded or logged, the attempt returns Ok(false) and the loop polls again.
+    #[tokio::test]
+    async fn startup_recovery_does_not_refuse_a_head_whose_header_is_not_stored_yet() {
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::types::GhostDagParams;
+        let (exec, storage, _dir) = fresh();
+        let (gs, genesis, _winner, loser) = restarted_on_tie_loser(&exec, &storage).await;
+        // Fork choice (GhostDAG) holds genesis, the applied tip and the head; the block store
+        // holds the head's ancestry but not the head itself (admitted to the DAG a moment
+        // before it is persisted).
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let r = roots(2);
+        let head = mk_block_scored(2, loser.header.block_hash, r[1], 2, VRF_OUT);
+        for b in [&genesis, &loser, &head] {
+            dag.store_block(b.clone()).await.expect("into the DAG");
+            ghostdag.add_block(b).await.expect("registered");
+        }
+        assert_eq!(
+            ghostdag.select_tip().await.expect("tip"),
+            head.header.block_hash,
+            "fixture: fork choice's head"
+        );
+        assert!(
+            storage
+                .blocks
+                .get_header(&head.header.block_hash)
+                .expect("read")
+                .is_none(),
+            "fixture: the head is not stored"
+        );
+        let app = CanonicalApplicator::new(exec.clone(), storage.clone())
+            .with_fork_choice(ghostdag.clone());
+        let rebuilt = app
+            .recover_automatic(gs, genesis.header.block_hash, head.header.block_hash)
+            .await
+            .expect("recovery");
+        assert!(!rebuilt, "rebuilt toward a head that is not stored");
+        assert_eq!(
+            app.applied_tip().await.hash,
+            loser.header.block_hash,
+            "the applied tip moved"
+        );
+        assert_eq!(
+            *app.refused_rebuild_head.lock(),
+            None,
+            "a head whose header is not stored yet was logged as a refused rebuild (NOT rebuilding)"
+        );
+    }
+
     /// rvHH: a restarted tie-loser whose applied tip is STORED in the DAG but
     /// not registered in GhostDAG `relations` (a restart registers tips only)
     /// refuses the rebuild at equal weight, and rebuilds once the winner gains
