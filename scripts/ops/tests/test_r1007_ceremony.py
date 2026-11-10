@@ -74,6 +74,49 @@ def fake_binary(tmp: Path, *, params: str | None = None, genesis: str | None = N
     return b
 
 
+class FleetIsolation(unittest.TestCase):
+    """fed #467 round 3 (BerryManifold P1): no test in this module can reach a fleet host.
+    scripts/ops/tests/fleet_guard.py blocks ssh/scp/doctl and os.system for the whole
+    module, and every ssh-transport test uses a copy of the fleet whose aliases end in
+    .invalid. Each probe below would be harmless even without the guard (`ssh -G` does not
+    connect; 192.0.2.1 is TEST-NET-1)."""
+
+    def test_the_guard_is_installed_for_this_module(self):
+        import fleet_guard  # noqa: F401  (red: absent at 2beaa095)
+        self.assertTrue(fleet_guard.installed())
+
+    def test_a_real_ssh_or_doctl_call_raises(self):
+        import fleet_guard
+        self.assertTrue(fleet_guard.installed())
+        for argv in (["ssh", "-G", "citrate-boot-1"], ["scp", "-h"], ["doctl", "version"]):
+            with self.assertRaises(fleet_guard.FleetCallBlocked, msg=argv):
+                subprocess.run(argv, capture_output=True, timeout=5)
+            with self.assertRaises(fleet_guard.FleetCallBlocked, msg=argv):
+                subprocess.check_output(argv, timeout=5)
+        with self.assertRaises(fleet_guard.FleetCallBlocked):
+            os.system("true")
+
+    def test_a_non_loopback_connection_raises(self):
+        import socket
+        import fleet_guard
+        self.assertTrue(fleet_guard.installed())
+        with self.assertRaises(fleet_guard.FleetCallBlocked):
+            socket.create_connection(("192.0.2.1", 9), timeout=0.5)
+
+    def test_child_processes_get_an_ssh_that_refuses(self):
+        import fleet_guard
+        self.assertTrue(fleet_guard.installed())
+        r = subprocess.run(["sh", "-c", "ssh -G citrate-boot-1"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(r.returncode, 97, r.stdout + r.stderr)
+
+    def test_ssh_tests_use_a_fleet_copy_that_cannot_resolve(self):
+        fleet = json.loads(FLEET.read_text())
+        self.assertEqual(fleet["transport"], "ssh")
+        self.assertTrue(all(h["ssh"].endswith(".invalid") for h in fleet["hosts"]), fleet["hosts"])
+        self.assertNotEqual(FLEET.resolve(), (R7 / "fleet.r1007.json").resolve())
+        self.assertEqual((C.HERE / "fleet.r1007.json").resolve(), FLEET.resolve())
+
+
 class _Stack:
     """Enter several context managers as one."""
 
