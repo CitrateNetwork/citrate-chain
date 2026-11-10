@@ -1,0 +1,39 @@
+name: AMC tripwires
+
+# AMC provider-governance contracts (contracts/src/amc/, not deployed; planset amc053 06):
+# grep-only fences for no value path (A1), registry stores no host (A2, RT-3) and receipts keep
+# no count or totals (A3, RT-4). The Foundry suites under contracts/test/amc/ run in
+# solidity-ci.yml with the rest of the tree.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "contracts/src/amc/**"
+      - "scripts/ci/amc_surface_tripwire.sh"
+      - ".github/workflows/amc-tripwires.yml"
+  pull_request:
+    paths:
+      - "contracts/src/amc/**"
+      - "scripts/ci/amc_surface_tripwire.sh"
+      - ".github/workflows/amc-tripwires.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amc-tripwires-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  tripwires:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tripwire self-test
+        run: scripts/ci/amc_surface_tripwire.sh --self-test
+      - name: AMC surface tripwires
+        run: scripts/ci/amc_surface_tripwire.sh

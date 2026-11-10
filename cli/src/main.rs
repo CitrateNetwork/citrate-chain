@@ -130,3 +130,142 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{CommandFactory, Parser};
+
+    /// Issue #448: clap only detects short/long flag clashes (a subcommand flag reusing a
+    /// global flag's `-c`/`-v`/`-r`, or two flags in one subcommand sharing `-a`) through its
+    /// debug assertions. A debug build panics at startup on a clash; a release build silently
+    /// routes the value to whichever argument wins. This walks the whole command tree so CI
+    /// fails on any clash before it ships.
+    #[test]
+    fn cli_command_tree_has_no_flag_clashes() {
+        Cli::command().debug_assert();
+    }
+
+    fn parses(args: &[&str]) -> bool {
+        Cli::try_parse_from(args).is_ok()
+    }
+
+    /// The short flags removed for #448 are rejected rather than silently read as another
+    /// argument; the long spellings still parse, and the global short flags keep their meaning
+    /// after a subcommand.
+    #[test]
+    fn removed_short_flags_are_rejected_and_long_flags_parse() {
+        let addr = "0x5fbdb2315678afecb367f032d99f2f9fc9a2f74b";
+        for args in [
+            vec!["citrate", "contract", "deploy", "c.bin", "-a", "[1]"],
+            vec!["citrate", "contract", "call", addr, "f()", "-a", "[1]"],
+            vec![
+                "citrate",
+                "contract",
+                "verify",
+                addr,
+                "s.sol",
+                "-c",
+                "v0.8.26+commit.8a97fa7a",
+            ],
+            vec!["citrate", "model", "deploy", "m.onnx", "-v", "1.0"],
+            vec!["citrate", "advanced", "monitor", "-c", "3"],
+            vec!["citrate", "advanced", "benchmark", "-c", "3"],
+            vec!["citrate", "advanced", "model-stats", "-r", "7d"],
+        ] {
+            // `-a`/`-c`/`-r` now hit the global flag or nothing; each of these lines either
+            // fails to parse or lands the value on the global flag, never on the old field.
+            match Cli::try_parse_from(&args) {
+                Err(_) => {}
+                Ok(cli) => assert!(
+                    cli.config.is_some() || cli.rpc.is_some() || cli.verbose > 0,
+                    "{args:?} parsed into the subcommand field"
+                ),
+            }
+        }
+        assert!(!parses(&[
+            "citrate", "contract", "deploy", "c.bin", "-a", "[1]"
+        ]));
+        assert!(!parses(&[
+            "citrate", "contract", "call", addr, "f()", "-a", "[1]"
+        ]));
+
+        assert!(parses(&[
+            "citrate",
+            "contract",
+            "deploy",
+            "c.bin",
+            "--args",
+            "[1]",
+            "--account",
+            "0xabc",
+            "--value",
+            "5",
+        ]));
+        assert!(parses(&[
+            "citrate",
+            "contract",
+            "call",
+            addr,
+            "f()",
+            "--args",
+            "[1]",
+            "--account",
+            "0xabc",
+            "--value",
+            "5",
+        ]));
+        assert!(parses(&[
+            "citrate",
+            "contract",
+            "verify",
+            addr,
+            "s.sol",
+            "--compiler",
+            "v0.8.26+commit.8a97fa7a",
+            "-o",
+        ]));
+        assert!(parses(&[
+            "citrate",
+            "model",
+            "deploy",
+            "m.onnx",
+            "--version",
+            "1.0"
+        ]));
+        assert!(parses(&["citrate", "advanced", "monitor", "--count", "3"]));
+        assert!(parses(&[
+            "citrate",
+            "advanced",
+            "benchmark",
+            "--concurrency",
+            "3"
+        ]));
+        assert!(parses(&[
+            "citrate",
+            "advanced",
+            "model-stats",
+            "--range",
+            "7d"
+        ]));
+
+        // `-c` after `contract verify` is the global --config, as everywhere else.
+        let cli = Cli::try_parse_from([
+            "citrate",
+            "contract",
+            "verify",
+            addr,
+            "--get",
+            addr,
+            "-c",
+            "/tmp/c.json",
+            "-vv",
+        ])
+        .expect("global -c and -v parse after a subcommand");
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/tmp/c.json"))
+        );
+        assert_eq!(cli.verbose, 2);
+    }
+}

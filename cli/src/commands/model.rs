@@ -71,7 +71,7 @@ pub enum ModelCommands {
         name: Option<String>,
 
         /// Model version
-        #[arg(short, long)]
+        #[arg(long)]
         version: Option<String>,
 
         /// Account to deploy from
