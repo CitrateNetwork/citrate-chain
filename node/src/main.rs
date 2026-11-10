@@ -78,6 +78,7 @@ mod finality_sync;
 #[cfg(test)]
 mod g11_test_seal;
 mod genesis;
+mod gossip_hold;
 mod hardening_rejoin;
 mod host_identity;
 mod inference;
@@ -95,6 +96,7 @@ mod rollback;
 mod serve_plane;
 #[cfg(test)]
 mod serve_plane_tests;
+mod slot_stats;
 #[cfg(test)]
 mod split_heal_tests;
 mod startup_guards;
@@ -2571,6 +2573,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
     memory_bounds::spawn_report(storage.clone(), shared_dag_store.clone());
+    // r1007 CV-4b: slot statistics for the S1 sortition decision (measure only).
+    slot_stats::spawn(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
     // pre-D2 binary can be carrying a chain-store hole with the block sitting
@@ -2695,11 +2699,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // merely shaped like genesis (parentless, arbitrary height) cannot
         // bypass the admission gates.
         shared_dag_store.set_configured_genesis(genesis_hash);
+        // r1007 G9 (#184): bind the slot origin (the genesis timestamp) from
+        // the same block. A DAG store that holds neither genesis nor the
+        // origin key (an in-memory store over a pruned chain) could otherwise
+        // slot-check nothing, and a store whose origin disagrees with this
+        // genesis would mis-slot every block: refuse to start.
+        if genesis_hash != citrate_consensus::types::Hash::default() {
+            match storage.blocks.get_block(&genesis_hash) {
+                Ok(Some(genesis)) => shared_dag_store
+                    .set_slot_origin(&genesis.header)
+                    .map_err(|e| anyhow::anyhow!("G9 slot origin: {e}"))?,
+                Ok(None) => warn!(
+                    "G9: genesis {genesis_hash} is indexed at height 0 but its block is not                      stored; the slot origin comes from the DAG store alone"
+                ),
+                Err(e) => return Err(anyhow::anyhow!("G9: read genesis {genesis_hash}: {e}")),
+            }
+        }
         let network_id: u32 = config.chain.chain_id as u32;
 
         // Incoming message channel (log-only for now)
         let (in_tx, mut in_rx) =
             tokio::sync::mpsc::channel::<(PeerId, citrate_network::NetworkMessage)>(512);
+        // r1007 G9 ingress: gossip holds early blocks and this weak handle
+        // feeds them back into the queue once due (`gossip_hold`). Weak, so
+        // the queue still closes when the peer manager drops its sender.
+        let held_release_tx = in_tx.downgrade();
         peer_manager.set_incoming(in_tx).await;
         // ADR CV-6 (planset H3): history serving has its own lane and task.
         // GetBlocks/GetHeaders never enter the consensus queue above and are
@@ -2910,6 +2934,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             peer_manager.clone(),
         ));
         let gossip_for_rx = gossip.clone();
+        // r1007 G9 ingress ("hold, rather than reject"): early blocks gossip
+        // held go back through the NewBlock arm below once their slot is due.
+        gossip_hold::spawn_release(gossip.clone(), held_release_tx);
         // Sync manager (basic integration)
         // WEDGE #85: judge sync completion against THIS node's applied chain, not
         // the height of the last block handed to us. Without this a node with a
@@ -3800,7 +3827,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await
                         {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
-                                Ok(_) => {
+                                // r1007 G9 ingress: an early block is held by
+                                // gossip, not admitted; `gossip_hold` re-delivers
+                                // it here once its slot is inside the drift.
+                                Ok(
+                                    citrate_network::BlockGossip::Held
+                                    | citrate_network::BlockGossip::HoldFull,
+                                ) => {}
+                                Ok(
+                                    citrate_network::BlockGossip::Relayed
+                                    | citrate_network::BlockGossip::AlreadyRelayed,
+                                ) => {
                                     // PBA-L1b-006: gossip validation proves only a
                                     // self-consistent, self-signed header — any key
                                     // can sign height u64::MAX. The height becomes

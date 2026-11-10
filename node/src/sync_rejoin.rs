@@ -1254,6 +1254,8 @@ mod tests {
             .expect("tip");
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         dag.set_configured_genesis(g.header.block_hash);
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         dag.store_block(g.clone()).await.expect("genesis dag");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         ghostdag.add_block(g).await.expect("genesis ghostdag");
@@ -1778,6 +1780,8 @@ mod tests {
         let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
         let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag load"));
         dag.set_configured_genesis(g.header.block_hash);
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         // As main.rs wires it: the G11 walk reads pruned headers from the chain store.
         let ghostdag = Arc::new(
             GhostDag::new(GhostDagParams::default(), dag.clone()).with_ancestry_headers(Arc::new(
@@ -3170,6 +3174,8 @@ mod tests {
         let point = tip_height.saturating_sub(retain);
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         dag.set_configured_genesis(h(g));
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         // Producer rehydration: every stored height is registered with GhostDAG;
         // only the retained range is in the DAG store (below the pruning point

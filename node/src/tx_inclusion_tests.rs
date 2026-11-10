@@ -130,6 +130,8 @@ impl TxNode {
         ));
         let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, true).expect("dag load"));
         dag.set_configured_genesis(genesis.header.block_hash);
+        dag.set_slot_origin(&genesis.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         // The mempool exactly as `start_node` builds it: committed nonce and
         // balance readers over the executor.

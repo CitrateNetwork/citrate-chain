@@ -391,3 +391,87 @@ pub fn record_parallel_groups(count: usize) {
         .with_label_values(&[])
         .observe(count as f64);
 }
+
+// r1007 CV-4b (sortition: design and measure only). Slot statistics over the
+// last completed window of slots, published by the node's slot-stats task
+// (`node/src/slot_stats.rs`; sources: the DAG store's slot index and the
+// applied tip). S1 decides the sortition threshold from these.
+pub static SLOT_STATS: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_gauge_vec!(
+            "citrate_slot_stats",
+            "Per-window slot statistics: blocks_per_slot, blocks_per_slot_max, empty_slot_rate, \
+             merge_rate, merge_parents_mean, reorg_rate, reorg_depth_max, window_slots",
+            &["stat"]
+        ),
+        "Failed to register slot stats metric",
+    )
+});
+
+/// Selected-chain reorgs seen by the slot-stats task (applied tip moved off
+/// its own chain), labelled by depth bucket.
+pub static SELECTED_CHAIN_REORGS: Lazy<prometheus::CounterVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_counter_vec!(
+            "citrate_selected_chain_reorgs_total",
+            "Selected-chain reorgs of the applied tip, by depth bucket (1, 2, 3, 4-10, >10)",
+            &["depth"]
+        ),
+        "Failed to register selected-chain reorg metric",
+    )
+});
+
+/// Equivocations recorded by the DAG store (G10 evidence), a gauge of the
+/// durable count.
+pub static EQUIVOCATIONS_RECORDED: Lazy<prometheus::GaugeVec> = Lazy::new(|| {
+    crate::metrics::must(
+        register_gauge_vec!(
+            "citrate_equivocations_recorded",
+            "Equivocation evidence records held by the DAG store (same proposer, same slot)",
+            &[]
+        ),
+        "Failed to register equivocation metric",
+    )
+});
+
+/// Publish one slot-stats window. `stat` names are the label values of
+/// `citrate_slot_stats`.
+pub fn update_slot_stats(stats: &[(&str, f64)]) {
+    for (stat, value) in stats {
+        SLOT_STATS.with_label_values(&[stat]).set(*value);
+    }
+}
+
+/// Read side of `citrate_slot_stats{stat}`.
+pub fn slot_stat(stat: &str) -> f64 {
+    SLOT_STATS.with_label_values(&[stat]).get()
+}
+
+/// Count one selected-chain reorg of `depth` blocks.
+pub fn record_selected_chain_reorg(depth: u64) {
+    let bucket = match depth {
+        0 | 1 => "1",
+        2 => "2",
+        3 => "3",
+        4..=10 => "4-10",
+        _ => ">10",
+    };
+    SELECTED_CHAIN_REORGS.with_label_values(&[bucket]).inc();
+}
+
+/// Read side of `citrate_selected_chain_reorgs_total{depth}`.
+pub fn selected_chain_reorgs(bucket: &str) -> f64 {
+    SELECTED_CHAIN_REORGS.with_label_values(&[bucket]).get()
+}
+
+/// Publish the number of equivocation evidence records.
+pub fn update_equivocations_recorded(count: usize) {
+    EQUIVOCATIONS_RECORDED
+        .with_label_values(&[])
+        .set(count as f64);
+}
+
+/// Read side of `citrate_equivocations_recorded`.
+pub fn equivocations_recorded() -> f64 {
+    EQUIVOCATIONS_RECORDED.with_label_values(&[]).get()
+}

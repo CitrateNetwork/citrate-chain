@@ -28,6 +28,7 @@ pub mod ghostdag;
 pub mod hardening;
 pub mod native_sig;
 pub mod ordering;
+pub mod slots;
 pub mod tip_selection;
 pub mod tx_auth;
 pub mod types;

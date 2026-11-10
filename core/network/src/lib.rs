@@ -89,7 +89,9 @@ pub use ai_handler::{AINetworkHandler, NetworkInferenceExecutor, NetworkInferenc
 pub use block_propagation::BlockPropagation;
 pub use bootnode::{resolve_bootnode, split_bootnode};
 pub use discovery::{Discovery, DiscoveryConfig};
-pub use gossip::{CheckpointLearningData, GossipConfig, GossipProtocol, LearningDedup};
+pub use gossip::{
+    BlockGossip, CheckpointLearningData, GossipConfig, GossipProtocol, LearningDedup,
+};
 pub use learning_messages::{
     AdapterOffer, BelnapConfidence, LearningEmbedding, LearningMessage, PerformanceProfile,
 };

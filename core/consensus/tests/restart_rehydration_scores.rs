@@ -102,6 +102,11 @@ fn block(tag: u8, height: u64, parent: Hash, merges: Vec<Hash>) -> Block {
         .parent(parent)
         .merge_parents(merges)
         .height(height)
+        // r1007 G9/G10: slot = height (genesis at 0), own proposer.
+        .timestamp(height * citrate_consensus::slots::SLOT_DURATION_SECS)
+        .proposer(citrate_consensus::types::PublicKey::new(
+            *hash(tag, height).as_bytes(),
+        ))
         .blue_score(height)
         .blue_work(citrate_consensus::types::blue_work_for_score(height))
         .build_unhashed()
@@ -134,6 +139,11 @@ async fn sealed(gd: &GhostDag, tag: u8, height: u64, parent: Hash, merges: Vec<H
         .parent(sp)
         .merge_parents(m)
         .height(h)
+        // r1007 G9/G10: slot = height (genesis at 0), own proposer.
+        .timestamp(h * citrate_consensus::slots::SLOT_DURATION_SECS)
+        .proposer(citrate_consensus::types::PublicKey::new(
+            *hash(tag, height).as_bytes(),
+        ))
         .blue_score(data.blue_score)
         .blue_work(data.blue_work)
         .build_unhashed()

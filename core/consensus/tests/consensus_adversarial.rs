@@ -27,6 +27,9 @@ fn make_block(
         .merge_parents(merge_parents)
         .height(height)
         .timestamp(height)
+        // r1007 G10: each block its own proposer, so siblings in one slot
+        // are honest width, not equivocation.
+        .proposer(citrate_consensus::types::PublicKey::new(hash))
         .blue_score(blue_score)
         // SECREM-01: admission enforces the canonical score→work relation.
         .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
@@ -47,6 +50,9 @@ async fn sealed(ghostdag: &GhostDag, hash: [u8; 32], parents: Vec<Hash>) -> Bloc
         .merge_parents(merges)
         .height(height)
         .timestamp(height)
+        // r1007 G10: each block its own proposer, so siblings in one slot
+        // are honest width, not equivocation.
+        .proposer(citrate_consensus::types::PublicKey::new(hash))
         .blue_score(data.blue_score)
         .blue_work(data.blue_work)
         .build_unhashed()

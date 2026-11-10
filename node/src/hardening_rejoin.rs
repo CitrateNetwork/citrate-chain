@@ -469,6 +469,8 @@ pub(crate) mod tests {
             Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()).with_pba_hardening(pba));
         let g = genesis();
         dag.set_configured_genesis(g.header.block_hash);
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let fresh = storage
             .blocks
             .get_block_by_height(0)
@@ -768,12 +770,50 @@ pub(crate) mod tests {
         assert_eq!(report.legacy_format, 6, "all six are in the old format");
     }
 
-    /// The same rejoin for a stale branch that is in the current format but
-    /// breaks another rule that switches on at `H`.
+    /// A stale branch in the current format that breaks the parent-relative
+    /// timestamp bound never gets onto a node of this release.
+    ///
+    /// r1007 G9 (#184): this test used to let a node on the old rules (the
+    /// PBA-R2 height unset) admit the branch, then check that the restart on
+    /// the new rules purged it. Under G9 a block with no later slot would
+    /// halt the chain, so the bound became a block-0 rule that holds at every
+    /// activation setting: the old-rules node of this release refuses the
+    /// first such block at admission and keeps its tip. The start-up purge
+    /// still checks the bound for blocks an older release stored
+    /// (`check_block`, covered by `timestamp_bound_edges`).
     #[tokio::test]
     async fn stale_branch_invalid_under_any_activation_rule_is_dropped() {
-        let report = assert_rejoins(stale_timestamp_jump).await;
-        assert_eq!(report.legacy_format, 0, "not the old format");
+        let old = PbaHardening::off();
+        let dir = tempfile::tempdir().expect("dir");
+        let (c, _) = open(dir.path(), old, false).await;
+        let mirror = Executor::new(Arc::new(StateDB::new()));
+        let mut p = genesis().header.block_hash;
+        for h in 1..H {
+            let b = produce(&mirror, old, h, p, CB_UPGRADED, 0x50 + h as u8);
+            assert!(
+                matches!(c.receive(&b).await, AdmitOutcome::Admitted { .. }),
+                "the shared prefix block {h} is valid"
+            );
+            p = b.header.block_hash;
+        }
+        let jump = stale_timestamp_jump(&mirror, H, p);
+        assert!(
+            !matches!(c.receive(&jump).await, AdmitOutcome::Admitted { .. }),
+            "a block past the timestamp bound is refused even with the activation height unset"
+        );
+        assert!(
+            c.storage
+                .blocks
+                .get_block(&jump.header.block_hash)
+                .expect("read")
+                .is_none(),
+            "and is not stored"
+        );
+        assert_eq!(
+            c.tip().await.height,
+            H - 1,
+            "the tip stays on the shared prefix"
+        );
     }
 
     /// The rejoin for a stale branch whose native transactions carry the
@@ -882,6 +922,8 @@ pub(crate) mod tests {
         {
             let dag = DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("dag");
             dag.set_configured_genesis(g.header.block_hash);
+            dag.set_slot_origin(&g.header)
+                .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
             for b in [&g, &b1, &good2, &legacy2, &legacy3] {
                 storage.blocks.put_block(b).expect("put");
                 dag.store_block(b.clone()).await.expect("dag put");
@@ -1017,6 +1059,8 @@ pub(crate) mod tests {
         {
             let dag = DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("dag");
             dag.set_configured_genesis(g.header.block_hash);
+            dag.set_slot_origin(&g.header)
+                .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
             for b in [&g, &b1, &b2] {
                 dag.store_block(b.clone()).await.expect("dag put");
             }
@@ -1504,6 +1548,8 @@ pub(crate) mod tests {
             Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()).with_pba_hardening(on));
         let g = genesis();
         dag.set_configured_genesis(g.header.block_hash);
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         storage
             .blocks
             .put_applied_tip(&g.header.block_hash, 0)
