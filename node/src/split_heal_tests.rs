@@ -2466,6 +2466,74 @@ mod tests {
         }
     }
 
+    /// R2 early seal (devnet fin-r2-k1000-1, p7, 2026-11-10). A producer restored from a
+    /// snapshot ~23 blocks behind the network came up with one inbound peer whose head it had
+    /// not heard yet, declared "Initial sync complete (applied=23271 target=23271 peers=1)"
+    /// 0.4 s later and sealed two blocks on its stale tip before the F2 gate had any network
+    /// height. A node that has heard nothing above its own applied tip has not shown that it
+    /// is caught up: it must not seal until it has heard where the network is (or the solo
+    /// grace runs out with no peer at all). Red at 6cc39b41: the sync tick counts the silent
+    /// peer as "in sync" and the producer seals.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restarted_producer_does_not_seal_before_it_hears_a_peer_head() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::a_restarted_producer_does_not_seal_before_it_hears_a_peer_head",
+            );
+        }
+        let n = 4;
+        let late = 3usize;
+        let mut fleet = Fleet::new(n).await;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..ACT + 4 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // The late node is down while the others go on (the R2 snapshot restore).
+        fleet.down.insert(late);
+        for _ in 0..20 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        fleet.down.remove(&late);
+        fleet.restart(late).await;
+        let heights = fleet.applied_heights().await;
+        let net = heights
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != late)
+            .map(|(_, h)| *h)
+            .max()
+            .expect("running nodes");
+        assert!(
+            net > heights[late] + crate::producer::CATCHUP_REFUSE_GAP,
+            "fixture: the restarted node must be behind (net {net}, it {})",
+            heights[late]
+        );
+        // Freshly connected: no Hello yet, so no peer head is known.
+        let peers: Vec<Arc<Peer>> = (0..n)
+            .filter(|j| *j != late)
+            .map(|j| fleet.peer(late, j))
+            .collect();
+        for p in &peers {
+            let mut info = p.info.write().await;
+            info.head_height = 0;
+            info.head_hash = Hash::default();
+        }
+        // The main loop's sync tick, 1 s into the process, then a production round.
+        fleet.nodes[late]
+            .tick(&peers, std::time::Duration::from_secs(1))
+            .await;
+        let sealed = fleet.nodes[late].producer.produce_block().await;
+        assert!(
+            sealed.is_err(),
+            "a producer {} blocks behind that has heard no peer head sealed on its stale tip \
+             (initial_sync={})",
+            net - heights[late],
+            fleet.nodes[late].initial_sync.load(Ordering::Relaxed)
+        );
+    }
+
     /// H1 (lead, from the CHAIN-SAFETY lane): a 4v3 split, then the sides hear
     /// each other's new blocks but serving between them is starved, and the
     /// three have stopped sealing (held quiet, as a producer that cannot
