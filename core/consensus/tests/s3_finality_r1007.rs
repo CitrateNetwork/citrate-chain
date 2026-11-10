@@ -438,10 +438,12 @@ fn spec_pp(h: u64) -> Hash {
 }
 
 /// Linear block at `h` with the given pruning point; linear GHOSTDAG values
-/// (genesis 0, each step +1, G7).
+/// (genesis 0, each step +1, G7), one block per slot of the genesis grid (G9:
+/// a block's slot is strictly after its parent's).
 fn linear(h: u64, pp: Hash) -> Block {
     BlockBuilder::new()
         .hash(chain_id(h))
+        .timestamp(h * citrate_consensus::slots::SLOT_DURATION_SECS)
         .parent(if h == 0 {
             Hash::default()
         } else {
@@ -589,6 +591,8 @@ fn sibling(h: u64, parent: Hash, pp: Hash, tag: u8) -> Block {
         .hash(Hash::new(id))
         .parent(parent)
         .height(h)
+        // The slot of height `h` on the genesis grid, as `linear` (G9).
+        .timestamp(h * citrate_consensus::slots::SLOT_DURATION_SECS)
         .blue_score(h)
         .blue_work(blue_work_for_score(h))
         .pruning_point(pp)
