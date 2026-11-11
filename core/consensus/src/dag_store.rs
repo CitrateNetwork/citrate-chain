@@ -244,14 +244,78 @@ pub struct DagStore {
     /// (proposer, slot), loaded from and written to the DAG metadata. Never
     /// pruned: it is what the slashing path needs after the blocks are gone.
     equivocations: Arc<RwLock<EquivocationRecords>>,
-    /// Spec 06 §3.10 (D11): blocks disqualified from the selected chain.
-    /// A read-through cache of the persisted `disq:<hash>` marks.
-    disqualified: Arc<Mutex<HashSet<Hash>>>,
+    /// Spec 06 §3.10 (D11, amended 2026-11-11, fed#533): ROOT marks only,
+    /// the blocks whose own commitments failed when the applied chain reached
+    /// them. A bounded read-through cache of the persisted `disq:<hash>` keys,
+    /// which are the source of truth; descendants are derived by
+    /// `GhostDag::is_disqualified`, never stored.
+    disqualified_roots: Arc<Mutex<BoundedCache<Hash, ()>>>,
 }
 
-/// `DAG_METADATA` key prefix of a disqualified-from-chain mark (spec 06
-/// §3.10, the spec's `CF_DISQUALIFIED`). Metadata, not a column family of its
-/// own, so an older binary still opens the database.
+/// Entries the in-memory root-mark cache holds (the persisted keys are the
+/// source of truth; an evicted root is re-read from the store).
+pub const DISQUALIFIED_ROOT_CACHE_CAP: usize = 4_096;
+
+/// A map with a fixed capacity that evicts its oldest insertion first. Used
+/// for caches whose source of truth is elsewhere.
+#[derive(Debug)]
+pub struct BoundedCache<K, V> {
+    cap: usize,
+    map: HashMap<K, V>,
+    order: std::collections::VecDeque<K>,
+}
+
+impl<K: std::hash::Hash + Eq + Copy, V: Copy> BoundedCache<K, V> {
+    /// An empty cache that holds at most `cap` entries (at least one).
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn get(&self, k: &K) -> Option<V> {
+        self.map.get(k).copied()
+    }
+
+    pub fn insert(&mut self, k: K, v: V) {
+        if self.map.insert(k, v).is_none() {
+            self.order.push_back(k);
+            while self.map.len() > self.cap {
+                match self.order.pop_front() {
+                    Some(old) => {
+                        self.map.remove(&old);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    pub fn remove(&mut self, k: &K) {
+        if self.map.remove(k).is_some() {
+            self.order.retain(|x| x != k);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// `DAG_METADATA` key prefix of a disqualified-from-chain ROOT mark (spec 06
+/// §3.10). Kept in the existing metadata family: it is a small, rare,
+/// write-once record with no column-family settings of its own.
 const DISQUALIFIED_PREFIX: &[u8] = b"disq:";
 
 fn disqualified_key(hash: &Hash) -> Vec<u8> {
@@ -355,7 +419,9 @@ impl DagStore {
             slot_origin: Arc::new(OnceLock::new()),
             slot_index: Arc::new(RwLock::new(BTreeMap::new())),
             equivocations: Arc::new(RwLock::new(BTreeMap::new())),
-            disqualified: Arc::new(Mutex::new(HashSet::new())),
+            disqualified_roots: Arc::new(Mutex::new(BoundedCache::new(
+                DISQUALIFIED_ROOT_CACHE_CAP,
+            ))),
         }
     }
 
@@ -580,7 +646,9 @@ impl DagStore {
             slot_origin: Arc::new(OnceLock::new()),
             slot_index: Arc::new(RwLock::new(BTreeMap::new())),
             equivocations: Arc::new(RwLock::new(BTreeMap::new())),
-            disqualified: Arc::new(Mutex::new(HashSet::new())),
+            disqualified_roots: Arc::new(Mutex::new(BoundedCache::new(
+                DISQUALIFIED_ROOT_CACHE_CAP,
+            ))),
         };
         store.load_from_persistent()?;
         Ok(store)
@@ -942,14 +1010,16 @@ impl DagStore {
         self.persistent.is_some()
     }
 
-    /// Spec 06 §3.10 (D11): mark `hash` disqualified from the selected chain,
-    /// persisted. Never cleared: the mark is a pure function of the block's
-    /// own data (its commitments do not reproduce), so it never changes.
-    pub fn mark_disqualified(&self, hash: &Hash) {
-        self.disqualified
+    /// Spec 06 §3.10 (D11): record `hash` as a disqualified-from-chain ROOT,
+    /// persisted: its own commitments did not reproduce when the applied
+    /// chain reached it. Descendants are never stored (fed#533); they are
+    /// derived from the roots. The write is best effort: a lost mark costs one
+    /// re-execution of that chain candidate, which marks it again.
+    pub fn mark_disqualified_root(&self, hash: &Hash) {
+        self.disqualified_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(*hash);
+            .insert(*hash, ());
         if let Some(ref kv) = self.persistent {
             if let Err(e) = kv.kv_put(cf::DAG_METADATA, &disqualified_key(hash), &[1]) {
                 warn!("Failed to persist the disqualified mark of {}: {}", hash, e);
@@ -957,14 +1027,16 @@ impl DagStore {
         }
     }
 
-    /// Whether `hash` is disqualified from the selected chain (in memory, or
-    /// persisted by an earlier process).
-    pub fn is_disqualified(&self, hash: &Hash) -> bool {
+    /// Whether `hash` is a disqualified root (cached, or persisted by an
+    /// earlier process). A read error counts as "not a root": the block is
+    /// then a chain candidate again and is re-executed, which is safe.
+    pub fn is_disqualified_root(&self, hash: &Hash) -> bool {
         if self
-            .disqualified
+            .disqualified_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(hash)
+            .get(hash)
+            .is_some()
         {
             return true;
         }
@@ -973,13 +1045,79 @@ impl DagStore {
         };
         match kv.kv_get(cf::DAG_METADATA, &disqualified_key(hash)) {
             Ok(Some(_)) => {
-                self.disqualified
+                self.disqualified_roots
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(*hash);
+                    .insert(*hash, ());
                 true
             }
             _ => false,
+        }
+    }
+
+    /// The number of root marks persisted (in memory for a store without a
+    /// persistent backend).
+    pub fn stored_disqualified_roots(&self) -> usize {
+        match &self.persistent {
+            Some(kv) => kv
+                .kv_iter_cf(cf::DAG_METADATA)
+                .map(|all| {
+                    all.iter()
+                        .filter(|(k, _)| k.starts_with(DISQUALIFIED_PREFIX))
+                        .count()
+                })
+                .unwrap_or(0),
+            None => self.disqualified_root_cache_len(),
+        }
+    }
+
+    /// Entries in the in-memory root cache (at most
+    /// [`DISQUALIFIED_ROOT_CACHE_CAP`]).
+    pub fn disqualified_root_cache_len(&self) -> usize {
+        self.disqualified_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Operator recovery (fed#533 (4)): delete every root mark. Safe: a
+    /// still-bad block is disqualified again when the applied chain reaches
+    /// it and its commitments fail again; a mark written by a local fault
+    /// (state corruption) is gone. Returns the number of marks removed.
+    pub fn clear_disqualified_marks(&self) -> Result<usize, DagStoreError> {
+        let mut removed = 0usize;
+        if let Some(ref kv) = self.persistent {
+            let keys: Vec<Vec<u8>> = kv
+                .kv_iter_cf(cf::DAG_METADATA)
+                .map_err(DagStoreError::StorageError)?
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| k.starts_with(DISQUALIFIED_PREFIX))
+                .collect();
+            for k in keys {
+                kv.kv_delete(cf::DAG_METADATA, &k)
+                    .map_err(DagStoreError::StorageError)?;
+                removed = removed.saturating_add(1);
+            }
+        } else {
+            removed = self.disqualified_root_cache_len();
+        }
+        self.disqualified_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        Ok(removed)
+    }
+
+    /// fed#532: a pruned block's root mark goes with it (a pruned block is
+    /// never re-admitted, so its mark can never be needed again).
+    fn persist_delete_disqualified_root(&self, hash: &Hash) {
+        self.disqualified_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(hash);
+        if let Some(ref kv) = self.persistent {
+            let _ = kv.kv_delete(cf::DAG_METADATA, &disqualified_key(hash));
         }
     }
 
@@ -1677,6 +1815,7 @@ impl DagStore {
                         // G12: the GHOSTDAG record must not outlive its block,
                         // or a pruned range leaves stale entries behind forever.
                         self.persist_delete_ghostdag_data(&hash);
+                        self.persist_delete_disqualified_root(&hash);
                         pruned_count = pruned_count.saturating_add(1);
                     }
                 }

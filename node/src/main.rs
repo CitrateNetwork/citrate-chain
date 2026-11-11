@@ -331,6 +331,13 @@ enum Commands {
         staker: Option<String>,
     },
 
+    /// Delete every disqualified-from-chain root mark (spec 06 §3.10) from
+    /// this node's DAG store. Run it with the node stopped. Safe: a block that
+    /// is still bad is disqualified again when the applied chain reaches it and
+    /// its commitments fail again; marks a local fault wrote (state corruption)
+    /// are gone. Prints the number of marks removed.
+    ClearDisqualified,
+
     /// Roll this node's stored chain back to a height. Run it with the node
     /// stopped. Removes every block above --to-height and any other block at
     /// it, keeps --keep there, and refuses the removed branch from peers from
@@ -696,6 +703,34 @@ async fn node_main() -> Result<()> {
         }
         Some(Commands::GenesisInfo) => {
             show_genesis_info()?;
+            return Ok(());
+        }
+        Some(Commands::ClearDisqualified) => {
+            let data_dir = match cli.data_dir.clone() {
+                Some(d) => d,
+                None => {
+                    let path = resolve_config_path(cli.config.clone()).ok_or_else(|| {
+                        anyhow::anyhow!("no node config found; pass --config or --data-dir")
+                    })?;
+                    NodeConfig::from_file(&path)?.storage.data_dir
+                }
+            };
+            // Opening the data directory fails while the node runs (RocksDB LOCK).
+            let storage = StorageManager::with_config(
+                &data_dir,
+                StorageConfig {
+                    pruning: PruningConfig {
+                        auto_prune: false,
+                        ..PruningConfig::default()
+                    },
+                    encryption: at_rest_encryption_from_env()?,
+                },
+            )?;
+            let removed = clear_disqualified_marks(&storage)?;
+            println!(
+                "removed {removed} disqualified-from-chain mark(s) from {}",
+                data_dir.display()
+            );
             return Ok(());
         }
         Some(Commands::Rollback {
@@ -5094,6 +5129,41 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The `clear-disqualified` command's store step: every root mark in the DAG
+/// metadata of `storage` (spec 06 §3.10).
+fn clear_disqualified_marks(storage: &StorageManager) -> anyhow::Result<usize> {
+    let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+    let dag = DagStore::persistent_with_strict_vrf(kv, false)
+        .map_err(|e| anyhow::anyhow!("open the DAG store: {e}"))?;
+    dag.clear_disqualified_marks()
+        .map_err(|e| anyhow::anyhow!("clear the disqualified marks: {e}"))
+}
+
+#[cfg(test)]
+mod clear_disqualified_tests {
+    use super::*;
+
+    /// fed#533 (4): the operator command removes every root mark from a
+    /// node's store, and the CLI parses it.
+    #[test]
+    fn clear_disqualified_removes_the_marks_of_a_node_store() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        {
+            let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+            let dag = DagStore::persistent_with_strict_vrf(kv, false).expect("dag");
+            dag.mark_disqualified_root(&citrate_consensus::types::Hash::new([7; 32]));
+            dag.mark_disqualified_root(&citrate_consensus::types::Hash::new([8; 32]));
+            assert_eq!(dag.stored_disqualified_roots(), 2);
+        }
+        assert_eq!(clear_disqualified_marks(&storage).expect("clear"), 2);
+        assert_eq!(clear_disqualified_marks(&storage).expect("again"), 0);
+        let cli = Cli::try_parse_from(["citrate", "--data-dir", "/tmp/x", "clear-disqualified"])
+            .expect("parses");
+        assert!(matches!(cli.command, Some(Commands::ClearDisqualified)));
+    }
 }
 
 /// The storage records a node restarted at applied tip `tip_height` loads into

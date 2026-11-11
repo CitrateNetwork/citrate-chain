@@ -2129,7 +2129,10 @@ async fn wrong_state_root_disqualifies_from_chain_not_from_dag() {
         b.storage.db.clone(),
     ));
     let reloaded = DagStore::persistent_with_strict_vrf(kv, true).expect("reload");
-    assert!(reloaded.is_disqualified_root(&xh), "the root mark survives a restart");
+    assert!(
+        reloaded.is_disqualified_root(&xh),
+        "the root mark survives a restart"
+    );
     // B keeps sealing on its applied tip. x can be merged only by a block
     // whose selected parent outweighs it (G3), so once B's own chain is
     // heavier one of its blocks merges x and executes x's own tx.

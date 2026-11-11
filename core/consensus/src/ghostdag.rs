@@ -188,6 +188,10 @@ const MAX_GHOSTDAG_CACHE_ENTRIES: usize = 65_536;
 /// branch built on a bad block; past this bound the tip is not a candidate.
 const MAX_DISQUALIFIED_WALK: u32 = 100_000;
 
+/// Derived disqualification verdicts held in memory (fed#533). The stored root
+/// marks are the source of truth; an evicted verdict is re-derived.
+pub const DISQUALIFIED_VERDICT_CACHE_CAP: usize = 65_536;
+
 /// Where the G11 pruning-point walk reads a selected-chain header that the
 /// DAG store no longer holds (spec 06 §2 G11, CV-7a).
 ///
@@ -218,6 +222,9 @@ pub struct GhostDag {
 
     /// GhostdagData records (G12). A cache over the persisted records.
     ghostdag_cache: Arc<RwLock<HashMap<Hash, Arc<GhostdagData>>>>,
+
+    /// Spec 06 §3.10 (fed#533): derived disqualification verdicts, bounded.
+    disq_verdicts: Arc<std::sync::Mutex<crate::dag_store::BoundedCache<Hash, bool>>>,
 
     /// Records computed by the consistency gate for blocks not yet added,
     /// keyed by hash and the (selected parent, merge parents, height) they were
@@ -324,6 +331,9 @@ impl GhostDag {
             pba_hardening: crate::hardening::PbaHardening::from_process(),
             relations: Arc::new(RwLock::new(HashMap::new())),
             ghostdag_cache: Arc::new(RwLock::new(HashMap::new())),
+            disq_verdicts: Arc::new(std::sync::Mutex::new(crate::dag_store::BoundedCache::new(
+                DISQUALIFIED_VERDICT_CACHE_CAP,
+            ))),
             validated: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             tips: Arc::new(RwLock::new(HashSet::new())),
             keys: Arc::new(RwLock::new(HashMap::new())),
@@ -1299,59 +1309,95 @@ impl GhostDag {
         tips.insert(block.hash());
         drop(tips);
 
-        // Spec 06 §3.10: a block whose selected parent is disqualified from
-        // the chain is disqualified with it (it is still a DAG block).
-        if !block.is_genesis() && self.dag_store.is_disqualified(&block.selected_parent()) {
-            self.dag_store.mark_disqualified(&block.hash());
-        }
+        // Spec 06 §3.10 (fed#533): a block whose selected parent is
+        // disqualified is disqualified with it (it is still a DAG block). That
+        // is derived (`is_disqualified`), never stored, so admitting any number
+        // of children of a disqualified block adds no stored state.
     }
 
     /// Spec 06 §3.10 (D11): whether `hash` is disqualified from the selected
-    /// chain (persisted with the DAG store).
-    pub fn is_disqualified(&self, hash: &Hash) -> bool {
-        self.dag_store.is_disqualified(hash)
-    }
-
-    /// Spec 06 §3.10 (D11): disqualify `hash` from the selected chain (its
-    /// commitments did not reproduce when the applied chain reached it), and
-    /// every held block whose selected chain passes through it. The block
-    /// stays in the DAG: it can still be merged, never be a chain block.
-    pub async fn disqualify(&self, hash: &Hash) {
-        let mut queue = vec![*hash];
-        while let Some(h) = queue.pop() {
-            if self.dag_store.is_disqualified(&h) && h != *hash {
-                continue;
+    /// chain: it, or a block on its selected chain, is a stored root mark
+    /// (`DagStore::is_disqualified_root`). Derived by walking selected parents
+    /// until a cached verdict, a root, genesis, or a block whose header is not
+    /// held (below the DAG prune floor) is reached, at most
+    /// [`MAX_DISQUALIFIED_WALK`] steps; reaching the bound counts as qualified.
+    /// Verdicts are cached in a bounded cache, cleared when a root is added.
+    pub async fn is_disqualified(&self, hash: &Hash) -> bool {
+        let mut path: Vec<Hash> = Vec::new();
+        let mut c = *hash;
+        let mut steps: u32 = 0;
+        let verdict = loop {
+            if let Some(v) = self
+                .disq_verdicts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&c)
+            {
+                break v;
             }
-            self.dag_store.mark_disqualified(&h);
-            let mut children: HashSet<Hash> = self
+            path.push(c);
+            if self.dag_store.is_disqualified_root(&c) {
+                break true;
+            }
+            steps = steps.saturating_add(1);
+            if steps > MAX_DISQUALIFIED_WALK {
+                break false;
+            }
+            let sp = match self
                 .relations
                 .read()
                 .await
-                .get(&h)
-                .map(|r| r.children.iter().copied().collect())
-                .unwrap_or_default();
-            children.extend(self.dag_store.get_children(&h).await);
-            for c in children {
-                let sp = match self
-                    .relations
-                    .read()
+                .get(&c)
+                .map(|r| r.selected_parent)
+            {
+                Some(sp) => Some(sp),
+                None => self
+                    .dag_store
+                    .get_header(&c)
                     .await
-                    .get(&c)
-                    .map(|r| r.selected_parent)
-                {
-                    Some(sp) => Some(sp),
-                    None => self
-                        .dag_store
-                        .get_header(&c)
-                        .await
-                        .ok()
-                        .map(|hd| hd.selected_parent_hash),
-                };
-                if sp == Some(h) {
-                    queue.push(c);
-                }
+                    .ok()
+                    .map(|hd| hd.selected_parent_hash),
+            };
+            match sp {
+                Some(sp) if sp != Hash::default() && sp != c => c = sp,
+                _ => break false,
             }
+        };
+        let mut cache = self.disq_verdicts.lock().unwrap_or_else(|e| e.into_inner());
+        for h in path {
+            cache.insert(h, verdict);
         }
+        verdict
+    }
+
+    /// Entries in the derived-verdict cache (at most its cap).
+    pub fn disqualified_cache_len(&self) -> usize {
+        self.disq_verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// Cap the derived-verdict cache (default [`DISQUALIFIED_VERDICT_CACHE_CAP`]).
+    pub fn with_disqualified_cache_cap(mut self, cap: usize) -> Self {
+        self.disq_verdicts = Arc::new(std::sync::Mutex::new(crate::dag_store::BoundedCache::new(
+            cap,
+        )));
+        self
+    }
+
+    /// Spec 06 §3.10 (D11): disqualify `hash` from the selected chain: its
+    /// commitments did not reproduce when the applied chain reached it. One
+    /// root mark is stored; every block whose selected chain passes through it
+    /// is disqualified by derivation. The block stays in the DAG: it can still
+    /// be merged, never be a chain block.
+    pub async fn disqualify(&self, hash: &Hash) {
+        self.dag_store.mark_disqualified_root(hash);
+        // A new root can turn cached "qualified" verdicts of its descendants.
+        self.disq_verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         warn!("block {} disqualified from the selected chain", hash);
     }
 
@@ -1361,7 +1407,7 @@ impl GhostDag {
     async fn first_qualified(&self, tip: Hash) -> Option<Hash> {
         let mut c = tip;
         let mut steps: u32 = 0;
-        while self.dag_store.is_disqualified(&c) {
+        while self.is_disqualified(&c).await {
             steps = steps.saturating_add(1);
             if steps > MAX_DISQUALIFIED_WALK {
                 return None;
@@ -3907,10 +3953,16 @@ mod tests {
             gd.validate_block_consistency(&x)
                 .await
                 .map_err(|e| e.to_string())?;
-            store.store_block(x.clone()).await.map_err(|e| e.to_string())?;
+            store
+                .store_block(x.clone())
+                .await
+                .map_err(|e| e.to_string())?;
             gd.add_block(&x).await.map_err(|e| e.to_string())
         };
-        assert!(readmit.await.is_err(), "a pruned block is never re-admitted");
+        assert!(
+            readmit.await.is_err(),
+            "a pruned block is never re-admitted"
+        );
     }
 
     /// fed#533 (4): the operator command's store call removes every root mark;
@@ -3978,7 +4030,10 @@ mod tests {
         gd.add_block(&z)
             .await
             .expect("a child of a marked block is still a DAG block");
-        assert!(gd.is_disqualified(&z.hash()).await, "derived after admission");
+        assert!(
+            gd.is_disqualified(&z.hash()).await,
+            "derived after admission"
+        );
         // Only the root is stored; a fresh GhostDag over the reopened store
         // derives the descendants again.
         let reopened = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("reopen"));
