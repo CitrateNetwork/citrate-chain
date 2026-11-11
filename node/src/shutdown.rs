@@ -6,6 +6,47 @@
 //! server close and join, "Shutting down..."). Both signals now run the same
 //! path.
 
+/// A registered shutdown signal: SIGTERM's handler is installed when this is
+/// created (so a SIGTERM that arrives after it no longer ends the process),
+/// SIGINT's when [`ShutdownSignal::wait`] is first polled.
+pub struct ShutdownSignal {
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignal {
+    /// Install the handlers. Each caller gets its own registration, so several
+    /// tasks can wait.
+    pub fn register() -> std::io::Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    /// Resolves with the signal's name when SIGINT or (on Unix) SIGTERM
+    /// arrives.
+    pub async fn wait(mut self) -> std::io::Result<&'static str> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => r.map(|()| "SIGINT"),
+                _ = self.term.recv() => Ok("SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &mut self;
+            tokio::signal::ctrl_c().await.map(|()| "SIGINT")
+        }
+    }
+}
+
+/// Resolves when the process receives SIGINT or (on Unix) SIGTERM.
+pub async fn shutdown_signal() -> std::io::Result<&'static str> {
+    ShutdownSignal::register()?.wait().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,7 +114,10 @@ mod tests {
         let mut rest = String::new();
         std::io::Read::read_to_string(&mut stdout, &mut rest).expect("read rest");
         let exit = child.wait().expect("wait");
-        assert!(exit.success(), "ended by the signal ({exit:?}):\n{seen}{rest}");
+        assert!(
+            exit.success(),
+            "ended by the signal ({exit:?}):\n{seen}{rest}"
+        );
         assert!(
             rest.contains("SHUTDOWN-PROBE graceful shutdown on SIGTERM"),
             "{seen}{rest}"

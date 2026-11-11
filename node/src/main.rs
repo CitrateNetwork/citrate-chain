@@ -98,9 +98,9 @@ mod registration_proof;
 mod registry_sync;
 mod rollback;
 mod serve_plane;
-mod shutdown;
 #[cfg(test)]
 mod serve_plane_tests;
+mod shutdown;
 mod slot_stats;
 #[cfg(test)]
 mod split_heal_tests;
@@ -4843,8 +4843,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             match rpc_server.spawn() {
                 Ok((close_handle, join_handle)) => {
                     info!("RPC server started");
-                    // Keep server alive
-                    tokio::signal::ctrl_c().await.ok();
+                    // Keep server alive until SIGINT or SIGTERM (CORE-053).
+                    shutdown::shutdown_signal().await.ok();
                     // Signal server to close and join its OS thread
                     close_handle.close();
                     tokio::task::spawn_blocking(move || {
@@ -5084,9 +5084,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
     }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    // Wait for shutdown signal: SIGINT or SIGTERM (systemd stop), CORE-053.
+    let signal = shutdown::shutdown_signal().await?;
+    info!("Shutting down ({signal})...");
 
     // Wait for RPC to shut down
     if let Some(handle) = rpc_handle {
