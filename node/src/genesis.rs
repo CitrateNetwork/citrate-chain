@@ -918,6 +918,84 @@ mod tests {
         assert!(e.contains("D-K3") || e.contains("MPT state root"), "{e}");
     }
 
+    /// S3-6 genesis tripwire (fed#465 §7.1): `ValidatorRegistry.activeSet()`
+    /// read against the r1007 block-0 state equals the compiled epoch-0
+    /// committee (`genesis_committee_set`, from the validators file), key for
+    /// key and stake for stake. The registry state delta and the list are built
+    /// from one file today; this fails if a future alloc (D-K3 fresh keys)
+    /// changes one without the other. Runs on the r1007 layout the build has
+    /// (the r1006-keys candidate) under the MPT rule, in a child process.
+    #[test]
+    fn r1007_block0_active_set_is_the_genesis_committee() {
+        r1007_child("genesis::tests::r1007_child_block0_active_set");
+    }
+
+    #[test]
+    fn r1007_child_block0_active_set() {
+        if std::env::var(R1007_CHILD_ENV).is_err() {
+            return;
+        }
+        use citrate_consensus::types::{BlockBuilder, Signature, Transaction};
+        use citrate_execution::StateDB;
+        citrate_execution::mpt_state_root::set_mpt_state_root_height(Some(0));
+        let cfg = citrate_economics::r1007::candidate_layout_with_r1006_role_keys()
+            .expect("the r1007 layout");
+        let ex = Arc::new(Executor::with_chain_id(Arc::new(StateDB::new()), 40204));
+        citrate_economics::genesis::initialize_shared_genesis_state(&ex, &cfg)
+            .expect("r1007 block-0 state");
+        let (registry, _) = citrate_economics::r1007::validator_set_binding()
+            .expect("binding")
+            .expect("the r1007 genesis registers a final producer set");
+        let mut to = [0u8; 32];
+        to[..20].copy_from_slice(&registry);
+        let mut from = [0u8; 32];
+        from[19] = 1;
+        let mut tx = Transaction {
+            hash: Hash::default(),
+            nonce: 0,
+            from: PublicKey::new(from),
+            to: Some(PublicKey::new(to)),
+            value: 0,
+            gas_limit: 50_000_000,
+            gas_price: 1,
+            data: crate::registry_sync::active_set_selector().to_vec(),
+            signature: Signature::new([0u8; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+        tx.determine_type();
+        let blk = BlockBuilder::new()
+            .base_fee_per_gas(1_000_000_000)
+            .height(0)
+            .build_unhashed();
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let receipt = rt
+            .block_on(ex.simulate_transaction(&blk, &tx))
+            .expect("activeSet() at block 0");
+        assert!(
+            receipt.status,
+            "activeSet() reverted: {:?}",
+            receipt.revert_reason
+        );
+        let mut on_chain: Vec<(PublicKey, u128)> =
+            crate::registry_sync::decode_active_set(&receipt.output)
+                .expect("decode activeSet")
+                .into_iter()
+                .map(|(k, st)| (PublicKey::new(k), st))
+                .collect();
+        let mut compiled =
+            genesis_committee_set(Some(&citrate_consensus::hardening::R1007_GENESIS))
+                .expect("validators file")
+                .expect("the r1007 epoch-0 committee");
+        on_chain.sort_by_key(|(k, st)| (k.0, *st));
+        compiled.sort_by_key(|(k, st)| (k.0, *st));
+        assert_eq!(compiled.len(), 7, "the seven producers");
+        assert_eq!(
+            on_chain, compiled,
+            "block 0's activeSet() must equal the compiled epoch-0 committee"
+        );
+    }
+
     #[test]
     fn r1007_boot_guard_cases() {
         use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS, RELEASE_GENESIS};
