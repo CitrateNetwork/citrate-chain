@@ -1747,6 +1747,71 @@ mod tests {
         );
     }
 
+    /// fed#465 §7.3 follow-up: the conflict record clears once a certificate
+    /// verifies on this node's chain, so a LATER conflict is counted again.
+    /// Without the clear, the second conflict below (the same (height,
+    /// certified, canonical) as the first) would be swallowed as a repeat and
+    /// `citrate_finality_conflicts_total` would undercount.
+    #[tokio::test]
+    async fn observed_conflict_record_clears_when_a_certificate_verifies_again() {
+        let (exec, storage, _dir) = fresh();
+        let app = Arc::new(CanonicalApplicator::new(exec, storage.clone()));
+        let (_a1, a2, b2, b3) = setup_fork(&app, &storage).await;
+        persist_certificate(&storage, &certificate(2, a2.header.block_hash, 3));
+        let r = rig(
+            &storage,
+            FloorMode::Observed,
+            manager_over(&storage),
+            app.clone(),
+        )
+        .await;
+        assert!(matches!(
+            r.verifier.boot_check().await,
+            FloorTick::Verified { height: 2, .. }
+        ));
+        let reorg = |to: Hash| {
+            let app = app.clone();
+            async move {
+                let lock = app.advance_lock();
+                let mut state = lock.lock().await;
+                match app.reorg_to(&mut state, to).await {
+                    ReorgOutcome::Reorged { .. } => {}
+                    other => panic!("expected the reorg to {to} to proceed, got {other:?}"),
+                }
+            }
+        };
+        let conflict = FloorTick::Conflict {
+            height: 2,
+            certified: a2.header.block_hash,
+            canonical: Some(b2.header.block_hash),
+        };
+        // 1. A reorg below the certificate: one conflict.
+        reorg(b3.header.block_hash).await;
+        assert_eq!(r.verifier.tick().await, conflict);
+        assert_eq!(r.verifier.tick().await, conflict);
+        assert_eq!(r.verifier.finality_conflicts(), 1, "counted once");
+        // 2. Back on the certified branch: the certificate verifies again and
+        //    the conflict record clears.
+        reorg(a2.header.block_hash).await;
+        assert!(
+            matches!(
+                r.verifier.tick().await,
+                FloorTick::Verified { height: 2, .. }
+            ),
+            "the certificate verifies on this node's chain again"
+        );
+        assert!(!r.gadget.halted());
+        // 3. The same reorg again is a new conflict, counted again.
+        reorg(b3.header.block_hash).await;
+        assert_eq!(r.verifier.tick().await, conflict);
+        assert_eq!(
+            r.verifier.finality_conflicts(),
+            2,
+            "a conflict after a verified certificate is counted again"
+        );
+        assert!(!r.gadget.halted(), "observed: still voting");
+    }
+
     /// Observed mode (lead decision 3): booting with a persisted certificate
     /// for ANOTHER branch is a finality conflict, not a safety stop. The floor
     /// and RPC tags are not raised and the gadget keeps voting.
