@@ -445,10 +445,22 @@ def role_inputs(inputs):
 def key_inventory(raw, vocabulary, problems):
     """GENESIS_KEY_INVENTORY: role-tagged JSON {address: [roles]} (fed #467 section 0.6).
     Returns {lowercase address: set(roles)}; problems name every malformed part."""
+    repeated = []
+
+    def once(pairs):  # json.loads keeps the last of two equal keys; refuse them instead
+        out = {}
+        for k, v in pairs:
+            if k in out:
+                repeated.append(k)
+            out[k] = v
+        return out
+
     try:
-        d = json.loads(raw)
+        d = json.loads(raw, object_pairs_hook=once)
     except ValueError:
         d = None
+    for k in repeated:
+        problems.append(f"GENESIS_KEY_INVENTORY: {k.lower() if isinstance(k, str) else k} appears more than once")
     if not isinstance(d, dict) or not d:
         problems.append("GENESIS_KEY_INVENTORY is not a JSON object {address: [roles]} with at least one key")
         return {}
@@ -464,7 +476,7 @@ def key_inventory(raw, vocabulary, problems):
             if r not in vocabulary:
                 problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} has an unknown role {r!r} (known: {', '.join(vocabulary)})")
         if a.lower() in inv:
-            problems.append(f"GENESIS_KEY_INVENTORY: {a} appears more than once")
+            problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} appears more than once")
         inv[a.lower()] = set(roles)
     return inv
 

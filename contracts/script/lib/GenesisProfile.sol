@@ -278,6 +278,22 @@ abstract contract GenesisProfile is Script, AdminChecks {
     function inventoryRoles(string memory json) public view returns (address[] memory gov, address[] memory grd) {
         if (bytes(json).length == 0) return (gov, grd);
         string[] memory keys = vm.parseJsonKeys(json, "$");
+        // A JSON parser keeps one of two equal keys; refuse a repeated address instead, both
+        // spelled exactly the same (the quoted key occurs twice in the text) and in two cases.
+        address[] memory seen = new address[](keys.length);
+        for (uint256 i = 0; i < keys.length; i++) {
+            seen[i] = vm.parseAddress(keys[i]);
+            require(
+                _occurrences(json, string.concat('"', keys[i], '"')) == 1,
+                string.concat("GENESIS_KEY_INVENTORY: ", keys[i], " appears more than once")
+            );
+            for (uint256 j = 0; j < i; j++) {
+                require(
+                    seen[j] != seen[i],
+                    string.concat("GENESIS_KEY_INVENTORY: ", vm.toString(seen[i]), " appears more than once")
+                );
+            }
+        }
         bool[] memory g = new bool[](keys.length);
         bool[] memory r = new bool[](keys.length);
         (uint256 ng, uint256 nr) = (0, 0);
@@ -295,6 +311,28 @@ abstract contract GenesisProfile is Script, AdminChecks {
             address who = vm.parseAddress(keys[i]);
             if (g[i]) gov[ng++] = who;
             if (r[i]) grd[nr++] = who;
+        }
+    }
+
+    /// @notice How many times `needle` occurs in `hay` (non-overlapping).
+    function _occurrences(string memory hay, string memory needle) internal pure returns (uint256 n) {
+        bytes memory h = bytes(hay);
+        bytes memory x = bytes(needle);
+        if (x.length == 0 || h.length < x.length) return 0;
+        for (uint256 i = 0; i + x.length <= h.length;) {
+            bool hit = true;
+            for (uint256 j = 0; j < x.length; j++) {
+                if (h[i + j] != x[j]) {
+                    hit = false;
+                    break;
+                }
+            }
+            if (hit) {
+                n++;
+                i += x.length;
+            } else {
+                i++;
+            }
         }
     }
 

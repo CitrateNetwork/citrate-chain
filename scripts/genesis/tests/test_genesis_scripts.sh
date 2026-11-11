@@ -1027,6 +1027,11 @@ for spec in rest:
         accounts[0]["storage"]["0x%02x" % len(accounts[0]["storage"])] = "0x000000000000000000000000" + a[2:]
     elif kind == "immutable":
         accounts[0]["code"] += "7f000000000000000000000000" + a[2:]
+    elif kind == "base":
+        out_d = {"baseAllocations": [{"role": "faucet", "address": a, "balance": "0x1"}]}
+        accounts.append({"address": "0x" + "c1" * 20, "balance": "0x0", "nonce": 1, "code": "0x6000", "storage": {}})
+        json.dump({"accounts": accounts, **out_d}, open(out, "w"))
+        sys.exit(0)
     elif kind == "deployer":
         accounts.append({"address": a, "balance": "0x1", "nonce": 92, "code": "0x", "storage": {}})
 json.dump({"accounts": accounts}, open(out, "w"))
@@ -1044,6 +1049,8 @@ akc_alloc "store=0x$(printf 'f2%.0s' $(seq 20))"
 expect "GO-K step 3: an EOA referenced from storage off the inventory is refused" 1 'references 0x(f2){20}' -- akc
 akc_alloc "immutable=0x$(printf 'f3%.0s' $(seq 20))"
 expect "GO-K step 3: an EOA referenced as a code immutable off the inventory is refused" 1 'references 0x(f3){20}' -- akc
+akc_alloc "base=0x$(printf 'f4%.0s' $(seq 20))"
+expect "GO-K step 3: a base allocation off the inventory is refused" 1 'baseAllocations \(faucet\) funds 0x(f4){20}' -- akc
 akc_alloc "deployer=$AKDEP"
 expect "GO-K step 3: a funded ceremony deployer is refused" 1 'the ceremony deployer .* has balance' -- akc
 akc_alloc "fund=0x$(printf 'd1%.0s' $(seq 20))"
