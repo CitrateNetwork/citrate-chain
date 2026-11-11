@@ -617,6 +617,13 @@ class DevnetTxLoad(unittest.TestCase):
         r = self.gate(self._work({"citrate-prod-4": "Acceptance commitment mismatch\n"}, {"citrate-prod-4-w1": 100}, target=3600))
         self.assertEqual(r.returncode, 1, r.stdout)
 
+    def test_the_default_load_reaches_30_tps(self):
+        # 3 workers per producer reached about 26 tx/s on the fleet-shape devnet (22:29Z run).
+        # One cast worker manages about 2.5 tx/s, so 7 producers x 4 workers covers 30 tx/s
+        # with margin (lead, 2026-11-11).
+        text = self.TXL.read_text()
+        self.assertIsNotNone(re.search(r"\bWORKERS=4\b", text), "the default is not 4 workers")
+
     def test_run_starts_several_workers_per_producer_and_funds_them_serially(self):
         text = self.TXL.read_text()
         self.assertIn("--workers", text)
