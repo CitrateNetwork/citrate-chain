@@ -300,6 +300,44 @@ class PlanAndGuards(unittest.TestCase):
             C.cmd_render(a, fleet, src)
         self.assertIn("D-K3", str(e.exception))
 
+    def test_the_r1007_genesis_timestamp_is_read_from_the_checkout(self):
+        self.assertIsInstance(SRC["r1007_genesis_timestamp"], int)
+        self.assertGreater(SRC["r1007_genesis_timestamp"], 1_700_000_000)
+
+    def test_rendering_r1007_for_the_fleet_refuses_a_stale_or_far_future_genesis_timestamp(self):
+        import argparse
+        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        a = argparse.Namespace(network="r1007", binary=sys.executable, state=tempfile.mkdtemp())
+        now = 1_800_000_000
+        for ts, ok in ((now - 3_601, False), (now + 3_601, False), (now - 3_600, True), (now + 60, True)):
+            src = dict(SRC, r1007_pending=[], r1007_genesis_timestamp=ts)
+            try:
+                C.check_genesis_timestamp(fleet, src, now)
+                refused = None
+            except C.Refuse as e:
+                refused = str(e)
+            self.assertEqual(refused is None, ok, f"{ts}: {refused}")
+            if not ok:
+                self.assertIn("stamp_genesis.py", refused)
+        # A local (devnet) rehearsal does not check it.
+        local = C.Fleet(local_fleet(Path(tempfile.mkdtemp())))
+        C.check_genesis_timestamp(local, dict(SRC, r1007_genesis_timestamp=0), now)
+
+    def test_rendering_r1007_for_the_fleet_works_with_a_final_alloc_and_a_fresh_stamp(self):
+        import argparse, time as _t
+        tmp = Path(tempfile.mkdtemp())
+        ids = {h["name"]: {"peer_id": h.get("peer_id") or peer(k + 1)}
+               for k, h in enumerate(json.loads((R7 / "fleet.r1007.json").read_text())["hosts"])}
+        (tmp / "identities.json").write_text(json.dumps({"schema": "r1007-identities/1", "hosts": ids}))
+        a = argparse.Namespace(network="r1007", binary=sys.executable, state=str(tmp))
+        src = dict(SRC, r1007_pending=[], r1007_genesis_timestamp=int(_t.time()))
+        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        self.assertEqual(C.cmd_render(a, fleet, src), 0)
+        man = json.loads((tmp / "render" / "r1007" / "render-manifest.json").read_text())
+        self.assertEqual(man["genesis"], SRC["r1007_genesis"])
+        self.assertEqual(man["r1007_genesis_timestamp"], src["r1007_genesis_timestamp"])
+        self.assertEqual(sorted(man["hosts"]), sorted(h["name"] for h in fleet.hosts()))
+
     def test_devnet_only_actions_are_refused_on_the_fleet(self):
         rc, _ = run(["collect", "--fleet", str(R7 / "fleet.r1007.json"), "--mint", "--state", tempfile.mkdtemp()])
         self.assertEqual(rc, 2)

@@ -387,3 +387,20 @@ fn the_r1006_layout_shows_where_r1007_must_replace_each_rotated_key() {
         "held under a hashed slot, if at all"
     );
 }
+
+/// The r1007 block 0 is stamped with the r1007 genesis timestamp (set at ceremony time by
+/// scripts/genesis/r1007/stamp_genesis.py), not the shared canonical timestamp, and the
+/// hash moves with it.
+#[test]
+fn r1007_block0_is_stamped_with_the_r1007_genesis_timestamp() {
+    let _g = rule(Some(0));
+    let cfg = GenesisConfig::r1007().expect("r1007");
+    let b = r1007::genesis_block(&cfg).expect("block 0");
+    assert_eq!(b.header.timestamp, r1007::GENESIS_TIMESTAMP);
+    assert_eq!(
+        r1007::genesis_block_hash(&cfg).expect("hash"),
+        *b.header.block_hash.as_bytes()
+    );
+    let later = r1007::genesis_block_hash_at(&cfg, r1007::GENESIS_TIMESTAMP + 1).expect("hash");
+    assert_ne!(later, *b.header.block_hash.as_bytes(), "the timestamp is in the hash");
+}

@@ -997,6 +997,21 @@ mod tests {
         );
     }
 
+    /// The node builds the r1007 block 0 at the r1007 genesis timestamp (the ceremony
+    /// stamps it), not at the shared canonical one its GenesisConfig carries.
+    #[test]
+    fn the_r1007_profile_stamps_block_0_with_the_r1007_genesis_timestamp() {
+        let src = include_str!("genesis.rs");
+        let build = src
+            .find("pub async fn initialize_genesis_state_with_profile(")
+            .expect("the profile build");
+        let body = &src[build..build + 1_200];
+        assert!(
+            body.contains("citrate_economics::r1007::GENESIS_TIMESTAMP"),
+            "the r1007 profile must use r1007::GENESIS_TIMESTAMP for block 0"
+        );
+    }
+
     #[test]
     fn r1007_boot_guard_cases() {
         use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS, RELEASE_GENESIS};
