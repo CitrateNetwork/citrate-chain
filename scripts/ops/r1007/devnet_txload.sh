@@ -82,11 +82,15 @@ worker() { # WID KEY RATE SECS RPC
   addr=$(cast wallet address --private-key "$key")
   n=0; end=$(( $(date +%s) + secs ))
   period=$(python3 -c "print(max(0.0, 1.0/$rate))")
+  start=$EPOCHREALTIME
   while (( $(date +%s) < end )); do
     tx=$(cast mktx --private-key "$key" --legacy --gas-price 2gwei --gas-limit 21000 --nonce "$n" --chain 40204 "$addr" --value 1wei)
     cast publish --rpc-url "$rpc" --async "$tx" >/dev/null 2>>"$TX/$wid.err" || true
     n=$((n + 1)); echo "$n" > "$TX/$wid.sent"
-    sleep "$period"
+    # Pace against the schedule (start + n x period): sleep only what is left of this slot,
+    # so cast's own time does not cut the rate. Behind schedule: no sleep.
+    wait_s=$(python3 -c "print(max(0.0, $start + $n * $period - $EPOCHREALTIME))")
+    sleep "$wait_s"
   done
   sleep 20
   cast nonce --rpc-url "$rpc" "$addr" > "$TX/$wid.included" 2>>"$TX/$wid.err" || echo 0 > "$TX/$wid.included"
