@@ -134,14 +134,14 @@ fn raw_kv(i: u32) -> (Vec<u8>, Vec<u8>) {
     (key, value)
 }
 
-/// 1.5 MiB of real block encodings: spans many 128 KiB zstd blocks
+/// 1.5 MiB of real (v0.1.3) block encodings: spans many 128 KiB zstd blocks
 /// (multi-block frames) while staying small as a fixture.
 fn large_blocks() -> Vec<u8> {
     const LEN: usize = 3 * 512 * 1024;
     let mut out = Vec::with_capacity(LEN + 4096);
     let mut n: u8 = 0;
     while out.len() < LEN {
-        out.extend(bincode::serialize(&rich_block(n)).expect("serialize block"));
+        out.extend(encode_block_v013(&rich_block(n)).expect("v013 block"));
         n = n.wrapping_add(1);
     }
     out.truncate(LEN);
@@ -414,7 +414,11 @@ fn block_encodings_are_explicit() {
     let old = rich_block(3);
     let v013 = encode_block_v013(&old).expect("v013");
     let r1007 = bincode::serialize(&old).expect("r1007");
-    assert_eq!(r1007.len(), v013.len() + 32, "r1007 appends the 32-byte accepted root");
+    assert_eq!(
+        r1007.len(),
+        v013.len() + 32,
+        "r1007 appends the 32-byte accepted root"
+    );
     assert_eq!(
         decode_stored_block(&v013).expect("v013 decodes").1,
         StoredBlockEncoding::V013
@@ -425,7 +429,9 @@ fn block_encodings_are_explicit() {
     );
     let mut accepting = old.clone();
     accepting.accepted_root = Hash::new([0xAC; 32]);
-    let e = encode_block_v013(&accepting).expect_err("no v013 form").to_string();
+    let e = encode_block_v013(&accepting)
+        .expect_err("no v013 form")
+        .to_string();
     assert!(e.contains("accepted_root"), "{e}");
     let (back, enc) =
         decode_stored_block(&bincode::serialize(&accepting).expect("ser")).expect("decodes");

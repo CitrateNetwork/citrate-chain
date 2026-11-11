@@ -403,7 +403,9 @@ impl BlockStore {
     /// Get a block by hash
     pub fn get_block(&self, hash: &Hash) -> Result<Option<Block>> {
         match self.db.get_cf(CF_BLOCKS, hash.as_bytes())? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes)?)),
+            // Either stored encoding (r1007, or v0.1.3 / r1006 with no
+            // accepted root): see `block_codec`.
+            Some(bytes) => Ok(Some(super::block_codec::decode_stored_block(&bytes)?.0)),
             None => Ok(None),
         }
     }
