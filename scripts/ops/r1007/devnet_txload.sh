@@ -4,7 +4,8 @@
 #   devnet_txload.sh run  --fleet FLEET --work DIR [--tps N] [--seconds N]
 #   devnet_txload.sh gate --work DIR
 #
-# `run` is called by devnet.sh inside its namespaces, right after the producers step. It needs
+# `run` is called by devnet.sh inside its namespaces, right after the producers step. Throwaway
+# devnet keys only (they go in cast argv, which cast 1.9 requires). It needs
 # `cast` (Foundry) on PATH. For each producer it starts ONE sender inside that producer's network
 # namespace:
 #   - the sender makes a fresh throwaway key (it never leaves DIR/txload, mode 0700);
@@ -25,10 +26,10 @@ set -euo pipefail
 usage() { echo "usage: devnet_txload.sh run --fleet F --work D [--tps N] [--seconds N] | gate --work D" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 MODE=$1; shift
-if [[ "$MODE" == _sender ]]; then  # internal: NAME ROOT RATE SECS WORK, inside a producer's netns
-  WORK=$5; TX="$WORK/txload"
-fi
 FLEET="" WORK="" TPS=30 SECS=120
+if [[ "$MODE" == _sender ]]; then  # internal: NAME ROOT RATE SECS WORK, inside a producer's netns
+  WORK=$5
+fi
 while [[ "$MODE" != _sender && $# -gt 0 ]]; do
   case "$1" in
     --fleet) FLEET="$2"; shift 2 ;;
@@ -61,13 +62,15 @@ sender() { # NAME ROOT RATE SECS  (runs inside the producer's netns)
   ks="$root/etc/citrate/keys"
   key=$(cast wallet new --json | python3 -c 'import json,sys; w=json.load(sys.stdin); w=w.get("data",w) if isinstance(w,dict) else w; w=w[0] if isinstance(w,list) else w; print(w["private_key"])')
   umask 077; printf '%s\n' "$key" > "$TX/$name.key"
-  addr=$(ETH_PRIVATE_KEY="$key" cast wallet address)
+  # Throwaway devnet keys inside the rehearsal's own namespaces: cast 1.9 reads no key from the
+  # environment, so these go in cast's argv. Never do this with a real key.
+  addr=$(cast wallet address --private-key "$key")
   cast send --rpc-url "$rpc" --keystore "$ks/staker.keystore.json" --password-file "$ks/staker.password" \
     --legacy --gas-price 2gwei "$addr" --value 10ether >/dev/null
   n=0; end=$(( $(date +%s) + secs ))
   period=$(python3 -c "print(max(0.0, 1.0/$rate))")
   while (( $(date +%s) < end )); do
-    tx=$(ETH_PRIVATE_KEY="$key" cast mktx --legacy --gas-price 2gwei --gas-limit 21000 --nonce "$n" --chain 40204 "$addr" --value 1wei)
+    tx=$(cast mktx --private-key "$key" --legacy --gas-price 2gwei --gas-limit 21000 --nonce "$n" --chain 40204 "$addr" --value 1wei)
     cast publish --rpc-url "$rpc" --async "$tx" >/dev/null 2>>"$TX/$name.err" || true
     n=$((n + 1)); echo "$n" > "$TX/$name.sent"
     sleep "$period"

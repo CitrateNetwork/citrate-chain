@@ -570,6 +570,12 @@ class DevnetTxLoad(unittest.TestCase):
             self.assertIn(opt, reexec, f"{opt} is lost at the namespace re-exec")
         self.assertIn("devnet_txload.sh", text)
 
+    def test_the_internal_sender_entry_keeps_its_work_dir(self):
+        # The first fleet-shape run (2026-11-11 22:03Z) failed with "usage" from every sender:
+        # the defaults line reset WORK after the _sender branch had set it.
+        text = self.TXL.read_text()
+        self.assertLess(text.index('FLEET="" WORK=""'), text.index('if [[ "$MODE" == _sender ]]'))
+
     def test_gate_passes_clean_logs_with_included_load(self):
         r = self.gate(self._work({"citrate-prod-1": "INFO sealed\n", "citrate-prod-2": "INFO ok\n"}, {"citrate-prod-1": 40, "citrate-prod-2": 38}))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
