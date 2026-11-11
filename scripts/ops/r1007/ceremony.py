@@ -192,6 +192,10 @@ def load_go(path: str | None, genesis: str) -> dict | None:
 # ─── collect ─────────────────────────────────────────────────────────────────
 
 
+R1006_PRODUCER_DATA = "/var/lib/citrate/data"
+R1006_STAKER_DIR = "/etc/citrate/r1006"
+
+
 def cmd_collect(a, fleet: Fleet, src: dict) -> int:
     """Public identities. Fleet: read-only host-identity on each producer (its r1006 keys).
     Devnet (--mint): mint each host's keys into its r1006 slot, as a real host has them."""
@@ -202,9 +206,16 @@ def cmd_collect(a, fleet: Fleet, src: dict) -> int:
     for h in fleet.hosts():
         if fleet.transport == "ssh" and h["role"] != "producer":
             continue  # boots and rpc-1 keep their published noise identities (fleet file)
-        root = Path(fleet.root(h))
-        data = root / ("var/lib/citrate/gen/r1006" if a.mint else "var/lib/citrate/data")
-        keys = root / "etc/citrate/keys"
+        if fleet.transport == "ssh":
+            # The live r1006 producer layout (2026-11-11 read-only check): node data in
+            # /var/lib/citrate/data, the staker keystore and password in /etc/citrate/r1006/.
+            # Absolute paths: over ssh there is no root prefix.
+            data = Path(R1006_PRODUCER_DATA)
+            keys = Path(R1006_STAKER_DIR)
+        else:
+            root = Path(fleet.root(h))
+            data = root / ("var/lib/citrate/gen/r1006" if a.mint else "var/lib/citrate/data")
+            keys = root / "etc/citrate/keys"
         if a.mint:
             data.mkdir(parents=True, exist_ok=True)
             keys.mkdir(parents=True, exist_ok=True)
