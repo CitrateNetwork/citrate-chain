@@ -134,20 +134,16 @@ contract V060GenesisSpecTest is Test {
         r[2] = makeAddr("retired-r1006-grantor");
     }
 
-    /// Test-only key parameters: the inventory is exactly the two councils' owners (the
-    /// deployer is the throwaway ceremony key, so it is not in it), the retired stand-ins, and a
-    /// 1 h veto margin. The real values are the owner's.
+    /// Test-only key parameters: the role-tagged inventory has the GOVERNANCE owners under
+    /// GOV_OWNERS and the GUARDIAN owners under GRD_OWNERS (the deployer is the throwaway
+    /// ceremony key, so it is not in it), the retired stand-ins, and a 1 h veto margin. The
+    /// real values are the owner's.
     function _keys(DeployGenesisGovernance.Council memory gc, DeployGenesisGovernance.Council memory rc)
         internal
         returns (V060GovernanceSpec.KeyParams memory k)
     {
-        k.keyInventory = new address[](gc.owners.length + rc.owners.length);
-        for (uint256 i = 0; i < gc.owners.length; i++) {
-            k.keyInventory[i] = gc.owners[i];
-        }
-        for (uint256 i = 0; i < rc.owners.length; i++) {
-            k.keyInventory[gc.owners.length + i] = rc.owners[i];
-        }
+        k.governanceOwners = gc.owners;
+        k.guardianOwners = rc.owners;
         k.retiredKeys = _retired();
         k.guardianVetoMargin = 1 hours;
     }
@@ -558,7 +554,8 @@ contract V060GenesisSpecTest is Test {
     function test_p1_v060_refuses_without_each_key_parameter() public {
         uint64 nonceBefore = vm.getNonce(SENDER);
         V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
-        k.keyInventory = new address[](0);
+        k.governanceOwners = new address[](0);
+        k.guardianOwners = new address[](0);
         vm.expectRevert(bytes(V060GovernanceSpec.PENDING_KEY_INVENTORY));
         this.p1(k, _gc(), _rc());
         k = _keys(_gc(), _rc());
@@ -581,7 +578,7 @@ contract V060GenesisSpecTest is Test {
         V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
         DeployGenesisGovernance.Council memory gc = _gc();
         gc.owners[1] = address(uint160(0xC011)); // 0xC001 mistyped
-        vm.expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        vm.expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY with role GOV_OWNERS"));
         this.p1(k, gc, _rc());
     }
 
@@ -590,19 +587,19 @@ contract V060GenesisSpecTest is Test {
         V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
         DeployGenesisGovernance.Council memory rc = _rc();
         rc.owners[2] = makeAddr("r1006-guardian-owner-not-on-the-retired-list");
-        vm.expectRevert(bytes("GUARDIAN owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        vm.expectRevert(bytes("GUARDIAN owner is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS"));
         this.p1(k, _gc(), rc);
     }
 
     /// An inventory that omits a council owner is refused.
     function test_p1_v060_refuses_an_inventory_omission() public {
         V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
-        address[] memory inv = new address[](k.keyInventory.length - 1);
+        address[] memory inv = new address[](k.guardianOwners.length - 1);
         for (uint256 i = 0; i < inv.length; i++) {
-            inv[i] = k.keyInventory[i]; // drops the last guardian owner
+            inv[i] = k.guardianOwners[i]; // drops the last guardian owner
         }
-        k.keyInventory = inv;
-        vm.expectRevert(bytes("GUARDIAN owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        k.guardianOwners = inv;
+        vm.expectRevert(bytes("GUARDIAN owner is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS"));
         this.p1(k, _gc(), _rc());
     }
 
@@ -646,7 +643,8 @@ contract V060GenesisSpecTest is Test {
     function test_builder_refuses_without_each_key_parameter() public {
         DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
-        i.keys.keyInventory = new address[](0);
+        i.keys.governanceOwners = new address[](0);
+        i.keys.guardianOwners = new address[](0);
         vm.expectRevert(bytes(V060GovernanceSpec.PENDING_KEY_INVENTORY));
         s.deployWith(SENDER, i);
         i = _inputs();
@@ -663,13 +661,13 @@ contract V060GenesisSpecTest is Test {
     function test_builder_refuses_an_on_chain_owner_missing_from_the_inventory() public {
         DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
-        address[] memory inv = new address[](i.keys.keyInventory.length);
+        address[] memory inv = new address[](i.keys.governanceOwners.length);
         for (uint256 k = 0; k < inv.length; k++) {
-            inv[k] = i.keys.keyInventory[k];
+            inv[k] = i.keys.governanceOwners[k];
         }
         inv[1] = address(uint160(0xA011)); // 0xA001 mistyped in the inventory
-        i.keys.keyInventory = inv;
-        vm.expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        i.keys.governanceOwners = inv;
+        vm.expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY with role GOV_OWNERS"));
         s.deployWith(SENDER, i);
     }
 
@@ -762,5 +760,46 @@ contract V060GenesisSpecTest is Test {
         archive.absorb();
         (string memory p,) = h.problem(book, gov.governanceTimelock);
         assertEq(p, "governance book names an unknown guardianCancellerVersion");
+    }
+
+    // Role-tagged inventory (round 2): a key on the inventory under another role is refused.
+
+    /// A key tagged GOV_OWNERS only may not sit on the GUARDIAN council.
+    function test_p1_v060_refuses_a_key_inventoried_under_another_role() public {
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        DeployGenesisGovernance.Council memory rc = _rc();
+        rc.owners[0] = address(uint160(0xC0FF)); // not a GOVERNANCE owner, but tagged GOV_OWNERS:
+        address[] memory gov_ = new address[](k.governanceOwners.length + 1);
+        for (uint256 n = 0; n < k.governanceOwners.length; n++) {
+            gov_[n] = k.governanceOwners[n];
+        }
+        gov_[k.governanceOwners.length] = rc.owners[0];
+        k.governanceOwners = gov_;
+        vm.expectRevert(bytes("GUARDIAN owner is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS"));
+        this.p1(k, _gc(), rc);
+    }
+
+    function test_builder_refuses_a_key_inventoried_under_another_role() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        // Swap the tags: every owner is on the inventory, each under the other council's role.
+        (i.keys.governanceOwners, i.keys.guardianOwners) = (i.keys.guardianOwners, i.keys.governanceOwners);
+        vm.expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY with role GOV_OWNERS"));
+        s.deployWith(SENDER, i);
+    }
+
+    /// The env form: GENESIS_KEY_INVENTORY is JSON {address: [roles]}; GOV_OWNERS and GRD_OWNERS
+    /// entries become the two lists, other roles are left to P0.
+    function test_the_inventory_json_is_split_by_role() public {
+        DeployV060Genesis s = _builder();
+        string memory inv = string.concat(
+            '{"', vm.toString(address(0xA0)), '":["GOV_OWNERS"],"', vm.toString(address(0xB0)),
+            '":["GRD_OWNERS","TREASURY"],"', vm.toString(address(0xC0)), '":["MEMBERSHIP_GRANTOR"]}'
+        );
+        (address[] memory g, address[] memory r) = s.inventoryRoles(inv);
+        assertEq(g.length, 1);
+        assertEq(g[0], address(0xA0));
+        assertEq(r.length, 1);
+        assertEq(r[0], address(0xB0));
     }
 }

@@ -972,29 +972,39 @@ expect "ceremony: an unknown phase is refused" 1 'must be one of' -- "${CEENV[@]
 # P0 checks. Negative controls on a copy of the tree: each kind of drift is caught.
 PI="$G/phase_inputs.py"
 expect "phase inputs tripwire: the tree's phase reads are all classified" 0 'phase_inputs: OK' -- python3 -I "$PI" check-spec
-# Keys of the 0.6.0 ceremony genesis (GENESIS_V060=1; fed #467 section 0.6, D-K3): the r1007 key
-# inventory is an allowlist for every address input and council owner (a producer staker also
-# passes), the retired r1006 keys an extra denylist, and the GUARDIAN delay plus the owner's
-# veto margin must fit in the 24 h registry window.
+# Keys of the 0.6.0 ceremony genesis (GENESIS_V060=1; fed #467 section 0.6, D-K3). The r1007
+# key inventory is role-tagged JSON {address: [roles]}: every role-holding address input and
+# council owner must be on it WITH that role. A producer staker gets no exemption for a role
+# (stakers sign nothing before S4-5). Contract inputs (PATRONAGE_MEMBERSHIP) are not keys and are
+# checked against the ceremony's books instead. The retired r1006 keys are an extra denylist,
+# and the GUARDIAN delay plus the owner's veto margin must fit in the 24 h registry window.
 KRK1=0x00000000000000000000000000000000000000a1
 KNK1=0x00000000000000000000000000000000000000b1
 KNK2=0x00000000000000000000000000000000000000b2
 KDEP=0x00000000000000000000000000000000000000c1
 KSTAKER=$(jq -r '.validators[0].staker' "$G/../../core/economics/assets/r1006/validators.json")
 pf() { env -i PATH="$PATH" "$@" python3 -I "$PI" preflight --phases P1; }
-KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,$KNK2" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$KDEP")
+kinv() { python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({a[i]: a[i+1].split("+") for i in range(0, len(a), 2)}))' "$@"; }
+KINV=$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS")
+KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$KDEP")
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
-expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
-expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_RETIRED_KEYS="$KRK1"
-expect "phase inputs keys: a typo'd address input is refused" 3 'TREASURY \(0x0+b3\) is not in GENESIS_KEY_INVENTORY' -- pf "${KV060[@]}" TREASURY=0x00000000000000000000000000000000000000b3
-expect "phase inputs keys: a stale key absent from the retired list is refused" 3 'GRD_OWNERS \(0x0+d1\) is not in GENESIS_KEY_INVENTORY' -- pf "${KV060[@]}" GRD_OWNERS="$KNK1,0x00000000000000000000000000000000000000d1"
-expect "phase inputs keys: an inventory omission is refused" 3 'GOV_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 GOV_OWNERS="$KNK1,$KNK2"
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1"
+expect "phase inputs keys: a typo'd address input is refused" 3 'TREASURY \(0x0+b3\) is not in GENESIS_KEY_INVENTORY with role TREASURY' -- pf "${KV060[@]}" TREASURY=0x00000000000000000000000000000000000000b3
+expect "phase inputs keys: a stale key absent from the retired list is refused" 3 'GRD_OWNERS \(0x0+d1\) is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS' -- pf "${KV060[@]}" GRD_OWNERS="$KNK1,0x00000000000000000000000000000000000000d1"
+expect "phase inputs keys: an inventory omission is refused" 3 'GOV_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY with role GOV_OWNERS' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$(kinv "$KNK1" GOV_OWNERS)" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 GOV_OWNERS="$KNK1,$KNK2"
+expect "phase inputs keys: a key inventoried under another role is refused" 3 'GRD_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS' -- pf "${KV060[@]}" GRD_OWNERS="$KNK2"
+expect "phase inputs keys: a producer staker as MEMBERSHIP_GRANTOR is refused" 3 'MEMBERSHIP_GRANTOR \(0x[0-9a-f]+\) is not in GENESIS_KEY_INVENTORY with role MEMBERSHIP_GRANTOR' -- pf "${KV060[@]}" MEMBERSHIP_GRANTOR="$KSTAKER"
+expect "phase inputs keys: a producer staker as CITRATE_AA_OWNER is refused" 3 'CITRATE_AA_OWNER \(0x[0-9a-f]+\) is not in GENESIS_KEY_INVENTORY with role CITRATE_AA_OWNER' -- pf "${KV060[@]}" CITRATE_AA_OWNER="$KSTAKER"
+expect "phase inputs keys: a producer staker as a GUARDIAN owner is refused" 3 'GRD_OWNERS \(0x[0-9a-f]+\) is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS' -- pf "${KV060[@]}" GRD_OWNERS="$KNK1,$KSTAKER"
+expect "phase inputs keys: an unknown role in the inventory is refused" 3 "GENESIS_KEY_INVENTORY: 0x0+b1 has an unknown role 'TRESURY'" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$(kinv "$KNK1" TRESURY)" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: an inventory that is not JSON is refused" 3 'GENESIS_KEY_INVENTORY is not a JSON object' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,$KNK2" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: a malformed inventory address is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY='{"0xzz":["GOV_OWNERS"]}' GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
 expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
-expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$KRK1"
-expect "phase inputs keys: a malformed inventory entry is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,0xzz" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=3600 DEPLOYER_ADDRESS="$KRK1"
 expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${KV060[@]}" GRD_MIN_DELAY=86000
-expect "phase inputs keys: a producer staker passes the allowlist" 0 '' -- pf "${KV060[@]}" TREASURY="$KSTAKER"
-expect "phase inputs keys: inventory keys pass (control)" 0 '' -- pf "${KV060[@]}" TREASURY="$KNK1" GOV_OWNERS="$KNK1,$KNK2" GRD_MIN_DELAY=3600
+expect "phase inputs keys: a contract input is not held to the key inventory" 0 '' -- pf "${KV060[@]}" PATRONAGE_MEMBERSHIP=0x00000000000000000000000000000000000000e1
+expect "phase inputs keys: inventory keys with their roles pass (control)" 0 '' -- pf "${KV060[@]}" TREASURY="$KNK1" GOV_OWNERS="$KNK1,$KNK2" GRD_OWNERS="$KNK1" GRD_MIN_DELAY=3600
 expect "phase inputs keys: the r1006/r1007 ceremony needs none of them (control)" 0 '' -- pf
 TW="$T/pi-tree"
 mkdir -p "$TW/scripts/genesis" "$TW/scripts/ops" "$TW/contracts"
