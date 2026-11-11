@@ -4018,6 +4018,29 @@ mod tests {
         );
     }
 
+    /// fed#541: a root lookup that read "no mark" just before the mark was
+    /// written must not overwrite the fresh positive entry with its stale
+    /// negative answer. Positives always win; a negative only fills an absent
+    /// entry.
+    #[tokio::test]
+    async fn a_stale_negative_root_answer_never_overwrites_a_fresh_mark() {
+        let store =
+            DagStore::persistent_with_strict_vrf(Arc::new(MemKv::default()), false).expect("store");
+        let x = Hash::new([0x41; 32]);
+        // The lookup read the store: no mark yet ...
+        // ... the mark is written (and cached as a root) ...
+        store.mark_disqualified_root(&x);
+        // ... then the lookup records its answer.
+        store.cache_root_answer(&x, false);
+        assert!(store.is_disqualified_root(&x), "the fresh mark stands");
+        // A negative still fills an absent entry, and a positive overwrites one.
+        let y = Hash::new([0x42; 32]);
+        store.cache_root_answer(&y, false);
+        assert!(!store.is_disqualified_root(&y));
+        store.cache_root_answer(&y, true);
+        assert!(store.is_disqualified_root(&y));
+    }
+
     /// fed#538: new roots in one slot cost root-mark reads in the new height
     /// range only, not a full re-walk of every tip with a DB read per step:
     /// negative root answers are cached and a new root invalidates only
