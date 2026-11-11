@@ -64,11 +64,12 @@ import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 ///         After the broadcast, `verify` re-reads every contract on chain; it is also a
 ///         standalone step (`--sig "verifyBook()"`) over the step's own output book.
 ///
-///         PENDING PARAMETER: the WorkMarket coordinator bonds wait on the tokenomics decision.
-///         They have no default anywhere. Without WORKMARKET_MIN_COORDINATOR_BOND and
-///         WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei; min > 0, default >= min) the step
-///         refuses before reading anything else. They are in WorkMarket's init code, so its
-///         address is unknown until they are decided.
+///         Coordinator bonds: required inputs with no default anywhere. Without
+///         WORKMARKET_MIN_COORDINATOR_BOND and WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei;
+///         min > 0, default >= min) the step refuses before reading anything else. The owner
+///         decided rehearsal values on 2026-11-11 (100 / 1,000 SALT, to revisit with tokenomics),
+///         recorded in scripts/genesis/v060/inputs.v060.env and enforced at P0. They are in
+///         WorkMarket's init code, so its address moves if they change.
 ///
 ///         Keys (fed #467 section 0.6; D-K3): GENESIS_KEY_INVENTORY (role-tagged allowlist, JSON
 ///         {address: [roles]}; a council owner needs its council's role, GOV_OWNERS/GRD_OWNERS),

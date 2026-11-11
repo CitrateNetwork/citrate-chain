@@ -10,15 +10,15 @@
 #   -> CheckDeployedAdmins over the governance, dormant-ledger and 0.6.0 books: 0 failures.
 #
 # Then the negatives, each of which must be refused:
-#   - DeployV060Genesis without the coordinator bonds (pending; no default): nothing sent;
+#   - DeployV060Genesis without the coordinator bonds (required inputs; no default): nothing sent;
 #   - DeployV060Genesis with a council owner on the retired list: nothing sent;
 #   - DeployV060Genesis with a veto margin other than the owner's decided 7200 s: nothing sent;
 #   - verifyBook after the GOVERNANCE timelock (impersonated) changes WorkMarket's verifier
 #     allowlist.
 #
 # Every key-like value here is a public placeholder. The deployer is anvil's public test
-# mnemonic; the council owners, the key inventory, the retired keys and the bond amounts are
-# test values, not the genesis values (those are the owner's and are pending).
+# mnemonic; the council owners, the key inventory and the retired keys are test values (the
+# owner's are pending). The bonds are the owner's decided rehearsal values (2026-11-11).
 # Env: ANVIL_PORT (default 8546; must be free), KEEP_OUTPUT=1 keeps contracts/genesis/anvil-v060/.
 # Requires foundry (anvil, forge, cast) and python3 on PATH. Exit 0 = rehearsal + gate passed.
 set -euo pipefail
@@ -80,7 +80,7 @@ import json, sys
 gov, grd = sys.argv[1].split(","), sys.argv[2].split(",")
 print(json.dumps({**{a: ["GOV_OWNERS"] for a in gov}, **{a: ["GRD_OWNERS"] for a in grd}}))' "$GOV_OWNERS" "$GRD_OWNERS")"
 export GENESIS_KEY_INVENTORY
-BONDS=(WORKMARKET_MIN_COORDINATOR_BOND=3000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=7000000000000000000)
+BONDS=(WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000)
 export GENESIS_GOVERNANCE_OUT="$OUT_REL/governance.json" GENESIS_GOVERNANCE_BOOK="$OUT_REL/governance.json"
 export DORMANT_LEDGERS_OUT="$OUT_REL/dormant.json"
 export V060_INPUT_BOOK="$OUT_REL/v060-input-book.json" V060_GENESIS_OUT="$OUT_REL/v060-genesis.json"
@@ -142,7 +142,7 @@ before="$(nonce "$DEPLOYER")"
 if forge script script/DeployV060Genesis.s.sol --rpc-url "$RPC" --broadcast --private-key "$KEY" >"$OUT/neg-bonds.log" 2>&1; then
   fail "DeployV060Genesis ran without the coordinator bonds"
 fi
-grep -q "PENDING PARAMETER: the WorkMarket coordinator bonds" "$OUT/neg-bonds.log" || fail "no-bonds run: not refused on the pending bonds"
+grep -q "REQUIRED INPUT: the WorkMarket coordinator bonds" "$OUT/neg-bonds.log" || fail "no-bonds run: not refused on the missing bonds"
 if env "${BONDS[@]}" GENESIS_RETIRED_KEYS="${GRD_LIST[1]}" forge script script/DeployV060Genesis.s.sol --rpc-url "$RPC" \
   --broadcast --private-key "$KEY" >"$OUT/neg-retired.log" 2>&1; then
   fail "DeployV060Genesis ran with a council owner on the retired list"

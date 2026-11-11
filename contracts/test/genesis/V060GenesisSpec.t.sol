@@ -835,7 +835,7 @@ contract V060GenesisSpecTest is Test {
     /// The same address in two spellings (checksummed and lower case) is refused too.
     function test_a_repeated_inventory_address_in_another_case_is_refused() public {
         DeployV060Genesis s = _builder();
-        address who = 0x00000000000000000000000000000000000aBcDe;
+        address who = 0x00000000000000000000000000000000000aBCdE;
         string memory inv = string.concat(
             '{"', vm.toString(who), '":["GOV_OWNERS"],"0x00000000000000000000000000000000000abcde":["GRD_OWNERS"]}'
         );
