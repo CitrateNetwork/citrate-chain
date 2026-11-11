@@ -5131,6 +5131,36 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod slot_config_line_tests {
+    use super::slot_config_line;
+
+    /// fed#535: one stable, greppable line; the fingerprint follows the
+    /// parameters; main logs it at start-up.
+    #[test]
+    fn the_slot_config_line_is_stable_and_logged_at_startup() {
+        let r = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS.render();
+        let line = slot_config_line(1, Some(&r));
+        assert!(
+            line.starts_with("SLOT_CONFIG slot_secs=1 target_block_time=1 chain_params_fp=0x"),
+            "{line}"
+        );
+        assert_eq!(line, slot_config_line(1, Some(&r)), "stable");
+        assert_eq!(line.split_whitespace().count(), 4, "{line}");
+        assert_ne!(
+            line,
+            slot_config_line(1, Some("other")),
+            "moves with the parameters"
+        );
+        assert_eq!(
+            slot_config_line(2, None),
+            "SLOT_CONFIG slot_secs=1 target_block_time=2 chain_params_fp=none"
+        );
+        assert!(include_str!("main.rs")
+            .contains("info!(\n        \"{}\",\n        slot_config_line(\n            config.mining.target_block_time,"));
+    }
+}
+
 /// The `clear-disqualified` command's store step: every root mark in the DAG
 /// metadata of `storage` (spec 06 §3.10).
 fn clear_disqualified_marks(storage: &StorageManager) -> anyhow::Result<usize> {
