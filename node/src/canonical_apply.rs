@@ -7254,7 +7254,11 @@ pub(crate) mod tests {
             app.apply_received(b).await;
         }
         assert_eq!(app.applied_tip().await.height, 3, "A applied");
-        assert_eq!(follower.get_nonce(&Address(ALICE)), 2, "A ran ALICE's two txs");
+        assert_eq!(
+            follower.get_nonce(&Address(ALICE)),
+            2,
+            "A ran ALICE's two txs"
+        );
 
         let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
         pb.set_balance(&Address(ALICE), U256::from(FUND));
@@ -7334,7 +7338,7 @@ pub(crate) mod tests {
     /// the state root, the reorg aborted and the node stayed on A.
     #[tokio::test]
     async fn an_external_read_inside_the_reorg_window_changes_nothing() {
-        let (_dir, mut app, follower, storage, b4) = readthrough_reorg_fixture().await;
+        let (_dir, app, follower, storage, b4) = readthrough_reorg_fixture().await;
         let reader = follower.clone();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let log = seen.clone();
@@ -7349,7 +7353,11 @@ pub(crate) mod tests {
             }
         });
         app.apply_received(&b4).await;
-        assert_eq!(seen.lock().len(), 1, "the reorg passed through its window once");
+        assert_eq!(
+            seen.lock().len(),
+            1,
+            "the reorg passed through its window once"
+        );
         assert_on_b(&app, &follower, &storage, "read inside the window").await;
     }
 
@@ -7362,7 +7370,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn concurrent_ingress_reads_during_a_reorg_never_change_its_outcome() {
         for round in 0..1_000u32 {
-            let (_dir, mut app, follower, storage, b4) = readthrough_reorg_fixture().await;
+            let (_dir, app, follower, storage, b4) = readthrough_reorg_fixture().await;
             let gate = Arc::new(std::sync::Barrier::new(2));
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let reader = {
@@ -7420,8 +7428,15 @@ pub(crate) mod tests {
         exec.set_balance(&Address(ALICE), U256::from(FUND));
         let before_accounts = exec.state_db().accounts.all_accounts().len();
         let before_root = exec.get_state_root().expect("root");
-        assert!(!exec.state_db().accounts.exists(&Address(BOB)), "BOB only in the store");
-        assert_eq!(exec.get_balance(&Address(BOB)), U256::from(7u64), "read through");
+        assert!(
+            !exec.state_db().accounts.exists(&Address(BOB)),
+            "BOB only in the store"
+        );
+        assert_eq!(
+            exec.get_balance(&Address(BOB)),
+            U256::from(7u64),
+            "read through"
+        );
         assert_eq!(exec.get_nonce(&Address(BOB)), 5, "read through");
         let _ = exec.get_code_hash(&Address(BOB));
         let _ = exec.get_canonical_account(&Address(BOB));
@@ -7429,7 +7444,10 @@ pub(crate) mod tests {
             !exec.state_db().accounts.exists(&Address(BOB)),
             "a read never makes an account resident"
         );
-        assert_eq!(exec.state_db().accounts.all_accounts().len(), before_accounts);
+        assert_eq!(
+            exec.state_db().accounts.all_accounts().len(),
+            before_accounts
+        );
         assert_eq!(exec.get_state_root().expect("root"), before_root);
     }
 
