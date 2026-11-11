@@ -266,6 +266,10 @@ GOV_BOOK="$CONTRACTS/$GOV_REL"
 VEST_BOOK="$CONTRACTS/$VEST_REL"
 DORMANT_BOOK="$CONTRACTS/$DORMANT_REL"
 MEMB_BOOK="$CONTRACTS/$MEMB_REL"
+# The 0.6.0 ceremony genesis (GENESIS_V060=1): DeployV060Genesis writes its book here
+# (V060_GENESIS_OUT), and P5 sweeps it with the other outputs.
+V060_REL="$OUT_REL/v060-genesis.json"
+V060_BOOK="$CONTRACTS/$V060_REL"
 # G9: the genesis membership deploy (chain#331). P2 runs it through regenesis.sh
 # --genesis-membership, and the generator reads the membership from its broadcast.
 GENESIS_MEMBERSHIP_SCRIPT=DeployGenesisMembership.s.sol
@@ -1556,6 +1560,21 @@ if should P4; then
   if [[ "$MODE" != dry ]]; then
     need_env P4 PATRONAGE_MEMBERSHIP
     why=$(phase_inputs P4 P3L) || gate_fail P4 "phase inputs: $why"
+    # A contract input is not a key (the 0.6.0 key inventory does not cover it): in a 0.6.0 run
+    # PATRONAGE_MEMBERSHIP must be this ceremony's own CitrateMemberSBT, the P2 book's entry,
+    # whose CREATE2 provenance and code P2's generator checked, and on --confirm that book must
+    # be the stack book this run recorded and the address must hold code.
+    if [[ "${GENESIS_V060:-}" == 1 ]]; then
+      msbt=$(book_addr "$ADDRESS_BOOK" CitrateMemberSBT) && is_addr "$msbt" ||
+        gate_fail P4 "$ADDRESS_BOOK has no CitrateMemberSBT: in a 0.6.0 run PATRONAGE_MEMBERSHIP must be this ceremony's member SBT"
+      [[ "$(lower "$PATRONAGE_MEMBERSHIP")" == "$(lower "$msbt")" ]] ||
+        gate_fail P4 "PATRONAGE_MEMBERSHIP is $PATRONAGE_MEMBERSHIP, not this ceremony's CitrateMemberSBT $msbt (the P2 book); a 0.6.0 run takes no other contract"
+      if [[ "$MODE" == confirm ]]; then
+        stack_book_bound P4 1
+        [[ "$("$CAST" code "$msbt" --rpc-url "$RPC_URL" 2>/dev/null)" != 0x ]] || gate_fail P4 "CitrateMemberSBT $msbt has no code"
+      fi
+      log "P4 PATRONAGE_MEMBERSHIP is this ceremony's CitrateMemberSBT $msbt"
+    fi
     # PatronageLedger's KYC registry is the library's KYCRegistry (P3L, under GOVERNANCE); on
     # --confirm the library book must be the one P3L recorded. A preset other value is refused.
     [[ -f "$LIB_BOOK" ]] || gate_fail P4 "$LIB_BOOK missing (run P3L first): PatronageLedger's KYC registry is the library's KYCRegistry"
@@ -1608,7 +1627,7 @@ if should P5; then
   log "P5 admin handover gate (FACTORY-ADMIN 0, DEPLOYER-ADMIN 0) over the book + the ceremony outputs"
   cmd=("$FORGE" script script/CheckDeployedAdmins.s.sol --rpc-url "${RPC_URL:-\$RPC_URL}")
   if [[ "$MODE" == dry ]]; then
-    log "P5 would merge $ADDRESS_BOOK + $GOV_REL, $VEST_REL, $DORMANT_REL, $LIB_REL → $P5_BOOK_REL"
+    log "P5 would merge $ADDRESS_BOOK + $GOV_REL, $VEST_REL, $DORMANT_REL, $LIB_REL$([[ "${GENESIS_V060:-}" == 1 ]] && echo ", $V060_REL") → $P5_BOOK_REL"
     describe_cmd "(cd contracts && ADDRESS_BOOK=$P5_BOOK_REL REQUIRE_ALL_CODE=true" "${cmd[@]}" ")"
   else
     extras=("$GOV_BOOK")
@@ -1622,6 +1641,19 @@ if should P5; then
         log "P5 note: $b absent in a simulation; not swept"
       fi
     done
+    # The 0.6.0 contracts (DeployV060Genesis, after P4) are swept with the rest. In a 0.6.0
+    # run the book is required on --confirm; outside one, a stray 0.6.0 book is refused.
+    if [[ "${GENESIS_V060:-}" == 1 ]]; then
+      if [[ -f "$V060_BOOK" ]]; then
+        extras+=("$V060_BOOK")
+      elif [[ "$MODE" == confirm ]]; then
+        gate_fail P5 "$V060_BOOK missing: a GENESIS_V060=1 ceremony must run DeployV060Genesis (V060_GENESIS_OUT=$V060_REL) before P5"
+      else
+        log "P5 note: $V060_BOOK absent in a simulation; not swept"
+      fi
+    elif [[ -f "$V060_BOOK" ]]; then
+      gate_fail P5 "$V060_BOOK exists but GENESIS_V060 is not 1: a 0.6.0 book belongs to a 0.6.0 ceremony only"
+    fi
     is_addr "${RUN_DEPLOYER:-}" || gate_fail P5 "no run deployer (the P0 run manifest did not load)"
     log "P5 deployer bound to run $RUN_ID: $RUN_DEPLOYER"
     load_governance P5 1

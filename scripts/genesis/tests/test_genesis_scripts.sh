@@ -972,6 +972,41 @@ expect "ceremony: an unknown phase is refused" 1 'must be one of' -- "${CEENV[@]
 # P0 checks. Negative controls on a copy of the tree: each kind of drift is caught.
 PI="$G/phase_inputs.py"
 expect "phase inputs tripwire: the tree's phase reads are all classified" 0 'phase_inputs: OK' -- python3 -I "$PI" check-spec
+# Keys of the 0.6.0 ceremony genesis (GENESIS_V060=1; fed #467 section 0.6, D-K3). The r1007
+# key inventory is role-tagged JSON {address: [roles]}: every role-holding address input and
+# council owner must be on it WITH that role. A producer staker gets no exemption for a role
+# (stakers sign nothing before S4-5). Contract inputs (PATRONAGE_MEMBERSHIP) are not keys and are
+# checked against the ceremony's books instead. The retired r1006 keys are an extra denylist,
+# and the GUARDIAN delay plus the owner's veto margin must fit in the 24 h registry window.
+KRK1=0x00000000000000000000000000000000000000a1
+KNK1=0x00000000000000000000000000000000000000b1
+KNK2=0x00000000000000000000000000000000000000b2
+KDEP=0x00000000000000000000000000000000000000c1
+KSTAKER=$(jq -r '.validators[0].staker' "$G/../../core/economics/assets/r1006/validators.json")
+pf() { env -i PATH="$PATH" "$@" python3 -I "$PI" preflight --phases P1; }
+kinv() { python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({a[i]: a[i+1].split("+") for i in range(0, len(a), 2)}))' "$@"; }
+KINV=$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS")
+KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KDEP")
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_GUARDIAN_VETO_MARGIN=7200
+expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1"
+expect "phase inputs keys: a typo'd address input is refused" 3 'TREASURY \(0x0+b3\) is not in GENESIS_KEY_INVENTORY with role TREASURY' -- pf "${KV060[@]}" TREASURY=0x00000000000000000000000000000000000000b3
+expect "phase inputs keys: a stale key absent from the retired list is refused" 3 'GRD_OWNERS \(0x0+d1\) is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS' -- pf "${KV060[@]}" GRD_OWNERS="$KNK1,0x00000000000000000000000000000000000000d1"
+expect "phase inputs keys: an inventory omission is refused" 3 'GOV_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY with role GOV_OWNERS' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$(kinv "$KNK1" GOV_OWNERS)" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 GOV_OWNERS="$KNK1,$KNK2"
+expect "phase inputs keys: a key inventoried under another role is refused" 3 'GRD_OWNERS \(0x0+b2\) is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS' -- pf "${KV060[@]}" GRD_OWNERS="$KNK2"
+expect "phase inputs keys: a producer staker as MEMBERSHIP_GRANTOR is refused" 3 'MEMBERSHIP_GRANTOR \(0x[0-9a-f]+\) is not in GENESIS_KEY_INVENTORY with role MEMBERSHIP_GRANTOR' -- pf "${KV060[@]}" MEMBERSHIP_GRANTOR="$KSTAKER"
+expect "phase inputs keys: a producer staker as CITRATE_AA_OWNER is refused" 3 'CITRATE_AA_OWNER \(0x[0-9a-f]+\) is not in GENESIS_KEY_INVENTORY with role CITRATE_AA_OWNER' -- pf "${KV060[@]}" CITRATE_AA_OWNER="$KSTAKER"
+expect "phase inputs keys: a producer staker as a GUARDIAN owner is refused" 3 'GRD_OWNERS \(0x[0-9a-f]+\) is not in GENESIS_KEY_INVENTORY with role GRD_OWNERS' -- pf "${KV060[@]}" GRD_OWNERS="$KNK1,$KSTAKER"
+expect "phase inputs keys: an unknown role in the inventory is refused" 3 "GENESIS_KEY_INVENTORY: 0x0+b1 has an unknown role 'TRESURY'" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$(kinv "$KNK1" TRESURY)" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
+expect "phase inputs keys: an inventory that is not JSON is refused" 3 'GENESIS_KEY_INVENTORY is not a JSON object' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,$KNK2" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
+expect "phase inputs keys: a malformed inventory address is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY='{"0xzz":["GOV_OWNERS"]}' GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
+expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
+expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KRK1"
+expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${KV060[@]}" GRD_MIN_DELAY=79201
+expect "phase inputs keys: a margin other than the owner's decided 7200 s is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is 3600; the owner decided 7200' -- pf "${KV060[@]}" GENESIS_GUARDIAN_VETO_MARGIN=3600
+expect "phase inputs keys: a contract input is not held to the key inventory" 0 '' -- pf "${KV060[@]}" PATRONAGE_MEMBERSHIP=0x00000000000000000000000000000000000000e1
+expect "phase inputs keys: inventory keys with their roles pass (control)" 0 '' -- pf "${KV060[@]}" TREASURY="$KNK1" GOV_OWNERS="$KNK1,$KNK2" GRD_OWNERS="$KNK1" GRD_MIN_DELAY=3600
+expect "phase inputs keys: the r1006/r1007 ceremony needs none of them (control)" 0 '' -- pf
 TW="$T/pi-tree"
 mkdir -p "$TW/scripts/genesis" "$TW/scripts/ops" "$TW/contracts"
 cp "$G/genesis_ceremony.sh" "$TW/scripts/genesis/"
@@ -1082,6 +1117,25 @@ printf '{"deployer":"%s","contracts":{"VestingAlice":"%s"}}' "$DEP" "$(addr 71)"
 printf '{"deployer":"%s","contracts":{"FederatedRoundLedger":"%s","PatronageLedger":"%s"}}' "$DEP" "$(addr 81)" "$(addr 82)" >"$GB/dormant-ledgers.json"
 expect "ceremony: P5 fails a deployer role held in the vesting output" 3 'DEPLOYER-ADMIN VestingAlice' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=VestingAlice bash "$CE" --simulate --only P5
 expect "ceremony: P5 fails a deployer role held in the dormant-ledger output" 3 'DEPLOYER-ADMIN PatronageLedger' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=PatronageLedger bash "$CE" --simulate --only P5
+# The 0.6.0 output (DeployV060Genesis) is swept in a GENESIS_V060=1 run, and refused outside one.
+# CEENV's keys, each under the role CEENV gives it (role-tagged inventory).
+V060_INV=$(python3 -c '
+import json, sys
+gov, grd, s1, s2, s3, rel, aao, aai, aas, grant, tre = sys.argv[1:]
+inv = {}
+def put(a, r): inv.setdefault(a, []).append(r)
+for a in gov.split(","): put(a, "GOV_OWNERS")
+for a in grd.split(","): put(a, "GRD_OWNERS")
+for a, r in ((s1, "SIGNER_1"), (s2, "SIGNER_2"), (s3, "SIGNER_3"), (rel, "RELAYER"), (aao, "CITRATE_AA_OWNER"),
+             (aai, "CITRATE_AA_IDENTITY_SIGNER"), (aas, "CITRATE_AA_SPONSOR_SIGNER"), (grant, "MEMBERSHIP_GRANTOR"), (tre, "TREASURY")):
+    put(a, r)
+print(json.dumps(inv))' "$(owners 11 12 13 14 15)" "$(owners 21 22 23)" "$(addr 61)" "$(addr 62)" "$(addr 63)" "$(addr 64)" "$(addr 65)" "$(addr 66)" "$(addr 67)" "$(addr 51)" "$(addr 90)")
+V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=7200 GENESIS_KEY_INVENTORY="$V060_INV")
+printf '{"deployer":"%s","contracts":{"WorkMarket":"%s"}}' "$DEP" "$(addr 83)" >"$GB/v060-genesis.json"
+expect "ceremony: P5 refuses a 0.6.0 book outside a 0.6.0 run" 3 'exists but GENESIS_V060 is not 1' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
+expect "ceremony: P5 sweeps the 0.6.0 output in a 0.6.0 run" 3 'DEPLOYER-ADMIN WorkMarket' -- "${CEENV[@]}" "${V060_KEYS[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=WorkMarket bash "$CE" --simulate --only P5
+rm -f "$GB/v060-genesis.json"
+expect "ceremony: P5 in a 0.6.0 simulation without the 0.6.0 book notes it and passes" 0 'v060-genesis.json absent in a simulation' -- "${CEENV[@]}" "${V060_KEYS[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 expect "ceremony: P5 refuses an output from another deployer" 3 "names deployer '0x0+9', not this run's deployer" -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash -c "printf '{\"deployer\":\"%s\",\"contracts\":{\"VestingAlice\":\"%s\"}}' '$(addr 9)' '$(addr 71)' > '$GB/team-vesting.json'; bash '$CE' --simulate --only P5"
 printf '{"deployer":"%s","contracts":{"Alpha":"%s"}}' "$DEP" "$(addr 71)" >"$GB/team-vesting.json"
 mk_manifest "$GB"
@@ -2350,6 +2404,8 @@ expect "ceremony: P4 runs with the nondefault dir" 0 'P4 dormant ledgers' -- "${
 grep -q "^PATRONAGE_KYC_REGISTRY=$(addr 51)$" "$FAKE/forge.env" && ok "ceremony P4: PatronageLedger's KYC registry is the library book's KYCRegistry" ||
   bad "ceremony P4: PatronageLedger's KYC registry is the library book's KYCRegistry" "$(grep PATRONAGE "$FAKE/forge.env" | tail -2)"
 expect "ceremony P4: a preset PATRONAGE_KYC_REGISTRY other than the library's is refused" 3 'GATE FAIL at P4: PATRONAGE_KYC_REGISTRY is set to 0x0+63, but this run.s library KYCRegistry is 0x0+33' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" PATRONAGE_MEMBERSHIP="$(addr 52)" PATRONAGE_KYC_REGISTRY="$(addr 99)" bash "$CE" --simulate --only P4
+# A contract input is checked against the ceremony's books, not the key inventory (0.6.0 run).
+expect "ceremony P4 (0.6.0): a PATRONAGE_MEMBERSHIP that is not the P2 book's CitrateMemberSBT is refused" 3 'GATE FAIL at P4: .*PATRONAGE_MEMBERSHIP' -- "${CEENV[@]}" "${V060_KEYS[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" PATRONAGE_MEMBERSHIP="$(addr 52)" bash "$CE" --simulate --only P4
 rm "$RUN2/library.json"
 expect "ceremony P4: without the P3L library book P4 stops (no KYC registry)" 3 'GATE FAIL at P4: .*library.json missing \(run P3L first\)' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 GENESIS_OUT_DIR="$RUN2" PATRONAGE_MEMBERSHIP="$(addr 52)" bash "$CE" --simulate --only P4
 # A fresh-run-shaped invocation that reaches P4 without P4's inputs: the gate is P4's, and so
