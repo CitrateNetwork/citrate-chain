@@ -104,6 +104,35 @@ def validators(repo: Path) -> dict:
     return d
 
 
+# D-K3 (owner 2026-11-10): the r1007 block 0 needs fresh non-producer keys. The
+# genesis is pending until an r1007 alloc built from fresh role inputs exists
+# with final inputs (docs/consensus/R1007_GENESIS.md §1.1). The roles come from
+# the Rust table the node's own refusal uses (core/economics/src/r1007.rs).
+R1007_ALLOC = Path("core/economics/assets/r1007/alloc.json")
+R1007_RS = Path("core/economics/src/r1007.rs")
+
+
+def r1007_pending(repo: Path) -> list[str]:
+    """Why the r1007 genesis cannot be rendered for the fleet yet; [] when ready."""
+    alloc = repo / R1007_ALLOC
+    if alloc.is_file():
+        try:
+            status = json.loads(alloc.read_text()).get("inputsStatus")
+        except json.JSONDecodeError as e:
+            raise ParamsError(f"{R1007_ALLOC}: {e}") from None
+        if status == "final":
+            return []
+        why = f"{R1007_ALLOC} inputsStatus is {status!r}, not final"
+    else:
+        why = f"no {R1007_ALLOC} (built from fresh role inputs) yet"
+    table = _read(repo, R1007_RS)
+    start = table.find("pub const ROTATED_R1006_KEYS")
+    roles = re.findall(r'role: "([A-Z0-9_]+)"', table[start:]) if start >= 0 else []
+    if not roles:
+        raise ParamsError(f"{R1007_RS}: ROTATED_R1006_KEYS not found")
+    return [f"D-K3: r1007 is pending fresh non-producer keys ({why}); roles: {', '.join(roles)}"]
+
+
 def load(repo: Path) -> dict:
     """Everything the ceremony renders and checks against, from this checkout."""
     p = chain_params(repo)
@@ -116,6 +145,7 @@ def load(repo: Path) -> dict:
         "default_vote_depth": default_vote_depth(repo),
         "validator_registry": v["validatorRegistry"].lower(),
         "validator_activation_height": p["validator_activation_height"],
+        "r1007_pending": r1007_pending(repo),
         "producers": [
             {"name": x["name"], "staker": x["staker"].lower(), "proposer_pubkey": x["proposer_pubkey"].lower()}
             for x in v["validators"]

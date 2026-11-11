@@ -339,6 +339,12 @@ def cmd_render(a, fleet: Fleet, src: dict) -> int:
     net = a.network
     if net == "r1006" and fleet.transport != "local":
         raise Refuse("rendering r1006 is for the devnet's stand-in r1006 only; the fleet's r1006 is parked as it is")
+    if net == "r1007" and src["r1007_pending"] and fleet.transport != "local":
+        # D-K3: the fleet's bundles would pin a candidate block 0 that names
+        # rotated r1006 keys (the node refuses to build it anyway).
+        raise Refuse("; ".join(src["r1007_pending"]))
+    if net == "r1007" and src["r1007_pending"]:
+        log("NOTE (local rehearsal): " + "; ".join(src["r1007_pending"]))
     ids = identities(a, fleet)
     stk = stakers(fleet, ids, src)
     binary = Path(a.binary)
@@ -364,6 +370,7 @@ def cmd_render(a, fleet: Fleet, src: dict) -> int:
         "schema": "r1007-render/1", "network": net, "genesis": src[f"{net}_genesis"],
         "params_render": src["params_render"] if net == "r1007" else None,
         "source_commit": git_head(), "binary_sha256": bin_sha, "hosts": hosts,
+        "r1007_pending": src["r1007_pending"] if net == "r1007" else None,
     })
     log(f"rendered {len(hosts)} hosts for {net} -> {out}")
     return 0
