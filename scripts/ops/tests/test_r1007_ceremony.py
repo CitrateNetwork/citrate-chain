@@ -20,7 +20,7 @@ import stat
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -131,6 +131,10 @@ class RenderAndCheck(unittest.TestCase):
             m = json.loads((self.rdir / host / "manifest.json").read_text())
             m["files"][name] = C.sha256(f)
             (self.rdir / host / "manifest.json").write_text(json.dumps(m))
+
+    def test_a_local_rehearsal_render_records_that_r1007_is_pending(self):
+        man = json.loads((self.rdir / "render-manifest.json").read_text())
+        self.assertEqual(man["r1007_pending"], SRC["r1007_pending"])
 
     def test_every_role_is_rendered_and_passes(self):
         rc, out = self.check(binary=True)
@@ -264,6 +268,25 @@ class PlanAndGuards(unittest.TestCase):
             f.write_text(json.dumps({"ceremony": "r1007", "genesis": SRC["r1006_genesis"], "approved_by": "o", "approved_at": "x", "steps": ["cut"]}))
             with self.assertRaises(C.Refuse):
                 C.load_go(str(f), SRC["r1007_genesis"])
+
+    def test_r1007_is_pending_under_d_k3(self):
+        # D-K3 (owner 2026-11-10): the r1007 block 0 needs fresh non-producer
+        # keys; until core/economics/assets/r1007/alloc.json exists with final
+        # inputs, the checkout says r1007 is pending and names the roles.
+        pending = SRC["r1007_pending"]
+        self.assertTrue(pending)
+        text = " ".join(pending)
+        self.assertIn("D-K3", text)
+        for role in ("TREASURY", "DEPLOYER", "GOV_OWNER_1", "MEMBERSHIP_GRANTOR"):
+            self.assertIn(role, text)
+
+    def test_rendering_r1007_for_the_fleet_is_refused_while_pending(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc, _ = run(["render", "--fleet", str(R7 / "fleet.r1007.json"), "--network", "r1007",
+                         "--binary", sys.executable, "--state", tempfile.mkdtemp()])
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertIn("D-K3", err.getvalue())
 
     def test_devnet_only_actions_are_refused_on_the_fleet(self):
         rc, _ = run(["collect", "--fleet", str(R7 / "fleet.r1007.json"), "--mint", "--state", tempfile.mkdtemp()])
