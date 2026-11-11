@@ -616,6 +616,28 @@ mod tests {
         assert_eq!(c.vote_depth, 5);
     }
 
+    /// fed#465 (06 G11 storage dependency): the pruning-point walk falls back
+    /// to chain-store headers, so a node that prunes its chain store must keep
+    /// at least PRUNING_DEPTH (10,000) headers. Below that it can refuse valid
+    /// blocks, so the node refuses the configuration at start-up.
+    #[test]
+    fn chain_store_pruning_below_pruning_depth_is_refused() {
+        let depth = citrate_consensus::ghostdag::PRUNING_DEPTH;
+        let mut c = NodeConfig::default();
+        c.storage.pruning = true;
+        c.storage.keep_blocks = depth - 1;
+        let e = c.validate().expect_err("keep_blocks below PRUNING_DEPTH");
+        assert!(e.contains("keep_blocks") && e.contains("10000"), "{e}");
+        c.storage.keep_blocks = depth;
+        c.validate().expect("keep_blocks = PRUNING_DEPTH is enough");
+        c.storage.keep_blocks = 100_000;
+        c.validate().expect("the default");
+        // Not pruning: the chain store keeps everything, whatever keep_blocks says.
+        c.storage.pruning = false;
+        c.storage.keep_blocks = 1_000;
+        c.validate().expect("pruning off");
+    }
+
     #[test]
     fn test_default_config() {
         // Clear env var to ensure deterministic defaults
