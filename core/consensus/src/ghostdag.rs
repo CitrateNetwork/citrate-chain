@@ -192,6 +192,34 @@ const MAX_DISQUALIFIED_WALK: u32 = 100_000;
 /// marks are the source of truth; an evicted verdict is re-derived.
 pub const DISQUALIFIED_VERDICT_CACHE_CAP: usize = 65_536;
 
+/// The derived-verdict cache and its generation (fed#537): a walk records the
+/// generation when it starts and may write its result only if no root was
+/// added meanwhile.
+pub(crate) struct VerdictCache {
+    cache: crate::dag_store::BoundedCache<Hash, (bool, u64)>,
+    generation: u64,
+}
+
+impl VerdictCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            cache: crate::dag_store::BoundedCache::new(cap),
+            generation: 0,
+        }
+    }
+}
+
+/// The result of a disqualification walk, not yet written to the cache.
+#[derive(Debug)]
+pub struct DisqualifiedWalk {
+    /// Whether the walked block is disqualified.
+    pub verdict: bool,
+    /// The blocks the walk visited, with their heights; all share the verdict.
+    path: Vec<(Hash, u64)>,
+    /// The cache generation when the walk started.
+    generation: u64,
+}
+
 /// Where the G11 pruning-point walk reads a selected-chain header that the
 /// DAG store no longer holds (spec 06 §2 G11, CV-7a).
 ///
@@ -223,8 +251,10 @@ pub struct GhostDag {
     /// GhostdagData records (G12). A cache over the persisted records.
     ghostdag_cache: Arc<RwLock<HashMap<Hash, Arc<GhostdagData>>>>,
 
-    /// Spec 06 §3.10 (fed#533): derived disqualification verdicts, bounded.
-    disq_verdicts: Arc<std::sync::Mutex<crate::dag_store::BoundedCache<Hash, bool>>>,
+    /// Spec 06 §3.10 (fed#533, #537, #538): derived disqualification
+    /// verdicts (verdict, block height), bounded, with the generation that
+    /// every new root advances.
+    disq_verdicts: Arc<std::sync::Mutex<VerdictCache>>,
 
     /// Records computed by the consistency gate for blocks not yet added,
     /// keyed by hash and the (selected parent, merge parents, height) they were
@@ -331,7 +361,7 @@ impl GhostDag {
             pba_hardening: crate::hardening::PbaHardening::from_process(),
             relations: Arc::new(RwLock::new(HashMap::new())),
             ghostdag_cache: Arc::new(RwLock::new(HashMap::new())),
-            disq_verdicts: Arc::new(std::sync::Mutex::new(crate::dag_store::BoundedCache::new(
+            disq_verdicts: Arc::new(std::sync::Mutex::new(VerdictCache::new(
                 DISQUALIFIED_VERDICT_CACHE_CAP,
             ))),
             validated: Arc::new(std::sync::Mutex::new(VecDeque::new())),
@@ -1317,57 +1347,101 @@ impl GhostDag {
 
     /// Spec 06 §3.10 (D11): whether `hash` is disqualified from the selected
     /// chain: it, or a block on its selected chain, is a stored root mark
-    /// (`DagStore::is_disqualified_root`). Derived by walking selected parents
-    /// until a cached verdict, a root, genesis, or a block whose header is not
-    /// held (below the DAG prune floor) is reached, at most
-    /// [`MAX_DISQUALIFIED_WALK`] steps; reaching the bound counts as qualified.
-    /// Verdicts are cached in a bounded cache, cleared when a root is added.
+    /// (`DagStore::is_disqualified_root`). See [`Self::walk_disqualified`].
     pub async fn is_disqualified(&self, hash: &Hash) -> bool {
-        let mut path: Vec<Hash> = Vec::new();
+        let walk = self.walk_disqualified(hash).await;
+        let verdict = walk.verdict;
+        self.commit_disqualified_walk(walk);
+        verdict
+    }
+
+    /// Derive `hash`'s status without writing the cache: walk selected
+    /// parents; at each block check the root mark FIRST (so a root never reads
+    /// as qualified, #537), then the verdict cache; stop at a root
+    /// (disqualified), a cached verdict, genesis, a block whose header is not
+    /// held, or a block at or below the pruning point's height (qualified,
+    /// #538: roots below it are pruned with their blocks), at most
+    /// [`MAX_DISQUALIFIED_WALK`] steps (reaching it counts as qualified).
+    pub async fn walk_disqualified(&self, hash: &Hash) -> DisqualifiedWalk {
+        let generation = self
+            .disq_verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation;
+        let pp = self.dag_store.get_pruning_point().await;
+        let pp_height = if pp == Hash::default() {
+            None
+        } else {
+            self.height_of(&pp).await.ok()
+        };
+        let mut path: Vec<(Hash, u64)> = Vec::new();
         let mut c = *hash;
         let mut steps: u32 = 0;
         let verdict = loop {
-            if let Some(v) = self
-                .disq_verdicts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&c)
-            {
-                break v;
-            }
-            path.push(c);
-            if self.dag_store.is_disqualified_root(&c) {
-                break true;
-            }
-            steps = steps.saturating_add(1);
-            if steps > MAX_DISQUALIFIED_WALK {
-                break false;
-            }
-            let sp = match self
+            let link = match self
                 .relations
                 .read()
                 .await
                 .get(&c)
-                .map(|r| r.selected_parent)
+                .map(|r| (r.height, r.selected_parent))
             {
-                Some(sp) => Some(sp),
+                Some(l) => Some(l),
                 None => self
                     .dag_store
                     .get_header(&c)
                     .await
                     .ok()
-                    .map(|hd| hd.selected_parent_hash),
+                    .map(|hd| (hd.height, hd.selected_parent_hash)),
             };
-            match sp {
-                Some(sp) if sp != Hash::default() && sp != c => c = sp,
-                _ => break false,
+            if self.dag_store.is_disqualified_root(&c) {
+                if let Some((h, _)) = link {
+                    path.push((c, h));
+                }
+                break true;
             }
+            if let Some((v, _)) = self
+                .disq_verdicts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cache
+                .get(&c)
+            {
+                break v;
+            }
+            let Some((h, sp)) = link else {
+                break false;
+            };
+            path.push((c, h));
+            if pp_height.is_some_and(|p| h <= p) {
+                break false;
+            }
+            steps = steps.saturating_add(1);
+            if steps > MAX_DISQUALIFIED_WALK {
+                break false;
+            }
+            if sp == Hash::default() || sp == c {
+                break false;
+            }
+            c = sp;
         };
-        let mut cache = self.disq_verdicts.lock().unwrap_or_else(|e| e.into_inner());
-        for h in path {
-            cache.insert(h, verdict);
+        DisqualifiedWalk {
+            verdict,
+            path,
+            generation,
         }
-        verdict
+    }
+
+    /// Write a walk's result to the verdict cache, unless a root was added
+    /// since the walk started (#537). Returns whether it wrote.
+    pub fn commit_disqualified_walk(&self, walk: DisqualifiedWalk) -> bool {
+        let mut vc = self.disq_verdicts.lock().unwrap_or_else(|e| e.into_inner());
+        if vc.generation != walk.generation {
+            return false;
+        }
+        for (h, height) in walk.path {
+            vc.cache.insert_or_update(h, (walk.verdict, height));
+        }
+        true
     }
 
     /// Entries in the derived-verdict cache (at most its cap).
@@ -1375,14 +1449,13 @@ impl GhostDag {
         self.disq_verdicts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .cache
             .len()
     }
 
     /// Cap the derived-verdict cache (default [`DISQUALIFIED_VERDICT_CACHE_CAP`]).
     pub fn with_disqualified_cache_cap(mut self, cap: usize) -> Self {
-        self.disq_verdicts = Arc::new(std::sync::Mutex::new(crate::dag_store::BoundedCache::new(
-            cap,
-        )));
+        self.disq_verdicts = Arc::new(std::sync::Mutex::new(VerdictCache::new(cap)));
         self
     }
 
@@ -1390,14 +1463,19 @@ impl GhostDag {
     /// commitments did not reproduce when the applied chain reached it. One
     /// root mark is stored; every block whose selected chain passes through it
     /// is disqualified by derivation. The block stays in the DAG: it can still
-    /// be merged, never be a chain block.
+    /// be merged, never be a chain block. Only cached "qualified" verdicts at
+    /// or above the root's height can change, so only those are dropped
+    /// (#538), and the generation moves so an in-flight walk cannot write a
+    /// stale result (#537).
     pub async fn disqualify(&self, hash: &Hash) {
+        let root_height = self.height_of(hash).await.unwrap_or(0);
         self.dag_store.mark_disqualified_root(hash);
-        // A new root can turn cached "qualified" verdicts of its descendants.
-        self.disq_verdicts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        {
+            let mut vc = self.disq_verdicts.lock().unwrap_or_else(|e| e.into_inner());
+            vc.generation = vc.generation.wrapping_add(1);
+            vc.cache
+                .retain(|_, (verdict, height)| *verdict || *height < root_height);
+        }
         warn!("block {} disqualified from the selected chain", hash);
     }
 

@@ -249,7 +249,9 @@ pub struct DagStore {
     /// them. A bounded read-through cache of the persisted `disq:<hash>` keys,
     /// which are the source of truth; descendants are derived by
     /// `GhostDag::is_disqualified`, never stored.
-    disqualified_roots: Arc<Mutex<BoundedCache<Hash, ()>>>,
+    /// Negative answers ("not a root") are cached too (fed#538); adding or
+    /// removing a root updates its own entry.
+    disqualified_roots: Arc<Mutex<BoundedCache<Hash, bool>>>,
 }
 
 /// Entries the in-memory root-mark cache holds (the persisted keys are the
@@ -279,6 +281,15 @@ impl<K: std::hash::Hash + Eq + Copy, V: Copy> BoundedCache<K, V> {
         self.map.get(k).copied()
     }
 
+    /// Insert, or overwrite the value of an existing entry.
+    pub fn insert_or_update(&mut self, k: K, v: V) {
+        if let Some(slot) = self.map.get_mut(&k) {
+            *slot = v;
+        } else {
+            self.insert(k, v);
+        }
+    }
+
     pub fn insert(&mut self, k: K, v: V) {
         if self.map.insert(k, v).is_none() {
             self.order.push_back(k);
@@ -304,8 +315,23 @@ impl<K: std::hash::Hash + Eq + Copy, V: Copy> BoundedCache<K, V> {
         self.order.clear();
     }
 
+    /// Keep only the entries `keep` accepts.
+    pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        self.map.retain(|k, v| keep(k, v));
+        let map = &self.map;
+        self.order.retain(|k| map.contains_key(k));
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// Entries whose value equals `v`.
+    pub fn count_values(&self, v: V) -> usize
+    where
+        V: PartialEq,
+    {
+        self.map.values().filter(|x| **x == v).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1019,7 +1045,7 @@ impl DagStore {
         self.disqualified_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(*hash, ());
+            .insert_or_update(*hash, true);
         if let Some(ref kv) = self.persistent {
             if let Err(e) = kv.kv_put(cf::DAG_METADATA, &disqualified_key(hash), &[1]) {
                 warn!("Failed to persist the disqualified mark of {}: {}", hash, e);
@@ -1031,28 +1057,30 @@ impl DagStore {
     /// earlier process). A read error counts as "not a root": the block is
     /// then a chain candidate again and is re-executed, which is safe.
     pub fn is_disqualified_root(&self, hash: &Hash) -> bool {
-        if self
+        if let Some(v) = self
             .disqualified_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(hash)
-            .is_some()
         {
-            return true;
+            return v;
         }
         let Some(ref kv) = self.persistent else {
             return false;
         };
-        match kv.kv_get(cf::DAG_METADATA, &disqualified_key(hash)) {
-            Ok(Some(_)) => {
-                self.disqualified_roots
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(*hash, ());
-                true
-            }
-            _ => false,
+        let (root, cache) = match kv.kv_get(cf::DAG_METADATA, &disqualified_key(hash)) {
+            Ok(Some(_)) => (true, true),
+            Ok(None) => (false, true),
+            // Not cached: the next read retries the store.
+            Err(_) => (false, false),
+        };
+        if cache {
+            self.disqualified_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert_or_update(*hash, root);
         }
+        root
     }
 
     /// The number of root marks persisted (in memory for a store without a
@@ -1067,7 +1095,11 @@ impl DagStore {
                         .count()
                 })
                 .unwrap_or(0),
-            None => self.disqualified_root_cache_len(),
+            None => self
+                .disqualified_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .count_values(true),
         }
     }
 
@@ -1100,7 +1132,11 @@ impl DagStore {
                 removed = removed.saturating_add(1);
             }
         } else {
-            removed = self.disqualified_root_cache_len();
+            removed = self
+                .disqualified_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .count_values(true);
         }
         self.disqualified_roots
             .lock()
