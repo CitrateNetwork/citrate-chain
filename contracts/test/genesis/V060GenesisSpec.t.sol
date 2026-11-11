@@ -842,4 +842,22 @@ contract V060GenesisSpecTest is Test {
         vm.expectRevert(bytes(string.concat("GENESIS_KEY_INVENTORY: ", vm.toString(who), " appears more than once")));
         s.inventoryRoles(inv);
     }
+
+    /// verify() re-reads the CANCELLER seat: a grant to v1's CREATE2 address after the build
+    /// (here by the GOVERNANCE timelock itself) is caught.
+    function test_verify_catches_canceller_granted_to_v1_after_the_build() public {
+        (DeployV060Genesis s, DeployV060Genesis.Deployed memory d) = _build();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        s.verify(i, d);
+        TimelockController gt = TimelockController(payable(gov.governanceTimelock));
+        address v1 = _at(
+            "Genesis.GuardianCanceller",
+            abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(gov.governanceTimelock, gov.guardianTimelock))
+        );
+        bytes32 role = gt.CANCELLER_ROLE();
+        vm.prank(gov.governanceTimelock);
+        gt.grantRole(role, v1);
+        vm.expectRevert(bytes("GuardianCanceller v1 holds CANCELLER on GOVERNANCE"));
+        s.verify(i, d);
+    }
 }
