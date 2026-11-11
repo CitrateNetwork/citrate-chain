@@ -1019,6 +1019,11 @@ for k in RELAYER SIGNER_1 SIGNER_2 SIGNER_3; do
 done
 expect "phase inputs keys: a minimum bond other than the owner's decided 100 SALT is refused" 3 'WORKMARKET_MIN_COORDINATOR_BOND is 3; the owner decided 100000000000000000000' -- pf "${KV060[@]}" WORKMARKET_MIN_COORDINATOR_BOND=3
 expect "phase inputs keys: a default bond other than the owner's decided 1,000 SALT is refused" 3 'WORKMARKET_DEFAULT_COORDINATOR_BOND is 7; the owner decided 1000000000000000000000' -- pf "${KV060[@]}" WORKMARKET_DEFAULT_COORDINATOR_BOND=7
+# FAUCET and TEAM are block-0 accounts (base allocations), not role inputs: the inventory may
+# tag them so the alloc check knows them. Post-genesis roles are not ceremony roles.
+expect "phase inputs keys: FAUCET and TEAM are known block-0 account tags" 0 '' -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER 0x00000000000000000000000000000000000000f5 FAUCET 0x00000000000000000000000000000000000000f6 TEAM)"
+expect "phase inputs keys: a post-genesis role in the inventory is refused" 3 "has an unknown role 'POSTGENESIS_DEPLOYER'" -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER 0x00000000000000000000000000000000000000f7 POSTGENESIS_DEPLOYER)"
+expect "phase inputs keys: a DEPLOYER tag in the inventory is refused (the deployer carries no role)" 3 "has an unknown role 'DEPLOYER'" -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER "$KDEP" DEPLOYER)"
 expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
 expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KRK1"
 expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${KV060[@]}" GRD_MIN_DELAY=79201
