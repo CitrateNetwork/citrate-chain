@@ -10911,6 +10911,10 @@ pub(crate) mod tests {
     const V251_DIR: &str = "V251_CHILD_DIR";
     const V251_ABORT_AT: &str = "V251_ABORT_AT";
     const V251_LOOP: &str = "V251_LOOP";
+    /// Random-SIGKILL soak knobs: the number of rounds (default 40) and the
+    /// xorshift seed (default 0x2510_2510_2510_2510). Each round logs its seed.
+    const V251_ROUNDS: &str = "V251_ROUNDS";
+    const V251_SEED: &str = "V251_SEED";
 
     /// Delegating store that aborts the process before its k-th write.
     struct V251AbortStore {
@@ -11570,6 +11574,57 @@ pub(crate) mod tests {
         cmd.spawn().expect("spawn child")
     }
 
+    /// The random-SIGKILL child's end of a run: clear the `current` marker
+    /// FIRST, then remove the run's store. A kill during the removal then
+    /// leaves no marker naming a half-deleted store (chain CI run 42906538713
+    /// panicked reopening one: `expect("reopen")`). The write truncates, so a
+    /// kill inside it leaves an empty marker, which also names no run.
+    fn v251_retire_run(dir: &std::path::Path, sub: &std::path::Path) {
+        std::fs::write(dir.join("current"), b"").expect("clear current");
+        std::fs::remove_dir_all(sub).ok();
+    }
+
+    /// The store the parent inspects after a SIGKILL: the run the marker
+    /// names, if it has a RocksDB `CURRENT` file. `None` before the first run
+    /// and while a finished run is being removed.
+    fn v251_run_to_inspect(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let current = std::fs::read_to_string(dir.join("current")).unwrap_or_default();
+        let run = std::path::PathBuf::from(current);
+        (!run.as_os_str().is_empty() && run.join("CURRENT").exists()).then_some(run)
+    }
+
+    /// A finished run whose removal is interrupted is never inspected: the
+    /// marker is cleared before the store is touched. Models the kill that
+    /// left a half-deleted store (MANIFEST gone, CURRENT still there).
+    #[tokio::test]
+    async fn verify251_a_run_being_removed_is_never_inspected() {
+        let dir = tempfile::tempdir().expect("dir");
+        let sub = dir.path().join("run0");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        std::fs::write(dir.path().join("current"), sub.to_string_lossy().as_bytes())
+            .expect("current");
+        v251_child_scenario(&sub, u64::MAX).await;
+        assert_eq!(v251_run_to_inspect(dir.path()), Some(sub.clone()));
+        // The first step of `v251_retire_run`, then a kill part-way through the
+        // removal: the store loses its MANIFEST but keeps CURRENT.
+        std::fs::write(dir.path().join("current"), b"").expect("clear current");
+        for entry in std::fs::read_dir(&sub).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("MANIFEST"))
+            {
+                std::fs::remove_file(&path).expect("remove manifest");
+            }
+        }
+        assert!(sub.join("CURRENT").exists(), "fixture: CURRENT remains");
+        assert_eq!(v251_run_to_inspect(dir.path()), None);
+        // The full retire leaves nothing to inspect either.
+        v251_retire_run(dir.path(), &sub);
+        assert!(!sub.exists());
+        assert_eq!(v251_run_to_inspect(dir.path()), None);
+    }
+
     /// Child entry point (a no-op unless V251_CHILD_DIR is set).
     #[tokio::test]
     async fn verify251_child() {
@@ -11585,7 +11640,7 @@ pub(crate) mod tests {
                 std::fs::write(dir.join("current"), sub.to_string_lossy().as_bytes())
                     .expect("current");
                 v251_child_scenario(&sub, u64::MAX).await;
-                std::fs::remove_dir_all(&sub).ok();
+                v251_retire_run(&dir, &sub);
             }
         }
         let abort_at: u64 = std::env::var(V251_ABORT_AT)
@@ -11913,13 +11968,20 @@ pub(crate) mod tests {
         }
         let test = "canonical_apply::tests::verify251_child";
         let (a0, a1, a2, b2, b3) = v251_blocks().await;
-        let mut seed: u64 = 0x2510_2510_2510_2510;
+        let mut seed: u64 = std::env::var(V251_SEED)
+            .ok()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(0x2510_2510_2510_2510);
         let mut torn = Vec::new();
-        let rounds = 40;
+        let rounds: u64 = std::env::var(V251_ROUNDS)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
         for r in 0..rounds {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
+            println!("V251 sigkill r={r} seed=0x{seed:016x}");
             let dir = tempfile::tempdir().expect("dir");
             let mut child = v251_spawn(
                 test,
@@ -11932,13 +11994,11 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
             child.kill().expect("SIGKILL");
             let _ = child.wait();
-            let current = std::fs::read_to_string(dir.path().join("current")).unwrap_or_default();
-            if current.is_empty() || !std::path::Path::new(&current).join("CURRENT").exists() {
-                println!("V251 sigkill r={r}: child had not started a run");
+            let Some(current) = v251_run_to_inspect(dir.path()) else {
+                println!("V251 sigkill r={r}: no run in progress (not started, or being removed)");
                 continue;
-            }
-            let (_, ok, d) =
-                v251_check(std::path::Path::new(&current), &a0, &a1, &a2, &b2, &b3, &[]);
+            };
+            let (_, ok, d) = v251_check(&current, &a0, &a1, &a2, &b2, &b3, &[]);
             println!("V251 sigkill r={r} after {wait_ms} ms -> {d}");
             if !ok {
                 torn.push(format!("r={r} {d}"));
