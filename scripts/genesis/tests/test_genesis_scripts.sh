@@ -1960,7 +1960,7 @@ for c in "P1:governance:governance.json" "P3:teamVesting:team-vesting.json" "P4:
   out=$("${C10ENV[@]}" bash "$CE" --confirm --only "$ph" --account deployer 2>&1)
   rc=$?
   if [[ $rc -eq 3 ]] && grep -q "GATE FAIL at P0: .*$file is this run.s $ph output: the run manifest records .*($key). $ph is done" <<<"$out" &&
-    grep -q "do NOT re-run $ph" <<<"$out" && not_moved_aside "$out" && ! grep -qE -- "--(only|from) $ph([^0-9L]|$)" <<<"$out"; then
+    grep -q "do NOT re-run $ph" <<<"$out" && not_moved_aside "$out" && ! grep -qE -- "--(only|from) $ph([^0-9LV]|$)" <<<"$out"; then
     ok "ceremony C10: --only $ph after a recorded $ph is refused at P0 as done, never 'move it aside'"
   else
     bad "ceremony C10: --only $ph after a recorded $ph is refused at P0 as done, never 'move it aside' (exit $rc)" "$out"
@@ -2070,7 +2070,7 @@ fi
 # guard), except the P5 checker, which reads. A new direct call is flagged.
 c10_direct() { # <ceremony script> -> the executable lines that run forge or regenesis.sh directly
   # (continuation lines are joined first, so a call is judged with the command it belongs to)
-  sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$1" | grep -nE '"\$(FORGE|REGENESIS)"|forge_in_contracts' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'describe_cmd|run_broadcast P2 bash "\$REGENESIS"|run_broadcast "\$phase" forge_in_contracts "\$\{args\[@\]\}"|forge_output_config_check "\$CONTRACTS" "\$FORGE"\)|^[0-9]+:forge_in_contracts\(\) \{ \(cd "\$CONTRACTS" && "\$FORGE" "\$@"\); \}$|-[xf] "\$REGENESIS"|CheckDeployedAdmins|projectIpfsV3\(address,address\)|FORGE="\$\{FORGE' || true
+  sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$1" | grep -nE '"\$(FORGE|REGENESIS)"|forge_in_contracts' | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'describe_cmd|run_broadcast P2 bash "\$REGENESIS"|run_broadcast "\$phase" forge_in_contracts "\$\{args\[@\]\}"|forge_output_config_check "\$CONTRACTS" "\$FORGE"\)|^[0-9]+:forge_in_contracts\(\) \{ \(cd "\$CONTRACTS" && "\$FORGE" "\$@"\); \}$|-[xf] "\$REGENESIS"|CheckDeployedAdmins|projectIpfsV3\(address,address\)|DeployV060Genesis.s.sol --sig .verifyBook\(\).|FORGE="\$\{FORGE' || true
 }
 tw=$(c10_direct "$CE")
 [[ -z "$tw" ]] && ok "tripwire C10: the ceremony runs forge and regenesis.sh only through run_broadcast" || bad "tripwire C10: the ceremony runs forge and regenesis.sh only through run_broadcast" "$tw"
