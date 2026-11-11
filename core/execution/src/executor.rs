@@ -1637,7 +1637,16 @@ impl Executor {
     /// NEVER mutates the shared consensus `state_db`.
     pub fn state_root_readonly(&self) -> Hash {
         let iso = Arc::new(StateDB::new());
-        iso.restore(self.state_db.snapshot());
+        let snapshot = {
+            // Never a half-restored working set (see `read_gate`).
+            let _shared = if StateTransition::held_here() {
+                None
+            } else {
+                Some(self.read_gate.read())
+            };
+            self.state_db.snapshot()
+        };
+        iso.restore(snapshot);
         iso.calculate_state_root()
     }
 

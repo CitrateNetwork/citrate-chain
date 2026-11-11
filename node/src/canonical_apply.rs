@@ -2259,6 +2259,35 @@ impl CanonicalApplicator {
         }
     }
 
+    /// Abort a reorg: memory and the §R' policy cell back to `pre_state`, and
+    /// the store (at the fork point, `base_snapshot`) reconciled back to it with
+    /// `pre_tip` and the abandoned receipts, as ONE working-set transition, so
+    /// an external read waits for both halves instead of seeing memory on the
+    /// old branch with the store still at the fork point.
+    fn revert_to_pre_reorg(
+        &self,
+        pre_state: StateSnapshot,
+        pre_policy: Option<citrate_execution::block_rewards::EpochRewardPolicy>,
+        base_snapshot: &StateSnapshot,
+        pre_tip: AppliedTip,
+        restore_index: &ReceiptIndexBatch,
+        new_tip: Hash,
+    ) {
+        let _transition = self.executor.state_transition();
+        self.executor.state_restore(pre_state);
+        self.executor.restore_reward_policy(pre_policy);
+        if let Err(re) = self.executor.reconcile_store_from_with_index(
+            base_snapshot,
+            Some((pre_tip.hash, pre_tip.height)),
+            restore_index,
+        ) {
+            warn!(
+                "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
+                new_tip
+            );
+        }
+    }
+
     /// Reorg the applied chain to `new_tip`: revert world state to the fork point
     /// (the deepest applied block on both the current and the target chain), then
     /// re-apply + state-root-verify the winning branch forward to `new_tip`.
@@ -2592,18 +2621,14 @@ impl CanonicalApplicator {
             // Restore in-memory state + the §R' policy cell and best-effort re-reconcile
             // the store back to pre_state (with pre_tip), then decline the reorg — world
             // state is left as before the attempt (invariant I3).
-            self.executor.state_restore(pre_state.clone());
-            self.executor.restore_reward_policy(pre_policy.clone());
-            if let Err(re) = self.executor.reconcile_store_from_with_index(
+            self.revert_to_pre_reorg(
+                pre_state.clone(),
+                pre_policy.clone(),
                 &base_snapshot,
-                Some((pre_tip.hash, pre_tip.height)),
+                pre_tip,
                 &restore_index,
-            ) {
-                warn!(
-                    "execute-on-receive: reorg to {} abort — store restore failed: {re}",
-                    new_tip
-                );
-            }
+                new_tip,
+            );
             warn!(
                 "execute-on-receive: reorg to {} aborted — could not revert store to fork point {} @ {}: {} (reverted to {})",
                 new_tip, fork.hash, fork.height, e, pre_tip.hash
@@ -2668,18 +2693,14 @@ impl CanonicalApplicator {
         {
             if let Some(gov) = crate::registry_sync::greatest_snapshot_at(fork.height) {
                 if let Err(e) = hook(gov).await {
-                    self.executor.state_restore(pre_state.clone());
-                    self.executor.restore_reward_policy(pre_policy.clone());
-                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                    self.revert_to_pre_reorg(
+                        pre_state.clone(),
+                        pre_policy.clone(),
                         &base_snapshot,
-                        Some((pre_tip.hash, pre_tip.height)),
+                        pre_tip,
                         &restore_index,
-                    ) {
-                        warn!(
-                            "execute-on-receive: reorg to {} abort — store restore failed: {re}",
-                            new_tip
-                        );
-                    }
+                        new_tip,
+                    );
                     warn!(
                         "execute-on-receive: reorg to {} aborted — governing-epoch policy seed at S({}) failed: {} (reverted to {})",
                         new_tip, gov, e, pre_tip.hash
@@ -2703,18 +2724,14 @@ impl CanonicalApplicator {
                         Err(e) => e.to_string(),
                         _ => "not stored".to_string(),
                     };
-                    self.executor.state_restore(pre_state.clone());
-                    self.executor.restore_reward_policy(pre_policy.clone());
-                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                    self.revert_to_pre_reorg(
+                        pre_state.clone(),
+                        pre_policy.clone(),
                         &base_snapshot,
-                        Some((pre_tip.hash, pre_tip.height)),
+                        pre_tip,
                         &restore_index,
-                    ) {
-                        warn!(
-                            "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
-                            new_tip
-                        );
-                    }
+                        new_tip,
+                    );
                     warn!(
                         "execute-on-receive: reorg to {new_tip} aborted — branch block {branch_hash} unreadable: {e} (reverted to {})",
                         pre_tip.hash
@@ -2767,23 +2784,19 @@ impl CanonicalApplicator {
                     if crate::registry_sync::snapshot_epoch_at(h).is_some() {
                         if let Some(hook) = &self.registry_policy_resync {
                             if let Err(e) = hook(h).await {
-                                self.executor.state_restore(pre_state.clone());
-                                self.executor.restore_reward_policy(pre_policy.clone());
                                 // The store was reverted to the fork point before reapply;
                                 // reconcile it back to pre_state (with pre_tip in the same
                                 // atomic batch) so the abort leaves the durable store AND
                                 // durable tip byte-identical to before the reorg (I2).
                                 // memory == pre_state, store == fork point (== base_snapshot).
-                                if let Err(re) = self.executor.reconcile_store_from_with_index(
+                                self.revert_to_pre_reorg(
+                                    pre_state.clone(),
+                                    pre_policy.clone(),
                                     &base_snapshot,
-                                    Some((pre_tip.hash, pre_tip.height)),
+                                    pre_tip,
                                     &restore_index,
-                                ) {
-                                    warn!(
-                                        "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
-                                        new_tip
-                                    );
-                                }
+                                    new_tip,
+                                );
                                 warn!(
                                     "execute-on-receive: reorg to {} aborted — reward-policy resync at S({}) failed: {} (reverted to {})",
                                     new_tip, h, e, pre_tip.hash
@@ -2803,19 +2816,15 @@ impl CanonicalApplicator {
                     // store — reverted to the fork point before reapply — back to
                     // pre_state, so a failed reorg leaves BOTH in-memory state AND the
                     // store byte-identical to before the attempt (invariants I2/I3).
-                    self.executor.state_restore(pre_state);
-                    self.executor.restore_reward_policy(pre_policy.clone());
                     // memory == pre_state, store == fork point (== base_snapshot).
-                    if let Err(re) = self.executor.reconcile_store_from_with_index(
+                    self.revert_to_pre_reorg(
+                        pre_state,
+                        pre_policy.clone(),
                         &base_snapshot,
-                        Some((pre_tip.hash, pre_tip.height)),
+                        pre_tip,
                         &restore_index,
-                    ) {
-                        warn!(
-                            "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
-                            new_tip
-                        );
-                    }
+                        new_tip,
+                    );
                     warn!(
                         "execute-on-receive: reorg to {} aborted at {} — {} (reverted to {})",
                         new_tip, block.header.block_hash, e, pre_tip.hash
@@ -2859,18 +2868,14 @@ impl CanonicalApplicator {
             // leave memory ahead of a store that never received it; abort exactly
             // like a failed reapply instead: memory back to pre_state, store back
             // to pre_state with pre_tip and the abandoned receipts restored.
-            self.executor.state_restore(pre_state);
-            self.executor.restore_reward_policy(pre_policy);
-            if let Err(re) = self.executor.reconcile_store_from_with_index(
+            self.revert_to_pre_reorg(
+                pre_state,
+                pre_policy,
                 &base_snapshot,
-                Some((pre_tip.hash, pre_tip.height)),
+                pre_tip,
                 &restore_index,
-            ) {
-                warn!(
-                    "execute-on-receive: reorg to {} abort — store restore to pre_state failed: {re}",
-                    new_tip
-                );
-            }
+                new_tip,
+            );
             warn!(
                 "execute-on-receive: reorg to {} aborted — store commit of the winning branch failed: {} (reverted to {})",
                 new_tip, e, pre_tip.hash
