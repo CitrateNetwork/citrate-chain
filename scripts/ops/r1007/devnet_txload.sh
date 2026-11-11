@@ -16,7 +16,7 @@
 #     sends from one staker race its nonce;
 #   - run the workers in parallel. Each sends 1-wei self-transfers to that producer's own RPC
 #     at TPS / (producers x WORKERS) per second, for SECONDS.
-# One cast worker manages about 2.5 tx/s, so the default of 3 workers per producer covers
+# One cast worker manages about 2.5 tx/s, so the default of 4 workers per producer covers
 # 30 tx/s on 7 producers. Every producer receives load, and the blocks it seals carry
 # transactions that the others execute on receive.
 #
@@ -32,7 +32,7 @@ set -euo pipefail
 usage() { echo "usage: devnet_txload.sh run --fleet F --work D [--tps N] [--seconds N] [--workers N] | gate --work D" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 MODE=$1; shift
-FLEET="" WORK="" TPS=30 SECS=120 WORKERS=3
+FLEET="" WORK="" TPS=30 SECS=120 WORKERS=4
 if [[ "$MODE" == _producer ]]; then  # internal: NAME ROOT RATE SECS WORK WORKERS, inside a producer's netns
   WORK=$5
 fi
