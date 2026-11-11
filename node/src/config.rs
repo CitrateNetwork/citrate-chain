@@ -548,6 +548,18 @@ impl NodeConfig {
     pub fn validate(&self) -> Result<(), String> {
         // Validate validator configuration (fail-closed in production)
         self.validator.validate()?;
+        // Spec 06 G11 (fed#465): the pruning-point walk reads pruned DAG
+        // headers from the chain store, so a pruning chain store must keep at
+        // least PRUNING_DEPTH chain-block headers below the applied tip.
+        let depth = citrate_consensus::ghostdag::PRUNING_DEPTH;
+        if self.storage.pruning && self.storage.keep_blocks < depth {
+            return Err(format!(
+                "[storage] keep_blocks = {} with pruning on is below PRUNING_DEPTH ({depth}): \
+                 the G11 pruning-point walk reads chain-store headers that deep, so this node \
+                 could refuse valid blocks. Set keep_blocks >= {depth} or pruning = false",
+                self.storage.keep_blocks
+            ));
+        }
         Ok(())
     }
 
