@@ -518,6 +518,24 @@ class PlanAndGuards(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class DevnetHarness(unittest.TestCase):
+    """devnet.sh's stand-in r1006 health gate (P5, 2026-11-11). Every producer stays in
+    initial sync for about a minute after start ("refusing to produce: initial sync since
+    start has not completed"), so a 20 s settle made health-r1006 fail on 2 of 7
+    producers in two of three runs on the stamped gc3 binary. Run 3, with a 90 s settle,
+    passed. So did the rehearsal-stamp run (P5b)."""
+
+    def test_the_r1006_health_gate_waits_out_initial_sync(self):
+        import re as _re
+        text = (R7 / "devnet.sh").read_text()
+        m = _re.search(r"^SETTLE=(\d+)$", text, _re.M)
+        self.assertIsNotNone(m, "devnet.sh has no SETTLE default")
+        self.assertGreaterEqual(int(m.group(1)), 90)
+        line = next(l for l in text.splitlines() if l.strip().startswith("health-r1006)"))
+        self.assertIn('sleep "$SETTLE"', line)
+        self.assertIn("--settle-seconds", text)
+
+
 class Agent(unittest.TestCase):
     """node_agent.py's generation slots, in a temp root (proc mode)."""
 
