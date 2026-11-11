@@ -70,7 +70,8 @@ import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 ///         refuses before reading anything else. They are in WorkMarket's init code, so its
 ///         address is unknown until they are decided.
 ///
-///         Keys (fed #467 section 0.6; D-K3): GENESIS_KEY_INVENTORY (allowlist),
+///         Keys (fed #467 section 0.6; D-K3): GENESIS_KEY_INVENTORY (role-tagged allowlist, JSON
+///         {address: [roles]}; a council owner needs its council's role, GOV_OWNERS/GRD_OWNERS),
 ///         GENESIS_RETIRED_KEYS (denylist) and GENESIS_GUARDIAN_VETO_MARGIN, none with a default
 ///         (V060GovernanceSpec.KeyParams). Every owner of both councils, read on chain, must be on
 ///         the inventory and off the retired list; the deployer off the retired list.
@@ -313,7 +314,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     }
 
     function _keysFromEnv() internal view returns (V060GovernanceSpec.KeyParams memory k) {
-        k.keyInventory = vm.envOr("GENESIS_KEY_INVENTORY", ",", new address[](0));
+        (k.governanceOwners, k.guardianOwners) = inventoryRoles(vm.envOr("GENESIS_KEY_INVENTORY", string("")));
         k.retiredKeys = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
         k.guardianVetoMargin = vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0));
         V060GovernanceSpec.requireKeyParams(k);
@@ -343,14 +344,16 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     function _checkKeys(address deployer, Inputs memory i) internal view {
         V060GovernanceSpec.requireKeyParams(i.keys);
         V060GovernanceSpec.requireNotRetired("deployer", deployer, i.keys.retiredKeys);
-        _checkCouncilKeys("GOVERNANCE", i.governanceMultisig, i.governanceTimelock, i.keys);
-        _checkCouncilKeys("GUARDIAN", i.guardianMultisig, i.guardianTimelock, i.keys);
+        _checkCouncilKeys("GOVERNANCE", "GOV_OWNERS", i.governanceMultisig, i.governanceTimelock, i.keys.governanceOwners, i.keys);
+        _checkCouncilKeys("GUARDIAN", "GRD_OWNERS", i.guardianMultisig, i.guardianTimelock, i.keys.guardianOwners, i.keys);
     }
 
     function _checkCouncilKeys(
         string memory name,
+        string memory tag,
         address multisig,
         address timelock,
+        address[] memory allowed,
         V060GovernanceSpec.KeyParams memory k
     ) internal view {
         require(multisig.code.length != 0, string.concat(name, " multisig: no code"));
@@ -359,7 +362,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         address[] memory owners = MultisigProposer(multisig).owners();
         require(owners.length != 0, string.concat(name, " multisig: no owners"));
         for (uint256 n = 0; n < owners.length; n++) {
-            V060GovernanceSpec.requireKnownKey(string.concat(name, " owner"), owners[n], k);
+            V060GovernanceSpec.requireKnownKey(string.concat(name, " owner"), tag, owners[n], allowed, k);
         }
     }
 

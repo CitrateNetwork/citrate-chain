@@ -271,6 +271,33 @@ abstract contract GenesisProfile is Script, AdminChecks {
         return "";
     }
 
+    /// @notice The council roles of the role-tagged r1007 key inventory (GENESIS_KEY_INVENTORY,
+    ///         JSON {address: [roles]}; fed #467 section 0.6): the keys tagged GOV_OWNERS and the
+    ///         keys tagged GRD_OWNERS. Other roles are P0's to check (phase_inputs.py, which also
+    ///         refuses unknown roles). Empty input gives two empty lists; malformed JSON reverts.
+    function inventoryRoles(string memory json) public view returns (address[] memory gov, address[] memory grd) {
+        if (bytes(json).length == 0) return (gov, grd);
+        string[] memory keys = vm.parseJsonKeys(json, "$");
+        bool[] memory g = new bool[](keys.length);
+        bool[] memory r = new bool[](keys.length);
+        (uint256 ng, uint256 nr) = (0, 0);
+        for (uint256 i = 0; i < keys.length; i++) {
+            string[] memory roles = vm.parseJsonStringArray(json, string.concat("$['", keys[i], "']"));
+            for (uint256 j = 0; j < roles.length; j++) {
+                bytes32 h = keccak256(bytes(roles[j]));
+                if (h == keccak256("GOV_OWNERS") && !g[i]) (g[i], ng) = (true, ng + 1);
+                if (h == keccak256("GRD_OWNERS") && !r[i]) (r[i], nr) = (true, nr + 1);
+            }
+        }
+        (gov, grd) = (new address[](ng), new address[](nr));
+        (ng, nr) = (0, 0);
+        for (uint256 i = 0; i < keys.length; i++) {
+            address who = vm.parseAddress(keys[i]);
+            if (g[i]) gov[ng++] = who;
+            if (r[i]) grd[nr++] = who;
+        }
+    }
+
     function _readUint(address target, bytes memory cd) internal view returns (bool ok, uint256 value) {
         (bool success, bytes memory ret) = target.staticcall(cd);
         if (!success || ret.length != 32) return (false, 0);

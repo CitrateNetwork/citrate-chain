@@ -100,8 +100,9 @@ import {V060GovernanceSpec} from "./lib/V060GovernanceSpec.sol";
 ///         rejected.
 ///         With GENESIS_V060=1 three key parameters are required, none with a default
 ///         (V060GovernanceSpec.KeyParams; fed #467 section 0.6, D-K3):
-///           GENESIS_KEY_INVENTORY         the r1007 key inventory (public addresses); every
-///                                         council owner must be on it (an allowlist)
+///           GENESIS_KEY_INVENTORY         the r1007 key inventory, role-tagged JSON
+///                                         {address: [roles]}; every council owner must be on it
+///                                         with role GOV_OWNERS / GRD_OWNERS (an allowlist)
 ///           GENESIS_RETIRED_KEYS          the retired r1006 non-producer keys; no council owner
 ///                                         and not the deployer may be on it (a denylist)
 ///           GENESIS_GUARDIAN_VETO_MARGIN  seconds; GRD_MIN_DELAY plus this must fit inside the
@@ -172,11 +173,10 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         // Resolve the output path before broadcasting, so a missing one fails first.
         vm.envString("GENESIS_GOVERNANCE_OUT");
         if (v060) {
-            V060GovernanceSpec.KeyParams memory k = V060GovernanceSpec.KeyParams({
-                keyInventory: vm.envOr("GENESIS_KEY_INVENTORY", ",", new address[](0)),
-                retiredKeys: vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0)),
-                guardianVetoMargin: vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0))
-            });
+            V060GovernanceSpec.KeyParams memory k;
+            (k.governanceOwners, k.guardianOwners) = inventoryRoles(vm.envOr("GENESIS_KEY_INVENTORY", string("")));
+            k.retiredKeys = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
+            k.guardianVetoMargin = vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0));
             d = deployWithV060(deployer, gov, grd, allowShared, allowWeak, k);
         } else {
             d = deployWith(deployer, gov, grd, allowShared, allowWeak, genesisProfile);
@@ -224,10 +224,10 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         V060GovernanceSpec.requireKeyParams(k);
         V060GovernanceSpec.requireNotRetired("deployer", deployer, k.retiredKeys);
         for (uint256 i = 0; i < gov.owners.length; i++) {
-            V060GovernanceSpec.requireKnownKey("GOVERNANCE owner", gov.owners[i], k);
+            V060GovernanceSpec.requireKnownKey("GOVERNANCE owner", "GOV_OWNERS", gov.owners[i], k.governanceOwners, k);
         }
         for (uint256 i = 0; i < grd.owners.length; i++) {
-            V060GovernanceSpec.requireKnownKey("GUARDIAN owner", grd.owners[i], k);
+            V060GovernanceSpec.requireKnownKey("GUARDIAN owner", "GRD_OWNERS", grd.owners[i], k.guardianOwners, k);
         }
         V060GovernanceSpec.requireVetoMargin(grd.minDelay, k.guardianVetoMargin);
         guardianVetoMargin = k.guardianVetoMargin;

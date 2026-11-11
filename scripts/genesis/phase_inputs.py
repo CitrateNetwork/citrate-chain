@@ -418,8 +418,8 @@ def preflight(spec, run_phases, started_after, deployer):
     return problems
 
 
-PRODUCERS = os.path.normpath(os.path.join(HERE, "..", "..", "core", "economics", "assets", "r1006", "validators.json"))
 VETO_WINDOW = 24 * 3600
+COUNCIL_ROLES = ("GOV_OWNERS", "GRD_OWNERS")
 
 
 def _address_list(raw, key, problems):
@@ -433,25 +433,56 @@ def _address_list(raw, key, problems):
     return out
 
 
-def producer_stakers(path=PRODUCERS):
-    """The producer stakers (fed #467 section 0.1: exposed and not rotated), from validators.json."""
+def role_inputs(inputs):
+    """The role-holding address inputs: every address-typed p0/late input that is not a
+    contract ("kind": "contract", checked against the ceremony's books instead), plus the
+    council owner lists. These names are the role vocabulary of GENESIS_KEY_INVENTORY."""
+    roles = [k for k, e in sorted(inputs.items())
+             if e.get("class") in ("p0", "late") and e.get("type", "address") == "address" and e.get("kind") != "contract"]
+    return roles + list(COUNCIL_ROLES)
+
+
+def key_inventory(raw, vocabulary, problems):
+    """GENESIS_KEY_INVENTORY: role-tagged JSON {address: [roles]} (fed #467 section 0.6).
+    Returns {lowercase address: set(roles)}; problems name every malformed part."""
     try:
-        with open(path) as f:
-            return {v["staker"].lower() for v in json.load(f)["validators"]}
-    except (OSError, ValueError, KeyError, TypeError) as e:
-        die(f"cannot read the producer stakers from {path}: {e}")
+        d = json.loads(raw)
+    except ValueError:
+        d = None
+    if not isinstance(d, dict) or not d:
+        problems.append("GENESIS_KEY_INVENTORY is not a JSON object {address: [roles]} with at least one key")
+        return {}
+    inv = {}
+    for a, roles in d.items():
+        if not isinstance(a, str) or not ADDR.fullmatch(a) or int(a, 16) == 0:
+            problems.append(f"GENESIS_KEY_INVENTORY: {a!r} is not a nonzero address")
+            continue
+        if not isinstance(roles, list) or not roles or not all(isinstance(r, str) for r in roles):
+            problems.append(f"GENESIS_KEY_INVENTORY: {a} needs a non-empty list of role names")
+            continue
+        for r in roles:
+            if r not in vocabulary:
+                problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} has an unknown role {r!r} (known: {', '.join(vocabulary)})")
+        if a.lower() in inv:
+            problems.append(f"GENESIS_KEY_INVENTORY: {a} appears more than once")
+        inv[a.lower()] = set(roles)
+    return inv
 
 
 def retired_key_problems(inputs, env, deployer):
-    """Keys of the 0.6.0 ceremony genesis (fed #467 section 0.6; D-K3, owner 2026-11-10).
+    """Keys of the 0.6.0 ceremony genesis (fed #467 section 0.6 steps 3-4; D-K3, owner 2026-11-10).
 
-    An entry with "required_with": K must be set when K=1. With GENESIS_V060=1, every address
-    input of the run (whatever its phase) and every council owner must be on
-    GENESIS_KEY_INVENTORY or be a producer staker (the allowlist), and none of them, nor the
-    deployer, may be on GENESIS_RETIRED_KEYS (the extra denylist). The deployer is the throwaway
-    ceremony key: it is not on the inventory, and it must end with no role and zero balance
-    (P5 and emit_alloc check that). GRD_MIN_DELAY plus GENESIS_GUARDIAN_VETO_MARGIN must fit in
-    the 24 h ProviderRegistry veto window."""
+    An entry with "required_with": K must be set when K=1. With GENESIS_V060=1:
+      - GENESIS_KEY_INVENTORY is role-tagged JSON {address: [roles]}, roles from role_inputs();
+      - every role-holding address input, and every council owner, must be on it WITH that
+        role. There is no exemption for a producer staker: stakers sign nothing before S4-5
+        (section 0.1), so none may hold a ceremony role. Stakers stay allowed only as funded
+        or referenced block-0 accounts, which the alloc check (section 0.6 step 3) covers;
+      - contract inputs ("kind": "contract", e.g. PATRONAGE_MEMBERSHIP) are not keys: the phase
+        that reads one checks it against this run's books;
+      - none of them, nor the deployer, may be on GENESIS_RETIRED_KEYS (an extra denylist);
+      - the deployer is the throwaway ceremony key: never on the inventory, no other seat;
+      - GRD_MIN_DELAY plus GENESIS_GUARDIAN_VETO_MARGIN must fit in the 24 h veto window."""
     problems = []
     for k, e in sorted(inputs.items()):
         w = e.get("required_with")
@@ -459,17 +490,16 @@ def retired_key_problems(inputs, env, deployer):
             problems.append(f"{k} is not set; {w}=1 requires it ({e['why']})")
     if env.get("GENESIS_V060", "") != "1":
         return problems
-    retired = _address_list(env.get("GENESIS_RETIRED_KEYS", ""), "GENESIS_RETIRED_KEYS", problems) if env.get("GENESIS_RETIRED_KEYS", "").strip() else set()
+    retired = _address_list(env["GENESIS_RETIRED_KEYS"], "GENESIS_RETIRED_KEYS", problems) if env.get("GENESIS_RETIRED_KEYS", "").strip() else set()
+    vocabulary = role_inputs(inputs)
     raw_inv = env.get("GENESIS_KEY_INVENTORY", "").strip()
-    inventory = _address_list(raw_inv, "GENESIS_KEY_INVENTORY", problems) if raw_inv else None
-    stakers = producer_stakers()
+    inventory = key_inventory(raw_inv, vocabulary, problems) if raw_inv else None
     named = []
-    for k, e in sorted(inputs.items()):
-        v = env.get(k, "").strip()
-        if v and e.get("type", "address" if e.get("class") in ("p0", "late") else "") == "address":
-            named.append((k, v))
-    for k in ("GOV_OWNERS", "GRD_OWNERS"):
-        named += [(k, x.strip()) for x in env.get(k, "").split(",") if x.strip()]
+    for k in vocabulary:
+        if k in COUNCIL_ROLES:
+            named += [(k, x.strip()) for x in env.get(k, "").split(",") if x.strip()]
+        elif env.get(k, "").strip():
+            named.append((k, env[k].strip()))
     deps = [(k, env[k].strip()) for k in ("DEPLOYER_ADDRESS", "CEREMONY_DEPLOYER_ADDRESS") if env.get(k, "").strip()]
     if deployer:
         deps.append(("the deployer", deployer))
@@ -480,12 +510,14 @@ def retired_key_problems(inputs, env, deployer):
         dep_set = {v.lower() for _, v in deps}
         for k, v in named:
             lv = v.lower()
-            if lv in inventory or lv in stakers:
-                continue
             if lv in dep_set:
                 problems.append(f"{k} ({v}) is the deployer; the throwaway ceremony key may hold no other seat")
-                continue
-            problems.append(f"{k} ({v}) is not in GENESIS_KEY_INVENTORY (the r1007 key inventory) and is not a producer staker")
+            elif k not in inventory.get(lv, set()):
+                problems.append(f"{k} ({v}) is not in GENESIS_KEY_INVENTORY with role {k}")
+    for k, e in sorted(inputs.items()):
+        dv, v = e.get("decided"), env.get(k, "").strip()
+        if dv is not None and v and v != dv:
+            problems.append(f"{k} is {v}; the owner decided {dv} ({e.get('decided_by', 'owner')})")
     margin = env.get("GENESIS_GUARDIAN_VETO_MARGIN", "").strip()
     delay = env.get("GRD_MIN_DELAY", "").strip()
     if margin:

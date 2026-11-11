@@ -1560,6 +1560,21 @@ if should P4; then
   if [[ "$MODE" != dry ]]; then
     need_env P4 PATRONAGE_MEMBERSHIP
     why=$(phase_inputs P4 P3L) || gate_fail P4 "phase inputs: $why"
+    # A contract input is not a key (the 0.6.0 key inventory does not cover it): in a 0.6.0 run
+    # PATRONAGE_MEMBERSHIP must be this ceremony's own CitrateMemberSBT, the P2 book's entry,
+    # whose CREATE2 provenance and code P2's generator checked, and on --confirm that book must
+    # be the stack book this run recorded and the address must hold code.
+    if [[ "${GENESIS_V060:-}" == 1 ]]; then
+      msbt=$(book_addr "$ADDRESS_BOOK" CitrateMemberSBT) && is_addr "$msbt" ||
+        gate_fail P4 "$ADDRESS_BOOK has no CitrateMemberSBT: in a 0.6.0 run PATRONAGE_MEMBERSHIP must be this ceremony's member SBT"
+      [[ "$(lower "$PATRONAGE_MEMBERSHIP")" == "$(lower "$msbt")" ]] ||
+        gate_fail P4 "PATRONAGE_MEMBERSHIP is $PATRONAGE_MEMBERSHIP, not this ceremony's CitrateMemberSBT $msbt (the P2 book); a 0.6.0 run takes no other contract"
+      if [[ "$MODE" == confirm ]]; then
+        stack_book_bound P4 1
+        [[ "$("$CAST" code "$msbt" --rpc-url "$RPC_URL" 2>/dev/null)" != 0x ]] || gate_fail P4 "CitrateMemberSBT $msbt has no code"
+      fi
+      log "P4 PATRONAGE_MEMBERSHIP is this ceremony's CitrateMemberSBT $msbt"
+    fi
     # PatronageLedger's KYC registry is the library's KYCRegistry (P3L, under GOVERNANCE); on
     # --confirm the library book must be the one P3L recorded. A preset other value is refused.
     [[ -f "$LIB_BOOK" ]] || gate_fail P4 "$LIB_BOOK missing (run P3L first): PatronageLedger's KYC registry is the library's KYCRegistry"

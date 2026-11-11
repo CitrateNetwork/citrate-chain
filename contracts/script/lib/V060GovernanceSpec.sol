@@ -22,17 +22,22 @@ library V060GovernanceSpec {
     /// The governance book records which canceller generation holds GOVERNANCE's CANCELLER seat.
     uint256 internal constant CANCELLER_V2 = 2;
 
-    /// @notice The key parameters the 0.6.0 genesis is built with (fed #467 §0.6; D-K3). Public
-    ///         addresses only, owner-provided, no defaults:
-    ///           keyInventory        the r1007 key inventory: every account the genesis funds,
-    ///                               references or gives a role must be in it (an allowlist);
-    ///                               the ceremony deployer is the one exception, and it must end
-    ///                               with no role and (checked at alloc time) zero balance
+    /// @notice The key parameters the 0.6.0 genesis is built with (fed #467 section 0.6; D-K3).
+    ///         Public addresses only, owner-provided, no defaults:
+    ///           governanceOwners    the r1007 key inventory's keys with role GOV_OWNERS
+    ///           guardianOwners      the r1007 key inventory's keys with role GRD_OWNERS
+    ///                               (GENESIS_KEY_INVENTORY is role-tagged JSON {address: [roles]};
+    ///                               a council owner must be on it WITH its council's role. P0
+    ///                               checks every other role input and the role vocabulary. The
+    ///                               ceremony deployer is never on it and ends with no role)
     ///           retiredKeys         the r1006 non-producer keys D-K3 retired (an extra denylist)
     ///           guardianVetoMargin  seconds the GUARDIAN timelock delay must leave inside the
-    ///                               ProviderRegistry veto window, so a veto lands in time
+    ///                               ProviderRegistry veto window, so a veto lands in time;
+    ///                               decided by the owner on 2026-11-11 as 7200 s
+    ///                               (DECIDED_GUARDIAN_VETO_MARGIN), and still a required input
     struct KeyParams {
-        address[] keyInventory;
+        address[] governanceOwners;
+        address[] guardianOwners;
         address[] retiredKeys;
         uint256 guardianVetoMargin;
     }
@@ -41,28 +46,41 @@ library V060GovernanceSpec {
         "PENDING PARAMETER: GENESIS_KEY_INVENTORY must list the r1007 key inventory (public addresses; fed #467 section 0.6)";
     string internal constant PENDING_VETO_MARGIN =
         "PENDING PARAMETER: GENESIS_GUARDIAN_VETO_MARGIN (seconds, above zero) is the owner's margin inside the ProviderRegistry veto window";
+    /// GENESIS_GUARDIAN_VETO_MARGIN as the owner decided it (2026-11-11): 2 h. Not a default:
+    /// the input must still be given, and any other value is refused.
+    uint256 internal constant DECIDED_GUARDIAN_VETO_MARGIN = 2 hours;
+    string internal constant VETO_MARGIN_NOT_DECIDED =
+        "GENESIS_GUARDIAN_VETO_MARGIN is not the owner's decided value (7200 s, owner 2026-11-11)";
     string internal constant VETO_MARGIN_TOO_SMALL =
         "GUARDIAN timelock: minDelay plus GENESIS_GUARDIAN_VETO_MARGIN must fit inside the ProviderRegistry veto window (24 h)";
 
     /// @notice Reverts unless all three key parameters are given (none has a default).
     function requireKeyParams(KeyParams memory k) internal pure {
-        require(k.keyInventory.length != 0, PENDING_KEY_INVENTORY);
+        require(k.governanceOwners.length != 0 && k.guardianOwners.length != 0, PENDING_KEY_INVENTORY);
         require(k.retiredKeys.length != 0, PENDING_RETIRED_KEYS);
         require(k.guardianVetoMargin != 0, PENDING_VETO_MARGIN);
     }
 
-    /// @notice A council owner: on the inventory (allowlist) and not a retired key (denylist).
-    function requireKnownKey(string memory role, address who, KeyParams memory k) internal pure {
+    /// @notice A council owner: off the retired list (denylist), and on the inventory with its
+    ///         council's role (`tag`, GOV_OWNERS or GRD_OWNERS; `allowed` is that role's keys).
+    function requireKnownKey(
+        string memory role,
+        string memory tag,
+        address who,
+        address[] memory allowed,
+        KeyParams memory k
+    ) internal pure {
         requireNotRetired(role, who, k.retiredKeys);
-        for (uint256 i = 0; i < k.keyInventory.length; i++) {
-            if (k.keyInventory[i] == who) return;
+        for (uint256 i = 0; i < allowed.length; i++) {
+            if (allowed[i] == who) return;
         }
-        revert(string.concat(role, " is not in GENESIS_KEY_INVENTORY (the r1007 key inventory)"));
+        revert(string.concat(role, " is not in GENESIS_KEY_INVENTORY with role ", tag));
     }
 
     /// @notice The GUARDIAN timelock delay leaves `margin` inside the registry veto window.
     function requireVetoMargin(uint256 guardianDelay, uint256 margin) internal pure {
         require(margin != 0, PENDING_VETO_MARGIN);
+        require(margin == DECIDED_GUARDIAN_VETO_MARGIN, VETO_MARGIN_NOT_DECIDED);
         require(guardianDelay + margin <= PROVIDER_VETO_WINDOW, VETO_MARGIN_TOO_SMALL);
     }
 
