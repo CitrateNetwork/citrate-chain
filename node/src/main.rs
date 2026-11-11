@@ -5140,7 +5140,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
 }
 
 /// The one start-up line the devnet judge greps (fed#535): the slot length
-/// consensus runs with, the configured `[mining] target_block_time`, and the
+/// consensus runs with, the configured `[mining] target_block_time`, the
+/// production period that becomes on the slot grid (this producer seals every
+/// `production_period_secs`; a cadence, not a consensus value), and the
 /// chain-params fingerprint (SHA-256 of `GenesisChainParams::render()` for a
 /// genesis that compiles chain params, `none` otherwise). Stable `key=value`
 /// fields after a fixed tag.
@@ -5151,9 +5153,10 @@ fn slot_config_line(target_block_time: u64, params_render: Option<&str>) -> Stri
         None => "none".to_string(),
     };
     format!(
-        "SLOT_CONFIG slot_secs={} target_block_time={} chain_params_fp={}",
+        "SLOT_CONFIG slot_secs={} target_block_time={} production_period_secs={} chain_params_fp={}",
         citrate_consensus::slots::SLOT_DURATION_SECS,
         target_block_time,
+        crate::timing::production_period_secs(target_block_time),
         fp
     )
 }
