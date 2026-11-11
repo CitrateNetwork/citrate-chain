@@ -131,6 +131,46 @@ fn reorg_forward_cap() -> u64 {
     MAX_REORG_FORWARD
 }
 
+/// The two points of a reorg's working-set transition a test can observe.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReorgWindow {
+    /// The transition is held; memory and store are still on the old branch.
+    BeforeRestore,
+    /// Memory is at the fork point; the store is still on the old branch.
+    AfterRestore,
+}
+
+/// Test-only per-thread observer of [`ReorgWindow`] points in `reorg_to`, so
+/// a test can read state exactly inside the transition (no sleeps).
+#[cfg(test)]
+pub(crate) mod test_reorg_window {
+    use super::ReorgWindow;
+    use std::cell::RefCell;
+    type Hook = Box<dyn Fn(ReorgWindow)>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    /// Observe this thread's reorg windows until the returned guard drops.
+    pub(crate) fn set(hook: impl Fn(ReorgWindow) + 'static) -> Reset {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        Reset
+    }
+    pub(crate) fn fire(at: ReorgWindow) {
+        HOOK.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f(at)
+            }
+        });
+    }
+    pub(crate) struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = None);
+        }
+    }
+}
+
 /// Test-only per-thread override of the forward branch cap, so tests can reach
 /// the far-ahead paths with a few hundred blocks.
 #[cfg(test)]
@@ -2499,42 +2539,49 @@ impl CanonicalApplicator {
                 }
             },
         };
-        self.executor.state_restore(base_snapshot.clone());
+        let reverted = {
+            #[cfg(test)]
+            test_reorg_window::fire(ReorgWindow::BeforeRestore);
+            self.executor.state_restore(base_snapshot.clone());
+            #[cfg(test)]
+            test_reorg_window::fire(ReorgWindow::AfterRestore);
 
-        // REORG-STORE-FIX (consensus fork remediation). The durable store is a FLAT
-        // latest-state KV: an account/slot ABSENT from the in-memory fork-point working
-        // set falls THROUGH to the store on read (`Executor::get_balance`/`get_nonce`/
-        // `get_code_hash` and the REVM adapter `basic`/`storage`). Immediately after the
-        // in-memory revert above, the store STILL holds the LOSING branch (`pre_state`),
-        // so a reapply read of any account the fork point never resident-cached but the
-        // losing branch persisted would return the losing value — settling the winning
-        // block against stale state → state-root mismatch → the reorg ABORTS and the
-        // node REJECTS a valid heavier branch its peers accepted (a partition/fork). This
-        // is generic (it also bites NORMAL-TX reorgs), and §R' registry credits trigger
-        // it reliably (the registry is credited on both branches but untouched at the
-        // fork point).
-        //
-        // Fix: revert the durable store to the FORK POINT *before* reapply, so every
-        // read-through resolves against fork-point state — uniformly for balance / nonce
-        // / code / storage. `reconcile_store_from(baseline)` writes the diff from
-        // `baseline` to CURRENT in-memory state; with memory just restored to the fork
-        // point and the store == `pre_state`, `reconcile_store_from(&pre_state)` rewrites
-        // the store from the losing branch back to the fork point (put changed accounts
-        // /slots at their fork-point value, delete losing-branch-created ones). On
-        // SUCCESS the store is reconciled forward to the winning branch (baseline = the
-        // fork point); on EVERY abort it is reconciled back to `pre_state` — so an
-        // aborted reorg still leaves the store byte-identical to before the attempt
-        // (HIGH-2 / invariant I2). Only committed branch states (fork point / pre_state /
-        // winning) are ever written — never an un-rollback-able candidate.
-        // #126: land the FORK-POINT tip in the SAME fsync'd batch as the fork-point
-        // state, so a crash during the (in-memory-only) reapply below leaves durable
-        // state and durable tip both AT THE FORK POINT — never torn. On success the tip
-        // advances to the winning tip (below); on abort it is restored to pre_tip.
-        if let Err(e) = self.executor.reconcile_store_from_with_index(
-            &pre_state,
-            Some((fork.hash, fork.height)),
-            &abandon_index,
-        ) {
+            // REORG-STORE-FIX (consensus fork remediation). The durable store is a FLAT
+            // latest-state KV: an account/slot ABSENT from the in-memory fork-point working
+            // set falls THROUGH to the store on read (`Executor::get_balance`/`get_nonce`/
+            // `get_code_hash` and the REVM adapter `basic`/`storage`). Immediately after the
+            // in-memory revert above, the store STILL holds the LOSING branch (`pre_state`),
+            // so a reapply read of any account the fork point never resident-cached but the
+            // losing branch persisted would return the losing value — settling the winning
+            // block against stale state → state-root mismatch → the reorg ABORTS and the
+            // node REJECTS a valid heavier branch its peers accepted (a partition/fork). This
+            // is generic (it also bites NORMAL-TX reorgs), and §R' registry credits trigger
+            // it reliably (the registry is credited on both branches but untouched at the
+            // fork point).
+            //
+            // Fix: revert the durable store to the FORK POINT *before* reapply, so every
+            // read-through resolves against fork-point state — uniformly for balance / nonce
+            // / code / storage. `reconcile_store_from(baseline)` writes the diff from
+            // `baseline` to CURRENT in-memory state; with memory just restored to the fork
+            // point and the store == `pre_state`, `reconcile_store_from(&pre_state)` rewrites
+            // the store from the losing branch back to the fork point (put changed accounts
+            // /slots at their fork-point value, delete losing-branch-created ones). On
+            // SUCCESS the store is reconciled forward to the winning branch (baseline = the
+            // fork point); on EVERY abort it is reconciled back to `pre_state` — so an
+            // aborted reorg still leaves the store byte-identical to before the attempt
+            // (HIGH-2 / invariant I2). Only committed branch states (fork point / pre_state /
+            // winning) are ever written — never an un-rollback-able candidate.
+            // #126: land the FORK-POINT tip in the SAME fsync'd batch as the fork-point
+            // state, so a crash during the (in-memory-only) reapply below leaves durable
+            // state and durable tip both AT THE FORK POINT — never torn. On success the tip
+            // advances to the winning tip (below); on abort it is restored to pre_tip.
+            self.executor.reconcile_store_from_with_index(
+                &pre_state,
+                Some((fork.hash, fork.height)),
+                &abandon_index,
+            )
+        };
+        if let Err(e) = reverted {
             // The reconcile is a single atomic batch (unchanged on failure).
             // Restore in-memory state + the §R' policy cell and best-effort re-reconcile
             // the store back to pre_state (with pre_tip), then decline the reorg — world
@@ -7152,6 +7199,232 @@ pub(crate) mod tests {
             follower.get_balance(&Address(TREASURY_ADDR)),
             "treasury reward durable balance matches after reorg"
         );
+    }
+
+    /// Two branches off a shared a1 on a store-backed follower that has applied
+    /// the A branch (a2 ALICE→BOB, a3 accepts it: ALICE nonce 2, BOB created and
+    /// persisted on A). B (b2, b3 ALICE→CAROL, b4 accepts b3) is heavier and never
+    /// touches BOB. Returns the follower's applicator (A applied, fork choice on
+    /// b4), the follower, its storage, and b4.
+    async fn readthrough_reorg_fixture() -> (
+        tempfile::TempDir,
+        CanonicalApplicator,
+        Arc<Executor>,
+        Arc<StorageManager>,
+        Block,
+    ) {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(
+            &pa,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![transfer(ALICE, DAVE, 1_000, 0)],
+        )
+        .await;
+        let a2 = produce(
+            &pa,
+            a1.header.block_hash,
+            2,
+            VRF_OUT,
+            vec![transfer(ALICE, BOB, 1_000, 1)],
+        )
+        .await;
+        let a3 = produce(&pa, a2.header.block_hash, 3, VRF_OUT, vec![]).await;
+        for b in [&a1, &a2, &a3] {
+            persist(&storage, b);
+            app.apply_received(b).await;
+        }
+        assert_eq!(app.applied_tip().await.height, 3, "A applied");
+        assert_eq!(follower.get_nonce(&Address(ALICE)), 2, "A ran ALICE's two txs");
+
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(
+            &pb,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![transfer(ALICE, DAVE, 1_000, 0)],
+        )
+        .await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(
+            &pb,
+            a1.header.block_hash,
+            2,
+            vrf_b,
+            vec![transfer(ALICE, CAROL, 1_000, 1)],
+        )
+        .await;
+        let b3 = produce(
+            &pb,
+            b2.header.block_hash,
+            3,
+            vrf_b,
+            vec![transfer(ALICE, CAROL, 1_000, 2)],
+        )
+        .await;
+        let b4 = produce(&pb, b3.header.block_hash, 4, vrf_b, vec![]).await;
+        for b in [&b2, &b3, &b4] {
+            persist(&storage, b);
+        }
+        app.fork_choice = Some(fork_choice_returning(b4.header.block_hash));
+        (dir, app, follower, storage, b4)
+    }
+
+    /// The reorg landed on B and left nothing of A in memory or in the store.
+    async fn assert_on_b(
+        app: &CanonicalApplicator,
+        follower: &Executor,
+        storage: &Arc<StorageManager>,
+        what: &str,
+    ) {
+        assert_eq!(app.applied_tip().await.height, 4, "{what}: reorged to B");
+        assert_eq!(
+            follower.get_nonce(&Address(ALICE)),
+            3,
+            "{what}: ALICE's B nonce"
+        );
+        assert_eq!(
+            follower.get_balance(&Address(CAROL)),
+            U256::from(2_000u64),
+            "{what}: CAROL funded on B"
+        );
+        assert!(
+            !follower.state_db().accounts.exists(&Address(BOB)),
+            "{what}: BOB (A only) is not in the working set"
+        );
+        let restarted = store_backed(storage);
+        assert_eq!(
+            restarted.get_balance(&Address(BOB)),
+            U256::zero(),
+            "{what}: BOB (A only) is not in the store"
+        );
+        assert_eq!(
+            restarted.get_nonce(&Address(ALICE)),
+            3,
+            "{what}: ALICE's durable nonce is B's"
+        );
+    }
+
+    /// gc2 tx-load split (2026-11-11): an external read (mempool admission, RPC)
+    /// landing between the reorg's snapshot restore and its store revert must
+    /// not pull the abandoned branch's account into the working set. Before the
+    /// fix, `get_balance` loaded BOB from the store (still on A) into memory as
+    /// clean state; the store revert then kept it, B's reapply folded it into
+    /// the state root, the reorg aborted and the node stayed on A.
+    #[tokio::test]
+    async fn an_external_read_inside_the_reorg_window_changes_nothing() {
+        let (_dir, mut app, follower, storage, b4) = readthrough_reorg_fixture().await;
+        let reader = follower.clone();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let _hook = test_reorg_window::set(move |at| {
+            if at == ReorgWindow::AfterRestore {
+                // The ingress reads a node makes for an incoming tx and a
+                // balance query, inline at the window (no thread, no timing).
+                let bal = reader.get_balance(&Address(BOB));
+                let nonce = reader.get_nonce(&Address(ALICE));
+                let code = reader.get_code_hash(&Address(BOB));
+                log.lock().push((bal, nonce, code));
+            }
+        });
+        app.apply_received(&b4).await;
+        assert_eq!(seen.lock().len(), 1, "the reorg passed through its window once");
+        assert_on_b(&app, &follower, &storage, "read inside the window").await;
+    }
+
+    /// The same reorg with a reader thread hammering the ingress reads, released
+    /// by a barrier at the start of the transition, 1,000 times. Every reorg
+    /// lands on B with nothing of A left, and no read sees a mix (memory at the
+    /// fork point with the store on A): while the transition is held a reader
+    /// waits, so a read released inside it returns the old branch's or the new
+    /// branch's values, never the abandoned store's BOB on a fork-point memory.
+    #[tokio::test]
+    async fn concurrent_ingress_reads_during_a_reorg_never_change_its_outcome() {
+        for round in 0..1_000u32 {
+            let (_dir, mut app, follower, storage, b4) = readthrough_reorg_fixture().await;
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (exec, gate, stop) = (follower.clone(), gate.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    let mut reads = 0u64;
+                    loop {
+                        let _ = exec.get_nonce(&Address(ALICE));
+                        let _ = exec.get_balance(&Address(BOB));
+                        let _ = exec.get_code_hash(&Address(CAROL));
+                        let _ = exec.get_canonical_account(&Address(DAVE));
+                        reads = reads.saturating_add(1);
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            return reads;
+                        }
+                    }
+                })
+            };
+            let release = gate.clone();
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mark = fired.clone();
+            let _hook = test_reorg_window::set(move |at| {
+                if at == ReorgWindow::BeforeRestore {
+                    mark.store(true, std::sync::atomic::Ordering::SeqCst);
+                    release.wait();
+                }
+            });
+            app.apply_received(&b4).await;
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if !fired.load(std::sync::atomic::Ordering::SeqCst) {
+                // Never reached the window: release the reader so the failure
+                // below is reported instead of a hang.
+                gate.wait();
+            }
+            let reads = reader.join().expect("reader");
+            assert!(reads > 0, "round {round}: the reader ran");
+            assert_on_b(&app, &follower, &storage, &format!("round {round}")).await;
+        }
+    }
+
+    /// The external reads never change the working set: not its accounts, not
+    /// its dirty set, not the state root (the fold covers every RESIDENT
+    /// account, so a read that made an account resident could move it).
+    #[tokio::test]
+    async fn external_reads_leave_the_working_set_unchanged() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let writer = store_backed(&storage);
+        writer.set_balance(&Address(BOB), U256::from(7u64));
+        writer.set_nonce(&Address(BOB), 5);
+        writer.persist_state_changes().await.expect("persist");
+        let exec = store_backed(&storage);
+        exec.set_balance(&Address(ALICE), U256::from(FUND));
+        let before_accounts = exec.state_db().accounts.all_accounts().len();
+        let before_root = exec.get_state_root().expect("root");
+        assert!(!exec.state_db().accounts.exists(&Address(BOB)), "BOB only in the store");
+        assert_eq!(exec.get_balance(&Address(BOB)), U256::from(7u64), "read through");
+        assert_eq!(exec.get_nonce(&Address(BOB)), 5, "read through");
+        let _ = exec.get_code_hash(&Address(BOB));
+        let _ = exec.get_canonical_account(&Address(BOB));
+        assert!(
+            !exec.state_db().accounts.exists(&Address(BOB)),
+            "a read never makes an account resident"
+        );
+        assert_eq!(exec.state_db().accounts.all_accounts().len(), before_accounts);
+        assert_eq!(exec.get_state_root().expect("root"), before_root);
     }
 
     /// HIGH-2 (abort path): a reorg that aborts on a bad block must leave the
