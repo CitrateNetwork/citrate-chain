@@ -543,7 +543,9 @@ class DevnetTxLoad(unittest.TestCase):
 
     TXL = R7 / "devnet_txload.sh"
 
-    def _work(self, logs: dict, included: dict) -> Path:
+    def _work(self, logs: dict, included: dict, expected=None, target: int = 0) -> Path:
+        """included: worker id -> included count (sent = included + 3). expected: the worker ids
+        `run` started (default: the keys of included). target: tx the run aimed for."""
         w = Path(tempfile.mkdtemp(prefix="r1007txl."))
         self.addCleanup(shutil.rmtree, w, True)
         for host, text in logs.items():
@@ -551,9 +553,11 @@ class DevnetTxLoad(unittest.TestCase):
             d.mkdir(parents=True)
             (d / "node-r1007.log").write_text(text)
         (w / "txload").mkdir()
-        for host, n in included.items():
-            (w / "txload" / f"{host}.included").write_text(f"{n}\n")
-            (w / "txload" / f"{host}.sent").write_text(f"{n + 3}\n")
+        for wid, n in included.items():
+            (w / "txload" / f"{wid}.included").write_text(f"{n}\n")
+            (w / "txload" / f"{wid}.sent").write_text(f"{n + 3}\n")
+        (w / "txload" / "expected").write_text("\n".join(expected if expected is not None else included) + "\n")
+        (w / "txload" / "target").write_text(f"{target}\n")
         return w
 
     def gate(self, w: Path) -> subprocess.CompletedProcess:
@@ -590,10 +594,33 @@ class DevnetTxLoad(unittest.TestCase):
         r = self.gate(self._work({"citrate-prod-4": "ERROR Block disqualified: bad state root\n"}, {"citrate-prod-4": 10}))
         self.assertEqual(r.returncode, 1, r.stdout)
 
-    def test_gate_fails_when_no_load_was_included(self):
+    def test_gate_is_a_harness_error_when_no_load_was_included(self):
         r = self.gate(self._work({"citrate-prod-1": "INFO ok\n"}, {"citrate-prod-1": 0}))
-        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertEqual(r.returncode, 2, r.stdout)
         self.assertIn("proved nothing", r.stdout)
+
+    # 2026-11-11 22:12Z run: prod-7's sender died while funding (no .sent), so the load came
+    # from 6 of 7 producers and the gate never noticed. A harness shortfall must never read as a
+    # pass, nor as a consensus failure: it is exit 2.
+    def test_gate_is_a_harness_error_when_an_expected_sender_never_ran(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO ok\n"}, {"citrate-prod-1-w1": 40},
+                                 expected=["citrate-prod-1-w1", "citrate-prod-7-w1"]))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("citrate-prod-7-w1", r.stdout)
+
+    def test_gate_is_a_harness_error_when_the_load_fell_short_of_its_target(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO ok\n"}, {"citrate-prod-1-w1": 100}, target=3600))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("below", r.stdout)
+
+    def test_a_divergence_is_reported_even_when_the_load_fell_short(self):
+        r = self.gate(self._work({"citrate-prod-4": "Acceptance commitment mismatch\n"}, {"citrate-prod-4-w1": 100}, target=3600))
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_run_starts_several_workers_per_producer_and_funds_them_serially(self):
+        text = self.TXL.read_text()
+        self.assertIn("--workers", text)
+        self.assertIn("expected", text)
 
 
 class Agent(unittest.TestCase):
