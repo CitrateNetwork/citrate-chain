@@ -41,6 +41,16 @@ from pathlib import Path
 GEN_OK = ("r1006", "r1007")
 SLOT_FILES = ("node.toml", "node.mine.toml", "node.sync.toml", "citrate-node.env", "citrate-node.service", "launch.json")
 SECRET_NAMES = ("noise.key", "proposer.key")
+# Where a host's live (pre-slot) r1006 install lives. Read from the fleet on 2026-11-11:
+# producers use the "producer" layout; boot-1..3 and rpc-1 use the "home" layout.
+R1006_LAYOUTS = {
+    "producer": {"files": ("/etc/citrate/node.toml", "/etc/citrate/citrate-node.env", "/usr/local/bin/citrate-node"),
+                 "data": "/var/lib/citrate/data"},
+    "home": {"files": ("/home/citrate/.citrate/node.toml", "/home/citrate/bin/citrate-node"),
+             "data": "/home/citrate/.citrate"},
+}
+UNIT = "/etc/systemd/system/citrate-node.service"
+DROPINS = "/etc/systemd/system/citrate-node.service.d"
 
 
 class Refused(Exception):
@@ -58,6 +68,7 @@ class Host:
         self.mode = a.mode
         self.run_as = a.run_as or None
         self.rpc = a.rpc
+        self.layout = R1006_LAYOUTS[a.r1006_layout]
 
     def p(self, path: str) -> Path:
         return self.root / path.lstrip("/")
@@ -243,19 +254,30 @@ def cmd_park_r1006(h: Host, a) -> int:
     etc = h.slot_etc("r1006")
     if etc.is_dir() and (etc / "citrate-node.service").is_file():
         return out({"parked": "r1006", "already": True})
-    unit = h.p("/etc/systemd/system/citrate-node.service")
+    unit = h.p(UNIT)
     if not unit.is_file():
         raise Refused("no live citrate-node unit to park")
     etc.mkdir(parents=True, exist_ok=True)
     shutil.copy2(unit, etc / "citrate-node.service")
+    # The unit's drop-ins belong to r1006 (on boots and rpc-1 they inject r1006 consensus
+    # env). Save them in the slot; switch installs exactly the target slot's set.
+    saved = etc / "dropins"
+    saved.mkdir(exist_ok=True)
+    dd = h.p(DROPINS)
+    dropins = {}
+    if dd.is_dir():
+        for f in sorted(dd.iterdir()):
+            if f.is_file():
+                shutil.copy2(f, saved / f.name)
+                dropins[f.name] = sha(f)
     refs = {}
-    for f in ("/etc/citrate/node.toml", "/etc/citrate/citrate-node.env", "/usr/local/bin/citrate-node"):
+    for f in h.layout["files"]:
         if h.p(f).is_file():
             refs[f] = sha(h.p(f))
-    (etc / "parked.json").write_text(json.dumps({"files": refs, "data_dir": "/var/lib/citrate/data"}, indent=2))
+    (etc / "parked.json").write_text(json.dumps({"files": refs, "data_dir": h.layout["data"], "dropins": dropins}, indent=2))
     if h.active() is None:
         h.active_file.write_text("r1006\n")
-    return out({"parked": "r1006", "already": False, "files": sorted(refs)})
+    return out({"parked": "r1006", "already": False, "files": sorted(refs), "dropins": sorted(dropins)})
 
 
 def cmd_snapshot(h: Host, a) -> int:
@@ -309,7 +331,7 @@ def cmd_seed_keys(h: Host, a) -> int:
     for k in keys:
         if k not in ("noise", "proposer"):
             raise Refused(f"unknown key {k}")
-    src_dir = h.p("/var/lib/citrate/data") if a.from_gen == "r1006" and not h.slot_data("r1006").is_dir() else h.slot_data(a.from_gen)
+    src_dir = h.p(h.layout["data"]) if a.from_gen == "r1006" and not h.slot_data("r1006").is_dir() else h.slot_data(a.from_gen)
     dst_dir = h.slot_data(a.to_gen)
     if not dst_dir.is_dir():
         raise Refused(f"slot {a.to_gen} has no data dir; stage first")
@@ -335,6 +357,29 @@ def cmd_seed_keys(h: Host, a) -> int:
     return out({"seeded": done, "from": a.from_gen, "to": a.to_gen})
 
 
+def install_dropins(h: Host, gen: str) -> None:
+    """Make the live drop-in dir hold exactly slot `gen`'s saved drop-ins (none for a slot
+    without a dropins/ dir). Every live drop-in must first equal one saved in the active
+    slot, so nothing unknown is removed and nothing is lost."""
+    dd = h.p(DROPINS)
+    live = {f.name: f for f in dd.iterdir() if f.is_file()} if dd.is_dir() else {}
+    cur = h.active()
+    saved_cur = h.slot_etc(cur) / "dropins" if cur else None
+    for name, f in live.items():
+        keep = saved_cur / name if saved_cur else None
+        if keep is None or not keep.is_file() or sha(keep) != sha(f):
+            raise Refused(f"live drop-in {name} is not saved in slot {cur}; refusing to switch")
+    want = h.slot_etc(gen) / "dropins"
+    for f in live.values():
+        f.unlink()
+    if want.is_dir():
+        files = [f for f in sorted(want.iterdir()) if f.is_file()]
+        if files:
+            dd.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                shutil.copy2(f, dd / f.name)
+
+
 def cmd_switch(h: Host, a) -> int:
     gen = a.gen
     etc = h.slot_etc(gen)
@@ -345,7 +390,8 @@ def cmd_switch(h: Host, a) -> int:
     if h.running():
         raise Refused("the node is running; stop it before switching generation")
     if h.mode == "systemd":
-        shutil.copy2(etc / "citrate-node.service", h.p("/etc/systemd/system/citrate-node.service"))
+        install_dropins(h, gen)
+        shutil.copy2(etc / "citrate-node.service", h.p(UNIT))
         subprocess.run(["systemctl", "daemon-reload"], check=True)
     h.active_file.parent.mkdir(parents=True, exist_ok=True)
     h.active_file.write_text(gen + "\n")
@@ -439,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mode", choices=("systemd", "proc"), default="systemd")
     ap.add_argument("--run-as", default="citrate")
     ap.add_argument("--rpc", default="http://127.0.0.1:8545")
+    ap.add_argument("--r1006-layout", choices=sorted(R1006_LAYOUTS), default="producer",
+                    help="where this host's live r1006 install lives (fleet file r1006_layout)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     sub.add_parser("park-r1006")

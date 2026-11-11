@@ -138,8 +138,10 @@ class Transport:
     def _base(self, h: dict) -> list[str]:
         if self.f.transport == "local":
             pre = ["nsenter", f"--net=/proc/{h['netns_pid']}/ns/net"] if h.get("netns_pid") else []
-            return pre + [sys.executable, str(AGENT), "--root", h["root"], "--mode", "proc", "--run-as", ""]
-        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", h["ssh"], "python3", "-", "--mode", "systemd"]
+            return pre + [sys.executable, str(AGENT), "--root", h["root"], "--mode", "proc", "--run-as", "",
+                          "--r1006-layout", h.get("r1006_layout", "producer")]
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", h["ssh"], "python3", "-", "--mode", "systemd",
+                "--r1006-layout", h.get("r1006_layout", "producer")]
 
     def agent(self, h: dict, *args: str, mutating: bool = True, step: str = "") -> dict:
         if self.f.transport == "ssh" and mutating:
