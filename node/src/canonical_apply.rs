@@ -7363,10 +7363,10 @@ pub(crate) mod tests {
 
     /// The same reorg with a reader thread hammering the ingress reads, released
     /// by a barrier at the start of the transition, 1,000 times. Every reorg
-    /// lands on B with nothing of A left, and no read sees a mix (memory at the
-    /// fork point with the store on A): while the transition is held a reader
-    /// waits, so a read released inside it returns the old branch's or the new
-    /// branch's values, never the abandoned store's BOB on a fork-point memory.
+    /// lands on B with nothing of A left, and every (ALICE nonce, BOB balance)
+    /// pair the reader saw belongs to one branch: while the transition is held
+    /// a reader waits, so it never sees memory at the fork point beside the
+    /// abandoned store's BOB.
     #[tokio::test]
     async fn concurrent_ingress_reads_during_a_reorg_never_change_its_outcome() {
         for round in 0..1_000u32 {
@@ -7377,15 +7377,15 @@ pub(crate) mod tests {
                 let (exec, gate, stop) = (follower.clone(), gate.clone(), stop.clone());
                 std::thread::spawn(move || {
                     gate.wait();
-                    let mut reads = 0u64;
+                    let mut pairs: Vec<(u64, U256)> = Vec::new();
                     loop {
-                        let _ = exec.get_nonce(&Address(ALICE));
-                        let _ = exec.get_balance(&Address(BOB));
+                        let nonce = exec.get_nonce(&Address(ALICE));
+                        let bob = exec.get_balance(&Address(BOB));
                         let _ = exec.get_code_hash(&Address(CAROL));
                         let _ = exec.get_canonical_account(&Address(DAVE));
-                        reads = reads.saturating_add(1);
+                        pairs.push((nonce, bob));
                         if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                            return reads;
+                            return pairs;
                         }
                     }
                 })
@@ -7406,10 +7406,144 @@ pub(crate) mod tests {
                 // below is reported instead of a hang.
                 gate.wait();
             }
-            let reads = reader.join().expect("reader");
-            assert!(reads > 0, "round {round}: the reader ran");
+            let pairs = reader.join().expect("reader");
+            assert!(!pairs.is_empty(), "round {round}: the reader ran");
+            // Each read pair belongs to one branch: A's tip (ALICE nonce 2, BOB
+            // 1,000), or the fork point and B's reapply (nonce 0..=3, no BOB).
+            // The nonce is read first, so a pair that straddles the switch is
+            // (2, 0), which is still one-branch. A fork-point nonce beside A's
+            // BOB is memory at the fork point with the store on A: a mix.
+            let a_bob = U256::from(1_000u64);
+            for (nonce, bob) in &pairs {
+                assert!(
+                    (*bob == a_bob && *nonce == 2) || (bob.is_zero() && *nonce <= 3),
+                    "round {round}: read (ALICE nonce {nonce}, BOB {bob}) mixes branches"
+                );
+            }
             assert_on_b(&app, &follower, &storage, &format!("round {round}")).await;
         }
+    }
+
+    /// The devnet's exact path: a sender X that is not in the fork-point working
+    /// set, is funded on both branches, and sends on both. A read of X inside
+    /// the reorg window must not pin A's X (nonce 1) in memory: B's own X→CAROL
+    /// (nonce 0) must execute on the reapply and the commitments reproduce.
+    /// Before the fix the read pinned A's X, B's tx was skipped on its nonce,
+    /// the accepted root did not reproduce, and the node stayed on A.
+    #[tokio::test]
+    async fn a_sender_read_inside_the_reorg_window_does_not_skip_its_txs() {
+        const X: [u8; 20] = [0x58; 20];
+        const X_FUND: u128 = FUND / 10;
+        let dir = tempfile::tempdir().expect("dir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let follower = store_backed(&storage);
+        follower.set_balance(&Address(ALICE), U256::from(FUND));
+        follower
+            .persist_state_changes()
+            .await
+            .expect("persist genesis");
+        let mut app = CanonicalApplicator::new(follower.clone(), storage.clone());
+
+        // A: a1 (shared), a2 funds X, a3 X→BOB, a4 accepts a3.
+        let pa = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pa.set_balance(&Address(ALICE), U256::from(FUND));
+        let a1 = produce(
+            &pa,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![transfer(ALICE, DAVE, 1_000, 0)],
+        )
+        .await;
+        let a2 = produce(
+            &pa,
+            a1.header.block_hash,
+            2,
+            VRF_OUT,
+            vec![transfer(ALICE, X, X_FUND, 1)],
+        )
+        .await;
+        let a3 = produce(
+            &pa,
+            a2.header.block_hash,
+            3,
+            VRF_OUT,
+            vec![transfer(X, BOB, 1_000, 0)],
+        )
+        .await;
+        let a4 = produce(&pa, a3.header.block_hash, 4, VRF_OUT, vec![]).await;
+        for b in [&a1, &a2, &a3, &a4] {
+            persist(&storage, b);
+            app.apply_received(b).await;
+        }
+        assert_eq!(app.applied_tip().await.height, 4, "A applied");
+        assert_eq!(follower.get_nonce(&Address(X)), 1, "X sent once on A");
+
+        // B off a1: b2 funds X, b3 X→CAROL (X's nonce 0 on B), b4 accepts b3.
+        let pb = Arc::new(Executor::new(Arc::new(StateDB::new())));
+        pb.set_balance(&Address(ALICE), U256::from(FUND));
+        let _b1 = produce(
+            &pb,
+            Hash::default(),
+            1,
+            VRF_OUT,
+            vec![transfer(ALICE, DAVE, 1_000, 0)],
+        )
+        .await;
+        let vrf_b = [0x5B; 32];
+        let b2 = produce(
+            &pb,
+            a1.header.block_hash,
+            2,
+            vrf_b,
+            vec![transfer(ALICE, X, X_FUND, 1)],
+        )
+        .await;
+        let b3 = produce(
+            &pb,
+            b2.header.block_hash,
+            3,
+            vrf_b,
+            vec![transfer(X, CAROL, 1_000, 0)],
+        )
+        .await;
+        let b4 = produce(&pb, b3.header.block_hash, 4, vrf_b, vec![]).await;
+        let b5 = produce(&pb, b4.header.block_hash, 5, vrf_b, vec![]).await;
+        assert_eq!(pb.get_nonce(&Address(X)), 1, "B ran X's own tx");
+        for b in [&b2, &b3, &b4, &b5] {
+            persist(&storage, b);
+        }
+        app.fork_choice = Some(fork_choice_returning(b5.header.block_hash));
+
+        let reader = follower.clone();
+        let _hook = test_reorg_window::set(move |at| {
+            if at == ReorgWindow::AfterRestore {
+                // Mempool admission of X's next tx: its nonce and balance.
+                let _ = reader.get_nonce(&Address(X));
+                let _ = reader.get_balance(&Address(X));
+            }
+        });
+        app.apply_received(&b5).await;
+
+        assert_eq!(app.applied_tip().await.height, 5, "reorged to B");
+        assert_eq!(follower.get_nonce(&Address(X)), 1, "B's X→CAROL ran");
+        assert_eq!(
+            follower.get_balance(&Address(CAROL)),
+            U256::from(1_000u64),
+            "CAROL got B's transfer"
+        );
+        assert!(
+            !follower.state_db().accounts.exists(&Address(BOB)),
+            "BOB (A only) is not in the working set"
+        );
+        let restarted = store_backed(&storage);
+        assert_eq!(restarted.get_nonce(&Address(X)), 1, "durable X is B's");
+        assert_eq!(
+            restarted.get_balance(&Address(CAROL)),
+            U256::from(1_000u64),
+            "durable CAROL is B's"
+        );
     }
 
     /// The external reads never change the working set: not its accounts, not
