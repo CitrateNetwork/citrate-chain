@@ -459,6 +459,34 @@ class PlanAndGuards(unittest.TestCase):
         self.assertIn("doctl databases delete fork-new --force", ops)
         self.assertFalse(any(c[0] == "host" and "indexer:reset" in c[2] for c in calls))
 
+    def test_collect_reads_the_live_r1006_staker_keystore_path(self):
+        # 2026-11-11, first read-only collect on the fleet: host-identity failed on prod-1
+        # because collect looked for /etc/citrate/keys/staker.keystore.json. The r1006 bring-up
+        # put the staker keystore and password under /etc/citrate/r1006/ on every producer.
+        from unittest import mock
+        fleet = C.Fleet(FLEET)
+        cmds = []
+        def fake_run(argv, *a, **kw):
+            cmds.append(argv)
+            host = argv[1]
+            p = next(x for x in SRC["producers"] if host.startswith(x["name"]))
+            pub = {"schema": "citrate-host-identity/1", "peer_id": "noise_" + "ab" * 32, "noise_pubkey": "0x" + "cd" * 32,
+                   "proposer_pubkey": p["proposer_pubkey"], "vrf_pubkey": "0x" + "ef" * 33,
+                   "staker_address": p["staker"], "coinbase_address": p["staker"]}
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(pub), stderr="")
+        import types
+        state = tempfile.mkdtemp()
+        with mock.patch.object(C.subprocess, "run", fake_run), redirect_stdout(io.StringIO()):
+            rc = C.cmd_collect(types.SimpleNamespace(mint=False, state=state, binary=None), fleet, SRC)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(cmds), 7)
+        for argv in cmds:
+            self.assertIn("--staker-keystore /etc/citrate/r1006/staker.keystore.json", argv[-1])
+            self.assertIn("--staker-password-file /etc/citrate/r1006/staker.password", argv[-1])
+            self.assertNotIn("/etc/citrate/keys", argv[-1])
+            # absolute: over ssh the tool has no root prefix, and a relative path lands in ~root
+            self.assertIn("--identity-dir /var/lib/citrate/data ", argv[-1])
+
     def test_an_owner_go_for_another_genesis_is_refused(self):
         with tempfile.TemporaryDirectory() as t:
             f = Path(t) / "go.json"
