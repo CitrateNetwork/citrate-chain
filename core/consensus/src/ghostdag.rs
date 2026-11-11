@@ -3802,11 +3802,140 @@ mod tests {
         }
     }
 
-    /// Spec 06 §3.10 (D11, as amended 2026-11-09): marking a block
-    /// disqualified marks every held block whose selected chain passes
-    /// through it; a block admitted later on a marked selected parent
-    /// inherits the mark; fork choice uses the first unmarked block on each
-    /// tip's selected chain; the mark is persisted with the DAG store.
+    /// fed#533: an equivocating producer can sign unlimited children of a
+    /// disqualified block. Each child adds NO stored mark (only the root is
+    /// stored), and the in-memory state stays bounded by the caches' caps,
+    /// whatever N is; every child is still disqualified.
+    #[tokio::test]
+    async fn children_of_a_disqualified_block_add_no_stored_marks_and_memory_stays_bounded() {
+        fn id(n: u16, tag: u8) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0] = tag;
+            b[1..3].copy_from_slice(&n.to_be_bytes());
+            b[31] = 0xD6;
+            b
+        }
+        const CAP: usize = 16;
+        const N: u16 = 200;
+        let kv = Arc::new(MemKv::default());
+        let store = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("persistent store"),
+        );
+        let gd = GhostDag::new(GhostDagParams::default(), store.clone())
+            .with_disqualified_cache_cap(CAP);
+        let g = create_test_block_with_parents(id(0, 1), Hash::default(), vec![], 0);
+        store.store_block(g.clone()).await.expect("store");
+        gd.add_block(&g).await.expect("genesis");
+        let x = sealed(&gd, id(0, 2), vec![g.hash()]).await;
+        store.store_block(x.clone()).await.expect("store");
+        gd.add_block(&x).await.expect("admit x");
+        gd.disqualify(&x.hash()).await;
+        let disq_keys = |kv: &MemKv| {
+            kv.data
+                .lock()
+                .unwrap()
+                .get(crate::dag_store::cf::DAG_METADATA)
+                .map(|m| m.keys().filter(|k| k.starts_with(b"disq:")).count())
+                .unwrap_or(0)
+        };
+        assert_eq!(disq_keys(&kv), 1, "the root mark");
+        let mut children = Vec::new();
+        for n in 1..=N {
+            let c = sealed(&gd, id(n, 3), vec![x.hash()]).await;
+            store.store_block(c.clone()).await.expect("store child");
+            gd.add_block(&c).await.expect("a child is a DAG block");
+            children.push(c.hash());
+        }
+        for c in &children {
+            assert!(gd.is_disqualified(c).await, "every child is disqualified");
+        }
+        assert_eq!(disq_keys(&kv), 1, "children add zero stored marks");
+        assert_eq!(store.stored_disqualified_roots(), 1);
+        assert!(
+            gd.disqualified_cache_len() <= CAP,
+            "derived verdicts are capped: {}",
+            gd.disqualified_cache_len()
+        );
+        assert!(
+            store.disqualified_root_cache_len() <= crate::dag_store::DISQUALIFIED_ROOT_CACHE_CAP
+        );
+    }
+
+    /// fed#532: root marks are deleted with their blocks when the DAG store
+    /// prunes them. That is safe only because a pruned block cannot come back
+    /// as a chain candidate: re-admitting it is refused (its ancestry is gone).
+    #[tokio::test]
+    async fn a_pruned_disqualified_block_is_not_readmitted_and_its_mark_goes_with_it() {
+        fn id(n: u8) -> [u8; 32] {
+            let mut b = [0u8; 32];
+            b[0] = n;
+            b[31] = 0xD7;
+            b
+        }
+        let kv = Arc::new(MemKv::default());
+        let store = Arc::new(
+            DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("persistent store"),
+        );
+        let gd = GhostDag::new(GhostDagParams::default(), store.clone());
+        let g = create_test_block_with_parents(id(1), Hash::default(), vec![], 0);
+        store.store_block(g.clone()).await.expect("store");
+        gd.add_block(&g).await.expect("genesis");
+        let mut blocks = vec![g.clone()];
+        for n in 2..=8u8 {
+            let b = sealed(&gd, id(n), vec![blocks.last().expect("tip").hash()]).await;
+            store.store_block(b.clone()).await.expect("store");
+            gd.add_block(&b).await.expect("admit");
+            blocks.push(b);
+        }
+        let x = blocks[2].clone(); // height 2
+        gd.disqualify(&x.hash()).await;
+        assert!(store.is_disqualified_root(&x.hash()));
+        // Prune below height 5.
+        store
+            .update_pruning_point(blocks[5].hash())
+            .await
+            .expect("pruning point");
+        assert!(store.prune().await.expect("prune") > 0);
+        assert!(!store.has_block(&x.hash()).await, "x is pruned");
+        assert!(
+            !store.is_disqualified_root(&x.hash()),
+            "its root mark is deleted with it"
+        );
+        assert_eq!(store.stored_disqualified_roots(), 0);
+        // x cannot be re-admitted: its selected parent is pruned too.
+        let readmit = async {
+            gd.validate_block_consistency(&x)
+                .await
+                .map_err(|e| e.to_string())?;
+            store.store_block(x.clone()).await.map_err(|e| e.to_string())?;
+            gd.add_block(&x).await.map_err(|e| e.to_string())
+        };
+        assert!(readmit.await.is_err(), "a pruned block is never re-admitted");
+    }
+
+    /// fed#533 (4): the operator command's store call removes every root mark;
+    /// it is safe because a still-bad block is disqualified again when the
+    /// applied chain reaches it and its commitments fail again.
+    #[tokio::test]
+    async fn clearing_disqualified_marks_removes_every_root() {
+        let kv = Arc::new(MemKv::default());
+        let store = DagStore::persistent_with_strict_vrf(kv.clone(), false).expect("store");
+        for n in 1..=3u8 {
+            store.mark_disqualified_root(&Hash::new([n; 32]));
+        }
+        assert_eq!(store.stored_disqualified_roots(), 3);
+        assert_eq!(store.clear_disqualified_marks().expect("clear"), 3);
+        assert_eq!(store.stored_disqualified_roots(), 0);
+        assert!(!store.is_disqualified_root(&Hash::new([1; 32])));
+        let reopened = DagStore::persistent_with_strict_vrf(kv, false).expect("reopen");
+        assert_eq!(reopened.stored_disqualified_roots(), 0);
+    }
+
+    /// Spec 06 §3.10 (D11, amended 2026-11-11, fed#533): marking a block
+    /// disqualified stores ONE root mark; every block whose selected chain
+    /// passes through it is disqualified by derivation (a bounded walk), held
+    /// or admitted later; fork choice uses the first qualified block on each
+    /// tip's selected chain; the root mark is persisted with the DAG store.
     #[tokio::test]
     async fn disqualify_propagates_to_selected_parent_descendants() {
         fn id(n: u8) -> [u8; 32] {
@@ -3833,26 +3962,32 @@ mod tests {
         let (b1, x, y) = (chain[1], chain[2], chain[3]);
         assert_eq!(gd.select_tip().await.expect("head"), y);
         gd.disqualify(&x).await;
-        assert!(gd.is_disqualified(&x));
+        assert!(gd.is_disqualified(&x).await);
         assert!(
-            gd.is_disqualified(&y),
-            "a held descendant is marked with it"
+            gd.is_disqualified(&y).await,
+            "a held descendant is disqualified with it"
         );
-        assert!(!gd.is_disqualified(&b1));
+        assert!(!gd.is_disqualified(&b1).await);
         assert_eq!(
             gd.select_tip().await.expect("head"),
             b1,
-            "the first unmarked block on the tip's selected chain"
+            "the first qualified block on the tip's selected chain"
         );
         let z = sealed(&gd, id(5), vec![y]).await;
         store.store_block(z.clone()).await.expect("store");
         gd.add_block(&z)
             .await
             .expect("a child of a marked block is still a DAG block");
-        assert!(gd.is_disqualified(&z.hash()), "inherited at admission");
-        let reopened = DagStore::persistent_with_strict_vrf(kv, false).expect("reopen");
-        assert!(reopened.is_disqualified(&x) && reopened.is_disqualified(&z.hash()));
-        assert!(!reopened.is_disqualified(&b1));
+        assert!(gd.is_disqualified(&z.hash()).await, "derived after admission");
+        // Only the root is stored; a fresh GhostDag over the reopened store
+        // derives the descendants again.
+        let reopened = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("reopen"));
+        assert!(reopened.is_disqualified_root(&x));
+        assert!(!reopened.is_disqualified_root(&y) && !reopened.is_disqualified_root(&z.hash()));
+        assert_eq!(reopened.stored_disqualified_roots(), 1);
+        let gd2 = GhostDag::new(GhostDagParams::default(), reopened);
+        assert!(gd2.is_disqualified(&z.hash()).await);
+        assert!(!gd2.is_disqualified(&b1).await);
         let s = sealed(&gd, id(6), vec![b1]).await;
         store.store_block(s.clone()).await.expect("store");
         gd.add_block(&s).await.expect("sibling");

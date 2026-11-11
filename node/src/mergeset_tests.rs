@@ -2117,7 +2117,7 @@ async fn wrong_state_root_disqualifies_from_chain_not_from_dag() {
     assert!(b.offer(&x).await, "admission never executes: x is admitted");
     assert_eq!(b.tip().await.0, a1.header.block_hash, "x is never applied");
     assert!(
-        b.ghostdag.is_disqualified(&xh),
+        b.ghostdag.is_disqualified(&xh).await,
         "x is disqualified from chain"
     );
     assert!(
@@ -2129,13 +2129,13 @@ async fn wrong_state_root_disqualifies_from_chain_not_from_dag() {
         b.storage.db.clone(),
     ));
     let reloaded = DagStore::persistent_with_strict_vrf(kv, true).expect("reload");
-    assert!(reloaded.is_disqualified(&xh), "the mark survives a restart");
+    assert!(reloaded.is_disqualified_root(&xh), "the root mark survives a restart");
     // B keeps sealing on its applied tip. x can be merged only by a block
     // whose selected parent outweighs it (G3), so once B's own chain is
     // heavier one of its blocks merges x and executes x's own tx.
     let m = b.produce().await;
     assert_eq!(m.header.selected_parent_hash, a1.header.block_hash);
-    assert!(!b.ghostdag.is_disqualified(&m.header.block_hash));
+    assert!(!b.ghostdag.is_disqualified(&m.header.block_hash).await);
     let mut merger = None;
     for _ in 0..3 {
         let next = b.produce().await;
@@ -2211,10 +2211,10 @@ async fn child_of_disqualified_sp_is_disqualified() {
     });
     // After the mark.
     b.receive(&x).await;
-    assert!(b.ghostdag.is_disqualified(&x.header.block_hash));
+    assert!(b.ghostdag.is_disqualified(&x.header.block_hash).await);
     assert!(b.offer(&y).await, "y is admitted");
     assert!(
-        b.ghostdag.is_disqualified(&y.header.block_hash),
+        b.ghostdag.is_disqualified(&y.header.block_hash).await,
         "y inherits the mark at admission"
     );
     assert_eq!(b.tip().await.0, a1.header.block_hash);
@@ -2535,5 +2535,5 @@ async fn unreadable_apply_input_is_node_local_not_a_block_fault() {
             got: Hash::new([2; 32]),
         }
     ));
-    assert!(!a.ghostdag.is_disqualified(&m.header.block_hash));
+    assert!(!a.ghostdag.is_disqualified(&m.header.block_hash).await);
 }
