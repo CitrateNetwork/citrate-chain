@@ -1075,12 +1075,29 @@ impl DagStore {
             Err(_) => (false, false),
         };
         if cache {
-            self.disqualified_roots
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert_or_update(*hash, root);
+            self.cache_root_answer(hash, root);
         }
-        root
+        // Re-read the cache: a mark written while the store read ran wins.
+        self.disqualified_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .unwrap_or(root)
+    }
+
+    /// Record a root lookup's answer in the cache (fed#541). A positive always
+    /// wins; a negative only fills an absent entry, so a lookup that read the
+    /// store just before a mark was written cannot hide the fresh root.
+    pub fn cache_root_answer(&self, hash: &Hash, root: bool) {
+        let mut c = self
+            .disqualified_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if root {
+            c.insert_or_update(*hash, true);
+        } else if c.get(hash).is_none() {
+            c.insert(*hash, false);
+        }
     }
 
     /// The number of root marks persisted (in memory for a store without a
