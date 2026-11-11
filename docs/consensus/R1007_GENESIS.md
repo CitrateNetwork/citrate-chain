@@ -38,7 +38,7 @@ Code:
 | State root of block 0 | standard MPT root (CV-14), with activation 0 covering block 0 itself | STATE_ROOT_MPT.md §1 |
 | Genesis header | the shared canonical genesis block (`create_canonical_genesis_block`, version 1, timestamp `CANONICAL_GENESIS_TIMESTAMP` = 1,767,225,600 = 2026-01-01T00:00:00Z) | unchanged from r1006 |
 | Supply split | unchanged: mining pool = 1T SALT − pre-allocations (the note holds no balance) | `GenesisConfig::r1006` |
-| Block-0 hash | `0x33438940e03d273932affe61346c9ac7f7cf3b2b0bf01a77d23fa62c242101ef` | **candidate**: the fresh-keys alloc at the canonical genesis timestamp; the ceremony stamps block 0 at ceremony time, which moves it (§2). The r1006-keys layout's hash was `0xd245a960…a7f` |
+| Block-0 hash | `0x7e1bf92b7a39d7338e9772db5ab886808167452a45bef8ec75a1d05850c2be3b` | **stamped for the ceremony**: the fresh-keys alloc at `GENESIS_TIMESTAMP` = 1794438000 (T0 = 2026-11-11T23:00:00Z), `stamp_genesis.py --at 1794438000 --repin`. Unstamped (canonical timestamp) it was `0x33438940…01ef` |
 
 **Every block-0 contract address is unchanged from r1006.** That includes `CitrateMemberSBT`
 `0x8831…060d`, `MembershipStakeVault` `0xd663…555e` and `ValidatorRegistry` `0xf511…31cd`,
