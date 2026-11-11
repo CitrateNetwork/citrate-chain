@@ -8,7 +8,9 @@ and every other role below, all read from addresses.env. Nothing is hard-coded, 
 cannot silently keep an earlier chain's owners (fed #493; owner 2026-11-10: rotate every
 non-producer EVM key for r1007). r1006 kept the three R2 governance and three R2 guardian
 owners; reproducing its inputs means passing those as GOV1-3 / GRD1-3 explicitly.
-Refuses a missing role, anything that is not a 20-byte address, and an address in two roles.
+The council seats may be written GOV_OWNER_1..5 / GRD_OWNER_1..3 (the owner's r1007 keygen) instead;
+one spelling per file. Refuses a missing role, anything that is not a 20-byte address, a role
+given twice (in either spelling), a mix of spellings, and an address in two roles.
 """
 import argparse
 import re
@@ -19,6 +21,9 @@ GRD = ["GRD1", "GRD2", "GRD3"]
 OTHER = ["TREASURY", "FAUCET", "RELAYER", "TEAM", "SIGNER_1", "SIGNER_2", "SIGNER_3", "CITRATE_AA_OWNER",
          "CITRATE_AA_IDENTITY_SIGNER", "CITRATE_AA_SPONSOR_SIGNER", "MEMBERSHIP_GRANTOR"]
 REQUIRED = GOV + GRD + OTHER
+# The owner's r1007 keygen (2026-11-11) names the council seats GOV_OWNER_1..5 / GRD_OWNER_1..3.
+# Either spelling is accepted for the whole file; mixing them, or naming a seat twice, is refused.
+ALIASES = {**{f"GOV_OWNER_{i}": f"GOV{i}" for i in range(1, 6)}, **{f"GRD_OWNER_{i}": f"GRD{i}" for i in range(1, 4)}}
 ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
@@ -31,6 +36,8 @@ def main():
     ap.add_argument("--addresses", required=True)
     a = ap.parse_args()
     got = {}
+    name = {}
+    spellings = set()
     for line in open(a.addresses):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -38,7 +45,19 @@ def main():
         k, _, v = line.partition("=")
         if not ADDR.match(v):
             fail(f"{k}: not an address")
-        got[k] = v.lower()
+        if k in ALIASES:
+            spellings.add("GOV_OWNER_n/GRD_OWNER_n")
+        elif k in GOV + GRD:
+            spellings.add("GOVn/GRDn")
+        seat = ALIASES.get(k, k)
+        if seat in got:
+            if name[seat] != k:
+                fail(f"{seat}: named by both spellings ({name[seat]} and {k})")
+            fail(f"{k}: given more than once")
+        got[seat] = v.lower()
+        name[seat] = k
+    if len(spellings) > 1:
+        fail("the file mixes the council spellings GOVn/GRDn and GOV_OWNER_n/GRD_OWNER_n; use one")
     missing = [r for r in REQUIRED if r not in got]
     if missing:
         fail(f"missing role addresses (every owner is a parameter): {missing}")
