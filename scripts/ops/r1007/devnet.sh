@@ -3,7 +3,7 @@
 # a stand-in r1006 comes up first, then the cut-over to r1007, the health gates, and the
 # rollback to r1006 with its data kept.
 #
-#   devnet.sh --binary PATH --work DIR [--producers N] [--gate-minutes N] [--stagger-seconds N]
+#   devnet.sh --binary PATH --work DIR [--producers N] [--gate-minutes N] [--stagger-seconds N] [--settle-seconds N]
 #             [--steps "…"] [--keep]
 #
 # Each host is a directory (its root) plus its own network namespace with an address on a
@@ -29,6 +29,9 @@ BIN=""
 WORK=""
 NPROD=4
 GATE=10
+# Producers refuse to produce for about a minute after start (initial sync), so the
+# stand-in r1006 health gate waits this long before it counts sealers (P5, 2026-11-11).
+SETTLE=90
 STAGGER=5
 STEPS="collect render-r1006 render-r1007 check devnet-r1006 health-r1006 prepare cut boots producers rpc indexer health-r1007 rollback health-kept"
 KEEP=0
@@ -38,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --work) WORK="$2"; shift 2 ;;
     --producers) NPROD="$2"; shift 2 ;;
     --gate-minutes) GATE="$2"; shift 2 ;;
+    --settle-seconds) SETTLE="$2"; shift 2 ;;
     --stagger-seconds) STAGGER="$2"; shift 2 ;;
     --steps) STEPS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
@@ -108,7 +112,7 @@ one() {
     render-r1007) "${C[@]}" render "${COMMON[@]}" --network r1007 ;;
     check) "${C[@]}" check "${COMMON[@]}" --network r1007 ;;
     devnet-r1006) "${C[@]}" run devnet-r1006 "${COMMON[@]}" ;;
-    health-r1006) sleep 20; "${C[@]}" health "${COMMON[@]}" --network r1006 --require-sealing ;;
+    health-r1006) sleep "$SETTLE"; "${C[@]}" health "${COMMON[@]}" --network r1006 --require-sealing ;;
     health-r1007) "${C[@]}" health "${COMMON[@]}" --network r1007 ;;
     health-kept) "${C[@]}" health "${COMMON[@]}" --network r1006 --expect-kept ;;
     *) "${C[@]}" run "$1" "${COMMON[@]}" ;;
