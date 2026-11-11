@@ -4888,9 +4888,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     info!("RPC server started");
                     // Keep server alive until SIGINT or SIGTERM (CORE-053).
                     shutdown::shutdown_signal().await.ok();
-                    // Signal server to close and join its OS thread
-                    close_handle.close();
+                    // Close the server and join its OS thread, both on a
+                    // blocking thread: `close` drops the server's own tokio
+                    // runtime, which panics inside an async context ("Cannot
+                    // drop a runtime in a context where blocking is not
+                    // allowed"; G4 2026-11-11, every SIGTERM shutdown).
                     tokio::task::spawn_blocking(move || {
+                        close_handle.close();
                         let _ = join_handle.join();
                     })
                     .await
@@ -5131,9 +5135,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     let signal = shutdown::shutdown_signal().await?;
     info!("Shutting down ({signal})...");
 
-    // Wait for RPC to shut down
-    if let Some(handle) = rpc_handle {
-        handle.abort();
+    // Wait for the RPC task to close its server (it waits on the same signal),
+    // bounded so a stuck server cannot hold the process; then abort it.
+    if let Some(mut handle) = rpc_handle {
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle)
+            .await
+            .is_err()
+        {
+            warn!("RPC server did not close within 10 s of the shutdown signal; aborting it");
+            handle.abort();
+        }
     }
 
     Ok(())
