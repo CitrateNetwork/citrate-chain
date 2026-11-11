@@ -536,6 +536,60 @@ class DevnetHarness(unittest.TestCase):
         self.assertIn("--settle-seconds", text)
 
 
+class DevnetTxLoad(unittest.TestCase):
+    """P5 tx-load phase (lead, 2026-11-11). Under about 30 tx/s the G4 devnet split six ways on
+    "Acceptance commitment mismatch" (execute-on-receive). P5 now runs a sustained load after
+    the producers step and gates on zero mismatch and zero "block disqualified" lines."""
+
+    TXL = R7 / "devnet_txload.sh"
+
+    def _work(self, logs: dict, included: dict) -> Path:
+        w = Path(tempfile.mkdtemp(prefix="r1007txl."))
+        self.addCleanup(shutil.rmtree, w, True)
+        for host, text in logs.items():
+            d = w / "hosts" / host / "var/lib/citrate/ceremony"
+            d.mkdir(parents=True)
+            (d / "node-r1007.log").write_text(text)
+        (w / "txload").mkdir()
+        for host, n in included.items():
+            (w / "txload" / f"{host}.included").write_text(f"{n}\n")
+            (w / "txload" / f"{host}.sent").write_text(f"{n + 3}\n")
+        return w
+
+    def gate(self, w: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(self.TXL), "gate", "--work", str(w)], capture_output=True, text=True, timeout=30)
+
+    def test_devnet_runs_the_load_after_producers_and_passes_its_options_through_the_reexec(self):
+        text = (R7 / "devnet.sh").read_text()
+        steps = re.search(r'^STEPS="([^"]+)"', text, re.M).group(1).split()
+        self.assertIn("txload", steps)
+        self.assertLess(steps.index("producers"), steps.index("txload"))
+        self.assertLess(steps.index("txload"), steps.index("health-r1007"))
+        reexec = text[text.index("exec unshare"):text.index("fi", text.index("exec unshare"))]
+        for opt in ("--settle-seconds", "--tx-tps", "--tx-seconds"):
+            self.assertIn(opt, reexec, f"{opt} is lost at the namespace re-exec")
+        self.assertIn("devnet_txload.sh", text)
+
+    def test_gate_passes_clean_logs_with_included_load(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO sealed\n", "citrate-prod-2": "INFO ok\n"}, {"citrate-prod-1": 40, "citrate-prod-2": 38}))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("included=78", r.stdout)
+
+    def test_gate_fails_on_an_acceptance_commitment_mismatch(self):
+        r = self.gate(self._work({"citrate-prod-3": "WARN Acceptance commitment mismatch at 0xab\n"}, {"citrate-prod-3": 10}))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("acceptance_commitment_mismatch=1", r.stdout)
+
+    def test_gate_fails_on_a_disqualified_block(self):
+        r = self.gate(self._work({"citrate-prod-4": "ERROR Block disqualified: bad state root\n"}, {"citrate-prod-4": 10}))
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_gate_fails_when_no_load_was_included(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO ok\n"}, {"citrate-prod-1": 0}))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("proved nothing", r.stdout)
+
+
 class Agent(unittest.TestCase):
     """node_agent.py's generation slots, in a temp root (proc mode)."""
 
