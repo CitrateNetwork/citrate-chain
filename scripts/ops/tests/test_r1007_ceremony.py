@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -32,6 +33,31 @@ import node_agent as NA  # noqa: E402
 import params as P  # noqa: E402
 
 SRC = P.load(REPO)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_guard  # noqa: E402
+
+# Every ssh-transport test uses this copy of the committed fleet: the same hosts, with ssh
+# aliases that cannot resolve (RFC 2606 .invalid). ceremony.HERE points at its directory, so
+# the tool's "committed fleet" checks accept it (fed #467 round 3).
+_FLEET_DIR = Path(tempfile.mkdtemp(prefix="r1007-fleet-copy-"))
+FLEET = _FLEET_DIR / "fleet.r1007.json"
+_HERE_REAL = C.HERE
+
+
+def setUpModule():
+    fleet_guard.install()
+    f = json.loads((R7 / "fleet.r1007.json").read_text())
+    for h in f["hosts"]:
+        h["ssh"] = h["name"] + ".invalid"
+    FLEET.write_text(json.dumps(f))
+    C.HERE = _FLEET_DIR
+
+
+def tearDownModule():
+    C.HERE = _HERE_REAL
+    fleet_guard.uninstall()
+    shutil.rmtree(_FLEET_DIR, ignore_errors=True)
 
 
 def peer(i: int) -> str:
@@ -72,6 +98,66 @@ def fake_binary(tmp: Path, *, params: str | None = None, genesis: str | None = N
     b.write_text("#!/bin/sh\necho '  2026-11-09T15:00:33Z INFO citrate_storage: RocksDB opened'\ncat <<'EOF'\n" + json.dumps(m, indent=2) + "\nEOF\n")
     b.chmod(0o755)
     return b
+
+
+class FleetIsolation(unittest.TestCase):
+    """fed #467 round 3 (BerryManifold P1): no test in this module can reach a fleet host.
+    scripts/ops/tests/fleet_guard.py blocks ssh/scp/doctl and os.system for the whole
+    module, and every ssh-transport test uses a copy of the fleet whose aliases end in
+    .invalid. Each probe below would be harmless even without the guard (`ssh -G` does not
+    connect; 192.0.2.1 is TEST-NET-1)."""
+
+    def test_the_guard_is_installed_for_this_module(self):
+        import fleet_guard  # noqa: F401  (red: absent at 2beaa095)
+        self.assertTrue(fleet_guard.installed())
+
+    def test_a_real_ssh_or_doctl_call_raises(self):
+        import fleet_guard
+        self.assertTrue(fleet_guard.installed())
+        for argv in (["ssh", "-G", "citrate-boot-1"], ["scp", "-h"], ["doctl", "version"]):
+            with self.assertRaises(fleet_guard.FleetCallBlocked, msg=argv):
+                subprocess.run(argv, capture_output=True, timeout=5)
+            with self.assertRaises(fleet_guard.FleetCallBlocked, msg=argv):
+                subprocess.check_output(argv, timeout=5)
+        with self.assertRaises(fleet_guard.FleetCallBlocked):
+            os.system("true")
+
+    def test_a_non_loopback_connection_raises(self):
+        import socket
+        import fleet_guard
+        self.assertTrue(fleet_guard.installed())
+        with self.assertRaises(fleet_guard.FleetCallBlocked):
+            socket.create_connection(("192.0.2.1", 9), timeout=0.5)
+
+    def test_child_processes_get_an_ssh_that_refuses(self):
+        import fleet_guard
+        self.assertTrue(fleet_guard.installed())
+        r = subprocess.run(["sh", "-c", "ssh -G host.invalid"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(r.returncode, 97, r.stdout + r.stderr)
+
+    def test_ssh_tests_use_a_fleet_copy_that_cannot_resolve(self):
+        fleet = json.loads(FLEET.read_text())
+        self.assertEqual(fleet["transport"], "ssh")
+        self.assertTrue(all(h["ssh"].endswith(".invalid") for h in fleet["hosts"]), fleet["hosts"])
+        self.assertNotEqual(FLEET.resolve(), (R7 / "fleet.r1007.json").resolve())
+        self.assertEqual((C.HERE / "fleet.r1007.json").resolve(), FLEET.resolve())
+
+
+class _Stack:
+    """Enter several context managers as one."""
+
+    def __init__(self, *cms):
+        self.cms = cms
+
+    def __enter__(self):
+        for c in self.cms:
+            c.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        for c in reversed(self.cms):
+            c.__exit__(*exc)
+        return False
 
 
 def run(argv: list[str]) -> tuple[int, str]:
@@ -235,7 +321,7 @@ class RenderAndCheck(unittest.TestCase):
 
 class PlanAndGuards(unittest.TestCase):
     def test_the_plan_order(self):
-        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        fleet = C.Fleet(FLEET)
         steps = C.plan_steps(fleet)
         self.assertEqual([s["step"] for s in steps], ["prepare", "cut", "boots", "producers", "rpc", "indexer", "health", "rollback"])
         by = {s["step"]: s for s in steps}
@@ -253,14 +339,174 @@ class PlanAndGuards(unittest.TestCase):
         names = [h["name"] for h in json.loads(text)["hosts"] if h["role"] == "producer"]
         self.assertEqual(names, [p["name"] for p in SRC["producers"]])
 
+    def test_the_committed_fleet_names_each_hosts_r1006_layout(self):
+        f = json.loads((R7 / "fleet.r1007.json").read_text())
+        lay = {h["name"]: h.get("r1006_layout", "producer") for h in f["hosts"]}
+        for n in ("citrate-boot-1", "citrate-boot-2", "citrate-boot-3", "citrate-rpc-1"):
+            self.assertEqual(lay[n], "home", n)
+        for n in [x for x in lay if "prod" in x]:
+            self.assertEqual(lay[n], "producer", n)
+
+    def test_the_agent_is_told_each_hosts_layout(self):
+        fleet = C.Fleet(FLEET)
+        t = C.Transport(fleet, None)
+        boot = fleet.hosts("boot")[0]
+        prod = fleet.hosts("producer")[0]
+        self.assertIn("--r1006-layout", t._base(boot))
+        self.assertEqual(t._base(boot)[t._base(boot).index("--r1006-layout") + 1], "home")
+        self.assertEqual(t._base(prod)[t._base(prod).index("--r1006-layout") + 1], "producer")
+
     def test_ssh_steps_need_the_owner_go(self):
-        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        fleet = C.Fleet(FLEET)
         h = fleet.hosts("boot")[0]
         with self.assertRaises(C.Refuse):
             C.Transport(fleet, None).agent(h, "stop", step="cut")
         go = {"ceremony": "r1007", "genesis": SRC["r1007_genesis"], "approved_by": "owner", "approved_at": "x", "steps": ["prepare"]}
         with self.assertRaises(C.Refuse):
             C.Transport(fleet, go).agent(h, "stop", step="cut")
+
+    # fed #495: the cut stops the explorer indexer first, and the indexer step backs the
+    # explorer DB up as a managed-cluster fork from the operator machine, never a pg_dump on
+    # rpc-1's disk.
+    def _ssh_fleet(self, steps):
+        fleet = C.Fleet(FLEET)
+        go = {"ceremony": "r1007", "genesis": SRC["r1007_genesis"], "approved_by": "owner", "approved_at": "x", "steps": steps}
+        return fleet, C.Transport(fleet, go)
+
+    def _record(self, forks_listed=()):
+        calls = []
+        def agent(_self, h, *args, mutating=True, step=""):
+            if mutating:
+                _self.require_go(step, h)
+            calls.append(("agent", h["name"], args))
+            return {}
+        def ssh_run(t, h, cmd, step):
+            t.require_go(step, h)
+            calls.append(("host", h["name"], cmd))
+        def operator_run(argv):
+            calls.append(("operator", "", " ".join(argv)))
+            if argv[:3] == ["doctl", "databases", "list"]:
+                listed = [{"name": n, "id": "fork-" + n, "status": "online"} for n in forks_listed]
+                if any(c[0] == "operator" and " fork " in f" {c[2]} " for c in calls):
+                    listed.append({"name": C.INDEXER_FORK_NAME, "id": "fork-new", "status": "online"})
+                return json.dumps(listed)
+            return ""
+        return calls, agent, ssh_run, operator_run
+
+    def _patched(self, agent, ssh_run, operator_run):
+        """Recorders for every way a step can reach a host or the cloud. subprocess.run is
+        blocked too: these tests use the committed ssh fleet, and a real ssh from a test
+        would reach the production hosts."""
+        from unittest import mock
+        block = mock.patch.object(C.subprocess, "run", side_effect=AssertionError("a test step tried a real subprocess"))
+        return (_Stack(mock.patch.object(C.Transport, "agent", agent), block),
+                mock.patch.object(C, "ssh_run", ssh_run, create=True),
+                mock.patch.object(C, "operator_run", operator_run, create=True))
+
+    def _args(self, **kw):
+        import types
+        base = {"db_cluster_id": "3d4c6713-5987-404c-8ea5-e58afa94adad", "db_fork_rule": "ip_addr:203.0.113.7",
+                "gate_minutes": 0.01, "state": tempfile.mkdtemp()}
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def test_cut_stops_the_indexer_before_any_node(self):
+        fleet, t = self._ssh_fleet(["cut"])
+        calls, agent, ssh_run, operator_run = self._record()
+        p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            C.step_cut(self._args(), fleet, t, SRC)
+        self.assertTrue(calls, "the cut did nothing")
+        first = calls[0]
+        self.assertEqual(first[0], "host", f"the first cut action is not on the indexer host: {first}")
+        self.assertEqual(first[1], "citrate-rpc-1")
+        self.assertIn("systemctl stop citratescan-indexer", first[2])
+        self.assertIn("is-active", first[2], "the stop is not confirmed")
+        self.assertTrue(any(c[0] == "agent" and c[2] == ("stop",) for c in calls[1:]))
+
+    def test_indexer_step_forks_the_cluster_and_writes_no_dump_on_the_host(self):
+        fleet, t = self._ssh_fleet(["indexer"])
+        calls, agent, ssh_run, operator_run = self._record()
+        p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            C.step_indexer(self._args(), fleet, t, SRC)
+        text = "\n".join(c[2] for c in calls)
+        self.assertNotIn("pg_dump", text)
+        self.assertNotIn("/var/backups", text)
+        ops = [c[2] for c in calls if c[0] == "operator"]
+        fork = [i for i, c in enumerate(calls) if c[0] == "operator" and c[2].startswith("doctl databases fork ")]
+        self.assertEqual(len(fork), 1, ops)
+        self.assertIn("--restore-from-cluster-id 3d4c6713-5987-404c-8ea5-e58afa94adad", calls[fork[0]][2])
+        self.assertIn("--wait", calls[fork[0]][2])
+        self.assertTrue(any(c.startswith("doctl databases firewalls append fork-new --rule ip_addr:203.0.113.7") for c in ops), ops)
+        confirm = [i for i, c in enumerate(calls) if c[0] == "host" and "--confirm" in c[2]]
+        self.assertEqual(len(confirm), 1)
+        self.assertLess(fork[0], confirm[0], "the reset runs before the backup fork exists")
+
+    def test_indexer_step_refuses_without_a_cluster_id_or_fork_rule(self):
+        for kw in ({"db_cluster_id": None}, {"db_cluster_id": "not-a-uuid"}, {"db_fork_rule": None}, {"db_fork_rule": "0.0.0.0/0"}):
+            fleet, t = self._ssh_fleet(["indexer"])
+            calls, agent, ssh_run, operator_run = self._record()
+            p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+            with p1, p2, p3, redirect_stdout(io.StringIO()):
+                with self.assertRaises(C.Refuse, msg=str(kw)):
+                    C.step_indexer(self._args(**kw), fleet, t, SRC)
+            self.assertEqual(calls, [], kw)
+
+    def test_indexer_step_refuses_a_stale_fork_of_the_same_name(self):
+        fleet, t = self._ssh_fleet(["indexer"])
+        calls, agent, ssh_run, operator_run = self._record(forks_listed=["citratescan-r1007-precut"])
+        p1, p2, p3 = self._patched(agent, ssh_run, operator_run)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            with self.assertRaises(C.Refuse):
+                C.step_indexer(self._args(), fleet, t, SRC)
+        self.assertFalse(any(c[0] == "host" and "indexer:reset" in c[2] for c in calls))
+
+    def test_a_failed_trusted_source_deletes_the_open_fork(self):
+        # BerryManifold P3 (fed #467 round 3): a fork left with no trusted source admits any
+        # IP, and a re-run then refuses on the existing name.
+        fleet, t = self._ssh_fleet(["indexer"])
+        calls, agent, ssh_run, operator_run = self._record()
+        def failing(argv):
+            if argv[:4] == ["doctl", "databases", "firewalls", "append"]:
+                calls.append(("operator", "", " ".join(argv)))
+                raise subprocess.CalledProcessError(1, argv)
+            return operator_run(argv)
+        p1, p2, p3 = self._patched(agent, ssh_run, failing)
+        with p1, p2, p3, redirect_stdout(io.StringIO()):
+            with self.assertRaises(C.Fail):
+                C.step_indexer(self._args(), fleet, t, SRC)
+        ops = [c[2] for c in calls if c[0] == "operator"]
+        self.assertIn("doctl databases delete fork-new --force", ops)
+        self.assertFalse(any(c[0] == "host" and "indexer:reset" in c[2] for c in calls))
+
+    def test_collect_reads_the_live_r1006_staker_keystore_path(self):
+        # 2026-11-11, first read-only collect on the fleet: host-identity failed on prod-1
+        # because collect looked for /etc/citrate/keys/staker.keystore.json. The r1006 bring-up
+        # put the staker keystore and password under /etc/citrate/r1006/ on every producer.
+        from unittest import mock
+        fleet = C.Fleet(FLEET)
+        cmds = []
+        def fake_run(argv, *a, **kw):
+            cmds.append(argv)
+            host = argv[1]
+            p = next(x for x in SRC["producers"] if host.startswith(x["name"]))
+            pub = {"schema": "citrate-host-identity/1", "peer_id": "noise_" + "ab" * 32, "noise_pubkey": "0x" + "cd" * 32,
+                   "proposer_pubkey": p["proposer_pubkey"], "vrf_pubkey": "0x" + "ef" * 33,
+                   "staker_address": p["staker"], "coinbase_address": p["staker"]}
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(pub), stderr="")
+        import types
+        state = tempfile.mkdtemp()
+        with mock.patch.object(C.subprocess, "run", fake_run), redirect_stdout(io.StringIO()):
+            rc = C.cmd_collect(types.SimpleNamespace(mint=False, state=state, binary=None), fleet, SRC)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(cmds), 7)
+        for argv in cmds:
+            self.assertIn("--staker-keystore /etc/citrate/r1006/staker.keystore.json", argv[-1])
+            self.assertIn("--staker-password-file /etc/citrate/r1006/staker.password", argv[-1])
+            self.assertNotIn("/etc/citrate/keys", argv[-1])
+            # absolute: over ssh the tool has no root prefix, and a relative path lands in ~root
+            self.assertIn("--identity-dir /var/lib/citrate/data ", argv[-1])
 
     def test_an_owner_go_for_another_genesis_is_refused(self):
         with tempfile.TemporaryDirectory() as t:
@@ -339,9 +585,9 @@ class PlanAndGuards(unittest.TestCase):
         self.assertEqual(sorted(man["hosts"]), sorted(h["name"] for h in fleet.hosts()))
 
     def test_devnet_only_actions_are_refused_on_the_fleet(self):
-        rc, _ = run(["collect", "--fleet", str(R7 / "fleet.r1007.json"), "--mint", "--state", tempfile.mkdtemp()])
+        rc, _ = run(["collect", "--fleet", str(FLEET), "--mint", "--state", tempfile.mkdtemp()])
         self.assertEqual(rc, 2)
-        rc, _ = run(["render", "--fleet", str(R7 / "fleet.r1007.json"), "--network", "r1006", "--binary", sys.executable, "--state", tempfile.mkdtemp()])
+        rc, _ = run(["render", "--fleet", str(FLEET), "--network", "r1006", "--binary", sys.executable, "--state", tempfile.mkdtemp()])
         self.assertEqual(rc, 2)
 
 
@@ -432,6 +678,84 @@ class Agent(unittest.TestCase):
         self.assertEqual((self.root / "etc/citrate/gen/r1006/citrate-node.service").read_text(), unit.read_text())
         self.assertEqual((self.root / "etc/citrate/active").read_text().strip(), "r1006")
         self.assertTrue(self.agent("park-r1006")[1]["already"])
+
+    # 2026-11-11 read-only fleet check: boot-1..3 and rpc-1 run r1006 from the "home" layout
+    # (/home/citrate/bin/citrate-node --config /home/citrate/.citrate/node.toml, data and
+    # noise.key in /home/citrate/.citrate) with unit drop-ins that inject r1006 consensus env
+    # (CITRATE_VALIDATOR_REGISTRY, ...). Producers use the "producer" layout.
+    def home_r1006(self) -> Path:
+        unit = self.root / "etc/systemd/system/citrate-node.service"
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("[Service]\nUser=citrate\nExecStart=/home/citrate/bin/citrate-node --config /home/citrate/.citrate/node.toml\n")
+        dd = self.root / "etc/systemd/system/citrate-node.service.d"
+        dd.mkdir(parents=True, exist_ok=True)
+        (dd / "r1006-consensus.conf").write_text("[Service]\nEnvironment=CITRATE_VALIDATOR_ACTIVATION_HEIGHT=1000\n")
+        (dd / "10-restart-always.conf").write_text("[Service]\nRestart=always\n")
+        home = self.root / "home/citrate/.citrate"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "node.toml").write_text("r1006 home config")
+        (home / "noise.key").write_bytes(b"H" * 32)
+        b = self.root / "home/citrate/bin"
+        b.mkdir(parents=True, exist_ok=True)
+        (b / "citrate-node").write_text("#!/bin/sh\n")
+        return home
+
+    def systemd_base(self):
+        """systemd mode with a fake systemctl first on PATH (inactive unit, daemon-reload ok)."""
+        fake = self.root / "fakebin"
+        fake.mkdir(exist_ok=True)
+        (fake / "systemctl").write_text("#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/systemctl.log\"\n"
+                                         "case \"$1\" in is-active) exit 3 ;; is-enabled) exit 1 ;; *) exit 0 ;; esac\n")
+        (fake / "systemctl").chmod(0o755)
+        os.environ["PATH"] = str(fake) + os.pathsep + os.environ["PATH"]
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", os.environ["PATH"].replace(str(fake) + os.pathsep, "", 1)))
+        return ["--root", str(self.root), "--mode", "systemd", "--run-as", "", "--r1006-layout", "home"]
+
+    def test_park_home_layout_records_its_files_and_dropins(self):
+        self.home_r1006()
+        self.base = ["--root", str(self.root), "--mode", "proc", "--run-as", "", "--r1006-layout", "home"]
+        rc, res = self.agent("park-r1006")
+        self.assertEqual(rc, 0, res)
+        parked = json.loads((self.root / "etc/citrate/gen/r1006/parked.json").read_text())
+        self.assertEqual(parked["data_dir"], "/home/citrate/.citrate")
+        self.assertIn("/home/citrate/.citrate/node.toml", parked["files"])
+        self.assertIn("/home/citrate/bin/citrate-node", parked["files"])
+        saved = self.root / "etc/citrate/gen/r1006/dropins"
+        self.assertEqual(sorted(x.name for x in saved.iterdir()), ["10-restart-always.conf", "r1006-consensus.conf"])
+        self.assertEqual((self.root / "home/citrate/.citrate/node.toml").read_text(), "r1006 home config")
+
+    def test_seed_keys_reads_the_home_layout(self):
+        self.home_r1006()
+        self.base = ["--root", str(self.root), "--mode", "proc", "--run-as", "", "--r1006-layout", "home"]
+        self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))
+        rc, res = self.agent("seed-keys", "--keys", "noise")
+        self.assertEqual(rc, 0, res)
+        self.assertEqual((self.root / "var/lib/citrate/gen/r1007/noise.key").read_bytes(), b"H" * 32)
+
+    def test_switch_to_r1007_leaves_no_r1006_dropin_and_switching_back_restores_them(self):
+        self.home_r1006()
+        self.base = self.systemd_base()
+        dd = self.root / "etc/systemd/system/citrate-node.service.d"
+        before = {f.name: f.read_bytes() for f in dd.iterdir()}
+        self.assertEqual(self.agent("park-r1006")[0], 0)
+        self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))
+        rc, res = self.agent("switch", "--gen", "r1007")
+        self.assertEqual(rc, 0, res)
+        self.assertEqual(sorted(dd.iterdir()) if dd.exists() else [], [], "an r1006 drop-in would apply to r1007")
+        rc, res = self.agent("switch", "--gen", "r1006")
+        self.assertEqual(rc, 0, res)
+        self.assertEqual({f.name: f.read_bytes() for f in dd.iterdir()}, before)
+
+    def test_switch_refuses_an_unknown_live_dropin(self):
+        self.home_r1006()
+        self.base = self.systemd_base()
+        self.assertEqual(self.agent("park-r1006")[0], 0)
+        self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))
+        (self.root / "etc/systemd/system/citrate-node.service.d/99-added-later.conf").write_text("[Service]\nNice=5\n")
+        rc, res = self.agent("switch", "--gen", "r1007")
+        self.assertEqual(rc, 2)
+        self.assertIn("drop-in", res["refused"])
+        self.assertTrue((self.root / "etc/systemd/system/citrate-node.service.d/99-added-later.conf").exists())
 
     def test_switch_refuses_while_running_and_snapshot_is_written_once(self):
         self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))

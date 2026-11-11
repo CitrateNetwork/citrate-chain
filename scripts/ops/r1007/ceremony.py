@@ -138,8 +138,10 @@ class Transport:
     def _base(self, h: dict) -> list[str]:
         if self.f.transport == "local":
             pre = ["nsenter", f"--net=/proc/{h['netns_pid']}/ns/net"] if h.get("netns_pid") else []
-            return pre + [sys.executable, str(AGENT), "--root", h["root"], "--mode", "proc", "--run-as", ""]
-        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", h["ssh"], "python3", "-", "--mode", "systemd"]
+            return pre + [sys.executable, str(AGENT), "--root", h["root"], "--mode", "proc", "--run-as", "",
+                          "--r1006-layout", h.get("r1006_layout", "producer")]
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", h["ssh"], "python3", "-", "--mode", "systemd",
+                "--r1006-layout", h.get("r1006_layout", "producer")]
 
     def agent(self, h: dict, *args: str, mutating: bool = True, step: str = "") -> dict:
         if self.f.transport == "ssh" and mutating:
@@ -192,6 +194,10 @@ def load_go(path: str | None, genesis: str) -> dict | None:
 # ─── collect ─────────────────────────────────────────────────────────────────
 
 
+R1006_PRODUCER_DATA = "/var/lib/citrate/data"
+R1006_STAKER_DIR = "/etc/citrate/r1006"
+
+
 def cmd_collect(a, fleet: Fleet, src: dict) -> int:
     """Public identities. Fleet: read-only host-identity on each producer (its r1006 keys).
     Devnet (--mint): mint each host's keys into its r1006 slot, as a real host has them."""
@@ -202,9 +208,16 @@ def cmd_collect(a, fleet: Fleet, src: dict) -> int:
     for h in fleet.hosts():
         if fleet.transport == "ssh" and h["role"] != "producer":
             continue  # boots and rpc-1 keep their published noise identities (fleet file)
-        root = Path(fleet.root(h))
-        data = root / ("var/lib/citrate/gen/r1006" if a.mint else "var/lib/citrate/data")
-        keys = root / "etc/citrate/keys"
+        if fleet.transport == "ssh":
+            # The live r1006 producer layout (2026-11-11 read-only check): node data in
+            # /var/lib/citrate/data, the staker keystore and password in /etc/citrate/r1006/.
+            # Absolute paths: over ssh there is no root prefix.
+            data = Path(R1006_PRODUCER_DATA)
+            keys = Path(R1006_STAKER_DIR)
+        else:
+            root = Path(fleet.root(h))
+            data = root / ("var/lib/citrate/gen/r1006" if a.mint else "var/lib/citrate/data")
+            keys = root / "etc/citrate/keys"
         if a.mint:
             data.mkdir(parents=True, exist_ok=True)
             keys.mkdir(parents=True, exist_ok=True)
@@ -601,15 +614,18 @@ def plan_steps(fleet: Fleet) -> list[dict]:
                  "(same hash at a common height), then mines. Gate per producer: its staker appears as a block miner."},
         {"step": "rpc", "owner_go": "GO-2", "hosts": rp, "reversible": True,
          "does": "switch rpc-1 to r1007, start (mining off). Gate: synced to the producers' tip."},
-        {"step": "indexer", "owner_go": "GO-3 (indexer reset)", "hosts": [h["name"] for h in fleet.hosts() if h.get("indexer")], "reversible": "from the backup",
-         "does": "on the indexer host: back up the explorer DB, pnpm indexer:reset --genesis R1007 --confirm "
-                 "(citrate-explorer DEPLOY.md §4a), start citratescan-indexer. Gate: /api/health reports the r1007 genesis."},
+        {"step": "indexer", "owner_go": "GO-3 (indexer reset)", "hosts": [h["name"] for h in fleet.hosts() if h.get("indexer")], "reversible": "from the fork",
+         "does": "confirm citratescan-indexer is stopped; from the operator machine, fork the explorer DB's managed cluster "
+                 "(doctl databases fork, --db-cluster-id) and give the fork one trusted source (--db-fork-rule); then on the "
+                 "indexer host pnpm indexer:reset --genesis R1007 (dry run), --confirm (citrate-explorer DEPLOY.md §4a), start "
+                 "citratescan-indexer. Nothing is written to the host's disk. Gate: /api/health reports the r1007 genesis."},
         {"step": "health", "owner_go": None, "hosts": b + pr + rp, "reversible": True,
          "does": "every node serves the r1007 block 0; every producer's staker is sealing; peer counts at or above the "
                  "floor; the same hash at a common height on every node."},
         {"step": "rollback", "owner_go": "GO-R (rollback, any time before G5)", "hosts": rp + pr + b, "reversible": True,
          "does": "stop r1007 everywhere, switch every host back to slot r1006, start exactly the services the pre-cut "
-                 "snapshot recorded as running, restore the indexer DB backup. Gate: r1006 health, heads at or above the pre-cut heads."},
+                 "snapshot recorded as running. The explorer DB is restored from the indexer-step fork by hand (runbook 3.1); "
+                 "this step does not do it. Gate: r1006 health, heads at or above the pre-cut heads."},
     ]
 
 
@@ -710,7 +726,38 @@ def step_prepare(a, fleet: Fleet, t: Transport, src: dict) -> None:
         log(f"prepare {h['name']}: staged r1007, keys seeded on the host ({keys})")
 
 
+INDEXER_UNIT = "citratescan-indexer"
+INDEXER_FORK_NAME = "citratescan-r1007-precut"
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# A DO managed-database trusted source: one IP, one droplet, one tag or one app. Never a CIDR.
+FORK_RULE_RE = re.compile(r"^(ip_addr:(\d{1,3}\.){3}\d{1,3}|droplet:\d+|tag:[A-Za-z0-9_.:-]+|app:[0-9a-f-]{36})$")
+
+
+def ssh_run(t: Transport, h: dict, cmd: str, step: str) -> None:
+    """One shell command on a fleet host, under the owner's go for this step."""
+    t.require_go(step, h)
+    subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", h["ssh"], cmd], check=True)
+
+
+def operator_run(argv: list[str]) -> str:
+    """One command on the operator machine (doctl). Returns stdout."""
+    return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+
+
+def stop_indexer(fleet: Fleet, t: Transport, step: str) -> None:
+    """Stop the explorer indexer and confirm it is stopped, so it never writes another
+    chain's blocks into the explorer DB."""
+    cmd = f"systemctl stop {INDEXER_UNIT} && ! systemctl is-active --quiet {INDEXER_UNIT}"
+    for h in [h for h in fleet.hosts() if h.get("indexer")]:
+        if fleet.transport == "local":
+            log(f"{step}: would run on {h['name']}: {cmd}")
+            continue
+        ssh_run(t, h, cmd, step)
+        log(f"{step} {h['name']}: {INDEXER_UNIT} stopped")
+
+
 def step_cut(a, fleet: Fleet, t: Transport, src: dict) -> None:
+    stop_indexer(fleet, t, "cut")  # first: before rpc-1 changes chain under it
     for h in fleet.hosts("rpc") + fleet.hosts("producer") + fleet.hosts("boot"):
         t.agent(h, "stop", step="cut")
         log(f"cut {h['name']}: r1006 stopped (data kept)")
@@ -758,25 +805,69 @@ def step_rpc(a, fleet: Fleet, t: Transport, src: dict) -> None:
         log(f"rpc {h['name']}: synced on r1007")
 
 
+def fork_explorer_db(a) -> str:
+    """Back up the explorer DB as a fork of its DO managed cluster, from the operator
+    machine (citrate-explorer docs/ops/VERIFY_V2_MIGRATION_RUNBOOK.md 2.1-2.2). Nothing is
+    written to the indexer host's disk. Returns the fork id."""
+    listed = json.loads(operator_run(["doctl", "databases", "list", "-o", "json"]) or "[]")
+    if any(d.get("name") == INDEXER_FORK_NAME for d in listed):
+        raise Refuse(f"a database named {INDEXER_FORK_NAME} already exists; check and delete it before a new backup")
+    operator_run(["doctl", "databases", "fork", INDEXER_FORK_NAME, "--restore-from-cluster-id", a.db_cluster_id, "--wait"])
+    listed = json.loads(operator_run(["doctl", "databases", "list", "-o", "json"]) or "[]")
+    fork = [d for d in listed if d.get("name") == INDEXER_FORK_NAME]
+    if len(fork) != 1 or fork[0].get("status") != "online":
+        raise Fail(f"the fork {INDEXER_FORK_NAME} is not online: {fork}")
+    fid = fork[0]["id"]
+    # A new DO database has no trusted sources, which means any IP may connect. If the rule
+    # cannot be added, delete the fork we just made: an open copy of production data must not
+    # stay, and a re-run would otherwise refuse on the existing name.
+    try:
+        operator_run(["doctl", "databases", "firewalls", "append", fid, "--rule", a.db_fork_rule])
+    except subprocess.CalledProcessError as e:
+        try:
+            operator_run(["doctl", "databases", "delete", fid, "--force"])
+        except subprocess.CalledProcessError:
+            raise Fail(f"the fork {INDEXER_FORK_NAME} ({fid}) has no trusted source and could not be deleted; "
+                       f"delete it now: doctl databases delete {fid}") from e
+        raise Fail(f"could not add the trusted source to {INDEXER_FORK_NAME}; the fork was deleted. "
+                   f"Fix --db-fork-rule and re-run") from e
+    log(f"indexer: explorer DB forked to {INDEXER_FORK_NAME} ({fid}), trusted source {a.db_fork_rule}")
+    return fid
+
+
 def step_indexer(a, fleet: Fleet, t: Transport, src: dict) -> None:
     hosts = [h for h in fleet.hosts() if h.get("indexer")]
+    g = src["r1007_genesis"]
+    host_cmds = [
+        f"systemctl stop {INDEXER_UNIT} && ! systemctl is-active --quiet {INDEXER_UNIT}",
+        f"cd /opt/citrate-explorer && pnpm indexer:reset --genesis {g}",
+        f"cd /opt/citrate-explorer && pnpm indexer:reset --genesis {g} --confirm",
+        f"systemctl start {INDEXER_UNIT}",
+    ]
     if fleet.transport == "local":
-        log("indexer: SKIP on the devnet (no explorer); on the fleet this step runs the reset below")
-    for h in hosts:
-        cmds = [
-            "systemctl stop citratescan-indexer",
-            "cd /opt/citrate-explorer && pg_dump \"$DATABASE_URL\" -Fc -f /var/backups/citratescan-pre-r1007-$(date -u +%Y%m%dT%H%M%SZ).dump",
-            f"cd /opt/citrate-explorer && pnpm indexer:reset --genesis {src['r1007_genesis']}",
-            f"cd /opt/citrate-explorer && pnpm indexer:reset --genesis {src['r1007_genesis']} --confirm",
-            "systemctl start citratescan-indexer",
-        ]
-        if fleet.transport == "local":
-            for c in cmds:
+        log("indexer: SKIP on the devnet (no explorer); on the fleet this step runs:")
+        log(f"  operator: doctl databases fork {INDEXER_FORK_NAME} --restore-from-cluster-id <--db-cluster-id> --wait,"
+            f" then doctl databases firewalls append <fork> --rule <--db-fork-rule>")
+        for h in hosts:
+            for c in host_cmds:
                 log(f"  would run on {h['name']}: {c}")
-            continue
+        return
+    cid = getattr(a, "db_cluster_id", None)
+    rule = getattr(a, "db_fork_rule", None)
+    if not cid or not UUID_RE.match(cid):
+        raise Refuse("the indexer step needs --db-cluster-id <the explorer DB's DO cluster id> (a UUID)")
+    if not rule or not FORK_RULE_RE.match(rule):
+        raise Refuse("the indexer step needs --db-fork-rule ip_addr:<ip> | droplet:<id> | tag:<t> | app:<id>"
+                     " (the fork's only trusted source)")
+    for h in hosts:
         t.require_go("indexer", h)
-        for c in cmds:
-            subprocess.run(["ssh", h["ssh"], c], check=True)
+    for h in hosts:
+        ssh_run(t, h, host_cmds[0], "indexer")
+    fork_explorer_db(a)
+    for h in hosts:
+        for c in host_cmds[1:]:
+            ssh_run(t, h, c, "indexer")
+        log(f"indexer {h['name']}: reset to {g} and started")
 
 
 def step_rollback(a, fleet: Fleet, t: Transport, src: dict) -> None:
@@ -865,6 +956,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-peers", type=int, default=2)
     ap.add_argument("--last", type=int, default=60)
     ap.add_argument("--lag", type=int, default=3)
+    ap.add_argument("--db-cluster-id", help="indexer step: the explorer DB's DO managed-cluster id")
+    ap.add_argument("--db-fork-rule", help="indexer step: the fork's one trusted source, e.g. ip_addr:<ip>")
     ap.add_argument("--require-sealing", action="store_true")
     ap.add_argument("--expect-kept", action="store_true", help="health after a rollback: heads at or above the pre-cut heads")
     a = ap.parse_args(argv)
