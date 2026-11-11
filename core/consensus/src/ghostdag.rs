@@ -3848,6 +3848,162 @@ mod tests {
         }
     }
 
+    /// A KvStore that counts the root-mark reads (`disq:` gets in DAG metadata).
+    #[derive(Default)]
+    struct CountingKv {
+        inner: MemKv,
+        disq_gets: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::dag_store::KvStore for CountingKv {
+        fn kv_get(&self, cf: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+            if cf == crate::dag_store::cf::DAG_METADATA && key.starts_with(b"disq:") {
+                self.disq_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.kv_get(cf, key)
+        }
+        fn kv_put(&self, cf: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
+            self.inner.kv_put(cf, key, value)
+        }
+        fn kv_delete(&self, cf: &str, key: &[u8]) -> Result<(), String> {
+            self.inner.kv_delete(cf, key)
+        }
+        fn kv_exists(&self, cf: &str, key: &[u8]) -> Result<bool, String> {
+            self.inner.kv_exists(cf, key)
+        }
+        fn kv_iter_cf(&self, cf: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
+            self.inner.kv_iter_cf(cf)
+        }
+    }
+
+    fn dq_id(n: u16, tag: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = tag;
+        b[1..3].copy_from_slice(&n.to_be_bytes());
+        b[31] = 0xD8;
+        b
+    }
+
+    /// A linear chain of `len` blocks after genesis; returns (store, gd, chain).
+    async fn dq_chain(
+        kv: Arc<dyn crate::dag_store::KvStore>,
+        len: u16,
+    ) -> (Arc<DagStore>, GhostDag, Vec<Block>) {
+        let store =
+            Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("persistent store"));
+        let gd = GhostDag::new(GhostDagParams::default(), store.clone());
+        let g = create_test_block_with_parents(dq_id(0, 1), Hash::default(), vec![], 0);
+        store.store_block(g.clone()).await.expect("store");
+        gd.add_block(&g).await.expect("genesis");
+        let mut chain = vec![g];
+        for n in 1..=len {
+            let b = sealed(&gd, dq_id(n, 2), vec![chain.last().expect("tip").hash()]).await;
+            store.store_block(b.clone()).await.expect("store");
+            gd.add_block(&b).await.expect("admit");
+            chain.push(b);
+        }
+        (store, gd, chain)
+    }
+
+    /// fed#537: a status walk that passed root C before C was disqualified
+    /// must not write "qualified" into the verdict cache after the root is
+    /// added (the generation changed), and the descendant reads disqualified.
+    #[tokio::test]
+    async fn a_walk_that_started_before_a_root_never_caches_qualified_after_it() {
+        let (_store, gd, chain) = dq_chain(Arc::new(MemKv::default()), 4).await;
+        let (x, y) = (chain[2].hash(), chain[4].hash());
+        // The walk runs (and finds y qualified) ...
+        let walk = gd.walk_disqualified(&y).await;
+        assert!(!walk.verdict);
+        // ... x is disqualified before the walk writes its result ...
+        gd.disqualify(&x).await;
+        // ... so the stale result is not written.
+        assert!(
+            !gd.commit_disqualified_walk(walk),
+            "a stale walk must not write"
+        );
+        assert!(gd.is_disqualified(&y).await, "y derives disqualified");
+    }
+
+    /// fed#537 (BerryManifold): the root mark is checked before the cache, so
+    /// a root can never read as qualified, even from a stale cached verdict.
+    #[tokio::test]
+    async fn a_root_never_reads_as_qualified_from_a_stale_cached_verdict() {
+        let (store, gd, chain) = dq_chain(Arc::new(MemKv::default()), 3).await;
+        let x = chain[2].hash();
+        assert!(!gd.is_disqualified(&x).await, "cached qualified");
+        // The root is written by another path that does not touch the cache.
+        store.mark_disqualified_root(&x);
+        assert!(
+            gd.is_disqualified(&x).await,
+            "the root mark wins over the cache"
+        );
+    }
+
+    /// fed#538: new roots in one slot cost root-mark reads in the new height
+    /// range only, not a full re-walk of every tip with a DB read per step:
+    /// negative root answers are cached and a new root invalidates only
+    /// verdicts at or above its height.
+    #[tokio::test]
+    async fn new_roots_cost_reads_in_the_new_height_range_only() {
+        const LEN: u16 = 300;
+        const N: u16 = 5;
+        let kv = Arc::new(CountingKv::default());
+        let (store, gd, chain) = dq_chain(kv.clone(), LEN).await;
+        let tip = chain.last().expect("tip").hash();
+        assert!(!gd.is_disqualified(&tip).await);
+        kv.disq_gets.store(0, std::sync::atomic::Ordering::SeqCst);
+        // N bad siblings on the tip, each disqualified in turn; the tip and
+        // every sibling are queried after each new root (fork choice does).
+        let mut sibs = Vec::new();
+        for n in 1..=N {
+            let b = sealed(&gd, dq_id(n, 3), vec![tip]).await;
+            store.store_block(b.clone()).await.expect("store");
+            gd.add_block(&b).await.expect("admit");
+            sibs.push(b.hash());
+        }
+        for s in &sibs {
+            gd.disqualify(s).await;
+            assert!(!gd.is_disqualified(&tip).await, "the tip stays qualified");
+            for t in &sibs {
+                let _ = gd.is_disqualified(t).await;
+            }
+        }
+        for s in &sibs {
+            assert!(gd.is_disqualified(s).await);
+        }
+        let reads = kv.disq_gets.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            reads <= usize::from(N) * usize::from(N) + usize::from(N),
+            "{reads} root-mark reads for {N} new roots over a {LEN}-block chain"
+        );
+    }
+
+    /// fed#538 (a): the walk stops at the pruning point's height; a fresh
+    /// node (empty caches) reads root marks only above it.
+    #[tokio::test]
+    async fn the_status_walk_stops_at_the_pruning_point() {
+        const LEN: u16 = 300;
+        let kv = Arc::new(CountingKv::default());
+        let (store, _gd, chain) = dq_chain(kv.clone(), LEN).await;
+        store
+            .update_pruning_point(chain[200].hash())
+            .await
+            .expect("pruning point");
+        let fresh = GhostDag::new(GhostDagParams::default(), store.clone());
+        kv.disq_gets.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !fresh
+                .is_disqualified(&chain.last().expect("tip").hash())
+                .await
+        );
+        let reads = kv.disq_gets.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            reads <= usize::from(LEN) - 200 + 1,
+            "{reads} root-mark reads: the walk went below the pruning point"
+        );
+    }
+
     /// fed#533: an equivocating producer can sign unlimited children of a
     /// disqualified block. Each child adds NO stored mark (only the root is
     /// stored), and the in-memory state stays bounded by the caches' caps,
