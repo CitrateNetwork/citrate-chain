@@ -992,8 +992,9 @@ KRL=0x00000000000000000000000000000000000000f4
 KINV=$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER)
 # The four inputs DeployEduStack would otherwise default to the deployer.
 KEDU=(SIGNER_1="$KS1" SIGNER_2="$KS2" SIGNER_3="$KS3" RELAYER="$KRL")
-# Test-only bond values: the real amounts are pending (tokenomics) and have no default.
-KBONDS=(WORKMARKET_MIN_COORDINATOR_BOND=3 WORKMARKET_DEFAULT_COORDINATOR_BOND=7)
+# The coordinator bonds the owner decided on 2026-11-11 (rehearsal values, to revisit with
+# tokenomics): 100 SALT minimum, 1,000 SALT default. They are inputs, not defaults.
+KBONDS=(WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000)
 KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KDEP" "${KBONDS[@]}" "${KEDU[@]}")
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_GUARDIAN_VETO_MARGIN=7200
@@ -1016,6 +1017,8 @@ for k in RELAYER SIGNER_1 SIGNER_2 SIGNER_3; do
   expect "phase inputs keys: an unset $k is refused in a 0.6.0 run (it would fall back to the deployer)" 3 "$k is not set; in a 0.6.0 run it would fall back to the deployer" -- \
     env -i PATH="$PATH" "${KV060[@]}" "$k=" python3 -I "$PI" preflight --phases P4V
 done
+expect "phase inputs keys: a minimum bond other than the owner's decided 100 SALT is refused" 3 'WORKMARKET_MIN_COORDINATOR_BOND is 3; the owner decided 100000000000000000000' -- pf "${KV060[@]}" WORKMARKET_MIN_COORDINATOR_BOND=3
+expect "phase inputs keys: a default bond other than the owner's decided 1,000 SALT is refused" 3 'WORKMARKET_DEFAULT_COORDINATOR_BOND is 7; the owner decided 1000000000000000000000' -- pf "${KV060[@]}" WORKMARKET_DEFAULT_COORDINATOR_BOND=7
 expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
 expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KRK1"
 expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${KV060[@]}" GRD_MIN_DELAY=79201
@@ -1195,7 +1198,7 @@ for a, r in ((s1, "SIGNER_1"), (s2, "SIGNER_2"), (s3, "SIGNER_3"), (rel, "RELAYE
              (aai, "CITRATE_AA_IDENTITY_SIGNER"), (aas, "CITRATE_AA_SPONSOR_SIGNER"), (grant, "MEMBERSHIP_GRANTOR"), (tre, "TREASURY")):
     put(a, r)
 print(json.dumps(inv))' "$(owners 11 12 13 14 15)" "$(owners 21 22 23)" "$(addr 61)" "$(addr 62)" "$(addr 63)" "$(addr 64)" "$(addr 65)" "$(addr 66)" "$(addr 67)" "$(addr 51)" "$(addr 90)")
-V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=7200 GENESIS_KEY_INVENTORY="$V060_INV" WORKMARKET_MIN_COORDINATOR_BOND=3 WORKMARKET_DEFAULT_COORDINATOR_BOND=7)
+V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=7200 GENESIS_KEY_INVENTORY="$V060_INV" WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000)
 # P4V, the 0.6.0 phase: planned (deploy, then the required on-chain verify) only in a 0.6.0 run.
 expect "ceremony P4V: a 0.6.0 dry run plans DeployV060Genesis" 0 'DRYRUN .*DeployV060Genesis' -- "${CEENV[@]}" "${V060_KEYS[@]}" bash "$CE"
 expect "ceremony P4V: a 0.6.0 dry run plans the verifyBook step" 0 "DRYRUN .*verifyBook" -- "${CEENV[@]}" "${V060_KEYS[@]}" bash "$CE"
