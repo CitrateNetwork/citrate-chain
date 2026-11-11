@@ -5169,11 +5169,14 @@ mod slot_config_line_tests {
         let r = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS.render();
         let line = slot_config_line(1, Some(&r));
         assert!(
-            line.starts_with("SLOT_CONFIG slot_secs=1 target_block_time=1 chain_params_fp=0x"),
+            line.starts_with(
+                "SLOT_CONFIG slot_secs=1 target_block_time=1 production_period_secs=1 \
+                 chain_params_fp=0x"
+            ),
             "{line}"
         );
         assert_eq!(line, slot_config_line(1, Some(&r)), "stable");
-        assert_eq!(line.split_whitespace().count(), 4, "{line}");
+        assert_eq!(line.split_whitespace().count(), 5, "{line}");
         assert_ne!(
             line,
             slot_config_line(1, Some("other")),
@@ -5181,8 +5184,13 @@ mod slot_config_line_tests {
         );
         assert_eq!(
             slot_config_line(2, None),
-            "SLOT_CONFIG slot_secs=1 target_block_time=2 chain_params_fp=none"
+            "SLOT_CONFIG slot_secs=1 target_block_time=2 production_period_secs=2 chain_params_fp=none"
         );
+        // The producer seals every ceil(target_block_time / slot) slots on the
+        // slot grid (timing::production_period_secs): the slot is consensus,
+        // target_block_time only this producer's cadence on it.
+        assert!(slot_config_line(3, None).contains(" production_period_secs=3 "));
+        assert!(slot_config_line(0, None).contains(" production_period_secs=1 "));
         assert!(include_str!("main.rs")
             .contains("info!(\n        \"{}\",\n        slot_config_line(\n            config.mining.target_block_time,"));
     }
