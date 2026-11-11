@@ -202,7 +202,7 @@ GRD_MIN_OWNERS=3
 GRD_MIN_DELAY_SECS=3600 # the contract floor
 GENESIS_TTL_SECS=1209600 # 14 days, fixed on 40204
 
-PHASES=(P0 P1 P2 P3 P3L P4 P5 P6 P7)
+PHASES=(P0 P1 P2 P3 P3L P4 P4V P5 P6 P7)
 MODE=dry
 FROM=P0
 ONLY=""
@@ -270,6 +270,7 @@ MEMB_BOOK="$CONTRACTS/$MEMB_REL"
 # (V060_GENESIS_OUT), and P5 sweeps it with the other outputs.
 V060_REL="$OUT_REL/v060-genesis.json"
 V060_BOOK="$CONTRACTS/$V060_REL"
+V060_INPUT_REL="$OUT_REL/v060-input-book.json"
 # G9: the genesis membership deploy (chain#331). P2 runs it through regenesis.sh
 # --genesis-membership, and the generator reads the membership from its broadcast.
 GENESIS_MEMBERSHIP_SCRIPT=DeployGenesisMembership.s.sol
@@ -324,7 +325,7 @@ after_broadcast() {
       ;;
     # P3/P4 record their output book themselves, and --confirm P5 refuses an unrecorded one, so
     # the way on is the record step (it sends nothing), never past the phase without it.
-    P3 | P4)
+    P3 | P4 | P4V)
       if [[ -f "${RUN_MANIFEST:-}" ]] && manifest_has "$RUN_MANIFEST" "$(phase_record "$1")"; then
         err "$1's book is recorded; resume after $1: $0 --confirm --from $(next_phase "$1")$acct"
       else
@@ -768,7 +769,7 @@ P2_BROADCAST_SCRIPTS=(DeployAll.s.sol DeployValidatorRegistry.s.sol DeployModelA
 # broadcast directory name (phase_scripts). A phase that broadcasts must be listed here: the
 # guard refuses any other, run_broadcast refuses a phase the guard has not cleared, and the
 # test suite's tripwire runs every phase against this run's broadcasts and counts what it sends.
-SENDS_ONCE_PHASES=(P1 P2 P3 P3L P4)
+SENDS_ONCE_PHASES=(P1 P2 P3 P3L P4 P4V)
 phase_record() {
   case "$1" in
     P1) echo governance ;;
@@ -776,6 +777,7 @@ phase_record() {
     P3) echo teamVesting ;;
     P3L) echo library ;;
     P4) echo dormantLedgers ;;
+    P4V) echo v060 ;;
     *) return 1 ;;
   esac
 }
@@ -786,6 +788,7 @@ phase_record_desc() {
     P3) echo "the vesting book" ;;
     P3L) echo "the library book" ;;
     P4) echo "the dormant-ledger book" ;;
+    P4V) echo "the 0.6.0 book" ;;
   esac
 }
 phase_scripts() {
@@ -795,6 +798,7 @@ phase_scripts() {
     P3) echo DeployTeamVesting.s.sol ;;
     P3L) "$PY" "$LIBRARY_PY" scripts ;;
     P4) echo DeployDormantLedgers.s.sol ;;
+    P4V) echo DeployV060Genesis.s.sol ;;
     *) return 1 ;;
   esac
 }
@@ -1606,6 +1610,85 @@ if should P4; then
   fi
 fi
 
+# ---------------------------------------------------------------- P4V
+# The 0.6.0 contract set (GENESIS_V060=1 only; DeployV060Genesis, V60-GEN): after P4, whose
+# FederatedRoundLedger it reads, and before P5, which sweeps its book. Its inputs are this
+# run's own books, merged into one input book (the P2 stack book, P1's governance, P3L's
+# library, P4's dormant ledgers; a name two books give different addresses fails). It sends
+# once (C10), records its book (v060), and then the on-chain verify step (verifyBook) must
+# pass: every 0.6.0 contract is re-read on chain against the inputs. Outside a 0.6.0 run the
+# phase is skipped, and --only P4V is refused.
+if should P4V; then
+  if [[ "${GENESIS_V060:-}" != 1 ]]; then
+    [[ "$ONLY" == P4V ]] && gate_fail P4V "P4V is the 0.6.0 phase: set GENESIS_V060=1 (and its inputs), or do not run it"
+    log "P4V skipped: not a 0.6.0 ceremony (GENESIS_V060 is not 1)"
+  else
+    sends_once P4V
+    load_governance P4V "$([[ "$MODE" == confirm ]] && echo 1 || echo 0)"
+    export V060_INPUT_BOOK="$V060_INPUT_REL" V060_GENESIS_OUT="$V060_REL"
+    if [[ "$MODE" == dry ]]; then
+      log "P4V would merge $ADDRESS_BOOK + $GOV_REL, $LIB_REL, $DORMANT_REL → $V060_INPUT_REL"
+      forge_phase P4V DeployV060Genesis.s.sol
+      describe_cmd "(cd contracts && V060_INPUT_BOOK=$V060_INPUT_REL V060_GENESIS_OUT=$V060_REL" "$FORGE" script script/DeployV060Genesis.s.sol --sig "'verifyBook()'" --rpc-url "${RPC_URL:-\$RPC_URL}" ")"
+    else
+      why=$(phase_inputs P4V P4) || gate_fail P4V "phase inputs: $why"
+      if [[ "$MODE" == confirm ]]; then
+        stack_book_bound P4V 1
+        manifest_has "$RUN_MANIFEST" library || gate_fail P4V "$LIB_BOOK was not recorded by P3L in this run"
+        manifest_has "$RUN_MANIFEST" dormantLedgers || gate_fail P4V "$DORMANT_BOOK was not recorded by P4 in this run"
+      fi
+      skip_sim=""
+      for b in "$GOV_BOOK" "$LIB_BOOK" "$DORMANT_BOOK"; do
+        if [[ ! -f "$b" ]]; then
+          [[ "$MODE" == confirm ]] && gate_fail P4V "$b missing: P4V reads every earlier ceremony output"
+          skip_sim="$b is absent"
+        fi
+      done
+      if [[ -z "$skip_sim" ]]; then
+        "$PY" - "$CONTRACTS/$V060_INPUT_REL" "$ADDRESS_BOOK" "$GOV_BOOK" "$LIB_BOOK" "$DORMANT_BOOK" <<'PY' || gate_fail P4V "cannot build the 0.6.0 input book (see above)"
+import json, sys
+out, books = sys.argv[1], sys.argv[2:]
+merged = {"contracts": {}, "aaStack": {}}
+seen = {}
+for p in books:
+    d = json.load(open(p))
+    for sec in ("contracts", "aaStack"):
+        for name, a in (d.get(sec) or {}).items():
+            prev = seen.get(name)
+            if prev and prev[0].lower() != str(a).lower():
+                sys.exit(f"{name}: {prev[1]} says {prev[0]}, {p} says {a}")
+            seen[name] = (a, p)
+            merged[sec][name] = a
+    if p == books[0]:
+        merged["deployer"] = d.get("deployer")
+json.dump(merged, open(out, "w"), indent=2, sort_keys=True)
+PY
+        frl=$(book_addr "$CONTRACTS/$V060_INPUT_REL" FederatedRoundLedger) || frl=""
+        if ! is_addr "$frl" || [[ "$("$CAST" code "$frl" --rpc-url "$RPC_URL" 2>/dev/null)" == 0x ]]; then
+          [[ "$MODE" == confirm ]] && gate_fail P4V "the FederatedRoundLedger ('$frl') has no code on chain: run P4 first"
+          skip_sim="the FederatedRoundLedger has no code (an earlier step only simulated)"
+        fi
+      fi
+      if [[ -n "$skip_sim" ]]; then
+        log "P4V note: skipped in a simulation: $skip_sim"
+      else
+        forge_phase P4V DeployV060Genesis.s.sol
+        record_output_book P4V v060 "$V060_BOOK" DeployV060Genesis.s.sol \
+          "$(printf '{"GovernanceTimelock":"%s"}' "$(lower "$GOVERNANCE")")"
+        if [[ -f "$V060_BOOK" ]]; then
+          out=$(cd "$CONTRACTS" && "$FORGE" script script/DeployV060Genesis.s.sol --sig 'verifyBook()' --rpc-url "$RPC_URL" 2>&1) ||
+            gate_fail P4V "verifyBook failed: $(printf '%s' "$out" | grep -E 'Error|revert' | head -3)"
+          grep -q 'V060 verify PASS' <<<"$out" || gate_fail P4V "verifyBook did not report PASS"
+          log "P4V PASS: verifyBook re-read every 0.6.0 contract on chain"
+        elif [[ "$MODE" == simulate ]]; then
+          log "P4V note: a simulation writes no 0.6.0 book, so verifyBook has nothing to re-read"
+        fi
+      fi
+    fi
+    sends_once_end
+  fi
+fi
+
 # ---------------------------------------------------------------- P5
 # The checker reads ONE book (ADDRESS_BOOK) and sweeps its .contracts and .aaStack. P5 hands
 # it a single merged book: the canonical book plus the .contracts of every ceremony output,
@@ -1647,7 +1730,7 @@ if should P5; then
       if [[ -f "$V060_BOOK" ]]; then
         extras+=("$V060_BOOK")
       elif [[ "$MODE" == confirm ]]; then
-        gate_fail P5 "$V060_BOOK missing: a GENESIS_V060=1 ceremony must run DeployV060Genesis (V060_GENESIS_OUT=$V060_REL) before P5"
+        gate_fail P5 "$V060_BOOK missing: a GENESIS_V060=1 ceremony must run P4V (DeployV060Genesis) before P5"
       else
         log "P5 note: $V060_BOOK absent in a simulation; not swept"
       fi
@@ -1660,7 +1743,9 @@ if should P5; then
     # C5: the vesting and dormant-ledger outputs are the ones this run recorded. P3/P4 record
     # them when they write them; on --confirm a book its step did not record is refused (a
     # simulation still records one at first use here).
-    for kb in "teamVesting:P3:$VEST_BOOK" "dormantLedgers:P4:$DORMANT_BOOK" "library:P3L:$LIB_BOOK"; do
+    kbs=("teamVesting:P3:$VEST_BOOK" "dormantLedgers:P4:$DORMANT_BOOK" "library:P3L:$LIB_BOOK")
+    [[ "${GENESIS_V060:-}" == 1 ]] && kbs+=("v060:P4V:$V060_BOOK")
+    for kb in "${kbs[@]}"; do
       IFS=: read -r k st b <<<"$kb"
       [[ -f "$b" ]] || continue
       cj=$(book_contracts_json "$b") || gate_fail P5 "$b has no well-formed contracts"

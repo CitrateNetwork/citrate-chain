@@ -4,7 +4,8 @@ name: Genesis pipeline (anvil)
 # `forge script --broadcast` runs against a throwaway anvil chain (chain id 40204), the
 # CheckDeployedAdmins gate over their books, and the negatives that must be refused
 # (simulated chain id != node chain id, a deployer-controlled timelock whose role-history
-# window starts after a hidden grant). Uses only anvil's public test mnemonic; no secret.
+# window starts after a hidden grant). Then genesis-pipeline-anvil-v060.sh rehearses the 0.6.0
+# ceremony genesis the same way. Uses only anvil's public test mnemonic; no secret.
 on:
   workflow_dispatch:
   push:
@@ -13,6 +14,7 @@ on:
       - 'contracts/src/genesis/**'
       - 'contracts/test/genesis/anvil/**'
       - 'scripts/ci/genesis-pipeline-anvil.sh'
+      - 'scripts/ci/genesis-pipeline-anvil-v060.sh'
       - '.github/workflows/genesis-pipeline.yml'
   pull_request:
     paths:
@@ -20,6 +22,7 @@ on:
       - 'contracts/src/genesis/**'
       - 'contracts/test/genesis/anvil/**'
       - 'scripts/ci/genesis-pipeline-anvil.sh'
+      - 'scripts/ci/genesis-pipeline-anvil-v060.sh'
       - '.github/workflows/genesis-pipeline.yml'
 
 permissions:
@@ -60,3 +63,7 @@ jobs:
         run: forge build
       - name: Genesis pipeline + negatives on anvil 40204
         run: bash scripts/ci/genesis-pipeline-anvil.sh
+      # The 0.6.0 ceremony genesis (GENESIS_V060=1): P1's v2 guardian veto, DeployV060Genesis,
+      # its required verifyBook step and the admin gate over the 0.6.0 book, plus negatives.
+      - name: 0.6.0 genesis rehearsal + negatives on anvil 40204
+        run: bash scripts/ci/genesis-pipeline-anvil-v060.sh

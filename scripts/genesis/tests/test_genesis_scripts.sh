@@ -986,7 +986,9 @@ KSTAKER=$(jq -r '.validators[0].staker' "$G/../../core/economics/assets/r1006/va
 pf() { env -i PATH="$PATH" "$@" python3 -I "$PI" preflight --phases P1; }
 kinv() { python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({a[i]: a[i+1].split("+") for i in range(0, len(a), 2)}))' "$@"; }
 KINV=$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS")
-KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KDEP")
+# Test-only bond values: the real amounts are pending (tokenomics) and have no default.
+KBONDS=(WORKMARKET_MIN_COORDINATOR_BOND=3 WORKMARKET_DEFAULT_COORDINATOR_BOND=7)
+KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KDEP" "${KBONDS[@]}")
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1"
@@ -1001,6 +1003,7 @@ expect "phase inputs keys: an unknown role in the inventory is refused" 3 "GENES
 expect "phase inputs keys: an inventory that is not JSON is refused" 3 'GENESIS_KEY_INVENTORY is not a JSON object' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,$KNK2" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: a malformed inventory address is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY='{"0xzz":["GOV_OWNERS"]}' GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: an exactly repeated inventory address is refused" 3 "GENESIS_KEY_INVENTORY: 0x0+b1 appears more than once" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="{\"$KNK1\":[\"GOV_OWNERS\"],\"$KNK1\":[\"GRD_OWNERS\"]}" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
+expect "phase inputs keys: GENESIS_V060=1 without the coordinator bonds is refused at P0" 3 'WORKMARKET_MIN_COORDINATOR_BOND is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
 expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KRK1"
 expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${KV060[@]}" GRD_MIN_DELAY=79201
@@ -1180,7 +1183,13 @@ for a, r in ((s1, "SIGNER_1"), (s2, "SIGNER_2"), (s3, "SIGNER_3"), (rel, "RELAYE
              (aai, "CITRATE_AA_IDENTITY_SIGNER"), (aas, "CITRATE_AA_SPONSOR_SIGNER"), (grant, "MEMBERSHIP_GRANTOR"), (tre, "TREASURY")):
     put(a, r)
 print(json.dumps(inv))' "$(owners 11 12 13 14 15)" "$(owners 21 22 23)" "$(addr 61)" "$(addr 62)" "$(addr 63)" "$(addr 64)" "$(addr 65)" "$(addr 66)" "$(addr 67)" "$(addr 51)" "$(addr 90)")
-V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=7200 GENESIS_KEY_INVENTORY="$V060_INV")
+V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=7200 GENESIS_KEY_INVENTORY="$V060_INV" WORKMARKET_MIN_COORDINATOR_BOND=3 WORKMARKET_DEFAULT_COORDINATOR_BOND=7)
+# P4V, the 0.6.0 phase: planned (deploy, then the required on-chain verify) only in a 0.6.0 run.
+expect "ceremony P4V: a 0.6.0 dry run plans DeployV060Genesis" 0 'DRYRUN .*DeployV060Genesis' -- "${CEENV[@]}" "${V060_KEYS[@]}" bash "$CE"
+expect "ceremony P4V: a 0.6.0 dry run plans the verifyBook step" 0 "DRYRUN .*verifyBook" -- "${CEENV[@]}" "${V060_KEYS[@]}" bash "$CE"
+expect "ceremony P4V: outside a 0.6.0 run the phase is skipped" 0 'P4V skipped: not a 0.6.0 ceremony' -- "${CEENV[@]}" bash "$CE"
+expect "ceremony P4V: --only P4V outside a 0.6.0 run is refused" 3 'P4V is the 0.6.0 phase' -- "${CEENV[@]}" bash "$CE" --only P4V
+expect "ceremony P4V: an unknown phase list still names P4V" 1 'must be one of P0 P1 P2 P3 P3L P4 P4V P5 P6 P7' -- "${CEENV[@]}" bash "$CE" --from P9
 printf '{"deployer":"%s","contracts":{"WorkMarket":"%s"}}' "$DEP" "$(addr 83)" >"$GB/v060-genesis.json"
 expect "ceremony: P5 refuses a 0.6.0 book outside a 0.6.0 run" 3 'exists but GENESIS_V060 is not 1' -- "${CEENV[@]}" RPC_URL=http://127.0.0.1:8545 bash "$CE" --simulate --only P5
 expect "ceremony: P5 sweeps the 0.6.0 output in a 0.6.0 run" 3 'DEPLOYER-ADMIN WorkMarket' -- "${CEENV[@]}" "${V060_KEYS[@]}" RPC_URL=http://127.0.0.1:8545 FAKE_DEPLOYER_HELD=WorkMarket bash "$CE" --simulate --only P5
