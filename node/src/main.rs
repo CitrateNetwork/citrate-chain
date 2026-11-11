@@ -98,6 +98,7 @@ mod registration_proof;
 mod registry_sync;
 mod rollback;
 mod serve_plane;
+mod shutdown;
 #[cfg(test)]
 mod serve_plane_tests;
 mod slot_stats;
