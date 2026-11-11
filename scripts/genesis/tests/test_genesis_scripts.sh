@@ -154,6 +154,13 @@ if [[ "$*" == *projectIpfsV3* ]]; then [[ "${FAKE_IPFS_V3:-}" == none ]] && exit
 # output book (TEAM_VESTING_OUT / DORMANT_LEDGERS_OUT, relative to contracts/, the cwd).
 if [[ "$*" == *DeployTeamVesting* && -n "${FAKE_P3_BOOK:-}" ]]; then cp "$FAKE_P3_BOOK" "$TEAM_VESTING_OUT"; fi
 if [[ "$*" == *DeployDormantLedgers* && -n "${FAKE_P4_BOOK:-}" ]]; then cp "$FAKE_P4_BOOK" "$DORMANT_LEDGERS_OUT"; fi
+# FAKE_V060_BOOK=<file>: the 0.6.0 step (P4V) "writes" its book (V060_GENESIS_OUT). Its verifyBook
+# call reports PASS unless FAKE_V060_VERIFY=fail (then it reverts on the allowlist, as on chain).
+if [[ "$*" == *DeployV060Genesis* && "$*" == *--broadcast* && -n "${FAKE_V060_BOOK:-}" ]]; then cp "$FAKE_V060_BOOK" "$V060_GENESIS_OUT"; fi
+if [[ "$*" == *verifyBook* ]]; then
+  if [[ "${FAKE_V060_VERIFY:-pass}" == pass ]]; then echo "  V060 verify PASS: every 0.6.0 genesis contract re-read on chain"; exit 0; fi
+  echo "Error: script failed: WorkMarket: verifier allowlist"; exit 1
+fi
 # FAKE_FORGE_BCAST=1: a --broadcast run records its broadcast as forge does
 # (broadcast/<script>/40204/run-<n>.json and run-latest.json, relative to contracts/, the cwd),
 # at FAKE_FORGE_TS (default 6000, after the fake block 0). FAKE_P1_BOOK=<file>: P1 "writes" that
@@ -1074,6 +1081,33 @@ akc_alloc "immutable=0x$(printf 'f3%.0s' $(seq 20))"
 expect "GO-K step 3: an EOA referenced as a code immutable off the inventory is refused" 1 'references 0x(f3){20}' -- akc
 akc_alloc "base=0x$(printf 'f4%.0s' $(seq 20))"
 expect "GO-K step 3: a base allocation off the inventory is refused" 1 'baseAllocations \(faucet\) funds 0x(f4){20}' -- akc
+# #463 review P3: in a 0.6.0 run the alloc render (build_r1006_genesis.sh alloc) runs the GO-K step 3
+# check as a required step: without --stakers it refuses, and a failing check removes the alloc.
+RB="$G/r1006/build_r1006_genesis.sh"
+RW="$T/akc-work"; mkdir -p "$RW/book"
+: >"$RW/dump.json"
+printf '{"devnetGenesis":"0x0","deployer":"%s","tip":1}\n' "$AKDEP" >"$RW/devnet.json"
+cat >"$T/fake-emit-alloc" <<'FEA'
+#!/usr/bin/env bash
+# stands in for emit_alloc.py: writes FAKE_ALLOC to --out
+while [[ $# -gt 0 ]]; do [[ "$1" == --out ]] && { cp "$FAKE_ALLOC" "$2"; exit 0; }; shift; done; exit 2
+FEA
+chmod +x "$T/fake-emit-alloc"
+akc_alloc "fund=0x$(printf 'b2%.0s' $(seq 20))"; cp "$AK/alloc.json" "$T/akc-good.json"
+akc_alloc "fund=0x$(printf 'f1%.0s' $(seq 20))"; cp "$AK/alloc.json" "$T/akc-bad.json"
+RBENV=(env PYTHON="$T/fake-emit-alloc" GENESIS_V060=1 GENESIS_KEY_INVENTORY="$AKINV" GENESIS_RETIRED_KEYS="$KRK1")
+expect "GO-K step 3 render: a 0.6.0 alloc render without --stakers is refused" 1 'GENESIS_V060=1 needs --stakers' -- "${RBENV[@]}" FAKE_ALLOC="$T/akc-good.json" bash "$RB" alloc --work "$RW" --out "$T/akc-out.json"
+expect "GO-K step 3 render: a 0.6.0 alloc that funds an unknown key is refused" 1 'GO-K step 3 failed' -- "${RBENV[@]}" FAKE_ALLOC="$T/akc-bad.json" bash "$RB" alloc --work "$RW" --out "$T/akc-out.json" --stakers "$AK/validators.json"
+[[ ! -e "$T/akc-out.json" ]] && ok "GO-K step 3 render: a refused alloc is removed" || bad "GO-K step 3 render: a refused alloc is removed" "$(ls -l "$T/akc-out.json")"
+expect "GO-K step 3 render: a 0.6.0 alloc of known keys passes (control)" 0 'alloc_keys_check: OK' -- "${RBENV[@]}" FAKE_ALLOC="$T/akc-good.json" bash "$RB" alloc --work "$RW" --out "$T/akc-out.json" --stakers "$AK/validators.json"
+# #463 review P2: an EOA whose first 4 (or 6) address bytes are zero is still checked, and every
+# word below the address floor is listed with its account and slot, not silently skipped.
+akc_alloc "store=0x00000000$(printf 'f5%.0s' $(seq 16))"
+expect "GO-K step 3: an EOA with 4 leading zero bytes off the inventory is refused" 1 'references 0x00000000(f5){16}' -- akc
+akc_alloc "store=0x000000000000$(printf 'f6%.0s' $(seq 14))"
+expect "GO-K step 3: an EOA with 6 leading zero bytes off the inventory is refused" 1 'references 0x000000000000(f6){14}' -- akc
+akc_alloc "store=0x0000000000000000000000000000000000000fa0"
+expect "GO-K step 3: a word below the address floor is listed with its slot" 0 'GOK3-UNCHECKED 0x(c0){20} storage 0x01 0xfa0' -- akc
 akc_alloc "deployer=$AKDEP"
 expect "GO-K step 3: a funded ceremony deployer is refused" 1 'the ceremony deployer .* has balance' -- akc
 akc_alloc "fund=0x$(printf 'd1%.0s' $(seq 20))"
@@ -2709,9 +2743,9 @@ for c in "P3:teamVesting:team-vesting.json:$VEST_OK:DeployTeamVesting.s.sol:CREA
   expect "ceremony $ph code: with code everywhere the record step records (control)" 0 "$ph $file recorded in the run manifest" -- "${OBENV[@]}" bash "$CE" --confirm --only "$ph" --record-book --account deployer
 done
 rm -f "$GB/team-vesting.json" "$GB/dormant-ledgers.json"
-expect "ceremony recovery: --record-book needs --confirm" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --simulate --only P3 --record-book
-expect "ceremony recovery: --record-book needs --only" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --confirm --from P3 --record-book --account deployer
-expect "ceremony recovery: --record-book is refused for a phase that writes no book" 1 '--record-book needs --confirm --only P2, P3, P3L or P4' -- "${OBENV[@]}" bash "$CE" --confirm --only P1 --record-book --account deployer
+expect "ceremony recovery: --record-book needs --confirm" 1 '--record-book needs --confirm --only P2, P3, P3L, P4 or P4V' -- "${OBENV[@]}" bash "$CE" --simulate --only P3 --record-book
+expect "ceremony recovery: --record-book needs --only" 1 '--record-book needs --confirm --only P2, P3, P3L, P4 or P4V' -- "${OBENV[@]}" bash "$CE" --confirm --from P3 --record-book --account deployer
+expect "ceremony recovery: --record-book is refused for a phase that writes no book" 1 '--record-book needs --confirm --only P2, P3, P3L, P4 or P4V' -- "${OBENV[@]}" bash "$CE" --confirm --only P1 --record-book --account deployer
 expect "ceremony recovery: --record-stack-book stays P2's" 1 '--record-stack-book needs --confirm --only P2' -- "${OBENV[@]}" bash "$CE" --confirm --only P3 --record-stack-book --account deployer
 
 # P5 on --confirm: a book its step did not record is refused; recorded books pass this check.
@@ -2740,6 +2774,21 @@ rm -f "$GB/p5-admin-book.json"
 expect "ceremony: --confirm P5 passes over the real-shaped books (dormant ledgers repeat the governance names)" 0 'P5 PASS: FACTORY-ADMIN 0, DEPLOYER-ADMIN 0' -- "${OBENV[@]}" ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P5 --account deployer
 python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["contracts"]; sys.exit(0 if {"ValidatorRegistry","GovernanceTimelock","GovernanceMultisig","GuardianTimelock","FederatedRoundLedger","PatronageLedger","TeamVesting_alice"} <= set(c) else 1)' "$GB/p5-admin-book.json" 2>/dev/null &&
   ok "ceremony: --confirm P5 merged every book once" || bad "ceremony: --confirm P5 merged every book once" "$(cat "$GB/p5-admin-book.json" 2>&1)"
+# P4V on --confirm (#463 review P1): verifyBook runs BEFORE the 0.6.0 book is recorded, so a
+# failed verify records nothing and --from P5 is refused; the record step re-verifies.
+V060B="$OBK/v060.json"
+printf '{"deployer":"%s","contracts":{"WorkMarket":"%s","TaskVerifier":"%s"}}\n' "$DEP" "$(addr 841)" "$(addr 842)" >"$V060B"
+rm -rf "${FAKE:?}/bc-stage"
+bc_run DeployV060Genesis.s.sol 6000 "CREATE2:WorkMarket:$(addr 841)" "CREATE2:TaskVerifier:$(addr 842)"
+rm -f "$GB/v060-genesis.json"
+expect "ceremony P4V: a failed verifyBook stops P4V before its book is recorded" 3 'GATE FAIL at P4V: verifyBook failed' -- "${OBENV[@]}" "${V060_KEYS[@]}" ADDRESS_BOOK="$T/book-vr.json" FAKE_V060_BOOK="$V060B" FAKE_V060_VERIFY=fail bash "$CE" --confirm --only P4V --account deployer
+[[ "$(manifest_key v060)" == null ]] && ok "ceremony P4V: a failed verify records no 0.6.0 book" || bad "ceremony P4V: a failed verify records no 0.6.0 book" "$(manifest_key v060)"
+expect "ceremony P4V: after a failed verify, --from P5 is refused" 3 'GATE FAIL at P5: .*v060-genesis.json was not recorded by P4V' -- "${OBENV[@]}" "${V060_KEYS[@]}" ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --from P5 --account deployer
+expect "ceremony P4V: the record step re-runs verifyBook and refuses while it fails" 3 'GATE FAIL at P4V: verifyBook failed' -- "${OBENV[@]}" "${V060_KEYS[@]}" ADDRESS_BOOK="$T/book-vr.json" FAKE_V060_VERIFY=fail bash "$CE" --confirm --only P4V --record-book --account deployer
+expect "ceremony P4V: once verifyBook passes, the record step records the 0.6.0 book" 0 'P4V v060-genesis.json recorded in the run manifest' -- "${OBENV[@]}" "${V060_KEYS[@]}" ADDRESS_BOOK="$T/book-vr.json" bash "$CE" --confirm --only P4V --record-book --account deployer
+[[ "$(manifest_key v060)" != null ]] && ok "ceremony P4V: the manifest holds the verified 0.6.0 book" || bad "ceremony P4V: the manifest holds the verified 0.6.0 book" "$(cat "$GB/ceremony-run.json")"
+rm -f "$GB/v060-genesis.json"
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); m.pop("v060", None); json.dump(m, open(sys.argv[1], "w"))' "$GB/ceremony-run.json"
 rm -rf "${FAKE:?}/call/$VR" "${GB:?}/p5-admin-book.json" "${GB:?}/library.json"
 ob_reset simulate
 rm -rf "${BCD:?}"
