@@ -335,6 +335,24 @@ def render_host(fleet: Fleet, h: dict, net: str, src: dict, ids: dict, stk: dict
     return files
 
 
+# Owner 2026-11-11: block 0 is stamped at ceremony time; a fleet render refuses a stamp more
+# than this far from the render (either side).
+GENESIS_STAMP_WINDOW_SECS = 3_600
+
+
+def check_genesis_timestamp(fleet: Fleet, src: dict, now: int) -> None:
+    """Refuse a fleet render whose r1007 genesis timestamp is stale or far in the future.
+    A local (devnet) rehearsal renders the checkout's timestamp as it is."""
+    if fleet.transport == "local":
+        return
+    ts = int(src["r1007_genesis_timestamp"])
+    if abs(now - ts) > GENESIS_STAMP_WINDOW_SECS:
+        raise Refuse(
+            f"the r1007 genesis timestamp {ts} is {now - ts:+d} s from now (limit "
+            f"{GENESIS_STAMP_WINDOW_SECS} s): stamp it at ceremony time with "
+            "scripts/genesis/r1007/stamp_genesis.py, rebuild the node binary, then render")
+
+
 def cmd_render(a, fleet: Fleet, src: dict) -> int:
     net = a.network
     if net == "r1006" and fleet.transport != "local":
@@ -345,6 +363,8 @@ def cmd_render(a, fleet: Fleet, src: dict) -> int:
         raise Refuse("; ".join(src["r1007_pending"]))
     if net == "r1007" and src["r1007_pending"]:
         log("NOTE (local rehearsal): " + "; ".join(src["r1007_pending"]))
+    if net == "r1007":
+        check_genesis_timestamp(fleet, src, int(time.time()))
     ids = identities(a, fleet)
     stk = stakers(fleet, ids, src)
     binary = Path(a.binary)
@@ -371,6 +391,7 @@ def cmd_render(a, fleet: Fleet, src: dict) -> int:
         "params_render": src["params_render"] if net == "r1007" else None,
         "source_commit": git_head(), "binary_sha256": bin_sha, "hosts": hosts,
         "r1007_pending": src["r1007_pending"] if net == "r1007" else None,
+        "r1007_genesis_timestamp": src["r1007_genesis_timestamp"] if net == "r1007" else None,
     })
     log(f"rendered {len(hosts)} hosts for {net} -> {out}")
     return 0

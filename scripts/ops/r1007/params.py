@@ -133,6 +133,15 @@ def r1007_pending(repo: Path) -> list[str]:
     return [f"D-K3: r1007 is pending fresh non-producer keys ({why}); roles: {', '.join(roles)}"]
 
 
+def genesis_timestamp(repo: Path) -> int:
+    """`pub const GENESIS_TIMESTAMP: u64 = <unix seconds>;` in core/economics/src/r1007.rs
+    (stamped at ceremony time by scripts/genesis/r1007/stamp_genesis.py)."""
+    m = re.search(r"pub const GENESIS_TIMESTAMP: u64 = ([0-9_]+);", _read(repo, R1007_RS))
+    if not m:
+        raise ParamsError(f"{R1007_RS}: GENESIS_TIMESTAMP not found")
+    return int(m.group(1).replace("_", ""))
+
+
 def load(repo: Path) -> dict:
     """Everything the ceremony renders and checks against, from this checkout."""
     p = chain_params(repo)
@@ -146,6 +155,7 @@ def load(repo: Path) -> dict:
         "validator_registry": v["validatorRegistry"].lower(),
         "validator_activation_height": p["validator_activation_height"],
         "r1007_pending": r1007_pending(repo),
+        "r1007_genesis_timestamp": genesis_timestamp(repo),
         "producers": [
             {"name": x["name"], "staker": x["staker"].lower(), "proposer_pubkey": x["proposer_pubkey"].lower()}
             for x in v["validators"]

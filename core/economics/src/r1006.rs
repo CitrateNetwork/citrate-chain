@@ -530,6 +530,20 @@ pub(crate) fn config_from_alloc(
 /// Block 0's hash for `cfg`, built exactly as a node builds it (shared genesis state
 /// on a fresh executor, the canonical genesis block, its state root).
 pub fn genesis_block_hash(cfg: &GenesisConfig) -> Result<[u8; 32], GenesisError> {
+    Ok(
+        *genesis_block_at(cfg, crate::genesis::CANONICAL_GENESIS_TIMESTAMP)?
+            .header
+            .block_hash
+            .as_bytes(),
+    )
+}
+
+/// Block 0 for `cfg` stamped `timestamp`, built exactly as a node builds it, with its hash
+/// set.
+pub(crate) fn genesis_block_at(
+    cfg: &GenesisConfig,
+    timestamp: u64,
+) -> Result<citrate_consensus::types::Block, GenesisError> {
     use citrate_execution::executor::Executor;
     use citrate_execution::state::state_db::StateDB;
     use std::sync::Arc;
@@ -538,10 +552,10 @@ pub fn genesis_block_hash(cfg: &GenesisConfig) -> Result<[u8; 32], GenesisError>
         cfg.chain_id,
     ));
     let root = crate::genesis::initialize_shared_genesis_state(&ex, cfg)?;
-    let mut b =
-        crate::genesis::create_canonical_genesis_block(crate::genesis::CANONICAL_GENESIS_TIMESTAMP);
+    let mut b = crate::genesis::create_canonical_genesis_block(timestamp);
     b.state_root = citrate_consensus::types::Hash::new(root);
-    Ok(*crate::genesis::calculate_canonical_block_hash(&b).as_bytes())
+    b.header.block_hash = crate::genesis::calculate_canonical_block_hash(&b);
+    Ok(b)
 }
 
 #[cfg(test)]

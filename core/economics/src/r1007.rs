@@ -41,6 +41,12 @@ pub const GENESIS_NOTE_ADDRESS: Address = Address([
 /// so it is part of the genesis hash.
 pub const GENESIS_NOTE: &str = "Citrate r1007: rehearsal genesis for chain 40204";
 
+/// The r1007 block-0 timestamp (unix seconds). Stamped at ceremony time by
+/// `scripts/genesis/r1007/stamp_genesis.py` (owner 2026-11-11), which re-pins
+/// `R1007_GENESIS` with it; the ceremony render refuses a stamp more than 1 h from its run.
+/// Until stamped it is the shared canonical timestamp.
+pub const GENESIS_TIMESTAMP: u64 = 1_767_225_600;
+
 /// Whether `cfg` is the r1007 genesis: it carries the r1007 note account. Used by the
 /// shared genesis function to require the MPT rule for this profile.
 pub fn is_r1007_config(cfg: &GenesisConfig) -> bool {
@@ -327,7 +333,24 @@ fn with_r1007_note(base: GenesisConfig) -> Result<GenesisConfig, GenesisError> {
 /// Block 0's hash for the r1007 configuration, built exactly as a node builds it. The
 /// MPT rule must be published (active from 0) first; otherwise this fails closed.
 pub fn genesis_block_hash(cfg: &GenesisConfig) -> Result<[u8; 32], GenesisError> {
-    r1006::genesis_block_hash(cfg)
+    genesis_block_hash_at(cfg, GENESIS_TIMESTAMP)
+}
+
+/// Block 0's hash for `cfg` stamped `timestamp` (what [`GENESIS_TIMESTAMP`] would give).
+pub fn genesis_block_hash_at(
+    cfg: &GenesisConfig,
+    timestamp: u64,
+) -> Result<[u8; 32], GenesisError> {
+    Ok(*r1006::genesis_block_at(cfg, timestamp)?
+        .header
+        .block_hash
+        .as_bytes())
+}
+
+/// Block 0 for `cfg` at [`GENESIS_TIMESTAMP`], as a node builds it (the MPT rule must be
+/// published first).
+pub fn genesis_block(cfg: &GenesisConfig) -> Result<citrate_consensus::types::Block, GenesisError> {
+    r1006::genesis_block_at(cfg, GENESIS_TIMESTAMP)
 }
 
 /// The ceremony step that first computes `R1007_GENESIS` (STATE_ROOT_MPT.md §1 step 3):

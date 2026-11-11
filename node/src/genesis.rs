@@ -418,8 +418,13 @@ pub async fn initialize_genesis_state_with_profile(
     config: &GenesisConfig,
     genesis_profile: Option<&str>,
 ) -> anyhow::Result<Hash> {
-    // Create genesis block
-    let mut genesis = create_genesis_block(config);
+    // Create genesis block. r1007 is stamped at ceremony time
+    // (`citrate_economics::r1007::GENESIS_TIMESTAMP`), not at the canonical timestamp.
+    let mut genesis = if genesis_profile == Some(R1007_PROFILE) {
+        shared_genesis::create_canonical_genesis_block(citrate_economics::r1007::GENESIS_TIMESTAMP)
+    } else {
+        create_genesis_block(config)
+    };
 
     // Select economics genesis config based on explicit profile or chain_id fallback
     let economics_config = match genesis_profile {
