@@ -624,6 +624,14 @@ class DevnetTxLoad(unittest.TestCase):
         text = self.TXL.read_text()
         self.assertIsNotNone(re.search(r"\bWORKERS=4\b", text), "the default is not 4 workers")
 
+    def test_workers_pace_against_a_schedule_not_a_fixed_sleep(self):
+        # 23:12Z run: 28 workers at a 1.07 tx/s target each sent 0.96 tx/s (27 tx/s total).
+        # Each loop slept the full period on top of the time cast itself took, so the
+        # rate fell short by that overhead. Pacing must sleep only until the next slot.
+        text = self.TXL.read_text()
+        self.assertIn("EPOCHREALTIME", text)
+        self.assertNotIn('sleep "$period"', text)
+
     def test_run_starts_several_workers_per_producer_and_funds_them_serially(self):
         text = self.TXL.read_text()
         self.assertIn("--workers", text)
