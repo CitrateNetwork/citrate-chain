@@ -145,7 +145,7 @@ contract V060GenesisSpecTest is Test {
         k.governanceOwners = gc.owners;
         k.guardianOwners = rc.owners;
         k.retiredKeys = _retired();
-        k.guardianVetoMargin = 1 hours;
+        k.guardianVetoMargin = 2 hours; // owner decision 2026-11-11
     }
 
     function _setupKeys() internal returns (V060GovernanceSpec.KeyParams memory) {
@@ -622,20 +622,36 @@ contract V060GenesisSpecTest is Test {
         this.p1(k, _gc(), _rc());
     }
 
-    /// The guardian-delay check lives in P1, with the owner's margin as a named parameter.
+    /// The guardian-delay check lives in P1, with the owner's margin (decided 2026-11-11: 2 h).
     function test_p1_v060_refuses_a_guardian_delay_without_the_margin() public {
         V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
-        k.guardianVetoMargin = 22 hours + 1; // 2 h delay + this > 24 h
+        DeployGenesisGovernance.Council memory rc = _rc();
+        rc.minDelay = 22 hours + 1; // + 2 h margin > 24 h
         vm.expectRevert(bytes(V060GovernanceSpec.VETO_MARGIN_TOO_SMALL));
+        this.p1(k, _gc(), rc);
+        rc.minDelay = 22 hours; // exactly fits: accepted
+        this.p1(k, _gc(), rc);
+    }
+
+    /// The margin is a decided ceremony input (owner 2026-11-11: 7200 s), not a default: an
+    /// unset margin is still refused (above), and any other value is refused too.
+    function test_p1_and_the_builder_refuse_a_margin_other_than_the_decided_value() public {
+        V060GovernanceSpec.KeyParams memory k = _keys(_gc(), _rc());
+        k.guardianVetoMargin = 1 hours;
+        vm.expectRevert(bytes(V060GovernanceSpec.VETO_MARGIN_NOT_DECIDED));
         this.p1(k, _gc(), _rc());
-        k.guardianVetoMargin = 22 hours; // exactly fits: accepted
-        this.p1(k, _gc(), _rc());
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        i.keys.guardianVetoMargin = 3 hours;
+        vm.expectRevert(bytes(V060GovernanceSpec.VETO_MARGIN_NOT_DECIDED));
+        s.deployWith(SENDER, i);
+        assertEq(V060GovernanceSpec.DECIDED_GUARDIAN_VETO_MARGIN, 7200);
     }
 
     function test_governance_book_records_the_veto_margin() public view {
         string memory book =
             govScript.bookJson(SENDER, gov, _council(0xA000, 5, 3, 48 hours), _council(0xB000, 3, 2, 1 hours));
-        assertEq(vm.parseJsonUint(book, ".params.guardianVetoMargin"), 1 hours);
+        assertEq(vm.parseJsonUint(book, ".params.guardianVetoMargin"), 2 hours);
     }
 
     // Builder refusals.
@@ -693,7 +709,10 @@ contract V060GenesisSpecTest is Test {
     function test_builder_rechecks_the_veto_margin_on_chain() public {
         DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
-        i.keys.guardianVetoMargin = 23 hours + 1; // the live GUARDIAN delay is 1 h
+        // The live GUARDIAN delay is 1 h; raise it past 22 h through the GUARDIAN timelock itself.
+        TimelockController rt = TimelockController(payable(gov.guardianTimelock));
+        vm.prank(gov.guardianTimelock);
+        rt.updateDelay(22 hours + 1);
         vm.expectRevert(bytes(V060GovernanceSpec.VETO_MARGIN_TOO_SMALL));
         s.deployWith(SENDER, i);
     }
