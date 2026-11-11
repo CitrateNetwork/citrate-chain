@@ -335,6 +335,23 @@ class PlanAndGuards(unittest.TestCase):
         names = [h["name"] for h in json.loads(text)["hosts"] if h["role"] == "producer"]
         self.assertEqual(names, [p["name"] for p in SRC["producers"]])
 
+    def test_the_committed_fleet_names_each_hosts_r1006_layout(self):
+        f = json.loads((R7 / "fleet.r1007.json").read_text())
+        lay = {h["name"]: h.get("r1006_layout", "producer") for h in f["hosts"]}
+        for n in ("citrate-boot-1", "citrate-boot-2", "citrate-boot-3", "citrate-rpc-1"):
+            self.assertEqual(lay[n], "home", n)
+        for n in [x for x in lay if "prod" in x]:
+            self.assertEqual(lay[n], "producer", n)
+
+    def test_the_agent_is_told_each_hosts_layout(self):
+        fleet = C.Fleet(FLEET)
+        t = C.Transport(fleet, None)
+        boot = fleet.hosts("boot")[0]
+        prod = fleet.hosts("producer")[0]
+        self.assertIn("--r1006-layout", t._base(boot))
+        self.assertEqual(t._base(boot)[t._base(boot).index("--r1006-layout") + 1], "home")
+        self.assertEqual(t._base(prod)[t._base(prod).index("--r1006-layout") + 1], "producer")
+
     def test_ssh_steps_need_the_owner_go(self):
         fleet = C.Fleet(FLEET)
         h = fleet.hosts("boot")[0]
@@ -588,6 +605,84 @@ class Agent(unittest.TestCase):
         self.assertEqual((self.root / "etc/citrate/gen/r1006/citrate-node.service").read_text(), unit.read_text())
         self.assertEqual((self.root / "etc/citrate/active").read_text().strip(), "r1006")
         self.assertTrue(self.agent("park-r1006")[1]["already"])
+
+    # 2026-11-11 read-only fleet check: boot-1..3 and rpc-1 run r1006 from the "home" layout
+    # (/home/citrate/bin/citrate-node --config /home/citrate/.citrate/node.toml, data and
+    # noise.key in /home/citrate/.citrate) with unit drop-ins that inject r1006 consensus env
+    # (CITRATE_VALIDATOR_REGISTRY, ...). Producers use the "producer" layout.
+    def home_r1006(self) -> Path:
+        unit = self.root / "etc/systemd/system/citrate-node.service"
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text("[Service]\nUser=citrate\nExecStart=/home/citrate/bin/citrate-node --config /home/citrate/.citrate/node.toml\n")
+        dd = self.root / "etc/systemd/system/citrate-node.service.d"
+        dd.mkdir(parents=True, exist_ok=True)
+        (dd / "r1006-consensus.conf").write_text("[Service]\nEnvironment=CITRATE_VALIDATOR_ACTIVATION_HEIGHT=1000\n")
+        (dd / "10-restart-always.conf").write_text("[Service]\nRestart=always\n")
+        home = self.root / "home/citrate/.citrate"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "node.toml").write_text("r1006 home config")
+        (home / "noise.key").write_bytes(b"H" * 32)
+        b = self.root / "home/citrate/bin"
+        b.mkdir(parents=True, exist_ok=True)
+        (b / "citrate-node").write_text("#!/bin/sh\n")
+        return home
+
+    def systemd_base(self):
+        """systemd mode with a fake systemctl first on PATH (inactive unit, daemon-reload ok)."""
+        fake = self.root / "fakebin"
+        fake.mkdir(exist_ok=True)
+        (fake / "systemctl").write_text("#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/systemctl.log\"\n"
+                                         "case \"$1\" in is-active) exit 3 ;; is-enabled) exit 1 ;; *) exit 0 ;; esac\n")
+        (fake / "systemctl").chmod(0o755)
+        os.environ["PATH"] = str(fake) + os.pathsep + os.environ["PATH"]
+        self.addCleanup(lambda: os.environ.__setitem__("PATH", os.environ["PATH"].replace(str(fake) + os.pathsep, "", 1)))
+        return ["--root", str(self.root), "--mode", "systemd", "--run-as", "", "--r1006-layout", "home"]
+
+    def test_park_home_layout_records_its_files_and_dropins(self):
+        self.home_r1006()
+        self.base = ["--root", str(self.root), "--mode", "proc", "--run-as", "", "--r1006-layout", "home"]
+        rc, res = self.agent("park-r1006")
+        self.assertEqual(rc, 0, res)
+        parked = json.loads((self.root / "etc/citrate/gen/r1006/parked.json").read_text())
+        self.assertEqual(parked["data_dir"], "/home/citrate/.citrate")
+        self.assertIn("/home/citrate/.citrate/node.toml", parked["files"])
+        self.assertIn("/home/citrate/bin/citrate-node", parked["files"])
+        saved = self.root / "etc/citrate/gen/r1006/dropins"
+        self.assertEqual(sorted(x.name for x in saved.iterdir()), ["10-restart-always.conf", "r1006-consensus.conf"])
+        self.assertEqual((self.root / "home/citrate/.citrate/node.toml").read_text(), "r1006 home config")
+
+    def test_seed_keys_reads_the_home_layout(self):
+        self.home_r1006()
+        self.base = ["--root", str(self.root), "--mode", "proc", "--run-as", "", "--r1006-layout", "home"]
+        self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))
+        rc, res = self.agent("seed-keys", "--keys", "noise")
+        self.assertEqual(rc, 0, res)
+        self.assertEqual((self.root / "var/lib/citrate/gen/r1007/noise.key").read_bytes(), b"H" * 32)
+
+    def test_switch_to_r1007_leaves_no_r1006_dropin_and_switching_back_restores_them(self):
+        self.home_r1006()
+        self.base = self.systemd_base()
+        dd = self.root / "etc/systemd/system/citrate-node.service.d"
+        before = {f.name: f.read_bytes() for f in dd.iterdir()}
+        self.assertEqual(self.agent("park-r1006")[0], 0)
+        self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))
+        rc, res = self.agent("switch", "--gen", "r1007")
+        self.assertEqual(rc, 0, res)
+        self.assertEqual(sorted(dd.iterdir()) if dd.exists() else [], [], "an r1006 drop-in would apply to r1007")
+        rc, res = self.agent("switch", "--gen", "r1006")
+        self.assertEqual(rc, 0, res)
+        self.assertEqual({f.name: f.read_bytes() for f in dd.iterdir()}, before)
+
+    def test_switch_refuses_an_unknown_live_dropin(self):
+        self.home_r1006()
+        self.base = self.systemd_base()
+        self.assertEqual(self.agent("park-r1006")[0], 0)
+        self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))
+        (self.root / "etc/systemd/system/citrate-node.service.d/99-added-later.conf").write_text("[Service]\nNice=5\n")
+        rc, res = self.agent("switch", "--gen", "r1007")
+        self.assertEqual(rc, 2)
+        self.assertIn("drop-in", res["refused"])
+        self.assertTrue((self.root / "etc/systemd/system/citrate-node.service.d/99-added-later.conf").exists())
 
     def test_switch_refuses_while_running_and_snapshot_is_written_once(self):
         self.agent("stage", "--gen", "r1007", "--incoming", str(self.bundle()))
