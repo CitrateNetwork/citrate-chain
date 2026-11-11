@@ -1000,6 +1000,7 @@ expect "phase inputs keys: a producer staker as a GUARDIAN owner is refused" 3 '
 expect "phase inputs keys: an unknown role in the inventory is refused" 3 "GENESIS_KEY_INVENTORY: 0x0+b1 has an unknown role 'TRESURY'" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$(kinv "$KNK1" TRESURY)" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: an inventory that is not JSON is refused" 3 'GENESIS_KEY_INVENTORY is not a JSON object' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KNK1,$KNK2" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: a malformed inventory address is refused" 3 "GENESIS_KEY_INVENTORY: '0xzz' is not a nonzero address" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY='{"0xzz":["GOV_OWNERS"]}' GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
+expect "phase inputs keys: an exactly repeated inventory address is refused" 3 "GENESIS_KEY_INVENTORY: 0x0+b1 appears more than once" -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="{\"$KNK1\":[\"GOV_OWNERS\"],\"$KNK1\":[\"GRD_OWNERS\"]}" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
 expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KRK1"
 expect "phase inputs keys: a guardian delay that leaves no margin is refused" 3 'exceeds the 24 h ProviderRegistry veto window' -- pf "${KV060[@]}" GRD_MIN_DELAY=79201
@@ -1007,6 +1008,48 @@ expect "phase inputs keys: a margin other than the owner's decided 7200 s is ref
 expect "phase inputs keys: a contract input is not held to the key inventory" 0 '' -- pf "${KV060[@]}" PATRONAGE_MEMBERSHIP=0x00000000000000000000000000000000000000e1
 expect "phase inputs keys: inventory keys with their roles pass (control)" 0 '' -- pf "${KV060[@]}" TREASURY="$KNK1" GOV_OWNERS="$KNK1,$KNK2" GRD_OWNERS="$KNK1" GRD_MIN_DELAY=3600
 expect "phase inputs keys: the r1006/r1007 ceremony needs none of them (control)" 0 '' -- pf
+# GO-K step 3 for the 0.6.0 genesis alloc (scripts/genesis/v060/alloc_keys_check.py): every EOA
+# the alloc funds or references (a 20-byte storage word or code immutable with no code at
+# block 0) must be in the key inventory, be a producer staker (from --stakers, a
+# validators.json), or be the ceremony deployer with balance 0.
+AKC="$G/v060/alloc_keys_check.py"
+AK="$T/akc"; mkdir -p "$AK"
+akc_alloc() { python3 - "$AK/alloc.json" "$@" <<'AKPY'
+import json, sys
+out, rest = sys.argv[1], sys.argv[2:]
+accounts = [{"address": "0x" + "c0" * 20, "balance": "0x0", "nonce": 1, "code": "0x6000",
+             "storage": {"0x01": "0x000000000000000000000000" + "b1" * 20}}]
+for spec in rest:
+    kind, a = spec.split("=", 1)
+    if kind == "fund":
+        accounts.append({"address": a, "balance": "0x1", "nonce": 0, "code": "0x", "storage": {}})
+    elif kind == "store":
+        accounts[0]["storage"]["0x%02x" % len(accounts[0]["storage"])] = "0x000000000000000000000000" + a[2:]
+    elif kind == "immutable":
+        accounts[0]["code"] += "7f000000000000000000000000" + a[2:]
+    elif kind == "deployer":
+        accounts.append({"address": a, "balance": "0x1", "nonce": 92, "code": "0x", "storage": {}})
+json.dump({"accounts": accounts}, open(out, "w"))
+AKPY
+}
+printf '{"validators":[{"staker":"0x%s"}]}' "$(printf 'd1%.0s' $(seq 20))" >"$AK/validators.json"
+AKINV="{\"0x$(printf 'b1%.0s' $(seq 20))\":[\"GOV_OWNERS\"],\"0x$(printf 'b2%.0s' $(seq 20))\":[\"TREASURY\"]}"
+AKDEP="0x$(printf 'e4%.0s' $(seq 20))"
+akc() { python3 -I "$AKC" --alloc "$AK/alloc.json" --key-inventory "$AKINV" --stakers "$AK/validators.json" --deployer "$AKDEP" "$@"; }
+akc_alloc "fund=0x$(printf 'b2%.0s' $(seq 20))" "fund=0x$(printf 'd1%.0s' $(seq 20))"
+expect "GO-K step 3: inventory keys and a producer staker pass (control)" 0 'alloc_keys_check: OK' -- akc
+akc_alloc "fund=0x$(printf 'f1%.0s' $(seq 20))"
+expect "GO-K step 3: a funded account off the inventory is refused" 1 'funds 0x(f1){20}, which is not in the key inventory' -- akc
+akc_alloc "store=0x$(printf 'f2%.0s' $(seq 20))"
+expect "GO-K step 3: an EOA referenced from storage off the inventory is refused" 1 'references 0x(f2){20}' -- akc
+akc_alloc "immutable=0x$(printf 'f3%.0s' $(seq 20))"
+expect "GO-K step 3: an EOA referenced as a code immutable off the inventory is refused" 1 'references 0x(f3){20}' -- akc
+akc_alloc "deployer=$AKDEP"
+expect "GO-K step 3: a funded ceremony deployer is refused" 1 'the ceremony deployer .* has balance' -- akc
+akc_alloc "fund=0x$(printf 'd1%.0s' $(seq 20))"
+printf '{"validators":[]}' >"$AK/none.json"
+expect "GO-K step 3: a missing staker file is an error, not an empty set" 2 'cannot read the producer stakers' -- python3 -I "$AKC" --alloc "$AK/alloc.json" --key-inventory "$AKINV" --stakers "$AK/missing.json" --deployer "$AKDEP"
+expect "GO-K step 3: the staker file is a parameter (a file without that staker does not admit it)" 1 'funds 0x(d1){20}' -- python3 -I "$AKC" --alloc "$AK/alloc.json" --key-inventory "$AKINV" --stakers "$AK/none.json" --deployer "$AKDEP"
 TW="$T/pi-tree"
 mkdir -p "$TW/scripts/genesis" "$TW/scripts/ops" "$TW/contracts"
 cp "$G/genesis_ceremony.sh" "$TW/scripts/genesis/"
