@@ -1703,6 +1703,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     if let Some(p) = &genesis_params {
         info!("Genesis chain parameters: {}", p.render());
     }
+    // fed#535: the slot length and chain-params fingerprint, one greppable line.
+    info!(
+        "{}",
+        slot_config_line(
+            config.mining.target_block_time,
+            genesis_params.as_ref().map(|p| p.render()).as_deref()
+        )
+    );
     let on_demand = producer::check_mine_on_demand(
         std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
         config.chain.genesis_profile.as_deref(),
@@ -5129,6 +5137,25 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The one start-up line the devnet judge greps (fed#535): the slot length
+/// consensus runs with, the configured `[mining] target_block_time`, and the
+/// chain-params fingerprint (SHA-256 of `GenesisChainParams::render()` for a
+/// genesis that compiles chain params, `none` otherwise). Stable `key=value`
+/// fields after a fixed tag.
+fn slot_config_line(target_block_time: u64, params_render: Option<&str>) -> String {
+    use sha2::Digest;
+    let fp = match params_render {
+        Some(r) => format!("0x{}", hex::encode(sha2::Sha256::digest(r.as_bytes()))),
+        None => "none".to_string(),
+    };
+    format!(
+        "SLOT_CONFIG slot_secs={} target_block_time={} chain_params_fp={}",
+        citrate_consensus::slots::SLOT_DURATION_SECS,
+        target_block_time,
+        fp
+    )
 }
 
 #[cfg(test)]
