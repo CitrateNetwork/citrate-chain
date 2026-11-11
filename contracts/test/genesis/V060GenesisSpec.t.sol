@@ -94,13 +94,22 @@ contract V060GenesisSpecTest is Test {
         // The block-0 contracts the 0.6.0 set reads. The ledger (P4) and the V1 module (P2) are
         // deployed as their phases deploy them, by CREATE2 under their own salts, because the
         // builder checks their identity; P3L's HUP registries only need their owner and wiring.
-        vm.startBroadcast(SENDER);
-        frl = new FederatedRoundLedger{salt: Salts.salt("FederatedRoundLedger")}();
-        recoveryV1 = new GuardianRecoveryModule{salt: Salts.salt("GuardianRecoveryModule")}();
-        vm.stopBroadcast();
+        // Through the Arachnid factory itself, so the address does not depend on how a forge
+        // version routes a salted `new` from a test contract.
+        frl = FederatedRoundLedger(_viaFactory("FederatedRoundLedger", type(FederatedRoundLedger).creationCode));
+        recoveryV1 =
+            GuardianRecoveryModule(_viaFactory("GuardianRecoveryModule", type(GuardianRecoveryModule).creationCode));
         memberSbt = new CitrateMemberSBT(gov.governanceTimelock);
         orgSbt = new OrganizationSBT(gov.governanceTimelock);
         agentSbt = new AgentSBT(gov.governanceTimelock, orgSbt, IERC721(address(memberSbt)));
+    }
+
+    /// Deploy `init` under Salts.salt(name) through the Arachnid factory (calldata = salt ++ init).
+    function _viaFactory(string memory name, bytes memory init) internal returns (address a) {
+        (bool ok, bytes memory ret) = FACTORY.call(abi.encodePacked(Salts.salt(name), init));
+        require(ok && ret.length == 20, "Arachnid factory deploy failed");
+        a = address(bytes20(ret));
+        require(a == _at(name, init), "factory deploy is not at its CREATE2 address");
     }
 
     function _council(uint256 base, uint256 n, uint256 m, uint256 delay)
