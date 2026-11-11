@@ -221,7 +221,7 @@ impl Executor {
         }
         // B4: EIP-3607, the sender must not have code.
         let sender = crate::address_utils::normalize_address(&tx.from);
-        let code = self.get_code_hash(&sender);
+        let code = self.resident_account(&sender).code_hash;
         if code != Hash::default() && code != empty_code_hash() {
             return Some(SkipReason::Code);
         }
@@ -339,7 +339,7 @@ impl Executor {
 
         // Treasury part of R(h).
         if em.treasury_amount > U256::zero() {
-            let bal = self.get_balance(&em.treasury);
+            let bal = self.resident_account(&em.treasury).balance;
             let credited = bal.checked_add(em.treasury_amount).ok_or_else(|| {
                 ExecutionError::RewardSettlement("treasury reward overflows balance".into())
             })?;
@@ -362,7 +362,7 @@ impl Executor {
             }
             if r.emission > U256::zero() {
                 let addr = Address(r.coinbase);
-                let bal = self.get_balance(&addr);
+                let bal = self.resident_account(&addr).balance;
                 let credited = bal.checked_add(r.emission).ok_or_else(|| {
                     ExecutionError::RewardSettlement("emission share overflows balance".into())
                 })?;

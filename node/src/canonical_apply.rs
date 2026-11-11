@@ -2539,7 +2539,13 @@ impl CanonicalApplicator {
                 }
             },
         };
+        // The restore and the store revert below are ONE working-set transition:
+        // an external read (mempool admission, candidate selection, RPC) waits
+        // until both are done, so it never sees memory at the fork point with the
+        // store still on the abandoned branch (and, being a read only, it never
+        // changes the working set either way).
         let reverted = {
+            let _transition = self.executor.state_transition();
             #[cfg(test)]
             test_reorg_window::fire(ReorgWindow::BeforeRestore);
             self.executor.state_restore(base_snapshot.clone());
