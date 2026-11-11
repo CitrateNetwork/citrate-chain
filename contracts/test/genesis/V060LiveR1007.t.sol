@@ -144,6 +144,15 @@ contract V060LiveR1007Test is Test {
         i.keys = _keys();
     }
 
+    /// The rotation (CHAIN-INTEG's second leg): the r1006 constructor owners the council addresses
+    /// commit to, and the rotated r1007 owners, in order, that owners() must equal.
+    function _rot() internal pure returns (AdminChecks.Rotation memory r) {
+        r.fromGov = _addrs(0xA000, 5);
+        r.fromGrd = _addrs(0xB000, 3);
+        r.toGov = _addrs(0xE000, 5);
+        r.toGrd = _addrs(0xF000, 3);
+    }
+
     function _builder() internal returns (DeployV060Genesis s) {
         V060LiveWithNode h = new V060LiveWithNode();
         h.useArchive(archive);
@@ -171,7 +180,7 @@ contract V060LiveR1007Test is Test {
         DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
         DeployV060Genesis.Deployed memory p = s.predict(i);
-        DeployV060Genesis.Deployed memory d = s.deployLive(liveDeployer, i);
+        DeployV060Genesis.Deployed memory d = s.deployLive(liveDeployer, i, _rot());
         assertEq(abi.encode(d), abi.encode(p));
         s.verifyLive(i, d);
         // Pre-swap, v1 is still the canceller; the full (post-swap) verify must not pass yet.
@@ -184,11 +193,11 @@ contract V060LiveR1007Test is Test {
         DeployV060Genesis.Inputs memory i = _inputs();
         i.keys.v060Deployers = new address[](0);
         _expectRevert(bytes(V060GovernanceSpec.PENDING_V060_DEPLOYER));
-        s.deployLive(liveDeployer, i);
+        s.deployLive(liveDeployer, i, _rot());
         i.keys.v060Deployers = new address[](1);
         i.keys.v060Deployers[0] = makeAddr("another-deployer");
         _expectRevert(bytes("deployer is not in GENESIS_KEY_INVENTORY with role V060_DEPLOYER"));
-        s.deployLive(liveDeployer, i);
+        s.deployLive(liveDeployer, i, _rot());
     }
 
     function test_live_mode_refuses_a_rotated_owner_off_the_inventory() public {
@@ -196,7 +205,7 @@ contract V060LiveR1007Test is Test {
         DeployV060Genesis.Inputs memory i = _inputs();
         i.keys.governanceOwners = _addrs(0xE001, 4); // 0xE000 is no longer on the inventory
         _expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY with role GOV_OWNERS"));
-        s.deployLive(liveDeployer, i);
+        s.deployLive(liveDeployer, i, _rot());
     }
 
     /// A MultisigProposer with the same immutables has the same code hash: the rule also needs it
@@ -207,7 +216,7 @@ contract V060LiveR1007Test is Test {
         DeployV060Genesis.Inputs memory i = _inputs();
         i.governanceMultisig = address(copy);
         archive.absorb();
-        try s.deployLive(liveDeployer, i) {
+        try s.deployLive(liveDeployer, i, _rot()) {
             fail();
         } catch Error(string memory reason) {
             assertEq(_prefix(reason, 21), "GOVERNANCE timelock: ");
@@ -220,7 +229,7 @@ contract V060LiveR1007Test is Test {
         i.guardianMultisig = address(frl); // code, but not a MultisigProposer
         archive.absorb();
         vm.expectRevert();
-        s.deployLive(liveDeployer, i);
+        s.deployLive(liveDeployer, i, _rot());
     }
 
     // ------------------------------------------------------------------ the canceller swap
@@ -237,7 +246,7 @@ contract V060LiveR1007Test is Test {
     function test_the_swap_proposal_executes_and_the_full_verify_passes() public {
         DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
-        DeployV060Genesis.Deployed memory d = s.deployLive(liveDeployer, i);
+        DeployV060Genesis.Deployed memory d = s.deployLive(liveDeployer, i, _rot());
         (bytes memory scheduleData, bytes memory executeData, bytes32 opId) = s.swapProposal(i);
         TimelockController gt = TimelockController(payable(gov.governanceTimelock));
         MultisigProposer ms = MultisigProposer(gov.governanceMultisig);
@@ -290,5 +299,24 @@ contract V060LiveR1007Test is Test {
             out[k] = a[k];
         }
         return string(out);
+    }
+
+    // CHAIN-INTEG's second leg: CREATE2 provenance against the r1006 constructor owners, then
+    // owners() exactly the rotated r1007 set, in order.
+
+    function test_live_mode_refuses_a_rotation_whose_original_owners_do_not_match() public {
+        DeployV060Genesis s = _builder();
+        AdminChecks.Rotation memory r = _rot();
+        r.fromGov = _addrs(0xA100, 5); // not the owners the GOVERNANCE multisig's address commits to
+        _expectRevert(bytes("GovernanceMultisig: not the MultisigProposer the ceremony deployed for these original owners, threshold and TTL"));
+        s.deployLive(liveDeployer, _inputs(), r);
+    }
+
+    function test_live_mode_refuses_rotated_owners_in_another_order() public {
+        DeployV060Genesis s = _builder();
+        AdminChecks.Rotation memory r = _rot();
+        (r.toGrd[0], r.toGrd[1]) = (r.toGrd[1], r.toGrd[0]);
+        _expectRevert(bytes("GuardianMultisig: owners() is not exactly the rotated set, in order"));
+        s.deployLive(liveDeployer, _inputs(), r);
     }
 }
