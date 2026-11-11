@@ -23,25 +23,30 @@ fn rule(activation: Option<u64>) -> MutexGuard<'static, ()> {
 }
 
 /// The ceremony step (STATE_ROOT_MPT.md §1 step 3): the rule on from 0, then the shared
-/// genesis function, twice over, gives exactly the block 0 this release pins. Under
-/// D-K3 (2026-11-10) the pinned value is the candidate of the r1006-keys layout: the
-/// keyed tables stay testable, and the value is re-pinned once fresh keys replace the
-/// rotated ones (R1007_GENESIS.md §2).
+/// genesis function, twice over, gives exactly the block 0 this release pins: the r1007
+/// configuration built from the fresh-keys alloc (D-K3 done 2026-11-11), at the canonical
+/// genesis timestamp. The ceremony stamps its own timestamp, which moves the hash again.
 #[test]
 fn r1007_genesis_hash_is_pinned_and_reproducible_under_the_mpt_rule() {
     let _g = rule(Some(0));
-    let cfg = r1007::candidate_layout_with_r1006_role_keys().expect("r1007 layout");
+    let cfg = GenesisConfig::r1007().expect("r1007 builds from the fresh-keys alloc");
     let a = r1007::genesis_block_hash(&cfg).expect("block 0");
-    let b = r1007::genesis_block_hash(
-        &r1007::candidate_layout_with_r1006_role_keys().expect("r1007 layout"),
-    )
-    .expect("block 0");
+    let b = r1007::genesis_block_hash(&GenesisConfig::r1007().expect("r1007")).expect("block 0");
     assert_eq!(a, b, "two builds of the r1007 genesis differ");
     assert_eq!(
         a,
         citrate_consensus::hardening::R1007_GENESIS,
-        "R1007_GENESIS is stale: the r1006-keys layout builds 0x{}",
+        "R1007_GENESIS is stale: the r1007 profile builds 0x{}",
         hex::encode(a)
+    );
+    assert_eq!(r1007::compute_genesis_hash_for_ceremony().expect("ceremony step"), a);
+    assert_ne!(
+        a,
+        r1007::genesis_block_hash(
+            &r1007::candidate_layout_with_r1006_role_keys().expect("r1006-keys layout")
+        )
+        .expect("candidate"),
+        "the fresh keys move block 0"
     );
     assert_ne!(a, citrate_consensus::hardening::R1006_GENESIS);
     // Block 0's root is the standard MPT root of the genesis state (the from-scratch
@@ -155,25 +160,94 @@ fn the_r1007_note_is_its_own_and_names_r1007() {
     assert_ne!(r1007::GENESIS_NOTE, r1006::GENESIS_NOTE);
 }
 
-/// Owner decision D-K3 (2026-11-10): every non-producer EVM key that r1006's block 0
-/// names is rotated at the r1007 ceremony; producer keys stay. Until fresh keys replace
-/// them, the r1007 genesis is pending and the builder refuses, naming every role.
+/// Owner decision D-K3 (2026-11-10), keys generated 2026-11-11: the r1007 block 0 is built
+/// from the fresh-keys alloc, names no rotated r1006 key, and is release-ready.
 #[test]
-fn r1007_genesis_refuses_while_the_rotated_r1006_keys_are_pending() {
+fn r1007_genesis_builds_from_the_fresh_keys_alloc() {
     let _g = rule(Some(0));
-    let e = GenesisConfig::r1007()
-        .expect_err("r1007 must not build a block 0 that names a rotated r1006 key")
-        .to_string();
-    assert!(e.contains("D-K3"), "{e}");
-    for k in r1007::ROTATED_R1006_KEYS {
-        assert!(e.contains(k.role), "{} not named in: {e}", k.role);
-    }
+    let cfg = GenesisConfig::r1007().expect("r1007 builds");
     assert!(
-        r1007::compute_genesis_hash_for_ceremony().is_err(),
-        "the ceremony step refuses too"
+        r1007::rotated_key_locations(&cfg).is_empty(),
+        "{:?}",
+        r1007::rotated_key_locations(&cfg)
     );
     let r = r1007::readiness().expect("readiness");
-    assert!(!r.is_release_ready(), "r1007 is pending, not release-ready");
+    assert!(r.is_release_ready(), "{:?}", r.missing());
+}
+
+/// The fresh-keys alloc, read raw: no rotated r1006 address anywhere in it. Not as an
+/// account, not in a storage value or code (at any byte offset), not as a mapping key
+/// keccak256(pad32(addr) ++ slot) for any slot below 64, and not in its header fields.
+#[test]
+fn the_r1007_alloc_names_no_rotated_r1006_key() {
+    use sha3::{Digest, Keccak256};
+    let raw: serde_json::Value = serde_json::from_str(r1007::R1007_ALLOC_JSON).expect("json");
+    assert_eq!(raw["profile"], "r1007");
+    assert_eq!(raw["inputsStatus"], "final");
+    let text = r1007::R1007_ALLOC_JSON.to_ascii_lowercase();
+    for k in r1007::ROTATED_R1006_KEYS {
+        let hex20 = hex::encode(k.r1006_address);
+        assert!(!text.contains(&hex20), "{} (0x{hex20}) appears in the r1007 alloc", k.role);
+        for slot in 0u64..64 {
+            let mut pre = [0u8; 64];
+            pre[12..32].copy_from_slice(&k.r1006_address);
+            pre[56..64].copy_from_slice(&slot.to_be_bytes());
+            let key = hex::encode(Keccak256::digest(pre));
+            assert!(
+                !text.contains(&key),
+                "{}: a mapping key of the r1006 address at slot {slot} remains",
+                k.role
+            );
+        }
+    }
+}
+
+/// Every rotated role that the r1006 block 0 names is named by its fresh r1007 key the
+/// same number of times (accounts and storage words), and its r1006 mapping keys are
+/// replaced one for one. The RELAYER is in neither block 0 (it is off chain).
+#[test]
+fn every_rotated_role_has_its_r1007_key_where_r1006_had_the_old_one() {
+    let _g = rule(Some(0));
+    let r6 = r1007::candidate_layout_with_r1006_role_keys().expect("r1006-keys layout");
+    let r7 = GenesisConfig::r1007().expect("r1007");
+    let fresh = r1007::r1007_role_keys().expect("inputs.r1007.env");
+    assert_eq!(fresh.len(), r1007::ROTATED_R1006_KEYS.len());
+    let old: HashSet<[u8; 20]> = r1007::ROTATED_R1006_KEYS
+        .iter()
+        .map(|k| k.r1006_address)
+        .collect();
+    let count = |cfg: &GenesisConfig, addr: [u8; 20]| -> usize {
+        cfg.accounts
+            .iter()
+            .map(|a| {
+                usize::from(a.address.0 == addr)
+                    + a.storage
+                        .iter()
+                        .filter(|(_, v)| v.windows(20).any(|w| w == addr))
+                        .count()
+            })
+            .sum()
+    };
+    for k in r1007::ROTATED_R1006_KEYS {
+        let new = fresh
+            .iter()
+            .find(|(role, _)| role == k.role)
+            .unwrap_or_else(|| panic!("{} missing from inputs.r1007.env", k.role))
+            .1;
+        assert!(!old.contains(&new), "{}: the r1007 key is a retired r1006 key", k.role);
+        assert_eq!(
+            count(&r7, new),
+            count(&r6, k.r1006_address),
+            "{}: occurrences of the fresh key in r1007 vs the old key in r1006",
+            k.role
+        );
+        if k.role == "RELAYER" {
+            assert_eq!(count(&r6, k.r1006_address), 0, "the relayer is not in block 0");
+        } else {
+            assert!(count(&r7, new) > 0, "{} is present in the r1007 block 0", k.role);
+        }
+    }
+    assert_eq!(r7.accounts.len(), r6.accounts.len(), "the same accounts, renamed");
 }
 
 /// The rotated set is exactly the non-producer keys of the r1006 ceremony inputs (every

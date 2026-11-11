@@ -863,9 +863,8 @@ mod tests {
     }
 
     /// The node's genesis build for profile `r1007`: the MPT rule is published for the
-    /// block 0 the profile compiles (main.rs `publish_mpt_rule_for_genesis_build`). Under
-    /// D-K3 (owner 2026-11-10) the build is then refused: the only r1007 layout names the
-    /// rotated r1006 non-producer keys, so the node never starts that block 0.
+    /// block 0 the profile compiles (main.rs `publish_mpt_rule_for_genesis_build`), and the
+    /// build then produces exactly `R1007_GENESIS` (the fresh-keys alloc, D-K3 done).
     #[test]
     fn r1007_profile_builds_the_pinned_block_0_under_the_published_rule() {
         r1007_child("genesis::tests::r1007_child_build_after_publication");
@@ -883,12 +882,15 @@ mod tests {
             Some(0)
         );
         let rt = tokio::runtime::Runtime::new().expect("rt");
-        let e = rt
+        let g = rt
             .block_on(build_profile(40204, Some(R1007_PROFILE)))
-            .expect_err("r1007 is pending under D-K3: refused, not built")
-            .to_string();
-        assert!(e.contains("D-K3"), "{e}");
-        assert!(e.contains("TREASURY") && e.contains("DEPLOYER"), "{e}");
+            .expect("the r1007 genesis builds from the fresh-keys alloc");
+        assert_eq!(
+            g,
+            citrate_consensus::hardening::R1007_GENESIS,
+            "the node built 0x{} for profile r1007",
+            hex::encode(g)
+        );
         // A configured per-node height that disagrees with the compiled one is refused.
         assert!(
             crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), Some(5)).is_err()
@@ -938,8 +940,7 @@ mod tests {
         use citrate_consensus::types::{BlockBuilder, Signature, Transaction};
         use citrate_execution::StateDB;
         citrate_execution::mpt_state_root::set_mpt_state_root_height(Some(0));
-        let cfg = citrate_economics::r1007::candidate_layout_with_r1006_role_keys()
-            .expect("the r1007 layout");
+        let cfg = EconomicsGenesisConfig::r1007().expect("the r1007 genesis");
         let ex = Arc::new(Executor::with_chain_id(Arc::new(StateDB::new()), 40204));
         citrate_economics::genesis::initialize_shared_genesis_state(&ex, &cfg)
             .expect("r1007 block-0 state");

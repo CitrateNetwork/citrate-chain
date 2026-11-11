@@ -269,24 +269,36 @@ class PlanAndGuards(unittest.TestCase):
             with self.assertRaises(C.Refuse):
                 C.load_go(str(f), SRC["r1007_genesis"])
 
-    def test_r1007_is_pending_under_d_k3(self):
-        # D-K3 (owner 2026-11-10): the r1007 block 0 needs fresh non-producer
-        # keys; until core/economics/assets/r1007/alloc.json exists with final
-        # inputs, the checkout says r1007 is pending and names the roles.
-        pending = SRC["r1007_pending"]
-        self.assertTrue(pending)
-        text = " ".join(pending)
-        self.assertIn("D-K3", text)
-        for role in ("TREASURY", "DEPLOYER", "GOV_OWNER_1", "MEMBERSHIP_GRANTOR"):
-            self.assertIn(role, text)
+    def test_r1007_is_no_longer_pending_with_the_fresh_keys_alloc(self):
+        # D-K3: the fresh-keys alloc (core/economics/assets/r1007/alloc.json,
+        # inputsStatus final) exists in this checkout, so nothing is pending.
+        self.assertEqual(SRC["r1007_pending"], [])
+
+    def test_r1007_is_pending_without_a_final_alloc(self):
+        # A checkout without the alloc (or with non-final inputs) is pending and
+        # names the roles, read from the Rust table.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / P.R1007_RS).parent.mkdir(parents=True)
+            shutil.copy(REPO / P.R1007_RS, root / P.R1007_RS)
+            pending = P.r1007_pending(root)
+            self.assertTrue(pending)
+            text = " ".join(pending)
+            self.assertIn("D-K3", text)
+            for role in ("TREASURY", "DEPLOYER", "GOV_OWNER_1", "MEMBERSHIP_GRANTOR"):
+                self.assertIn(role, text)
+            (root / P.R1007_ALLOC).parent.mkdir(parents=True)
+            (root / P.R1007_ALLOC).write_text(json.dumps({"inputsStatus": "placeholder"}))
+            self.assertTrue(P.r1007_pending(root))
 
     def test_rendering_r1007_for_the_fleet_is_refused_while_pending(self):
-        err = io.StringIO()
-        with redirect_stderr(err):
-            rc, _ = run(["render", "--fleet", str(R7 / "fleet.r1007.json"), "--network", "r1007",
-                         "--binary", sys.executable, "--state", tempfile.mkdtemp()])
-        self.assertEqual(rc, 2, err.getvalue())
-        self.assertIn("D-K3", err.getvalue())
+        fleet = C.Fleet(R7 / "fleet.r1007.json")
+        import argparse
+        a = argparse.Namespace(network="r1007", binary=sys.executable, state=tempfile.mkdtemp())
+        src = dict(SRC, r1007_pending=["D-K3: r1007 is pending (test)"])
+        with self.assertRaises(C.Refuse) as e:
+            C.cmd_render(a, fleet, src)
+        self.assertIn("D-K3", str(e.exception))
 
     def test_devnet_only_actions_are_refused_on_the_fleet(self):
         rc, _ = run(["collect", "--fleet", str(R7 / "fleet.r1007.json"), "--mint", "--state", tempfile.mkdtemp()])
