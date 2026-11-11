@@ -207,12 +207,11 @@ pub const R1006_GENESIS: [u8; 32] =
 /// allocation, the genesis block encoding or the root rule moves it, on purpose
 /// (docs/consensus/R1007_GENESIS.md).
 ///
-/// **Candidate, not final (D-K3, owner 2026-11-10):** this is the hash of the layout
-/// over r1006's role keys, which r1007 rotates, so no node builds it
-/// (`GenesisConfig::r1007` refuses while the fresh keys are pending). It keys the r1007
-/// tables until the fresh-keys alloc exists; that alloc re-pins it.
+/// D-K3 done (2026-11-11): the hash of the r1007 profile built from the fresh-keys alloc
+/// (`core/economics/assets/r1007/alloc.json`), at the canonical genesis timestamp. It is
+/// still a candidate: the ceremony stamps block 0 with its own timestamp, which moves it.
 pub const R1007_GENESIS: [u8; 32] =
-    hex32("d245a960a616896a2b80f9aa8e92417b44a4fb451640efdb9c75dda5abc1ba7f");
+    hex32("33438940e03d273932affe61346c9ac7f7cf3b2b0bf01a77d23fa62c242101ef");
 
 /// Activation heights compiled into this release for ONE genesis, keyed by its block-0
 /// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin

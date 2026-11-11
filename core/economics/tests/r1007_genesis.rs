@@ -39,7 +39,10 @@ fn r1007_genesis_hash_is_pinned_and_reproducible_under_the_mpt_rule() {
         "R1007_GENESIS is stale: the r1007 profile builds 0x{}",
         hex::encode(a)
     );
-    assert_eq!(r1007::compute_genesis_hash_for_ceremony().expect("ceremony step"), a);
+    assert_eq!(
+        r1007::compute_genesis_hash_for_ceremony().expect("ceremony step"),
+        a
+    );
     assert_ne!(
         a,
         r1007::genesis_block_hash(
@@ -187,7 +190,11 @@ fn the_r1007_alloc_names_no_rotated_r1006_key() {
     let text = r1007::R1007_ALLOC_JSON.to_ascii_lowercase();
     for k in r1007::ROTATED_R1006_KEYS {
         let hex20 = hex::encode(k.r1006_address);
-        assert!(!text.contains(&hex20), "{} (0x{hex20}) appears in the r1007 alloc", k.role);
+        assert!(
+            !text.contains(&hex20),
+            "{} (0x{hex20}) appears in the r1007 alloc",
+            k.role
+        );
         for slot in 0u64..64 {
             let mut pre = [0u8; 64];
             pre[12..32].copy_from_slice(&k.r1006_address);
@@ -234,7 +241,11 @@ fn every_rotated_role_has_its_r1007_key_where_r1006_had_the_old_one() {
             .find(|(role, _)| role == k.role)
             .unwrap_or_else(|| panic!("{} missing from inputs.r1007.env", k.role))
             .1;
-        assert!(!old.contains(&new), "{}: the r1007 key is a retired r1006 key", k.role);
+        assert!(
+            !old.contains(&new),
+            "{}: the r1007 key is a retired r1006 key",
+            k.role
+        );
         assert_eq!(
             count(&r7, new),
             count(&r6, k.r1006_address),
@@ -242,12 +253,24 @@ fn every_rotated_role_has_its_r1007_key_where_r1006_had_the_old_one() {
             k.role
         );
         if k.role == "RELAYER" {
-            assert_eq!(count(&r6, k.r1006_address), 0, "the relayer is not in block 0");
+            assert_eq!(
+                count(&r6, k.r1006_address),
+                0,
+                "the relayer is not in block 0"
+            );
         } else {
-            assert!(count(&r7, new) > 0, "{} is present in the r1007 block 0", k.role);
+            assert!(
+                count(&r7, new) > 0,
+                "{} is present in the r1007 block 0",
+                k.role
+            );
         }
     }
-    assert_eq!(r7.accounts.len(), r6.accounts.len(), "the same accounts, renamed");
+    assert_eq!(
+        r7.accounts.len(),
+        r6.accounts.len(),
+        "the same accounts, renamed"
+    );
 }
 
 /// The rotated set is exactly the non-producer keys of the r1006 ceremony inputs (every

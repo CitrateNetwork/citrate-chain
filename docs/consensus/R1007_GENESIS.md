@@ -2,8 +2,8 @@
 created: 2026-11-09
 branch: r1007/s3-6-genesis
 author: Claude Opus 5.5 (lane S3-6 GENESIS WIRING) for Larry Klosowski
-status: draft for second-reviewer review (Matr0xshka, kurtatwork); owner parameters decided 2026-11-09; PENDING under D-K3 (owner 2026-11-10): the rotated non-producer keys (§1.1); the block-0 hash is the candidate of the r1006-keys layout
-amended: 2026-11-10 on r1007/genesis-candidate-2 (lane CHAIN-INTEG): D-K3 pending parameters §1.1, integration items §5.1-§5.3 done
+status: draft for second-reviewer review (Matr0xshka, kurtatwork); owner parameters decided 2026-11-09; D-K3 done 2026-11-11 (fresh role keys, §1.1); the block-0 hash is the candidate at the canonical genesis timestamp (the ceremony stamps its own)
+amended: 2026-11-10 on r1007/genesis-candidate-2 (lane CHAIN-INTEG): D-K3 pending parameters §1.1, integration items §5.1-§5.3 done; 2026-11-11 on r1007/integ-followups: the fresh-keys alloc (§1.1), R1007_GENESIS re-pinned (§1, §2), ceremony render (§5)
 adr: ADR-2026-11-03-chain-convergence-r1007 CV-2, CV-7a, CV-8, CV-12, CV-13, CV-14
 planset: 2026-11-03-r1007-v060 05 S3-6, 06 §1.2
 ---
@@ -14,8 +14,8 @@ r1007 is the new-genesis rehearsal of chain 40204 (ADR Q-1). It runs every r1007
 consensus rule from block 0 (CV-2). This page lists every parameter the r1007 profile
 fixes, where each one comes from, and its status. The owner decided every pending
 parameter on 2026-11-09. On 2026-11-10 the owner decided D-K3: every non-producer EVM key
-is rotated at the r1007 ceremony. The keys of §1.1 are therefore pending again, and the
-builder refuses to build r1007 until fresh keys replace them. It also
+is rotated at the r1007 ceremony. The owner generated the fresh keys on 2026-11-11, and the
+r1007 block 0 is built from an allocation that uses them (§1.1). It also
 gives the plan for re-issuing grants after genesis.
 
 Code:
@@ -38,7 +38,7 @@ Code:
 | State root of block 0 | standard MPT root (CV-14), with activation 0 covering block 0 itself | STATE_ROOT_MPT.md §1 |
 | Genesis header | the shared canonical genesis block (`create_canonical_genesis_block`, version 1, timestamp `CANONICAL_GENESIS_TIMESTAMP` = 1,767,225,600 = 2026-01-01T00:00:00Z) | unchanged from r1006 |
 | Supply split | unchanged: mining pool = 1T SALT − pre-allocations (the note holds no balance) | `GenesisConfig::r1006` |
-| Block-0 hash | `0xd245a960a616896a2b80f9aa8e92417b44a4fb451640efdb9c75dda5abc1ba7f` | **candidate of the r1006-keys layout**, never built by a node under D-K3; re-pinned from the fresh-keys alloc, see §2 |
+| Block-0 hash | `0x33438940e03d273932affe61346c9ac7f7cf3b2b0bf01a77d23fa62c242101ef` | **candidate**: the fresh-keys alloc at the canonical genesis timestamp; the ceremony stamps block 0 at ceremony time, which moves it (§2). The r1006-keys layout's hash was `0xd245a960…a7f` |
 
 **Every block-0 contract address is unchanged from r1006.** That includes `CitrateMemberSBT`
 `0x8831…060d`, `MembershipStakeVault` `0xd663…555e` and `ValidatorRegistry` `0xf511…31cd`,
@@ -67,48 +67,54 @@ producer keys as r1006**, so the validators file is r1006's and nothing is refil
 keys, D-K3, would mean refilling it with `scripts/genesis/r1006/fill_producers.py` and
 re-pinning the hash; that is for the ceremony genesis, not r1007.)
 
-### 1.1 Pending genesis parameters: the rotated non-producer keys (D-K3, owner 2026-11-10)
+### 1.1 The rotated non-producer keys (D-K3, owner 2026-11-10; keys generated 2026-11-11)
 
 Every non-producer EVM key touched at the r1007 ceremony is rotated. Producer keys (the
-proposer keys and the staker accounts of `validators.json`) stay. The r1006 block-0 state
-names the r1006 keys below, so "r1007 keeps r1006's block-0 state byte for byte" no longer
-holds for them. They are compiled as `r1007::ROTATED_R1006_KEYS` (public addresses only),
-bound to `scripts/genesis/r1006/inputs.r1006.env` and the alloc deployer by
-`the_rotated_keys_are_every_r1006_non_producer_key`.
+proposer keys and the staker accounts of `validators.json`) stay. The r1006 roles are
+compiled as `r1007::ROTATED_R1006_KEYS` (public addresses), bound to
+`scripts/genesis/r1006/inputs.r1006.env` and the alloc deployer by
+`the_rotated_keys_are_every_r1006_non_producer_key`. The fresh keys' public addresses are
+`scripts/genesis/r1007/inputs.r1007.env`, one per role (the owner verified each fresh on live
+r1006: nonce 0, balance 0, no overlap with the retired set). The owner's four post-genesis keys
+hold nothing at block 0 and are not in it.
 
-`GenesisConfig::r1007()` refuses while they are pending. It names every role, with its
-plain occurrences in the layout (`r1007::rotated_key_locations`). The node (profile
-`r1007`), the GUI and the light node all build through it, so none of them can start a
-block 0 that names a rotated key. `r1007::readiness()` reports `inputs_final = false`.
+**The r1007 allocation** (`core/economics/assets/r1007/alloc.json`, profile `r1007`, inputs
+final) is built by `scripts/genesis/r1007/rotate_keys.py` from the r1006 allocation, read in
+place. Every occurrence of each rotated address is replaced by its fresh address: account
+addresses, storage words (at any byte offset), the keys of address-keyed mappings
+(`keccak256(pad32(addr) ++ slot)`, recomputed for the new address), and the header fields
+(base allocations, deployer). The tool refuses if an old address remains anywhere, or occurs
+in contract code (none does: no immutable holds a rotated key). `rotate_keys.py --check` proves
+the committed file is the rotation of the committed r1006 alloc.
 
-| Role (inputs.r1006.env) | Where the r1006 block 0 uses it (plain occurrences, `the_r1006_layout_shows_where_r1007_must_replace_each_rotated_key`) |
+Before editing, every storage key of the contracts that hold a rotated key was classified
+(2026-11-11): small slots, dynamic-array elements, address-keyed mappings at slot 1 (the
+multisig owner sets and the institutional signer set), and EIP-1967 / ERC-7201 namespaced
+slots. No nested address-keyed mapping (an AccessControl role member, a per-proposal approval)
+holds a rotated key, so the edit is complete. That is why an edit is enough here and a re-run
+of the ceremony is not needed; a re-run would also move every contract address.
+
+| Role | Where the r1006 block 0 used the old key, now the fresh one |
 |---|---|
-| `GOV_OWNER_1`..`GOV_OWNER_5` (`GOV_OWNERS`) | GovernanceMultisig `0x3975…2c5c` owner set |
-| `GRD_OWNER_1`..`GRD_OWNER_3` (`GRD_OWNERS`) | GuardianMultisig `0xc6ed…af1d` owner set |
+| `GOV_OWNER_1`..`GOV_OWNER_5` | GovernanceMultisig `0x3975…2c5c`: owner array and the `isOwner` mapping |
+| `GRD_OWNER_1`..`GRD_OWNER_3` | GuardianMultisig `0xc6ed…af1d`: owner array and mapping |
 | `MEMBERSHIP_GRANTOR` | CitrateMemberSBT `0x8831…060d` and MembershipStakeVault `0xd663…555e` |
-| `SIGNER_1`..`SIGNER_3` | InstitutionalVault `0x9fea…7938` signers |
-| `RELAYER` | not found in a plain storage word: held under a hashed mapping slot, or off chain only. Check against DeployAll before the fresh alloc is accepted |
+| `SIGNER_1`..`SIGNER_3` | InstitutionalVault `0x9fea…7938`: signer array and `_isSigner` mapping |
+| `RELAYER` | not in block 0 (it was not in r1006's either): off chain only |
 | `CITRATE_AA_OWNER` | CitratePaymaster `0x5a1e…ff56` and CitrateWalletFactory `0x6ee3…434c` |
 | `CITRATE_AA_IDENTITY_SIGNER` | CitrateWalletFactory |
 | `CITRATE_AA_SPONSOR_SIGNER` | CitratePaymaster |
-| `TREASURY` (`TREASURY`, `BASE_TREASURY`) | base allocation (its own balance) and the fee recipient of X402Facilitator, ComputeMarketplace and ModelMarketplace |
-| `FAUCET` (`BASE_FAUCET`) | base allocation |
-| `TEAM` (`BASE_TEAM`, `TEAM_VESTING_BENEFICIARY`) | base allocation and the TeamVesting beneficiary |
-| `DEPLOYER` (alloc `deployer`) | the ceremony deployer account itself (nonce 92) |
+| `TREASURY` | base allocation and the fee recipient of X402Facilitator, ComputeMarketplace, ModelMarketplace |
+| `FAUCET` | base allocation |
+| `TEAM` | base allocation and the TeamVesting beneficiary |
+| `DEPLOYER` | the ceremony deployer account (its nonce 92 is kept, so the fresh key's first transaction uses nonce 92) |
 
-The scan sees an account's own address and any storage word that holds the address. A
-key held only under a hashed mapping slot (an AccessControl role member, for example) is
-invisible to it, so the fresh alloc must come from fresh inputs, not from editing these
-words. To unblock r1007:
-1. generate the fresh role keys (`scripts/genesis/r1006/new_role_keys.sh` pattern), and
-   write r1007 inputs (public addresses only);
-2. re-run the ceremony build from those inputs into an r1007 alloc;
-3. point `GenesisConfig::r1007()` at it, keep `rotated_key_locations` empty as its guard,
-   and re-pin `R1007_GENESIS` (§2);
-4. re-render the canonical book and the ops profile from the new hash.
-
-Open with the owner: whether the producer **staker** accounts count as producer keys
-(this page assumes they do and keeps them).
+`GenesisConfig::r1007()` builds from this allocation and still refuses, fail closed, if any
+rotated r1006 key is named (`r1007::rotated_key_locations`). Tests:
+`the_r1007_alloc_names_no_rotated_r1006_key`,
+`every_rotated_role_has_its_r1007_key_where_r1006_had_the_old_one`,
+`r1007_genesis_builds_from_the_fresh_keys_alloc` (economics), and the node's
+`r1007_block0_active_set_is_the_genesis_committee`.
 
 ## 2. The block-0 hash: how it is computed and when it moves
 
@@ -127,18 +133,17 @@ pinned value. Three tests keep the hash honest:
 - `r1007_profile_builds_the_pinned_block_0_under_the_published_rule` (node, in a child
   process) runs the node's own path: `publish_mpt_rule_for_genesis_build` for profile
   `r1007`, which resolves `Some(0)` from the genesis table, and then
-  `initialize_genesis_state_with_profile`. Under D-K3 that build is refused (it checks the
-  refusal names D-K3); the layout tests above read the r1006-keys layout directly.
+  `initialize_genesis_state_with_profile`, and checks it builds `R1007_GENESIS`.
 - `r1007_genesis_state_refuses_to_build_without_the_mpt_rule` and
   `r1007_profile_build_refuses_without_the_published_rule`: with the rule unset, or
   active only from a later height, the build is refused. It never silently builds a
   different block 0.
 
-**The hash is a candidate, not final.** It is the hash of the r1006-keys layout, which
-no node builds under D-K3 (§1.1); it keys the r1007 tables until the fresh-keys alloc
-re-pins it. It is a function of the allocation, the genesis block encoding and the root
-rule. It moves when any of them changes:
-- **D-K3: the fresh role keys change the allocation, so it moves;**
+**The hash is a candidate, not final.** It is the hash of the fresh-keys allocation at the
+canonical genesis timestamp (`CANONICAL_GENESIS_TIMESTAMP`). It is a function of the
+allocation, the genesis block encoding, the timestamp and the root rule. It moves when any of
+them changes:
+- **the ceremony stamps block 0 with its own timestamp;**
 - a lane changes the genesis header or its hash pre-image (for example a v3 genesis
   header with `accepted_root` from mergeset execution);
 - a lane changes the MPT leaf encoding;
@@ -304,9 +309,9 @@ The procedures are in the federation `ops/r1007-ceremony/RUNBOOK.md` (fed#467).
 **Status on `r1007/genesis-candidate-2` (2026-11-10):** items 1 to 3 are done there
 (item 1 with the merge order in its merge commits, the finality fallback fix in `eb486a44`
 and `cca762ce`; item 2 in `cca762ce`; item 3 as `r1007_chain_params_bind_the_lane_constants`).
-Item 4 waits for D-K3 (§1.1): the hash cannot be final until the fresh-keys alloc exists.
-Item 6 is open: the ops tooling renders `R1007_GENESIS` and should refuse while r1007 is
-pending (a node it starts refuses anyway, at its genesis build).
+Item 4: re-pinned to the fresh-keys hash on `r1007/integ-followups` (2026-11-11); the ceremony
+timestamp re-pins it once more. Item 6: `ceremony.py render` refuses the fleet while r1007 is
+pending (no final r1007 alloc); with the alloc in place it renders.
 
 
 1. Merge order: storage-cow is already in this branch. Then mergeset-execution,

@@ -9,10 +9,10 @@
 //!   same as on r1006;
 //! * **D-K3 (owner 2026-11-10): every non-producer EVM key is rotated** at the r1007
 //!   ceremony (treasury, faucet, team, deployer, grantor, signers, relayer, AA keys,
-//!   governance and guardian owners). The r1006 block-0 state names those keys, so
-//!   r1007 cannot keep it byte for byte for them: they are pending genesis parameters
-//!   ([`ROTATED_R1006_KEYS`]) and [`GenesisConfig::r1007`] refuses to build until fresh
-//!   keys replace them. Producer keys stay;
+//!   governance and guardian owners; [`ROTATED_R1006_KEYS`]). The owner generated the
+//!   fresh keys on 2026-11-11: block 0 is the r1006 block-0 state with each of them
+//!   replaced ([`R1007_ALLOC_JSON`], `scripts/genesis/r1007/rotate_keys.py`). Producer keys
+//!   and stakers stay;
 //! * membership grants are **re-issued by script** after genesis (they were
 //!   post-genesis transactions on r1006 and are not in block 0; see
 //!   `docs/consensus/R1007_GENESIS.md` §4);
@@ -217,48 +217,74 @@ pub fn rotated_key_locations(cfg: &GenesisConfig) -> Vec<KeyLocation> {
     out
 }
 
-/// What the compiled r1007 genesis still waits for. Pending under D-K3: its ceremony
-/// inputs are r1006's, whose non-producer keys are rotated, so `inputs_final` is false
-/// until an r1007 alloc is built from fresh role keys. The producer set and the
-/// OrangeSeed artifacts are r1006's.
+/// The r1007 ceremony allocation (D-K3, keys generated 2026-11-11): the r1006 block-0
+/// state with every rotated role key replaced by its fresh r1007 key, built by
+/// `scripts/genesis/r1007/rotate_keys.py` from `inputs.r1007.env` (public addresses).
+pub const R1007_ALLOC_JSON: &str = include_str!("../assets/r1007/alloc.json");
+
+/// The fresh r1007 role keys, as `(role, address)` in file order: the public inputs the
+/// r1007 alloc was built from (`scripts/genesis/r1007/inputs.r1007.env`).
+pub const R1007_INPUTS_ENV: &str = include_str!("../../../scripts/genesis/r1007/inputs.r1007.env");
+
+/// [`R1007_INPUTS_ENV`] parsed: one `(role, address)` per ROTATED_R1006_KEYS role.
+pub fn r1007_role_keys() -> Result<Vec<(String, [u8; 20])>, GenesisError> {
+    let mut out = Vec::new();
+    for line in R1007_INPUTS_ENV.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k == "R1007_INPUTS_STATUS" {
+            if v != "final" {
+                return Err(GenesisError::Invalid(format!(
+                    "inputs.r1007.env: R1007_INPUTS_STATUS is {v}, not final"
+                )));
+            }
+            continue;
+        }
+        let bytes = hex::decode(v.trim_start_matches("0x"))
+            .map_err(|e| GenesisError::Invalid(format!("inputs.r1007.env {k}: {e}")))?;
+        let addr: [u8; 20] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| GenesisError::Invalid(format!("inputs.r1007.env {k}: not 20 bytes")))?;
+        out.push((k.to_string(), addr));
+    }
+    Ok(out)
+}
+
+/// What the compiled r1007 genesis still waits for: read from the r1007 alloc (its inputs
+/// status and OrangeSeed record) and the shared producer set.
 pub fn readiness() -> Result<r1006::Readiness, GenesisError> {
-    let mut r = r1006::readiness()?;
-    r.inputs_final = false;
-    Ok(r)
+    r1006::readiness_of(R1007_ALLOC_JSON, "r1007")
 }
 
 /// The ValidatorRegistry the r1007 genesis registers its producers in, and the
 /// activation height of the stake-gated producer set: the r1006 ones, since block 0
 /// holds the same registry state (`None` while the producer set is a placeholder).
 pub fn validator_set_binding() -> Result<Option<([u8; 20], u64)>, GenesisError> {
-    r1006::validator_set_binding()
+    r1006::validator_set_binding_of(R1007_ALLOC_JSON, "r1007")
 }
 
 impl GenesisConfig {
-    /// The r1007 genesis configuration (chain 40204). **Pending (D-K3, owner
-    /// 2026-11-10):** the only layout this build has is
-    /// [`candidate_layout_with_r1006_role_keys`], which names the rotated r1006 keys, so
-    /// this refuses, naming every role and where the layout uses it. A node, the GUI and
-    /// the light node all build r1007 through here, so none of them can start a block 0
-    /// that names a rotated key. It builds once an r1007 alloc made from fresh role keys
-    /// replaces the r1006 inputs (R1007_GENESIS.md §1.1), and `R1007_GENESIS` is re-pinned.
+    /// The r1007 genesis configuration (chain 40204): the r1007 ceremony allocation
+    /// ([`R1007_ALLOC_JSON`], the r1006 block-0 state with the D-K3 fresh role keys), the
+    /// shared producer set, and the r1007 note in place of the r1006 note. Fail closed: it
+    /// refuses if any rotated r1006 key is still named ([`rotated_key_locations`]).
     pub fn r1007() -> Result<Self, GenesisError> {
-        let layout = candidate_layout_with_r1006_role_keys()?;
-        let found = rotated_key_locations(&layout);
-        let roles: Vec<String> = ROTATED_R1006_KEYS
-            .iter()
-            .map(|k| {
-                let n = found.iter().filter(|l| l.role == k.role).count();
-                format!("{} ({}; {n} plain occurrence(s))", k.role, k.r1006_use)
-            })
-            .collect();
-        Err(GenesisError::Invalid(format!(
-            "r1007: pending genesis parameters (D-K3, owner 2026-11-10): the r1007 block 0 is \
-             laid out from the r1006 ceremony inputs, whose non-producer keys are rotated. \
-             Fresh r1007 keys are needed for: {}. Build the r1007 alloc from fresh role \
-             inputs, then re-pin R1007_GENESIS",
-            roles.join(", ")
-        )))
+        let cfg = with_r1007_note(r1006::config_from_alloc(R1007_ALLOC_JSON, "r1007")?)?;
+        let found = rotated_key_locations(&cfg);
+        if !found.is_empty() {
+            let roles: Vec<&str> = found.iter().map(|l| l.role).collect();
+            return Err(GenesisError::Invalid(format!(
+                "r1007: the r1007 alloc still names rotated r1006 keys (D-K3): {}",
+                roles.join(", ")
+            )));
+        }
+        Ok(cfg)
     }
 }
 
@@ -270,7 +296,12 @@ impl GenesisConfig {
 /// `R1007_GENESIS` today, kept so the genesis-keyed tables stay testable and so the
 /// fresh-keys alloc can be diffed against it.
 pub fn candidate_layout_with_r1006_role_keys() -> Result<GenesisConfig, GenesisError> {
-    let base = GenesisConfig::r1006()?;
+    with_r1007_note(GenesisConfig::r1006()?)
+}
+
+/// `base` with the r1006 note replaced by the r1007 note (balances, nonces, code and
+/// storage of every other account unchanged; the note holds no balance).
+fn with_r1007_note(base: GenesisConfig) -> Result<GenesisConfig, GenesisError> {
     let mut accounts: Vec<GenesisAccount> = base
         .accounts
         .into_iter()

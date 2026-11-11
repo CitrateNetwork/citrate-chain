@@ -99,6 +99,11 @@ struct AllocFile {
     orangeseed: Option<OrangeSeedRecord>,
     #[allow(dead_code)]
     deployer: String,
+    /// r1007 (D-K3): the record of the key rotation this alloc was built by
+    /// (`scripts/genesis/r1007/rotate_keys.py`); absent for r1006.
+    #[serde(default)]
+    #[allow(dead_code)]
+    rotated_from: Option<serde_json::Value>,
     accounts: Vec<AllocAccount>,
 }
 
@@ -252,11 +257,21 @@ pub fn solidity_string_slots(s: &str) -> Vec<([u8; 32], [u8; 32])> {
     out
 }
 
+#[cfg(test)]
 fn parse_alloc() -> Result<(AllocFile, Vec<GenesisAccount>), GenesisError> {
-    let f: AllocFile =
-        serde_json::from_str(R1006_ALLOC_JSON).map_err(|e| invalid(format!("parse: {e}")))?;
-    if f.format != "citrate-genesis-alloc-v1" || f.profile != "r1006" {
-        return Err(invalid("not a citrate-genesis-alloc-v1 file for r1006"));
+    parse_alloc_text(R1006_ALLOC_JSON, "r1006")
+}
+
+/// Parse a ceremony allocation (`citrate-genesis-alloc-v1`) written for `profile`.
+fn parse_alloc_text(
+    text: &str,
+    profile: &str,
+) -> Result<(AllocFile, Vec<GenesisAccount>), GenesisError> {
+    let f: AllocFile = serde_json::from_str(text).map_err(|e| invalid(format!("parse: {e}")))?;
+    if f.format != "citrate-genesis-alloc-v1" || f.profile != profile {
+        return Err(invalid(format!(
+            "not a citrate-genesis-alloc-v1 file for {profile}"
+        )));
     }
     let mut accounts = Vec::with_capacity(f.accounts.len());
     let mut prev: Option<[u8; 20]> = None;
@@ -301,7 +316,16 @@ pub const R1006_VALIDATOR_ACTIVATION_HEIGHT: u64 = 1_000;
 /// The ValidatorRegistry the compiled r1006 genesis registers its producers in, and the
 /// activation height, when the producer set is filled (`None` while it is a placeholder).
 pub fn validator_set_binding() -> Result<Option<([u8; 20], u64)>, GenesisError> {
-    let (f, _) = parse_alloc()?;
+    validator_set_binding_of(R1006_ALLOC_JSON, "r1006")
+}
+
+/// [`validator_set_binding`] for the ceremony allocation `alloc_json` of `profile`
+/// (the producer set is the shared `validators.json`).
+pub(crate) fn validator_set_binding_of(
+    alloc_json: &str,
+    profile: &str,
+) -> Result<Option<([u8; 20], u64)>, GenesisError> {
+    let (f, _) = parse_alloc_text(alloc_json, profile)?;
     let v = parse_validators()?;
     if v.status != "final" || v.registry.is_none() {
         return Ok(None);
@@ -343,7 +367,12 @@ pub fn genesis_validator_set() -> Result<Option<Vec<GenesisValidator>>, GenesisE
 
 /// What the compiled r1006 genesis still waits for.
 pub fn readiness() -> Result<Readiness, GenesisError> {
-    let (f, accounts) = parse_alloc()?;
+    readiness_of(R1006_ALLOC_JSON, "r1006")
+}
+
+/// [`readiness`] for the ceremony allocation `alloc_json` of `profile`.
+pub(crate) fn readiness_of(alloc_json: &str, profile: &str) -> Result<Readiness, GenesisError> {
+    let (f, accounts) = parse_alloc_text(alloc_json, profile)?;
     let has_code = |a: &Address| {
         accounts
             .iter()
@@ -386,7 +415,20 @@ impl GenesisConfig {
     /// base account at the same address (the Arachnid factory, whose nonce the ceremony
     /// moved). The mining pool is what the 1T supply leaves after every pre-allocation.
     pub fn r1006() -> Result<Self, GenesisError> {
-        let (f, mut ceremony) = parse_alloc()?;
+        config_from_alloc(R1006_ALLOC_JSON, "r1006")
+    }
+}
+
+/// The genesis configuration built from the ceremony allocation `alloc_json` of
+/// `profile`, as [`GenesisConfig::r1006`] builds r1006's: the base allocations, the
+/// ceremony state, the registry delta from the shared `validators.json`, the stakers,
+/// the r1006 genesis note and the OrangeSeed accounts. r1007 replaces the note.
+pub(crate) fn config_from_alloc(
+    alloc_json: &str,
+    profile: &str,
+) -> Result<GenesisConfig, GenesisError> {
+    {
+        let (f, mut ceremony) = parse_alloc_text(alloc_json, profile)?;
         let v = parse_validators()?;
         if let Some(reg) = &v.registry {
             let vr = address(&f.validator_registry)?;
