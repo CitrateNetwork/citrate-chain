@@ -985,10 +985,16 @@ KDEP=0x00000000000000000000000000000000000000c1
 KSTAKER=$(jq -r '.validators[0].staker' "$G/../../core/economics/assets/r1006/validators.json")
 pf() { env -i PATH="$PATH" "$@" python3 -I "$PI" preflight --phases P1; }
 kinv() { python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps({a[i]: a[i+1].split("+") for i in range(0, len(a), 2)}))' "$@"; }
-KINV=$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS")
+KS1=0x00000000000000000000000000000000000000f1
+KS2=0x00000000000000000000000000000000000000f2
+KS3=0x00000000000000000000000000000000000000f3
+KRL=0x00000000000000000000000000000000000000f4
+KINV=$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER)
+# The four inputs DeployEduStack would otherwise default to the deployer.
+KEDU=(SIGNER_1="$KS1" SIGNER_2="$KS2" SIGNER_3="$KS3" RELAYER="$KRL")
 # Test-only bond values: the real amounts are pending (tokenomics) and have no default.
 KBONDS=(WORKMARKET_MIN_COORDINATOR_BOND=3 WORKMARKET_DEFAULT_COORDINATOR_BOND=7)
-KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KDEP" "${KBONDS[@]}")
+KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KDEP" "${KBONDS[@]}" "${KEDU[@]}")
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_GUARDIAN_VETO_MARGIN is refused" 3 'GENESIS_GUARDIAN_VETO_MARGIN is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1"
@@ -1008,7 +1014,7 @@ expect "phase inputs keys: GENESIS_V060=1 without the coordinator bonds is refus
 # the key preflight refuses that before anything is sent, whichever phases this invocation runs.
 for k in RELAYER SIGNER_1 SIGNER_2 SIGNER_3; do
   expect "phase inputs keys: an unset $k is refused in a 0.6.0 run (it would fall back to the deployer)" 3 "$k is not set; in a 0.6.0 run it would fall back to the deployer" -- \
-    env -i PATH="$PATH" "${KV060[@]}" python3 -I "$PI" preflight --phases P4V
+    env -i PATH="$PATH" "${KV060[@]}" "$k=" python3 -I "$PI" preflight --phases P4V
 done
 expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
 expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KRK1"

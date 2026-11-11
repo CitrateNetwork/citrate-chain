@@ -422,6 +422,7 @@ def preflight(spec, run_phases, started_after, deployer):
 
 VETO_WINDOW = 24 * 3600
 COUNCIL_ROLES = ("GOV_OWNERS", "GRD_OWNERS")
+FALLBACK_TO_DEPLOYER = ("RELAYER", "SIGNER_1", "SIGNER_2", "SIGNER_3")
 
 
 def _address_list(raw, key, problems):
@@ -505,6 +506,11 @@ def retired_key_problems(inputs, env, deployer):
     if env.get("GENESIS_V060", "") != "1":
         return problems
     retired = _address_list(env["GENESIS_RETIRED_KEYS"], "GENESIS_RETIRED_KEYS", problems) if env.get("GENESIS_RETIRED_KEYS", "").strip() else set()
+    # DeployEduStack falls back to the deployer for these when unset; refuse that here, before
+    # anything is sent, whichever phases this invocation runs.
+    for k in FALLBACK_TO_DEPLOYER:
+        if not env.get(k, "").strip():
+            problems.append(f"{k} is not set; in a 0.6.0 run it would fall back to the deployer (DeployEduStack), which may hold no seat")
     vocabulary = role_inputs(inputs)
     raw_inv = env.get("GENESIS_KEY_INVENTORY", "").strip()
     inventory = key_inventory(raw_inv, vocabulary, problems) if raw_inv else None
