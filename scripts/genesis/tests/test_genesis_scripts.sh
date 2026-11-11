@@ -1111,7 +1111,7 @@ akc_alloc "store=0x0000000000000000000000000000000000000fa0"
 expect "GO-K step 3: a word below the address floor is listed with its slot" 0 'GOK3-UNCHECKED 0x(c0){20} storage 0x01 0xfa0' -- akc
 # A post-genesis key (POSTGENESIS_DEPLOYER, V060_DEPLOYER, ...) is known but must not appear in block 0.
 akc_alloc "fund=0x$(printf 'b2%.0s' $(seq 20))" "fund=0x$(printf 'f9%.0s' $(seq 20))"
-expect "GO-K step 3: a funded post-genesis key is refused" 1 '0x(f9){20} is a post-genesis key \(V060_DEPLOYER\)' -- python3 -I "$AKC" --alloc "$AK/alloc.json" --key-inventory "{\"0x$(printf 'b2%.0s' $(seq 20))\":[\"TREASURY\"],\"0x$(printf 'f9%.0s' $(seq 20))\":[\"V060_DEPLOYER\"]}" --stakers "$AK/validators.json" --deployer "$AKDEP"
+expect "GO-K step 3: a funded post-genesis key is refused" 1 '0x(f9){20}, which is a post-genesis key \(V060_DEPLOYER\)' -- python3 -I "$AKC" --alloc "$AK/alloc.json" --key-inventory "{\"0x$(printf 'b2%.0s' $(seq 20))\":[\"TREASURY\"],\"0x$(printf 'f9%.0s' $(seq 20))\":[\"V060_DEPLOYER\"]}" --stakers "$AK/validators.json" --deployer "$AKDEP"
 akc_alloc "deployer=$AKDEP"
 expect "GO-K step 3: a funded ceremony deployer is refused" 1 'the ceremony deployer .* has balance' -- akc
 akc_alloc "fund=0x$(printf 'd1%.0s' $(seq 20))"

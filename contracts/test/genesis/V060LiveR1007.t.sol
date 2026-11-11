@@ -208,19 +208,15 @@ contract V060LiveR1007Test is Test {
         s.deployLive(liveDeployer, i, _rot());
     }
 
-    /// A MultisigProposer with the same immutables has the same code hash: the rule also needs it
-    /// to be the timelock's exact council (holder sets), so an unwired copy is refused.
+    /// A MultisigProposer with the same immutables has the same code hash, but it is not at the
+    /// CREATE2 address the ceremony deployed for the original owners: refused by provenance.
     function test_live_mode_refuses_an_unwired_multisig_with_the_right_code() public {
         MultisigProposer copy = new MultisigProposer(gov.governanceTimelock, govNew, 3, 14 days);
         DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
         i.governanceMultisig = address(copy);
-        archive.absorb();
-        try s.deployLive(liveDeployer, i, _rot()) {
-            fail();
-        } catch Error(string memory reason) {
-            assertEq(_prefix(reason, 21), "GOVERNANCE timelock: ");
-        }
+        _expectRevert(bytes("GovernanceMultisig: not the MultisigProposer the ceremony deployed for these original owners, threshold and TTL"));
+        s.deployLive(liveDeployer, i, _rot());
     }
 
     function test_live_mode_refuses_a_multisig_that_is_not_a_multisig_proposer() public {
@@ -291,15 +287,6 @@ contract V060LiveR1007Test is Test {
         ms.execute(id);
     }
 
-    function _prefix(string memory s_, uint256 n) internal pure returns (string memory) {
-        bytes memory a = bytes(s_);
-        if (a.length < n) return s_;
-        bytes memory out = new bytes(n);
-        for (uint256 k = 0; k < n; k++) {
-            out[k] = a[k];
-        }
-        return string(out);
-    }
 
     // CHAIN-INTEG's second leg: CREATE2 provenance against the r1006 constructor owners, then
     // owners() exactly the rotated r1007 set, in order.

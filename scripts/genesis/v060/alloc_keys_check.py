@@ -46,6 +46,8 @@ PUSH32_ADDR = re.compile(r"7f000000000000000000000000([0-9a-f]{40})")
 # and 2**152, and the largest non-address word is ~2**102 (an amount). Every nonzero word below
 # the floor is listed (GOK3-UNCHECKED) with its account and slot, never silently skipped.
 FLOOR = 2**104
+# Post-genesis keys (fed #561): known to the inventory, but never funded or referenced at block 0.
+POSTGENESIS_TAGS = {"POSTGENESIS_DEPLOYER", "DPF_OPERATOR", "BUNDLER", "RADAR_DEPLOYER", "CHATBOT_RELAYER", "V060_DEPLOYER"}
 
 
 def die(msg, code=2):
@@ -76,13 +78,13 @@ def inventory(raw):
         die(f"the key inventory is not JSON: {e}")
     if not isinstance(d, dict) or not d:
         die("the key inventory is not a JSON object {address: [roles]}")
-    out = set()
-    for a in d:
+    out = {}
+    for a, roles in d.items():
         if not ADDR.match(a):
             die(f"the key inventory has a malformed address {a!r}")
         if a.lower() in out:
             die(f"the key inventory names {a.lower()} more than once")
-        out.add(a.lower())
+        out[a.lower()] = set(roles) if isinstance(roles, list) else set()
     return out
 
 
@@ -131,6 +133,8 @@ def main():
     def judge(who, how, where):
         if who in retired:
             problems.append(f"{where} {how} {who}, a key retired at the r1007 ceremony (D-K3)")
+        elif who in known and known[who] and known[who] <= POSTGENESIS_TAGS:
+            problems.append(f"{where} {how} {who}, which is a post-genesis key ({', '.join(sorted(known[who]))}) and must not appear in block 0")
         elif who in known or who in staker_set:
             return
         elif who == deployer:

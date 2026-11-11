@@ -857,6 +857,62 @@ abstract contract AdminChecks {
         return "";
     }
 
+    /// @notice A council whose owners were rotated in storage after its ceremony (r1007's block 0
+    ///         is r1006's state with every non-producer key replaced, rotate_keys.py: the owner
+    ///         array elements and the `isOwner` keys at slot 1; threshold and TTL unchanged).
+    ///           fromGov / fromGrd  the constructor owners the council addresses commit to (r1006,
+    ///                              scripts/genesis/r1006/inputs.r1006.env), in order
+    ///           toGov / toGrd      the rotated owners (r1007, scripts/genesis/r1007/inputs.r1007.env),
+    ///                              in order
+    struct Rotation {
+        address[] fromGov;
+        address[] fromGrd;
+        address[] toGov;
+        address[] toGrd;
+    }
+
+    /// @notice Empty when `multisig` is the ceremony's MultisigProposer for `timelock`, deployed
+    ///         under `saltName` with the constructor owners `fromOwners`, and since rotated to
+    ///         exactly `toOwners`. Two legs (CHAIN-INTEG, 2026-11-11):
+    ///           1. provenance: the CREATE2 address for (timelock, fromOwners, its threshold, its
+    ///              TTL), and this build's runtime code for those immutables (owners are storage,
+    ///              so the rotation leaves the code hash alone);
+    ///           2. the rotation: `owners()` is exactly `toOwners`, in order.
+    ///         `_multisigProposerProblem` (provenance over the CURRENT owners) cannot hold on a
+    ///         rotated council: its address commits to the original owners. Never reverts on a
+    ///         contract that answers; an unreadable one is a problem.
+    function _rotatedMultisigProblem(
+        address multisig,
+        address timelock,
+        string memory saltName,
+        address[] memory fromOwners,
+        address[] memory toOwners
+    ) internal returns (string memory) {
+        if (multisig.code.length == 0) return "no code at address";
+        (bool okT, bytes memory rt) = multisig.staticcall(abi.encodeWithSignature("threshold()"));
+        if (!okT || rt.length != 32) return "threshold() unreadable";
+        (bool okL, bytes memory rl) = multisig.staticcall(abi.encodeWithSignature("proposalTtl()"));
+        if (!okL || rl.length != 32) return "proposalTtl() unreadable";
+        (bool okO, bytes memory ro) = multisig.staticcall(abi.encodeWithSignature("owners()"));
+        if (!okO || ro.length < 64) return "owners() unreadable";
+        uint256 threshold = abi.decode(rt, (uint256));
+        uint256 ttl = abi.decode(rl, (uint256));
+        bytes memory init = _multisigProposerInitCode(timelock, fromOwners, threshold, ttl);
+        if (_ceremonyCreate2Address(saltName, init) != multisig) {
+            return "not the MultisigProposer the ceremony deployed for these original owners, threshold and TTL";
+        }
+        // On a chain whose block 0 copied the account (r1007), the address alone does not prove
+        // the code: compare it with this build's instance for the same immutables.
+        if (multisig.codehash != address(new MultisigProposer(timelock, fromOwners, threshold, ttl)).codehash) {
+            return "runtime code is not this build's MultisigProposer for its timelock, threshold and TTL";
+        }
+        address[] memory owners = abi.decode(ro, (address[]));
+        if (keccak256(abi.encode(owners)) != keccak256(abi.encode(toOwners))) {
+            return "owners() is not exactly the rotated set, in order";
+        }
+        return "";
+    }
+
     /// @notice Revert unless `_multisigProposerProblem` is empty (see there).
     function _assertMultisigProposer(string memory name, address multisig, address timelock, string memory saltName)
         internal

@@ -121,7 +121,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         address workAttestations;
     }
 
-    function run() external returns (Deployed memory d) {
+    function run() external virtual returns (Deployed memory d) {
         // The pending parameter first: nothing else is read, checked or sent without it.
         (uint128 minBond, uint128 defaultBond) = _bondsFromEnv();
         V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
@@ -316,6 +316,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         (k.governanceOwners, k.guardianOwners) = inventoryRoles(vm.envOr("GENESIS_KEY_INVENTORY", string("")));
         k.retiredKeys = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
         k.guardianVetoMargin = vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0));
+        k.v060Deployers = inventoryRole(vm.envOr("GENESIS_KEY_INVENTORY", string("")), "V060_DEPLOYER");
         V060GovernanceSpec.requireKeyParams(k);
     }
 
@@ -432,6 +433,12 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         );
         _checkGovernance(i, p);
 
+        _checkReadInputs(i);
+    }
+
+    /// @notice The block-0 contracts the 0.6.0 set reads: this build's instances, owned as P3L
+    ///         leaves them (both modes).
+    function _checkReadInputs(Inputs memory i) internal {
         require(i.federatedRoundLedger.code.length != 0, "FederatedRoundLedger: no code");
         require(i.guardianRecoveryModule.code.length != 0, "GuardianRecoveryModule (V1): no code");
         // Identity, not only code: this build's instance at the address its phase deploys it to.
@@ -454,6 +461,172 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         require(okA && agentOwner == i.governanceTimelock, "AgentSBT: owner is not the GOVERNANCE timelock");
         (bool okR, address agentOrgs) = _readAddress(i.agentSbt, abi.encodeWithSignature("orgContract()"));
         require(okR && agentOrgs == i.organizationSbt, "AgentSBT: reads another OrganizationSBT");
+    }
+
+    // ------------------------------------------------------------------ live mode (r1007)
+    //
+    // fed #561 (owner 2026-11-11): the 0.6.0 set deployed post-genesis on r1007, whose block 0 is
+    // r1006's state with every non-producer key rotated in storage (rotate_keys.py). There, P1
+    // ran in its v1 shape long ago, so this mode deploys ProviderRegistry and GuardianCancellerV2
+    // itself and leaves the canceller swap to a governance proposal (`swapProposal`), and the
+    // councils keep their r1006 addresses with rotated owners, so they are authenticated by
+    // AdminChecks `_rotatedMultisigProblem`: CREATE2 provenance against the r1006 constructor
+    // owners plus this build's code, then owners() exactly the rotated r1007 set, in order.
+    // runLive reads them from R1006_GOV_OWNERS / R1006_GRD_OWNERS (inputs.r1006.env) and
+    // GOV_OWNERS / GRD_OWNERS (inputs.r1007.env, in order).
+
+    function _inputsFromBook(string memory json, uint128 minBond, uint128 defaultBond, V060GovernanceSpec.KeyParams memory k)
+        internal
+        view
+        returns (Inputs memory i)
+    {
+        i = Inputs({
+            governanceTimelock: _bookAddr(json, "GovernanceTimelock"),
+            governanceMultisig: _bookAddr(json, "GovernanceMultisig"),
+            guardianTimelock: _bookAddr(json, "GuardianTimelock"),
+            guardianMultisig: _bookAddr(json, "GuardianMultisig"),
+            guardianCanceller: _bookAddr(json, "GuardianCanceller"),
+            federatedRoundLedger: _bookAddr(json, "FederatedRoundLedger"),
+            guardianRecoveryModule: _bookAddr(json, "GuardianRecoveryModule"),
+            organizationSbt: _bookAddr(json, "OrganizationSBT"),
+            agentSbt: _bookAddr(json, "AgentSBT"),
+            minCoordinatorBond: minBond,
+            defaultCoordinatorBond: defaultBond,
+            keys: k
+        });
+    }
+
+    /// @notice Live mode with explicit inputs. Refuses, before broadcasting, unless every input
+    ///         checks out (keys, the rotated councils, the v1 seat, the block-0 identities and the
+    ///         margin); deploys the ten contracts by CREATE2 (reused when live); then `verifyLive`.
+    function deployLive(address deployer, Inputs memory i, Rotation memory rot) public returns (Deployed memory d) {
+        require(deployer != address(0), "deployer must be set");
+        V060GovernanceSpec.requireKeyParams(i.keys);
+        V060GovernanceSpec.requireLiveDeployer(deployer, i.keys);
+        Deployed memory p = predict(i);
+        _resolveChainProfile(true);
+        _checkKeys(deployer, i);
+        _checkLiveInputs(i, p, rot);
+
+        console.log("=== 0.6.0 contracts, live mode (post-genesis) ===");
+        console.log("Deployer:", deployer);
+        _startBroadcastAsDeployer(deployer);
+        d.providerRegistry = _deployProviderRegistry(i);
+        d.guardianCancellerV2 = _deployCancellerV2(i, d.providerRegistry);
+        d.flRoundVerifier = _deployFlRoundVerifier(i);
+        d.taskVerifier = _deployTaskVerifier();
+        d.workMarket = _deployWorkMarket(i, d);
+        d.datasetRegistry = _deployDatasetRegistry(i);
+        d.guardianRecoveryModuleV2 = _deployGuardianRecoveryV2(i);
+        d.usageReceipts = _deployUsageReceipts();
+        d.orgBudgets = _deployOrgBudgets(i);
+        d.workAttestations = _deployWorkAttestations(i);
+        vm.stopBroadcast();
+
+        require(keccak256(abi.encode(d)) == keccak256(abi.encode(p)), "a 0.6.0 contract is not at its predicted address");
+        verifyLive(i, d);
+        console.log("ProviderRegistry         :", d.providerRegistry);
+        console.log("GuardianCancellerV2      :", d.guardianCancellerV2);
+        console.log("WorkMarket               :", d.workMarket);
+    }
+
+    /// @notice The canceller-swap proposal (fed #561 section 3.1): one batch on the GOVERNANCE
+    ///         timelock, revokeRole(CANCELLER, v1) + grantRole(CANCELLER, v2), values 0,
+    ///         predecessor 0, salt SWAP_SALT, the timelock's own delay. Refused unless v2 has this
+    ///         build's code at its predicted address and v1 is still the seat, so nobody queues a
+    ///         grant to an address that holds nothing. Returns the GovernanceMultisig `propose`
+    ///         payloads (scheduleBatch, then executeBatch after the delay) and the operation id.
+    function swapProposal(Inputs memory i)
+        public
+        returns (bytes memory scheduleData, bytes memory executeData, bytes32 opId)
+    {
+        Deployed memory p = predict(i);
+        address v2 = p.guardianCancellerV2;
+        require(
+            v2.code.length != 0
+                && v2.codehash
+                    == address(new GuardianCancellerV2(i.governanceTimelock, i.guardianTimelock, p.providerRegistry)).codehash,
+            V060GovernanceSpec.SWAP_NEEDS_V2_CODE
+        );
+        TimelockController gt = TimelockController(payable(i.governanceTimelock));
+        bytes32 role = gt.CANCELLER_ROLE();
+        address v1 = _v1Address(i);
+        require(gt.hasRole(role, v1) && !gt.hasRole(role, v2), "the swap is not pending: v1 is not the seat, or v2 already holds it");
+        address[] memory targets = new address[](2);
+        (targets[0], targets[1]) = (i.governanceTimelock, i.governanceTimelock);
+        uint256[] memory values = new uint256[](2);
+        bytes[] memory payloads = new bytes[](2);
+        payloads[0] = abi.encodeCall(gt.revokeRole, (role, v1));
+        payloads[1] = abi.encodeCall(gt.grantRole, (role, v2));
+        bytes32 salt = V060GovernanceSpec.SWAP_SALT;
+        scheduleData = abi.encodeCall(gt.scheduleBatch, (targets, values, payloads, bytes32(0), salt, gt.getMinDelay()));
+        executeData = abi.encodeCall(gt.executeBatch, (targets, values, payloads, bytes32(0), salt));
+        opId = gt.hashOperationBatch(targets, values, payloads, bytes32(0), salt);
+    }
+
+    /// @notice The live-mode input checks (r1007's rotated block 0).
+    function _checkLiveInputs(Inputs memory i, Deployed memory p, Rotation memory rot) internal {
+        require(i.governanceTimelock.code.length != 0, "GOVERNANCE timelock: no code");
+        require(i.guardianTimelock.code.length != 0, "GUARDIAN timelock: no code");
+        V060GovernanceSpec.requireVetoMargin(
+            TimelockController(payable(i.guardianTimelock)).getMinDelay(), i.keys.guardianVetoMargin
+        );
+        _requireCouncilFloor("GOVERNANCE", i.governanceTimelock, i.governanceMultisig, true);
+        _requireCouncilFloor("GUARDIAN", i.guardianTimelock, i.guardianMultisig, false);
+        string memory r = _rotatedMultisigProblem(
+            i.governanceMultisig,
+            i.governanceTimelock,
+            string.concat(GENESIS_SALT_PREFIX, "GovernanceMultisig"),
+            rot.fromGov,
+            rot.toGov
+        );
+        require(bytes(r).length == 0, string.concat("GovernanceMultisig: ", r));
+        r = _rotatedMultisigProblem(
+            i.guardianMultisig,
+            i.guardianTimelock,
+            string.concat(GENESIS_SALT_PREFIX, "GuardianMultisig"),
+            rot.fromGrd,
+            rot.toGrd
+        );
+        require(bytes(r).length == 0, string.concat("GuardianMultisig: ", r));
+        // The seat: v1 at its CREATE2 address with this build's code, holding CANCELLER; v2 not yet.
+        address v1 = _v1Address(i);
+        require(
+            i.guardianCanceller == v1 && v1.code.length != 0
+                && v1.codehash == address(new GuardianCanceller(i.governanceTimelock, i.guardianTimelock)).codehash,
+            "GuardianCanceller: the input book's seat is not this build's v1 at its CREATE2 address"
+        );
+        TimelockController gt = TimelockController(payable(i.governanceTimelock));
+        require(gt.hasRole(gt.CANCELLER_ROLE(), v1), "GuardianCanceller v1 does not hold CANCELLER on GOVERNANCE");
+        require(!gt.hasRole(gt.CANCELLER_ROLE(), p.guardianCancellerV2), "GuardianCancellerV2 already holds CANCELLER");
+        // Complete holder sets: each timelock's council, and v1 as GOVERNANCE's one extra canceller.
+        address[] memory extra = new address[](1);
+        extra[0] = v1;
+        string memory h = _timelockHolderProblem(i.governanceTimelock, i.governanceMultisig, extra);
+        require(bytes(h).length == 0, string.concat("GOVERNANCE timelock: ", h));
+        h = _timelockHolderProblem(i.guardianTimelock, i.guardianMultisig, new address[](0));
+        require(bytes(h).length == 0, string.concat("GUARDIAN timelock: ", h));
+        _checkReadInputs(i);
+    }
+
+    function _deployProviderRegistry(Inputs memory i) internal returns (address) {
+        string memory n = V060GovernanceSpec.PROVIDER_REGISTRY;
+        bytes memory init = V060GovernanceSpec.providerRegistryInit(i.governanceTimelock, i.guardianTimelock);
+        if (_isLive(n, init)) return _create2Address(n, init);
+        return address(
+            new ProviderRegistry{salt: Salts.salt(n)}(
+                i.governanceTimelock, i.guardianTimelock, V060GovernanceSpec.PROVIDER_VETO_WINDOW
+            )
+        );
+    }
+
+    function _deployCancellerV2(Inputs memory i, address registry) internal returns (address) {
+        string memory n = V060GovernanceSpec.GUARDIAN_CANCELLER_V2;
+        bytes memory init = V060GovernanceSpec.guardianCancellerV2Init(i.governanceTimelock, i.guardianTimelock, registry);
+        if (_isLive(n, init)) return _create2Address(n, init);
+        return address(
+            new GuardianCancellerV2{salt: Salts.salt(n)}(i.governanceTimelock, i.guardianTimelock, registry)
+        );
     }
 
     // ------------------------------------------------------------------ deploys (reuse when live)
@@ -542,6 +715,36 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     ///         (slashSink, verifier allowlist, bonds, time windows, governance and guardian seats,
     ///         CANCELLER on GOVERNANCE held by v2 and not v1). Reverts on the first difference.
     function verify(Inputs memory i, Deployed memory d) public view {
+        _verifyContracts(i, d);
+        TimelockController g = TimelockController(payable(i.governanceTimelock));
+        bytes32 cancellerRole = g.CANCELLER_ROLE();
+        require(g.hasRole(cancellerRole, d.guardianCancellerV2), "GuardianCancellerV2 lacks CANCELLER on GOVERNANCE");
+        require(!g.hasRole(cancellerRole, _v1Address(i)), "GuardianCanceller v1 holds CANCELLER on GOVERNANCE");
+    }
+
+    /// @notice Live mode (r1007, post-genesis), before the canceller swap (fed #561 section 3.1)
+    ///         executes: every 0.6.0 contract re-read as in `verify`, with v1 still holding
+    ///         GOVERNANCE's CANCELLER seat and v2 holding nothing yet. After the swap, `verify`.
+    function verifyLive(Inputs memory i, Deployed memory d) public view {
+        _verifyContracts(i, d);
+        TimelockController g = TimelockController(payable(i.governanceTimelock));
+        bytes32 cancellerRole = g.CANCELLER_ROLE();
+        require(
+            g.hasRole(cancellerRole, _v1Address(i)),
+            "GuardianCanceller v1 no longer holds CANCELLER: use the full verify"
+        );
+        require(!g.hasRole(cancellerRole, d.guardianCancellerV2), "GuardianCancellerV2 holds CANCELLER before the swap");
+        require(i.guardianCanceller == _v1Address(i), "the input book's canceller seat is not v1");
+    }
+
+    function _v1Address(Inputs memory i) internal pure returns (address) {
+        return _create2Address(
+            "Genesis.GuardianCanceller",
+            abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(i.governanceTimelock, i.guardianTimelock))
+        );
+    }
+
+    function _verifyContracts(Inputs memory i, Deployed memory d) internal view {
         for (uint256 n = 0; n < 10; n++) {
             require(_at(d, n).code.length != 0, "a 0.6.0 genesis contract has no code");
         }
@@ -580,13 +783,6 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
             c.governanceTimelock() == gt && c.guardian() == rt && c.providerRegistry() == d.providerRegistry,
             "GuardianCancellerV2: wiring"
         );
-        TimelockController g = TimelockController(payable(gt));
-        bytes32 cancellerRole = g.CANCELLER_ROLE();
-        require(g.hasRole(cancellerRole, d.guardianCancellerV2), "GuardianCancellerV2 lacks CANCELLER on GOVERNANCE");
-        address v1 = _create2Address(
-            "Genesis.GuardianCanceller", abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(gt, rt))
-        );
-        require(!g.hasRole(cancellerRole, v1), "GuardianCanceller v1 holds CANCELLER on GOVERNANCE");
     }
 
     function _at(Deployed memory d, uint256 n) internal pure returns (address) {
