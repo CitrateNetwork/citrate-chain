@@ -13,10 +13,21 @@ denylist: none of those addresses may be funded or referenced at all.
 
   funded      an account with a nonzero balance and no code, and every baseAllocations entry
   referenced  a 32-byte storage word whose top 12 bytes are zero and whose low 20 bytes are an
-              address at or above 2**128, or the same 32-byte pattern pushed by PUSH32 in an
+              address at or above 2**104, or the same 32-byte pattern pushed by PUSH32 in an
               account's code (an address immutable), when that address has no code in the
-              allocation. Smaller words are not addresses this check can tell from counters,
-              timestamps or amounts; they are counted and reported, not checked.
+              allocation. Smaller nonzero words cannot be told from counters, timestamps or
+              amounts; each one is listed as GOK3-UNCHECKED with its account and slot.
+
+Limits (it is an extra check; GO-K step 4, reading every role member on chain, stays the
+hard gate):
+  - an address packed into a slot beside other fields is not found (only whole words whose top
+    12 bytes are zero are read);
+  - an address that appears only as a mapping key (hashed into the slot) is not found;
+  - an address below 2**104 (7 or more leading zero bytes) is listed as GOK3-UNCHECKED, not
+    judged;
+  - the code scan is not aligned to instructions: it matches PUSH32 bytes anywhere, including
+    inside data or other push arguments. So it can only refuse wrongly (a false match on an
+    unknown address), never let an address through that a true PUSH32 holds.
 
 Usage: alloc_keys_check.py --alloc FILE --key-inventory JSON --stakers FILE --deployer ADDR
                            [--retired-keys ADDR,ADDR,...]
@@ -30,7 +41,11 @@ import sys
 ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
 WORD = re.compile(r"^(?:0x)?([0-9a-fA-F]{64})$")
 PUSH32_ADDR = re.compile(r"7f000000000000000000000000([0-9a-f]{40})")
-FLOOR = 2**128
+# Words at or above 2**104 (an address with at most 6 leading zero bytes) are checked as
+# addresses. Measured on the r1006 alloc: no counter, timestamp or amount lies between 2**104
+# and 2**152, and the largest non-address word is ~2**102 (an amount). Every nonzero word below
+# the floor is listed (GOK3-UNCHECKED) with its account and slot, never silently skipped.
+FLOOR = 2**104
 
 
 def die(msg, code=2):
@@ -111,7 +126,7 @@ def main():
         die(f"{a.alloc} has no accounts list")
 
     has_code = {acc["address"].lower() for acc in accounts if (acc.get("code") or "0x") not in ("0x", "")}
-    problems, small = [], 0
+    problems, unchecked = [], []
 
     def judge(who, how, where):
         if who in retired:
@@ -141,7 +156,8 @@ def main():
             w = m.group(1).lower().rjust(64, "0")
             who = address_of(w)
             if who is None:
-                small += int(w[:24] == "0" * 24 and int(w, 16) != 0)
+                if w[:24] == "0" * 24 and int(w, 16) != 0:
+                    unchecked.append(f"{addr} storage {slot} {hex(int(w, 16))}")
                 continue
             if who not in has_code:
                 judge(who, "references", f"{addr} storage {slot}")
@@ -161,12 +177,14 @@ def main():
         elif who not in has_code:
             judge(who, "funds", f"baseAllocations ({b.get('role', '?')})")
 
+    for u in unchecked:
+        print(f"GOK3-UNCHECKED {u}")
     for p in problems:
         print(f"GOK3-FAIL {p}")
     if problems:
         print(f"alloc_keys_check: {len(problems)} problem(s)")
         return 1
-    print(f"alloc_keys_check: OK ({len(accounts)} accounts; {small} small storage words not address-checked)")
+    print(f"alloc_keys_check: OK ({len(accounts)} accounts; {len(unchecked)} storage words below the address floor listed as GOK3-UNCHECKED)")
     return 0
 
 

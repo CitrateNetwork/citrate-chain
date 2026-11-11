@@ -291,8 +291,8 @@ idx() {
 if [[ "$RECORD_FLAG" == --record-stack-book && ( "$MODE" != confirm || "$ONLY" != P2 ) ]]; then
   die "--record-stack-book needs --confirm --only P2 (it records the book of a P2 that has broadcast)" 1
 fi
-if [[ "$RECORD_FLAG" == --record-book && ( "$MODE" != confirm || ! " P2 P3 P3L P4 " == *" ${ONLY:-none} "* ) ]]; then
-  die "--record-book needs --confirm --only P2, P3, P3L or P4 (it records the book of a phase that has broadcast)" 1
+if [[ "$RECORD_FLAG" == --record-book && ( "$MODE" != confirm || ! " P2 P3 P3L P4 P4V " == *" ${ONLY:-none} "* ) ]]; then
+  die "--record-book needs --confirm --only P2, P3, P3L, P4 or P4V (it records the book of a phase that has broadcast)" 1
 fi
 should() {
   if [[ -n "$ONLY" ]]; then [[ "$1" == "$ONLY" ]]; else [[ $(idx "$1") -ge $(idx "$FROM") ]]; fi
@@ -1672,17 +1672,24 @@ PY
       if [[ -n "$skip_sim" ]]; then
         log "P4V note: skipped in a simulation: $skip_sim"
       else
-        forge_phase P4V DeployV060Genesis.s.sol
-        record_output_book P4V v060 "$V060_BOOK" DeployV060Genesis.s.sol \
-          "$(printf '{"GovernanceTimelock":"%s"}' "$(lower "$GOVERNANCE")")"
+        if [[ "$RECORD_BOOK" == 1 ]]; then
+          log "P4V record step: nothing is sent; verifyBook re-reads the 0.6.0 set, then the book is checked against this run's broadcasts and recorded"
+        else
+          forge_phase P4V DeployV060Genesis.s.sol
+        fi
+        # #463 review P1: verifyBook runs BEFORE the book is recorded. A failed verify records
+        # nothing, so P5 (which on --confirm needs the recorded 0.6.0 book) refuses to run; the
+        # way on is the record step, which re-runs verifyBook and records only on PASS.
         if [[ -f "$V060_BOOK" ]]; then
           out=$(cd "$CONTRACTS" && "$FORGE" script script/DeployV060Genesis.s.sol --sig 'verifyBook()' --rpc-url "$RPC_URL" 2>&1) ||
             gate_fail P4V "verifyBook failed: $(printf '%s' "$out" | grep -E 'Error|revert' | head -3)"
           grep -q 'V060 verify PASS' <<<"$out" || gate_fail P4V "verifyBook did not report PASS"
-          log "P4V PASS: verifyBook re-read every 0.6.0 contract on chain"
+          log "P4V verifyBook PASS: every 0.6.0 contract re-read on chain"
         elif [[ "$MODE" == simulate ]]; then
           log "P4V note: a simulation writes no 0.6.0 book, so verifyBook has nothing to re-read"
         fi
+        record_output_book P4V v060 "$V060_BOOK" DeployV060Genesis.s.sol \
+          "$(printf '{"GovernanceTimelock":"%s"}' "$(lower "$GOVERNANCE")")"
       fi
     fi
     sends_once_end

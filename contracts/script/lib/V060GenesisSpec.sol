@@ -47,7 +47,8 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/
 ///         scripts/genesis/phase_inputs.json (`decided`, enforced at P0) and
 ///         scripts/genesis/v060/inputs.v060.env, never a default here: DeployV060Genesis refuses
 ///         to build without both (`PENDING_COORDINATOR_BONDS`). They are in WorkMarket's init
-///         code, so its address moves if they are revisited.
+///         code, so its address moves if they are revisited: the 0.6.0 address book is
+///         PROVISIONAL (WorkMarket's address) until the bonds are final.
 library V060GenesisSpec {
     // CREATE2 salt names (Salts.salt(name)). The "Genesis." prefix is the P1 convention.
     string internal constant FL_ROUND_VERIFIER = "Genesis.FLRoundVerifier";
