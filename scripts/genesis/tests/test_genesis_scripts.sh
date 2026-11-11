@@ -1029,7 +1029,8 @@ expect "phase inputs keys: a default bond other than the owner's decided 1,000 S
 # FAUCET and TEAM are block-0 accounts (base allocations), not role inputs: the inventory may
 # tag them so the alloc check knows them. Post-genesis roles are not ceremony roles.
 expect "phase inputs keys: FAUCET and TEAM are known block-0 account tags" 0 '' -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER 0x00000000000000000000000000000000000000f5 FAUCET 0x00000000000000000000000000000000000000f6 TEAM)"
-expect "phase inputs keys: a post-genesis role in the inventory is refused" 3 "has an unknown role 'POSTGENESIS_DEPLOYER'" -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER 0x00000000000000000000000000000000000000f7 POSTGENESIS_DEPLOYER)"
+expect "phase inputs keys: a post-genesis role (no block-0 seat) is a known inventory tag" 0 '' -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER 0x00000000000000000000000000000000000000f7 POSTGENESIS_DEPLOYER 0x00000000000000000000000000000000000000f8 V060_DEPLOYER)"
+expect "phase inputs keys: a post-genesis key may not hold a ceremony role" 3 'TREASURY \(0x0+f8\) is not in GENESIS_KEY_INVENTORY with role TREASURY' -- pf "${KV060[@]}" TREASURY=0x00000000000000000000000000000000000000f8 GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER 0x00000000000000000000000000000000000000f8 V060_DEPLOYER)"
 expect "phase inputs keys: a DEPLOYER tag in the inventory is refused (the deployer carries no role)" 3 "has an unknown role 'DEPLOYER'" -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER "$KDEP" DEPLOYER)"
 expect "phase inputs keys: a retired TREASURY is refused (denylist)" 3 'TREASURY \(0x0+a1\) is a key retired at the r1007 ceremony' -- pf "${KV060[@]}" TREASURY="$KRK1"
 expect "phase inputs keys: a retired deployer is refused" 3 'DEPLOYER_ADDRESS \(0x0+a1\) is a key retired' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KRK1"
@@ -1108,6 +1109,9 @@ akc_alloc "store=0x000000000000$(printf 'f6%.0s' $(seq 14))"
 expect "GO-K step 3: an EOA with 6 leading zero bytes off the inventory is refused" 1 'references 0x000000000000(f6){14}' -- akc
 akc_alloc "store=0x0000000000000000000000000000000000000fa0"
 expect "GO-K step 3: a word below the address floor is listed with its slot" 0 'GOK3-UNCHECKED 0x(c0){20} storage 0x01 0xfa0' -- akc
+# A post-genesis key (POSTGENESIS_DEPLOYER, V060_DEPLOYER, ...) is known but must not appear in block 0.
+akc_alloc "fund=0x$(printf 'b2%.0s' $(seq 20))" "fund=0x$(printf 'f9%.0s' $(seq 20))"
+expect "GO-K step 3: a funded post-genesis key is refused" 1 '0x(f9){20} is a post-genesis key \(V060_DEPLOYER\)' -- python3 -I "$AKC" --alloc "$AK/alloc.json" --key-inventory "{\"0x$(printf 'b2%.0s' $(seq 20))\":[\"TREASURY\"],\"0x$(printf 'f9%.0s' $(seq 20))\":[\"V060_DEPLOYER\"]}" --stakers "$AK/validators.json" --deployer "$AKDEP"
 akc_alloc "deployer=$AKDEP"
 expect "GO-K step 3: a funded ceremony deployer is refused" 1 'the ceremony deployer .* has balance' -- akc
 akc_alloc "fund=0x$(printf 'd1%.0s' $(seq 20))"
