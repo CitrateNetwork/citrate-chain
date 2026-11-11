@@ -402,5 +402,9 @@ fn r1007_block0_is_stamped_with_the_r1007_genesis_timestamp() {
         *b.header.block_hash.as_bytes()
     );
     let later = r1007::genesis_block_hash_at(&cfg, r1007::GENESIS_TIMESTAMP + 1).expect("hash");
-    assert_ne!(later, *b.header.block_hash.as_bytes(), "the timestamp is in the hash");
+    assert_ne!(
+        later,
+        *b.header.block_hash.as_bytes(),
+        "the timestamp is in the hash"
+    );
 }
