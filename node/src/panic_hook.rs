@@ -17,8 +17,9 @@
 //!   transaction quarantined.
 //!
 //! An aborting hook runs before any of those barriers can catch the panic, so
-//! one panicking transaction would abort every node that executes it. Whether
-//! to abort on the panics no barrier catches is an open decision.
+//! one panicking transaction would abort every node that executes it. Lead
+//! decision 2026-11-10: log only, no abort (the devnet g4-health check already
+//! fails any run with a PANIC line).
 
 use std::panic::PanicHookInfo;
 
@@ -79,6 +80,68 @@ mod tests {
             !main.contains("#[tokio::main]"),
             "a #[tokio::main] entry point starts the runtime before any statement of main"
         );
+    }
+
+    const CAUGHT_CHILD: &str = "CITRATE_PANIC_HOOK_CAUGHT_CHILD";
+
+    /// Lead decision 2026-11-10 (log only): a panic that a deliberate barrier
+    /// catches (here the producer's supervised round, `run_supervised`) still
+    /// leaves its one PANIC line, and the process keeps running: the round is
+    /// reported as panicked and the code after it runs. The logger is
+    /// process-wide, so this runs in a child process.
+    #[test]
+    fn a_caught_panic_is_logged_and_the_node_keeps_running() {
+        if std::env::var(CAUGHT_CHILD).is_ok() {
+            let _guard = crate::logging::init_logging(&crate::logging::LogConfig::from_env())
+                .expect("node logging");
+            install();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let outcome = rt.block_on(crate::producer::run_supervised::<(), _>(async {
+                panic!("caught-panic-probe");
+            }));
+            assert!(
+                matches!(outcome, crate::producer::RoundOutcome::Panicked(ref m) if m.contains("caught-panic-probe")),
+                "{outcome:?}"
+            );
+            tracing::info!("still running after the caught panic");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args([
+                "panic_hook::tests::a_caught_panic_is_logged_and_the_node_keeps_running",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CAUGHT_CHILD, "1")
+            .env_remove("RUST_LOG")
+            .env("LOG_FORMAT", "compact")
+            .env("LOG_ANSI", "false")
+            .output()
+            .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+        let panic_at = stdout
+            .lines()
+            .position(|l| l.contains("PANIC in thread") && l.contains("caught-panic-probe"))
+            .unwrap_or_else(|| panic!("no PANIC line:\n{stdout}"));
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|l| l.contains("PANIC in thread"))
+                .count(),
+            1,
+            "{stdout}"
+        );
+        let after = stdout
+            .lines()
+            .position(|l| l.contains("still running after the caught panic"))
+            .unwrap_or_else(|| panic!("the process did not keep running:\n{stdout}"));
+        assert!(after > panic_at, "{stdout}");
     }
 
     /// A task spawned on the multi-thread runtime panics; the node log (the
