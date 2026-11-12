@@ -663,8 +663,17 @@ def head(t: Transport, h: dict, at: int | None = None) -> dict:
     return t.agent(h, *args, mutating=False)
 
 
-def same_tip(t: Transport, hosts: list[dict], lag: int) -> dict:
+def same_tip(t: Transport, hosts: list[dict], lag: int, max_behind: int = 20) -> dict:
     heads = {h["name"]: head(t, h) for h in hosts}
+    top = max(x["head"] for x in heads.values())
+    # Every node must be within `max_behind` of the highest head, so the hashes are compared
+    # near the tip. A node far behind would otherwise pull the comparison down to its own
+    # height, where old blocks agree (fix P5, 2026-11-12: rpc-1 at 57 against producers at 1000
+    # passed at 38). The heads are read one host at a time, over ssh on the fleet, at 1 block/s,
+    # hence a tolerance wider than `lag`.
+    behind = {n: x["head"] for n, x in heads.items() if top - x["head"] > max_behind}
+    if behind:
+        raise Fail(f"nodes behind the tip {top} by more than {max_behind} blocks: {behind}")
     common = min(x["head"] for x in heads.values()) - lag
     if common < 1:
         raise Fail(f"heads too low for a common block ({heads})")
@@ -689,7 +698,7 @@ def run_health(a, fleet: Fleet, t: Transport, src: dict, net: str) -> dict:
             raise Fail(f"{h['name']} serves block 0 {x['block0']}, not {genesis}")
         if x["peers"] < a.min_peers:
             raise Fail(f"{h['name']} has {x['peers']} peers (< {a.min_peers})")
-    tip = same_tip(t, hosts, a.lag)
+    tip = same_tip(t, hosts, a.lag, a.max_behind)
     report["tip"] = tip
     if net == "r1007" or a.require_sealing:
         ids = identities(a, fleet)
@@ -783,7 +792,7 @@ def step_producers(a, fleet: Fleet, t: Transport, src: dict) -> None:
         wait_until(f"{h['name']} serves the r1007 block 0", lambda h=h: gate_block0(t, h, g), a.gate_minutes)
         if up:
             # Join by sync: the same block as the producers already up, at a common height.
-            wait_until(f"{h['name']} reaches the producers' tip", lambda h=h: same_tip(t, up + [h], a.lag), a.gate_minutes)
+            wait_until(f"{h['name']} reaches the producers' tip", lambda h=h: same_tip(t, up + [h], a.lag, a.max_behind), a.gate_minutes)
         t.agent(h, "mining", "on", "--expect-genesis", g, step="producers")
         up.append(h)
         wait_until(f"{h['name']} seals a block",
@@ -801,7 +810,7 @@ def step_rpc(a, fleet: Fleet, t: Transport, src: dict) -> None:
         t.agent(h, "switch", "--gen", "r1007", step="rpc")
         t.agent(h, "start", step="rpc")
         wait_until(f"{h['name']} serves the r1007 block 0", lambda h=h: gate_block0(t, h, g), a.gate_minutes)
-        wait_until(f"{h['name']} reaches the producers' tip", lambda h=h: same_tip(t, prods + [h], a.lag), a.gate_minutes)
+        wait_until(f"{h['name']} reaches the producers' tip", lambda h=h: same_tip(t, prods + [h], a.lag, a.max_behind), a.gate_minutes)
         log(f"rpc {h['name']}: synced on r1007")
 
 
@@ -956,6 +965,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-peers", type=int, default=2)
     ap.add_argument("--last", type=int, default=60)
     ap.add_argument("--lag", type=int, default=3)
+    ap.add_argument("--max-behind", type=int, default=20, help="health and join gates: the most blocks any node may trail the highest head")
     ap.add_argument("--db-cluster-id", help="indexer step: the explorer DB's DO managed-cluster id")
     ap.add_argument("--db-fork-rule", help="indexer step: the fork's one trusted source, e.g. ip_addr:<ip>")
     ap.add_argument("--require-sealing", action="store_true")

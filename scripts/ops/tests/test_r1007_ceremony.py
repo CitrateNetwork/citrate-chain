@@ -591,6 +591,166 @@ class PlanAndGuards(unittest.TestCase):
         self.assertEqual(rc, 2)
 
 
+class DevnetHarness(unittest.TestCase):
+    """devnet.sh's stand-in r1006 health gate (P5, 2026-11-11). Every producer stays in
+    initial sync for about a minute after start ("refusing to produce: initial sync since
+    start has not completed"), so a 20 s settle made health-r1006 fail on 2 of 7
+    producers in two of three runs on the stamped gc3 binary. Run 3, with a 90 s settle,
+    passed. So did the rehearsal-stamp run (P5b)."""
+
+    def test_the_r1006_health_gate_waits_out_initial_sync(self):
+        import re as _re
+        text = (R7 / "devnet.sh").read_text()
+        m = _re.search(r"^SETTLE=(\d+)$", text, _re.M)
+        self.assertIsNotNone(m, "devnet.sh has no SETTLE default")
+        self.assertGreaterEqual(int(m.group(1)), 90)
+        line = next(l for l in text.splitlines() if l.strip().startswith("health-r1006)"))
+        self.assertIn('sleep "$SETTLE"', line)
+        self.assertIn("--settle-seconds", text)
+
+
+class DevnetTxLoad(unittest.TestCase):
+    """P5 tx-load phase (lead, 2026-11-11). Under about 30 tx/s the G4 devnet split six ways on
+    "Acceptance commitment mismatch" (execute-on-receive). P5 now runs a sustained load after
+    the producers step and gates on zero mismatch and zero "block disqualified" lines."""
+
+    TXL = R7 / "devnet_txload.sh"
+
+    def _work(self, logs: dict, included: dict, expected=None, target: int = 0) -> Path:
+        """included: worker id -> included count (sent = included + 3). expected: the worker ids
+        `run` started (default: the keys of included). target: tx the run aimed for."""
+        w = Path(tempfile.mkdtemp(prefix="r1007txl."))
+        self.addCleanup(shutil.rmtree, w, True)
+        for host, text in logs.items():
+            d = w / "hosts" / host / "var/lib/citrate/ceremony"
+            d.mkdir(parents=True)
+            (d / "node-r1007.log").write_text(text)
+        (w / "txload").mkdir()
+        for wid, n in included.items():
+            (w / "txload" / f"{wid}.included").write_text(f"{n}\n")
+            (w / "txload" / f"{wid}.sent").write_text(f"{n + 3}\n")
+        (w / "txload" / "expected").write_text("\n".join(expected if expected is not None else included) + "\n")
+        (w / "txload" / "target").write_text(f"{target}\n")
+        return w
+
+    def gate(self, w: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", str(self.TXL), "gate", "--work", str(w)], capture_output=True, text=True, timeout=30)
+
+    def test_devnet_runs_the_load_after_producers_and_passes_its_options_through_the_reexec(self):
+        text = (R7 / "devnet.sh").read_text()
+        steps = re.search(r'^STEPS="([^"]+)"', text, re.M).group(1).split()
+        self.assertIn("txload", steps)
+        self.assertLess(steps.index("producers"), steps.index("txload"))
+        self.assertLess(steps.index("txload"), steps.index("health-r1007"))
+        reexec = text[text.index("exec unshare"):text.index("fi", text.index("exec unshare"))]
+        for opt in ("--settle-seconds", "--tx-tps", "--tx-seconds"):
+            self.assertIn(opt, reexec, f"{opt} is lost at the namespace re-exec")
+        self.assertIn("devnet_txload.sh", text)
+
+    def test_the_internal_sender_entry_keeps_its_work_dir(self):
+        # The first fleet-shape run (2026-11-11 22:03Z) failed with "usage" from every sender:
+        # the defaults line reset WORK after the _sender branch had set it.
+        text = self.TXL.read_text()
+        self.assertLess(text.index('FLEET="" WORK=""'), text.index('if [[ "$MODE" == _producer ]]'))
+
+    def test_gate_passes_clean_logs_with_included_load(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO sealed\n", "citrate-prod-2": "INFO ok\n"}, {"citrate-prod-1": 40, "citrate-prod-2": 38}))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("included=78", r.stdout)
+
+    def test_gate_fails_on_an_acceptance_commitment_mismatch(self):
+        r = self.gate(self._work({"citrate-prod-3": "WARN Acceptance commitment mismatch at 0xab\n"}, {"citrate-prod-3": 10}))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("acceptance_commitment_mismatch=1", r.stdout)
+
+    def test_gate_fails_on_a_disqualified_block(self):
+        r = self.gate(self._work({"citrate-prod-4": "ERROR Block disqualified: bad state root\n"}, {"citrate-prod-4": 10}))
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_gate_is_a_harness_error_when_no_load_was_included(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO ok\n"}, {"citrate-prod-1": 0}))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("proved nothing", r.stdout)
+
+    # 2026-11-11 22:12Z run: prod-7's sender died while funding (no .sent), so the load came
+    # from 6 of 7 producers and the gate never noticed. A harness shortfall must never read as a
+    # pass, nor as a consensus failure: it is exit 2.
+    def test_gate_is_a_harness_error_when_an_expected_sender_never_ran(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO ok\n"}, {"citrate-prod-1-w1": 40},
+                                 expected=["citrate-prod-1-w1", "citrate-prod-7-w1"]))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("citrate-prod-7-w1", r.stdout)
+
+    def test_gate_is_a_harness_error_when_the_load_fell_short_of_its_target(self):
+        r = self.gate(self._work({"citrate-prod-1": "INFO ok\n"}, {"citrate-prod-1-w1": 100}, target=3600))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("below", r.stdout)
+
+    def test_a_divergence_is_reported_even_when_the_load_fell_short(self):
+        r = self.gate(self._work({"citrate-prod-4": "Acceptance commitment mismatch\n"}, {"citrate-prod-4-w1": 100}, target=3600))
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_the_default_load_reaches_30_tps(self):
+        # 3 workers per producer reached about 26 tx/s on the fleet-shape devnet (22:29Z run).
+        # One cast worker manages about 2.5 tx/s, so 7 producers x 4 workers covers 30 tx/s
+        # with margin (lead, 2026-11-11).
+        text = self.TXL.read_text()
+        self.assertIsNotNone(re.search(r"\bWORKERS=4\b", text), "the default is not 4 workers")
+
+    def test_workers_pace_against_a_schedule_not_a_fixed_sleep(self):
+        # 23:12Z run: 28 workers at a 1.07 tx/s target each sent 0.96 tx/s (27 tx/s total).
+        # Each loop slept the full period on top of the time cast itself took, so the
+        # rate fell short by that overhead. Pacing must sleep only until the next slot.
+        text = self.TXL.read_text()
+        self.assertIn("EPOCHREALTIME", text)
+        self.assertNotIn('sleep "$period"', text)
+
+    def test_run_starts_several_workers_per_producer_and_funds_them_serially(self):
+        text = self.TXL.read_text()
+        self.assertIn("--workers", text)
+        self.assertIn("expected", text)
+
+
+class SameTip(unittest.TestCase):
+    """same_tip compares hashes near the TIP, and fails when a node lags.
+
+    2026-11-12 P5 on the fix (/root/r1007-p5-fix-051789fb-2353Z): the producers were at
+    height 1000 and the boots at 999, but rpc-1 had synced only to 57. same_tip picked
+    min(heads) - lag = 38 (after the agent's own head was read), the hashes agreed there, and
+    the rpc and health-r1007 gates passed with rpc-1 about 940 blocks behind."""
+
+    def _t(self, heads: dict, hashes: dict | None = None):
+        class T:
+            def agent(_s, h, *args, mutating=True, step=""):
+                if "--at" in args:
+                    at = int(args[args.index("--at") + 1])
+                    return {"hash_at": (hashes or {}).get(h["name"], {}).get(at, f"0x{at:064x}")}
+                return {"head": heads[h["name"]]}
+        return T()
+
+    def hosts(self, names):
+        return [{"name": n} for n in names]
+
+    def test_a_lagging_node_fails_even_if_old_blocks_agree(self):
+        heads = {"citrate-prod-1": 1000, "citrate-prod-2": 1000, "citrate-rpc-1": 57}
+        with self.assertRaises(C.Fail) as e:
+            C.same_tip(self._t(heads), self.hosts(heads), 3)
+        self.assertIn("citrate-rpc-1", str(e.exception))
+        self.assertIn("behind", str(e.exception))
+
+    def test_nodes_within_the_lag_compare_near_the_tip(self):
+        heads = {"citrate-prod-1": 1000, "citrate-boot-1": 999, "citrate-rpc-1": 998}
+        tip = C.same_tip(self._t(heads), self.hosts(heads), 3)
+        self.assertEqual(tip["common"], 995)
+        self.assertGreaterEqual(tip["common"], max(heads.values()) - 2 * 3 - 1)
+
+    def test_a_split_near_the_tip_still_fails(self):
+        heads = {"citrate-prod-1": 1000, "citrate-prod-2": 1000}
+        hashes = {"citrate-prod-2": {997: "0xfork"}}
+        with self.assertRaises(C.Fail):
+            C.same_tip(self._t(heads, hashes), self.hosts(heads), 3)
+
+
 class Agent(unittest.TestCase):
     """node_agent.py's generation slots, in a temp root (proc mode)."""
 
