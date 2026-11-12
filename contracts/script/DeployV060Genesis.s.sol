@@ -7,6 +7,7 @@ import "./Salts.sol";
 import "./lib/Create2Deploy.sol";
 import "./lib/GenesisBook.sol";
 import "./lib/GenesisProfile.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 import {V060GenesisSpec} from "./lib/V060GenesisSpec.sol";
 import {V060GovernanceSpec} from "./lib/V060GovernanceSpec.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
@@ -88,7 +89,7 @@ import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 ///           V060_GENESIS_OUT   book-shaped output (under ./genesis)
 ///           CEREMONY_DEPLOYER_ADDRESS or DEPLOYER_ADDRESS   (must be the forge signer)
 ///         The deployer gets no role: every contract here names GOVERNANCE or no admin at all.
-contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
+contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile, EnvSigner {
 
     struct Inputs {
         address governanceTimelock;
@@ -502,6 +503,11 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     ///         margin); deploys the ten contracts by CREATE2 (reused when live); then `verifyLive`.
     function deployLive(address deployer, Inputs memory i, Rotation memory rot) public returns (Deployed memory d) {
         require(deployer != address(0), "deployer must be set");
+        // Env-key signing only (EnvSigner, #464 review P2-2): no CLI-wallet path for the live mode.
+        require(
+            _envSignerKey() != 0,
+            "live mode signs only from an env-held key: set PRIVATE_KEY (op run) and EXPECTED_SENDER"
+        );
         V060GovernanceSpec.requireKeyParams(i.keys);
         V060GovernanceSpec.requirePureLiveDeployer(deployer, i.keys);
         Deployed memory p = predict(i);
@@ -511,7 +517,9 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
 
         console.log("=== 0.6.0 contracts, live mode (post-genesis) ===");
         console.log("Deployer:", deployer);
-        _startBroadcastAsDeployer(deployer);
+        // EnvSigner guards: EXPECTED_SENDER set, the key's address equals it, forge --sender equals
+        // it, and it is this deployer.
+        _startBroadcastEnv(deployer);
         d.providerRegistry = _deployProviderRegistry(i);
         d.guardianCancellerV2 = _deployCancellerV2(i, d.providerRegistry);
         d.flRoundVerifier = _deployFlRoundVerifier(i);

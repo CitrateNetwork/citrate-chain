@@ -920,7 +920,9 @@ abstract contract AdminChecks {
     ///           1. provenance: the CREATE2 address for (timelock, fromOwners, its threshold, its
     ///              TTL), and this build's runtime code for those immutables (owners are storage,
     ///              so the rotation leaves the code hash alone);
-    ///           2. the rotation: `owners()` is exactly `toOwners`, in order.
+    ///           2. the rotation: `owners()` is exactly `toOwners`, in order, and `isOwner`
+    ///              (what authorizes a signer) is false for every removed original owner and
+    ///              true for every rotated one.
     ///         `_multisigProposerProblem` (provenance over the CURRENT owners) cannot hold on a
     ///         rotated council: its address commits to the original owners. Never reverts on a
     ///         contract that answers; an unreadable one is a problem.
@@ -952,6 +954,25 @@ abstract contract AdminChecks {
         address[] memory owners = abi.decode(ro, (address[]));
         if (keccak256(abi.encode(owners)) != keccak256(abi.encode(toOwners))) {
             return "owners() is not exactly the rotated set, in order";
+        }
+        // isOwner is what authorizes a signer (rotate_keys.py rewrites its keys at slot 1):
+        // every removed original owner false, every rotated owner true. #464 review P2-1.
+        for (uint256 i = 0; i < fromOwners.length; i++) {
+            bool kept;
+            for (uint256 j = 0; j < toOwners.length; j++) {
+                if (toOwners[j] == fromOwners[i]) kept = true;
+            }
+            if (kept) continue;
+            (bool okI, bool authorized) =
+                _readBool(multisig, abi.encodeWithSignature("isOwner(address)", fromOwners[i]));
+            if (!okI) return "isOwner unreadable";
+            if (authorized) return "isOwner still authorizes a removed original owner";
+        }
+        for (uint256 j = 0; j < toOwners.length; j++) {
+            (bool okI, bool authorized) =
+                _readBool(multisig, abi.encodeWithSignature("isOwner(address)", toOwners[j]));
+            if (!okI) return "isOwner unreadable";
+            if (!authorized) return "isOwner does not authorize a rotated owner";
         }
         return "";
     }

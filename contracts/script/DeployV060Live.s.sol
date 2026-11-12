@@ -10,6 +10,13 @@ import {V060GovernanceSpec} from "./lib/V060GovernanceSpec.sol";
 ///         it is the D2c step on r1007 (REDEPLOY_AND_REPIN), after D2b, from the r1007
 ///         V060_DEPLOYER (lead decision on fed #561), funded with 2 SALT from TREASURY at D2c.
 ///
+///         Signing: env-held key only (EnvSigner; the same rule as env-key-signing-2). There is no
+///         CLI-wallet path:
+///           op run --env-file=<(printf 'PRIVATE_KEY=op://citrate-chain-ops/r1007 V060_DEPLOYER/password\n') -- \
+///             env EXPECTED_SENDER=<V060_DEPLOYER> DEPLOYER_ADDRESS=<V060_DEPLOYER> ... \
+///             forge script script/DeployV060Live.s.sol --rpc-url <r1007> --sender <V060_DEPLOYER> --broadcast --slow
+///         The key's address must equal EXPECTED_SENDER, forge's --sender and the deployer.
+///
 ///         Inputs:
 ///           V060_INPUT_BOOK        the r1007 block-0 book (GovernanceTimelock, GovernanceMultisig,
 ///                                  GuardianTimelock, GuardianMultisig, GuardianCanceller = v1,
