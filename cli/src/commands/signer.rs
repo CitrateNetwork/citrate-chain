@@ -65,39 +65,126 @@ pub struct SignerArgs {
 
 /// The genesis hash in the root address book.
 pub fn expected_genesis() -> Result<String> {
-    anyhow::bail!("not implemented")
+    let book: Value =
+        serde_json::from_str(ROOT_BOOK).context("parsing contracts/addresses/40204.json")?;
+    book.get("genesisHash")
+        .and_then(Value::as_str)
+        .map(str::to_lowercase)
+        .context("contracts/addresses/40204.json has no genesisHash")
 }
 
 /// Refuse to sign for a node that is not the expected chain, unless overridden.
 pub fn check_chain(
-    _node_chain_id: u64,
-    _node_genesis: &str,
-    _expected_genesis: &str,
-    _allow_foreign: bool,
+    node_chain_id: u64,
+    node_genesis: &str,
+    expected_genesis: &str,
+    allow_foreign: bool,
 ) -> Result<()> {
+    if allow_foreign {
+        return Ok(());
+    }
+    if node_chain_id != EXPECTED_CHAIN_ID {
+        anyhow::bail!(
+            "Refusing to sign: the node serves chain {node_chain_id}, not chain \
+             {EXPECTED_CHAIN_ID}. Pass --allow-foreign-chain to sign for it anyway."
+        );
+    }
+    if !node_genesis.eq_ignore_ascii_case(expected_genesis) {
+        anyhow::bail!(
+            "Refusing to sign: the node's genesis is {node_genesis}, but this CLI expects \
+             {expected_genesis} (contracts/addresses/40204.json). Update the CLI, or pass \
+             --allow-foreign-chain to sign for this chain anyway."
+        );
+    }
     Ok(())
 }
 
 /// Parse a 32-byte ed25519 secret from hex (with or without 0x).
-pub fn parse_secret_hex(_hex_key: &str) -> Result<SigningKey> {
-    anyhow::bail!("not implemented")
+pub fn parse_secret_hex(hex_key: &str) -> Result<SigningKey> {
+    let trimmed = hex_key.trim();
+    let raw = Zeroizing::new(
+        hex::decode(trimmed.strip_prefix("0x").unwrap_or(trimmed))
+            .context("the private key is not hex")?,
+    );
+    let bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "the private key must be 32 bytes (64 hex characters), got {} bytes",
+            raw.len()
+        )
+    })?;
+    let bytes = Zeroizing::new(bytes);
+    Ok(SigningKey::from_bytes(&bytes))
 }
 
-/// The account address of a signing key, as the chain derives it.
-pub fn address_of(_key: &SigningKey) -> [u8; 20] {
-    [0u8; 20]
+/// The account address of a signing key, as the chain derives it
+/// (`Address::from_public_key`, the same rule `account create` names files by).
+pub fn address_of(key: &SigningKey) -> [u8; 20] {
+    Address::from_public_key(&PublicKey::new(*key.verifying_key().as_bytes())).0
 }
 
-/// Where the signing key comes from. `account` is `--account`; `env_key` is
-/// the PRIVATE_KEY value; `default_account` is the config's.
+fn parse_address(s: &str) -> Result<[u8; 20]> {
+    let t = s.trim();
+    let bytes = hex::decode(t.strip_prefix("0x").unwrap_or(t))
+        .with_context(|| format!("invalid address {s}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("address {s} is not 20 bytes"))
+}
+
+/// Where the signing key comes from, in order: `--account` (keystore), the
+/// PRIVATE_KEY value, the config's `default_account` (keystore). With a
+/// keystore account and PRIVATE_KEY both present, they must be the same key.
 pub fn resolve_key(
-    _account: Option<&str>,
-    _env_key: Option<Zeroizing<String>>,
-    _default_account: Option<&str>,
-    _keystore_dir: &Path,
-    _password: &dyn Fn() -> Result<Zeroizing<String>>,
+    account: Option<&str>,
+    env_key: Option<Zeroizing<String>>,
+    default_account: Option<&str>,
+    keystore_dir: &Path,
+    password: &dyn Fn() -> Result<Zeroizing<String>>,
 ) -> Result<SigningKey> {
-    anyhow::bail!("not implemented")
+    let from_keystore = |addr: &str| -> Result<SigningKey> {
+        let a = parse_address(addr)?;
+        let path = keystore_dir.join(format!("{}.json", hex::encode(a)));
+        if !path.exists() {
+            anyhow::bail!(
+                "No keystore file for 0x{} in {:?}. Create or import the account first \
+                 (`account create` / `account import`).",
+                hex::encode(a),
+                keystore_dir
+            );
+        }
+        let pw = password()?;
+        let key = keystore::load_key(&path, &pw)?;
+        if address_of(&key) != a {
+            anyhow::bail!("keystore file {:?} holds a key for another address", path);
+        }
+        Ok(key)
+    };
+    let env = env_key.filter(|k| !k.trim().is_empty());
+    if let Some(addr) = account {
+        let key = from_keystore(addr)?;
+        if let Some(env) = env {
+            let env_key = parse_secret_hex(&env)?;
+            if address_of(&env_key) != address_of(&key) {
+                anyhow::bail!(
+                    "{PRIVATE_KEY_ENV} is set to a key for 0x{}, but --account is {addr}. \
+                     Unset {PRIVATE_KEY_ENV} or drop --account.",
+                    hex::encode(address_of(&env_key))
+                );
+            }
+        }
+        return Ok(key);
+    }
+    if let Some(env) = env {
+        return parse_secret_hex(&env).with_context(|| format!("reading {PRIVATE_KEY_ENV}"));
+    }
+    if let Some(addr) = default_account {
+        return from_keystore(addr);
+    }
+    anyhow::bail!(
+        "No signing key. Pass --account <address> to sign with a keystore account, or set \
+         {PRIVATE_KEY_ENV} to a 32-byte hex key (never pass a key on the command line)."
+    )
 }
 
 /// The values the node supplies for one transaction.
@@ -109,20 +196,37 @@ pub struct TxParams {
     pub chain_id: u64,
 }
 
-/// Build and sign a transaction with citrate-wallet's builder.
+/// Build and sign a transaction with citrate-wallet's builder
+/// (`TransactionBuilder::build_and_sign`: native ed25519, V2 digest, bincode raw).
 pub fn build_signed(
-    _key: &SigningKey,
-    _to: Option<[u8; 20]>,
-    _value: u128,
-    _data: Vec<u8>,
-    _params: &TxParams,
+    key: &SigningKey,
+    to: Option<[u8; 20]>,
+    value: u128,
+    data: Vec<u8>,
+    params: &TxParams,
 ) -> Result<SignedTransaction> {
-    anyhow::bail!("not implemented")
+    TransactionBuilder::new()
+        .from(PublicKey::new(*key.verifying_key().as_bytes()))
+        .to(to.map(Address))
+        .value(U256::from(value))
+        .data(data)
+        .nonce(params.nonce)
+        .gas_price(params.gas_price)
+        .gas_limit(params.gas_limit)
+        .chain_id(params.chain_id)
+        .build_and_sign(key)
+        .map_err(|e| anyhow::anyhow!("signing failed: {e}"))
 }
 
-/// The gas limit to use for an `eth_estimateGas` answer.
-pub fn gas_with_headroom(estimate: u64, _has_data: bool) -> u64 {
-    estimate
+/// The gas limit to use for an `eth_estimateGas` answer: 20% headroom for a
+/// call or deploy (state can change between estimate and inclusion), none for
+/// a plain transfer.
+pub fn gas_with_headroom(estimate: u64, has_data: bool) -> u64 {
+    if has_data {
+        estimate.saturating_add(estimate / 5)
+    } else {
+        estimate
+    }
 }
 
 /// A signed, submitted transaction and its receipt.
@@ -132,25 +236,166 @@ pub struct Sent {
     pub receipt: Value,
 }
 
+/// One JSON-RPC call to the configured endpoint; an RPC error becomes an error.
+async fn rpc(
+    client: &reqwest::Client,
+    config: &Config,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let body: Value = client
+        .post(&config.rpc_endpoint)
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
+        .send()
+        .await
+        .context("Failed to connect to RPC endpoint")?
+        .json()
+        .await
+        .with_context(|| format!("{method}: the endpoint did not answer with JSON"))?;
+    if let Some(err) = body.get("error") {
+        let message = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("{method}: {message}");
+    }
+    Ok(body.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn hex_u64(v: &Value, what: &str) -> Result<u64> {
+    let s = v
+        .as_str()
+        .with_context(|| format!("{what}: expected a hex quantity"))?;
+    u64::from_str_radix(s.trim_start_matches("0x"), 16)
+        .with_context(|| format!("{what}: invalid hex quantity {s}"))
+}
+
 /// Sign and submit one transaction, then wait for its receipt.
+///
+/// Data sources, all on the configured endpoint: `eth_chainId` and
+/// `eth_getBlockByNumber("0x0")` (chain guard), `eth_getTransactionCount(from,
+/// "pending")` (nonce), `eth_gasPrice`, `eth_estimateGas` (unless
+/// `--gas-limit`), `eth_sendRawTransaction`, `eth_getTransactionReceipt`.
 pub async fn sign_and_send(
-    _config: &Config,
-    _args: &SignerArgs,
-    _to: Option<[u8; 20]>,
-    _value: u128,
-    _data: Vec<u8>,
+    config: &Config,
+    args: &SignerArgs,
+    to: Option<[u8; 20]>,
+    value: u128,
+    data: Vec<u8>,
 ) -> Result<Sent> {
-    anyhow::bail!("not implemented")
+    let password_file = args.password_file.clone();
+    let password = move || -> Result<Zeroizing<String>> {
+        if let Some(path) = &password_file {
+            let raw = Zeroizing::new(
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("Failed to read password file {}", path.display()))?,
+            );
+            return Ok(Zeroizing::new(raw.lines().next().unwrap_or("").to_string()));
+        }
+        Ok(Zeroizing::new(
+            rpassword::prompt_password("Keystore password: ")
+                .context("Failed to read password from terminal")?,
+        ))
+    };
+    let env_key = std::env::var(PRIVATE_KEY_ENV).ok().map(Zeroizing::new);
+    let key = resolve_key(
+        args.account.as_deref(),
+        env_key,
+        config.default_account.as_deref(),
+        &config.keystore_path,
+        &password,
+    )?;
+    let from = address_of(&key);
+    let from_hex = format!("0x{}", hex::encode(from));
+
+    let client = reqwest::Client::new();
+    let chain_id = hex_u64(
+        &rpc(&client, config, "eth_chainId", json!([])).await?,
+        "eth_chainId",
+    )?;
+    let genesis = rpc(
+        &client,
+        config,
+        "eth_getBlockByNumber",
+        json!(["0x0", false]),
+    )
+    .await?
+    .get("hash")
+    .and_then(Value::as_str)
+    .map(str::to_string)
+    .context("the node did not return block 0")?;
+    check_chain(
+        chain_id,
+        &genesis,
+        &expected_genesis()?,
+        args.allow_foreign_chain,
+    )?;
+
+    let nonce = hex_u64(
+        &rpc(
+            &client,
+            config,
+            "eth_getTransactionCount",
+            json!([from_hex, "pending"]),
+        )
+        .await?,
+        "eth_getTransactionCount",
+    )?;
+    let gas_price = hex_u64(
+        &rpc(&client, config, "eth_gasPrice", json!([])).await?,
+        "eth_gasPrice",
+    )?;
+    let gas_limit = match args.gas_limit {
+        Some(g) => g,
+        None => {
+            let mut call = json!({
+                "from": from_hex,
+                "value": format!("0x{value:x}"),
+                "data": format!("0x{}", hex::encode(&data)),
+            });
+            if let (Some(to), Some(obj)) = (to, call.as_object_mut()) {
+                obj.insert("to".into(), json!(format!("0x{}", hex::encode(to))));
+            }
+            let estimate = hex_u64(
+                &rpc(&client, config, "eth_estimateGas", json!([call])).await?,
+                "eth_estimateGas",
+            )?;
+            gas_with_headroom(estimate, !data.is_empty())
+        }
+    };
+
+    let params = TxParams {
+        nonce,
+        gas_price,
+        gas_limit,
+        chain_id,
+    };
+    let signed = build_signed(&key, to, value, data, &params)?;
+    let raw = format!("0x{}", hex::encode(&signed.raw));
+    let hash = rpc(&client, config, "eth_sendRawTransaction", json!([raw]))
+        .await?
+        .as_str()
+        .map(str::to_string)
+        .context("eth_sendRawTransaction returned no hash")?;
+    eprintln!("Sent {hash} from {from_hex} (nonce {nonce}, gas {gas_limit} at {gas_price} wei)");
+
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let receipt = rpc(&client, config, "eth_getTransactionReceipt", json!([hash])).await?;
+        if receipt.is_object() {
+            return Ok(Sent {
+                hash,
+                from,
+                receipt,
+            });
+        }
+    }
+    anyhow::bail!("{hash} was submitted but has no receipt after 120 s; check it with `network transaction {hash}`")
 }
 
-#[allow(dead_code)]
-fn unused(_: U256, _: PublicKey, _: Address, _: TransactionBuilder) -> Value {
-    json!(null)
-}
-
-#[allow(dead_code)]
-fn unused2(p: &Path, pw: &str) -> Result<SigningKey> {
-    keystore::load_key(p, pw).context("x")
+/// Whether a receipt reports success (`status` 0x1).
+pub fn receipt_ok(receipt: &Value) -> bool {
+    receipt.get("status").and_then(Value::as_str) == Some("0x1")
 }
 
 #[cfg(test)]

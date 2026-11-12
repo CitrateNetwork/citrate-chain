@@ -5,22 +5,33 @@ use clap::Subcommand;
 use colored::Colorize;
 use serde_json::json;
 
+use crate::commands::signer::{self, SignerArgs};
 use crate::config::Config;
 
 #[derive(Subcommand)]
 pub enum GovernanceCommands {
     /// Set governance admin (address hex)
-    SetAdmin { address: String },
+    SetAdmin {
+        address: String,
+        #[command(flatten)]
+        signer: SignerArgs,
+    },
 
     /// Queue parameter update with timelock
     QueueParam {
         key: String,
         value: String,
         eta: u64,
+        #[command(flatten)]
+        signer: SignerArgs,
     },
 
     /// Execute parameter update after timelock
-    ExecuteParam { key: String },
+    ExecuteParam {
+        key: String,
+        #[command(flatten)]
+        signer: SignerArgs,
+    },
 
     /// Get parameter value
     GetParam { key: String },
@@ -28,16 +39,21 @@ pub enum GovernanceCommands {
 
 pub async fn execute(cmd: GovernanceCommands, config: &Config) -> Result<()> {
     match cmd {
-        GovernanceCommands::SetAdmin { address } => {
-            call_precompile(config, encode_set_admin(&address)?).await?;
+        GovernanceCommands::SetAdmin { address, signer } => {
+            call_precompile(config, &signer, encode_set_admin(&address)?).await?;
             println!("{}", "✓ Admin updated".green());
         }
-        GovernanceCommands::QueueParam { key, value, eta } => {
-            call_precompile(config, encode_queue_param(&key, &value, eta)?).await?;
+        GovernanceCommands::QueueParam {
+            key,
+            value,
+            eta,
+            signer,
+        } => {
+            call_precompile(config, &signer, encode_queue_param(&key, &value, eta)?).await?;
             println!("{}", "✓ Parameter queued".green());
         }
-        GovernanceCommands::ExecuteParam { key } => {
-            call_precompile(config, encode_execute_param(&key)?).await?;
+        GovernanceCommands::ExecuteParam { key, signer } => {
+            call_precompile(config, &signer, encode_execute_param(&key)?).await?;
             println!("{}", "✓ Parameter executed".green());
         }
         GovernanceCommands::GetParam { key } => {
@@ -150,30 +166,29 @@ fn encode_get_param(key: &str) -> Result<String> {
     Ok(format!("0x{}", hex::encode(data)))
 }
 
-async fn call_precompile(config: &Config, data_hex: String) -> Result<()> {
-    let to = precompile_address();
-    let resp = reqwest::Client::new()
-        .post(&config.rpc_endpoint)
-        .json(&json!({
-            "jsonrpc":"2.0",
-            "method":"eth_sendTransaction",
-            "params":[{
-                "from": config.default_account.as_ref().context("Missing default account")?,
-                "to": to,
-                "data": data_hex,
-                "gas": format!("0x{:x}", config.gas_limit.max(300000)),
-                "gasPrice": format!("0x{:x}", config.gas_price.max(1_000_000_000)),
-            }],
-            "id": 1
-        }))
-        .send()
-        .await?;
-    let v: serde_json::Value = resp.json().await?;
-    if let Some(err) = v.get("error") {
-        let message = err["message"].as_str().unwrap_or("Unknown error");
+/// Sign and send a governance precompile call (0x…1003) with the local signer.
+async fn call_precompile(
+    config: &Config,
+    signer_args: &SignerArgs,
+    data_hex: String,
+) -> Result<()> {
+    let mut to = [0u8; 20];
+    let raw_to = hex::decode(precompile_address().trim_start_matches("0x"))
+        .context("governance precompile address")?;
+    if raw_to.len() != 20 {
+        anyhow::bail!("governance precompile address is not 20 bytes");
+    }
+    to.copy_from_slice(&raw_to);
+    let data = hex::decode(data_hex.trim_start_matches("0x")).context("encoded call data")?;
+    let sent = signer::sign_and_send(config, signer_args, Some(to), 0, data).await?;
+    println!("Transaction: {}", sent.hash.cyan());
+    if !signer::receipt_ok(&sent.receipt) {
         anyhow::bail!(
-            "Governance call failed: {}",
-            super::rpc_hint::explain_send_error(message)
+            "Governance call reverted (receipt status {})",
+            sent.receipt
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing")
         );
     }
     Ok(())

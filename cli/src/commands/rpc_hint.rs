@@ -9,17 +9,17 @@ pub const PUBLIC_RPC: &str = "https://rpc.citrate.ai";
 
 /// The message a write command reports for a JSON-RPC error.
 ///
-/// The write commands send `eth_sendTransaction`, which asks the node to sign.
-/// Public nodes refuse it, so that error gets the next step appended. Every
-/// other message is returned unchanged.
+/// The load tools (`advanced benchmark`, `advanced stress-test`) send
+/// `eth_sendTransaction`, which asks the node to sign. Public nodes refuse it,
+/// so that error gets the next step appended. Every other message is returned
+/// unchanged.
 pub fn explain_send_error(message: &str) -> String {
     if message.contains("eth_sendTransaction is disabled") {
         format!(
             "{message}\n\nThis command sends an unsigned transaction for the node to sign \
-             (eth_sendTransaction); citrate-cli does not sign transactions itself. Public \
-             endpoints such as {PUBLIC_RPC} refuse that. To move SALT, use \
-             `citrate-wallet send`, which signs locally. For contract and governance writes, \
-             point --rpc at a local development node that has eth_sendTransaction enabled."
+             (eth_sendTransaction), which public endpoints such as {PUBLIC_RPC} refuse. It is \
+             meant for a local development node. `account send`, `contract deploy`, \
+             `contract call` and the `governance` writes sign locally and work on {PUBLIC_RPC}."
         )
     } else {
         message.to_string()
@@ -108,8 +108,8 @@ mod tests {
             "eth_sendTransaction is disabled. Use eth_sendRawTransaction with a signed transaction.",
         );
         assert!(msg.starts_with("eth_sendTransaction is disabled"), "{msg}");
-        assert!(msg.contains("does not sign transactions"), "{msg}");
-        assert!(msg.contains("citrate-wallet send"), "{msg}");
+        assert!(msg.contains("sign locally"), "{msg}");
+        assert!(msg.contains("account send"), "{msg}");
     }
 
     #[test]

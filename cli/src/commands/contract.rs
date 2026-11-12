@@ -7,6 +7,7 @@ use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::commands::signer::{self, SignerArgs};
 use crate::commands::verify;
 use crate::config::Config;
 
@@ -19,17 +20,17 @@ pub enum ContractCommands {
         /// Path to contract bytecode or WASM file
         contract: PathBuf,
 
-        /// Constructor arguments (JSON)
+        /// Constructor arguments (JSON). Not supported: append the ABI-encoded
+        /// arguments to the bytecode file instead.
         #[arg(long)]
         args: Option<String>,
-
-        /// Account to deploy from
-        #[arg(long)]
-        account: Option<String>,
 
         /// Contract value in wei
         #[arg(long, default_value = "0")]
         value: String,
+
+        #[command(flatten)]
+        signer: SignerArgs,
     },
 
     /// Call a contract method
@@ -44,13 +45,12 @@ pub enum ContractCommands {
         #[arg(long)]
         args: Option<String>,
 
-        /// Account to call from
-        #[arg(long)]
-        account: Option<String>,
-
         /// Value to send in wei
         #[arg(long, default_value = "0")]
         value: String,
+
+        #[command(flatten)]
+        signer: SignerArgs,
     },
 
     /// Read contract state (call without transaction)
@@ -217,19 +217,19 @@ pub async fn execute(cmd: ContractCommands, config: &Config) -> Result<()> {
         ContractCommands::Deploy {
             contract,
             args,
-            account,
             value,
+            signer,
         } => {
-            deploy_contract(config, contract, args, account, value).await?;
+            deploy_contract(config, contract, args, value, &signer).await?;
         }
         ContractCommands::Call {
             address,
             method,
             args,
-            account,
             value,
+            signer,
         } => {
-            call_contract(config, &address, &method, args, account, value).await?;
+            call_contract(config, &address, &method, args, value, &signer).await?;
         }
         ContractCommands::Read {
             address,
@@ -329,8 +329,8 @@ async fn deploy_contract(
     config: &Config,
     contract_path: PathBuf,
     args: Option<String>,
-    account: Option<String>,
     value: String,
+    signer_args: &SignerArgs,
 ) -> Result<()> {
     println!("{}", "Deploying contract...".cyan());
 
@@ -347,90 +347,44 @@ async fn deploy_contract(
         content.trim().trim_start_matches("0x").to_string()
     };
 
-    // Parse constructor arguments
-    let _constructor_args = if let Some(args_str) = args {
-        serde_json::from_str(&args_str).context("Invalid constructor arguments JSON")?
-    } else {
-        json!([])
-    };
-
-    // Get account
-    let from_account = account
-        .or(config.default_account.clone())
-        .context("No account specified and no default account configured")?;
-
-    // Parse value
+    // Constructor arguments are not ABI-encoded here; refuse rather than drop them.
+    if let Some(args_str) = args {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&args_str).context("Invalid constructor arguments JSON")?;
+        if parsed.as_array().is_none_or(|a| !a.is_empty()) {
+            anyhow::bail!(
+                "--args is not supported for deploy: append the ABI-encoded constructor \
+                 arguments to the bytecode (e.g. `cast abi-encode`)"
+            );
+        }
+    }
+    let code = hex::decode(&bytecode).context("Contract file is not hex bytecode")?;
     let value_wei = value.parse::<u128>().context("Invalid value")?;
 
-    // Make RPC call to deploy
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&config.rpc_endpoint)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "eth_sendTransaction",
-            "params": [{
-                "from": from_account,
-                "data": format!("0x{}", bytecode),
-                "value": format!("0x{:x}", value_wei),
-                "gas": format!("0x{:x}", config.gas_limit),
-                "gasPrice": format!("0x{:x}", config.gas_price),
-            }],
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("Failed to connect to RPC endpoint")?;
-
-    let result: serde_json::Value = response.json().await?;
-
-    if let Some(tx_hash) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_str()
-    {
-        println!("{}", "✓ Contract deployment initiated".green());
-        println!("Transaction: {}", tx_hash.cyan());
-
-        // Wait for receipt
-        println!("Waiting for confirmation...");
-
-        let receipt = wait_for_receipt(config, tx_hash).await?;
-
-        if let Some(contract_address) = receipt
-            .get("contractAddress")
-            .unwrap_or(&serde_json::Value::Null)
-            .as_str()
-        {
+    let sent = signer::sign_and_send(config, signer_args, None, value_wei, code).await?;
+    println!("Transaction: {}", sent.hash.cyan());
+    let receipt = &sent.receipt;
+    match receipt.get("contractAddress").and_then(|v| v.as_str()) {
+        Some(addr) if signer::receipt_ok(receipt) => {
             println!("{}", "✓ Contract deployed successfully".green().bold());
-            println!("Contract Address: {}", contract_address.cyan().bold());
+            println!("Contract Address: {}", addr.cyan().bold());
             println!(
                 "Gas Used: {}",
                 receipt
                     .get("gasUsed")
-                    .unwrap_or(&serde_json::Value::Null)
-                    .as_str()
+                    .and_then(|v| v.as_str())
                     .unwrap_or("N/A")
             );
-        } else {
-            anyhow::bail!("Contract deployment failed");
+            Ok(())
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
-        anyhow::bail!(
-            "Deployment failed: {}",
-            super::rpc_hint::explain_send_error(
-                error["message"].as_str().unwrap_or("Unknown error")
-            )
-        );
-    } else {
-        anyhow::bail!("Unexpected response from RPC");
+        _ => anyhow::bail!(
+            "Contract deployment failed (receipt status {})",
+            receipt
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing")
+        ),
     }
-
-    Ok(())
 }
 
 async fn call_contract(
@@ -438,117 +392,67 @@ async fn call_contract(
     address: &str,
     method: &str,
     args: Option<String>,
-    account: Option<String>,
     value: String,
+    signer_args: &SignerArgs,
 ) -> Result<()> {
     println!("{}", format!("Calling {}...", method).cyan());
 
-    // Parse method arguments
     let method_args = if let Some(args_str) = args {
         serde_json::from_str(&args_str).context("Invalid method arguments JSON")?
     } else {
         json!([])
     };
-
-    // Encode method call
     let call_data = encode_method_call(method, method_args)?;
-
-    // Get account
-    let from_account = account
-        .or(config.default_account.clone())
-        .context("No account specified and no default account configured")?;
-
-    // Parse value
+    let data = hex::decode(call_data.trim_start_matches("0x")).context("encoded call data")?;
+    let to = parse_address20(address)?;
     let value_wei = value.parse::<u128>().context("Invalid value")?;
 
-    // Make RPC call
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&config.rpc_endpoint)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "eth_sendTransaction",
-            "params": [{
-                "from": from_account,
-                "to": address,
-                "data": call_data,
-                "value": format!("0x{:x}", value_wei),
-                "gas": format!("0x{:x}", config.gas_limit),
-                "gasPrice": format!("0x{:x}", config.gas_price),
-            }],
-            "id": 1
-        }))
-        .send()
-        .await
-        .context("Failed to connect to RPC endpoint")?;
-
-    let result: serde_json::Value = response.json().await?;
-
-    if let Some(tx_hash) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_str()
-    {
-        println!("{}", "✓ Transaction sent".green());
-        println!("Transaction: {}", tx_hash.cyan());
-
-        // Wait for receipt
-        println!("Waiting for confirmation...");
-
-        let receipt = wait_for_receipt(config, tx_hash).await?;
-
-        if receipt
-            .get("status")
-            .unwrap_or(&serde_json::Value::Null)
-            .as_str()
-            == Some("0x1")
-        {
-            println!("{}", "✓ Transaction successful".green().bold());
-            println!(
-                "Gas Used: {}",
-                receipt
-                    .get("gasUsed")
-                    .unwrap_or(&serde_json::Value::Null)
-                    .as_str()
-                    .unwrap_or("N/A")
-            );
-
-            // Decode logs if any
-            if let Some(logs) = receipt
-                .get("logs")
-                .unwrap_or(&serde_json::Value::Null)
-                .as_array()
-            {
-                if !logs.is_empty() {
-                    println!("\nEvents emitted:");
-                    for log in logs {
-                        if let Some(topics) = log["topics"].as_array() {
-                            if let Some(topic0) = topics.first() {
-                                println!("  Event: {}", topic0.as_str().unwrap_or("Unknown"));
-                            }
-                        }
-                    }
+    let sent = signer::sign_and_send(config, signer_args, Some(to), value_wei, data).await?;
+    println!("Transaction: {}", sent.hash.cyan());
+    let receipt = &sent.receipt;
+    if !signer::receipt_ok(receipt) {
+        anyhow::bail!(
+            "Transaction failed (receipt status {})",
+            receipt
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing")
+        );
+    }
+    println!("{}", "✓ Transaction successful".green().bold());
+    println!(
+        "Gas Used: {}",
+        receipt
+            .get("gasUsed")
+            .and_then(|v| v.as_str())
+            .unwrap_or("N/A")
+    );
+    if let Some(logs) = receipt.get("logs").and_then(|v| v.as_array()) {
+        if !logs.is_empty() {
+            println!("\nEvents emitted:");
+            for log in logs {
+                if let Some(topic0) = log
+                    .get("topics")
+                    .and_then(|t| t.as_array())
+                    .and_then(|t| t.first())
+                {
+                    println!("  Event: {}", topic0.as_str().unwrap_or("Unknown"));
                 }
             }
-        } else {
-            anyhow::bail!("Transaction failed");
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
-        anyhow::bail!(
-            "Call failed: {}",
-            super::rpc_hint::explain_send_error(
-                error["message"].as_str().unwrap_or("Unknown error")
-            )
-        );
-    } else {
-        anyhow::bail!("Unexpected response from RPC");
     }
-
     Ok(())
+}
+
+/// A 20-byte address from hex.
+fn parse_address20(s: &str) -> Result<[u8; 20]> {
+    let t = s.trim();
+    let bytes = hex::decode(t.strip_prefix("0x").unwrap_or(t))
+        .with_context(|| format!("Invalid address {s}"))?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Address {s} is not 20 bytes"))
 }
 
 async fn read_contract(
@@ -868,37 +772,6 @@ async fn list_verifications(config: &Config) -> Result<()> {
         println!("No verification records found");
     }
     Ok(())
-}
-
-async fn wait_for_receipt(config: &Config, tx_hash: &str) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-
-    for _ in 0..30 {
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        let response = client
-            .post(&config.rpc_endpoint)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "method": "eth_getTransactionReceipt",
-                "params": [tx_hash],
-                "id": 1
-            }))
-            .send()
-            .await?;
-
-        let result: serde_json::Value = response.json().await?;
-
-        if let Some(receipt) = result
-            .get("result")
-            .unwrap_or(&serde_json::Value::Null)
-            .as_object()
-        {
-            return Ok(json!(receipt));
-        }
-    }
-
-    anyhow::bail!("Transaction receipt not found after 60 seconds");
 }
 
 fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<String> {
