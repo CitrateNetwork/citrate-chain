@@ -45,7 +45,7 @@ pub const GENESIS_NOTE: &str = "Citrate r1007: rehearsal genesis for chain 40204
 /// `scripts/genesis/r1007/stamp_genesis.py` (owner 2026-11-11), which re-pins
 /// `R1007_GENESIS` with it; the ceremony render refuses a stamp more than 1 h from its run.
 /// Until stamped it is the shared canonical timestamp.
-pub const GENESIS_TIMESTAMP: u64 = 1794502800;
+pub const GENESIS_TIMESTAMP: u64 = 1794492000;
 
 /// Whether `cfg` is the r1007 genesis: it carries the r1007 note account. Used by the
 /// shared genesis function to require the MPT rule for this profile.

@@ -211,7 +211,7 @@ pub const R1006_GENESIS: [u8; 32] =
 /// (`core/economics/assets/r1007/alloc.json`), at the canonical genesis timestamp. It is
 /// still a candidate: the ceremony stamps block 0 with its own timestamp, which moves it.
 pub const R1007_GENESIS: [u8; 32] =
-    hex32("db25bee2bb35aac027afb0b58097301bb840ca87552061c1bbdcbc7be404c478");
+    hex32("cf68634502b4fca1e977ac8dd35aa006bb40c04208d5cd55f1c2b508bba96631");
 
 /// Activation heights compiled into this release for ONE genesis, keyed by its block-0
 /// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin
