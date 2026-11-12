@@ -1,6 +1,8 @@
 class Citrate < Formula
-  desc "Citrate AI blockchain platform CLI and node"
+  desc "Citrate Network command-line tools and node"
   homepage "https://citrate.ai"
+  # Set to the release tag (without the "v") when the first release this formula
+  # serves is cut. No v0.4.0 release exists; see homebrew/README.md "Status".
   version "0.4.0"
 
   # CHAIN-B-E005: URLs point at the canonical CitrateNetwork/citrate-chain
@@ -15,20 +17,23 @@ class Citrate < Formula
   # this formula is published to a tap. Do NOT replace these with `:no_check`
   # or a hand-copied value that was not computed over the real release
   # artifact — that would install an unverified binary.
+  # Asset names follow .github/workflows/release.yml: one tarball per target,
+  # citrate-chain-<rust target triple>.tar.gz, holding citrate-chain-<target>/.
+  # scripts/tests/test_homebrew_formula.sh checks these names against release.yml.
   if Hardware::CPU.intel?
     if OS.mac?
-      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-v#{version}-macos-x86_64.tar.gz"
+      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-chain-x86_64-apple-darwin.tar.gz"
       sha256 "PENDING_RELEASE_DIGEST"
     else
-      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-v#{version}-linux-x86_64.tar.gz"
+      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-chain-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "PENDING_RELEASE_DIGEST"
     end
   else
     if OS.mac?
-      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-v#{version}-macos-arm64.tar.gz"
+      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-chain-aarch64-apple-darwin.tar.gz"
       sha256 "PENDING_RELEASE_DIGEST"
     else
-      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-v#{version}-linux-arm64.tar.gz"
+      url "https://github.com/CitrateNetwork/citrate-chain/releases/download/v#{version}/citrate-chain-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "PENDING_RELEASE_DIGEST"
     end
   end
@@ -38,45 +43,37 @@ class Citrate < Formula
   depends_on "openssl"
 
   def install
-    bin.install "citrate"
+    bin.install "citrate-node"
     bin.install "citrate-cli"
     bin.install "citrate-wallet"
-    bin.install "faucet"
-
-    # Install shell completions
-    generate_completions_from_executable(bin/"citrate-cli", "completion")
+    bin.install "citrate-faucet"
 
     # Create config directory
     (etc/"citrate").mkpath
-
-    # Install example configuration
-    (etc/"citrate").install "config.toml.example" if File.exist?("config.toml.example")
   end
 
   def post_install
     puts <<~EOS
-      Citrate AI blockchain platform has been installed!
+      Citrate command-line tools are installed:
+        citrate-cli     chain reads, contract calls and sends (signs locally)
+        citrate-wallet  keystore and SALT transfers
+        citrate-node    full node
+        citrate-faucet  testnet faucet server (operators)
 
-      Quick start:
-        1. Initialize a new node:
-           citrate init --data-dir ~/.citrate
+      Quick start against the public network (chain 40204):
+        export CITRATE_RPC=https://rpc.citrate.ai
+        citrate-cli network status
+        citrate-cli account create
 
-        2. Start the node:
-           citrate start --config ~/.citrate/config.toml
+      Run a node (joins the public testnet):
+        citrate-node --network testnet --data-dir ~/.citrate/node
 
-        3. Create a wallet:
-           citrate-wallet create
-
-        4. Check node status:
-           citrate-cli status
-
-      Documentation: https://docs.citrate.ai
-      Community: https://discord.gg/A3Uwe4BvdN
+      Documentation: https://docs.citrate.ai/chain/cli
     EOS
   end
 
   service do
-    run [opt_bin/"citrate", "start", "--config", etc/"citrate/config.toml"]
+    run [opt_bin/"citrate-node", "--network", "testnet", "--data-dir", var/"lib/citrate"]
     keep_alive true
     log_path var/"log/citrate.log"
     error_log_path var/"log/citrate.log"
@@ -84,9 +81,9 @@ class Citrate < Formula
   end
 
   test do
-    system "#{bin}/citrate", "--version"
-    system "#{bin}/citrate-cli", "--help"
+    system "#{bin}/citrate-node", "--version"
+    system "#{bin}/citrate-cli", "--version"
     system "#{bin}/citrate-wallet", "--help"
-    system "#{bin}/faucet", "--help"
+    system "#{bin}/citrate-faucet", "--help"
   end
 end
