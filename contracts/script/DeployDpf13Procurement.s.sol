@@ -5,11 +5,12 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/TinaWorkpaperRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf13Procurement — Stage 11 broadcast
 /// @notice Deploys TinaWorkpaperRegistry to chain 40204. Deployer
 ///         self-authorizes as recorder.
-contract DeployDpf13Procurement is ScriptEnv, GovernanceOps {
+contract DeployDpf13Procurement is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address tina) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -19,7 +20,7 @@ contract DeployDpf13Procurement is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         TinaWorkpaperRegistry reg = new TinaWorkpaperRegistry(governance);
         console.log("TinaWorkpaperRegistry:  ", address(reg));

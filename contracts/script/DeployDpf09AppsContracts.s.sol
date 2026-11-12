@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "../src/defense_prime/AppRegistry.sol";
 import "../src/defense_prime/CrossOrgIndex.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf09AppsContracts — Stage 7 broadcast
 /// @notice Deploys the DPF-09 contract pair (AppRegistry + CrossOrgIndex)
@@ -22,7 +23,7 @@ import "../src/defense_prime/CrossOrgIndex.sol";
 ///       --rpc-url https://rpc.citrate.ai \
 ///       --private-key $DEPLOYER_PRIVATE_KEY \
 ///       --broadcast --slow
-contract DeployDpf09AppsContracts is ScriptEnv {
+contract DeployDpf09AppsContracts is ScriptEnv, EnvSigner {
     /// @notice MultiSigEnvelope deployed in DPF-08 Stage 1.
     /// @dev Hardcoded for testnet; production would read from env.
     address constant MULTISIG_ENVELOPE_STAGE_1 = 0x05825775315f3d074db9F948713D05059e12a8Fd;
@@ -47,7 +48,7 @@ contract DeployDpf09AppsContracts is ScriptEnv {
         console.log("Envelope oracle: ", envelopeOracle);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         AppRegistry ar = new AppRegistry(governance, envelopeOracle);
         console.log("AppRegistry:    ", address(ar));

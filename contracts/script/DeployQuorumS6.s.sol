@@ -12,6 +12,7 @@ import {VoteAllowance} from "../src/quorum/VoteAllowance.sol";
 import {Sortition} from "../src/quorum/Sortition.sol";
 import {MeetingRegistry} from "../src/cit_agent/MeetingRegistry.sol";
 import {AnchorRegistry} from "../src/cit_agent/AnchorRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployQuorumS6 — the citrate-quorum governance set (QRM-S6.9)
 ///
@@ -41,7 +42,7 @@ import {AnchorRegistry} from "../src/cit_agent/AnchorRegistry.sol";
 /// `TenantHierarchy` must already be deployed AND its root seeded, or three of
 /// these bind immutably to a dead address. Pass it explicitly rather than
 /// reading a book, so the ceremony cannot silently inherit a stale pin.
-contract DeployQuorumS6 is Script {
+contract DeployQuorumS6 is EnvSigner {
     struct Deployed {
         address anchorRegistry;
         address meetingRegistry;
@@ -64,7 +65,7 @@ contract DeployQuorumS6 is Script {
         require(tenants != address(0), "TENANT_HIERARCHY is zero");
         require(tenants.code.length > 0, "TENANT_HIERARCHY has no code - redeploy the RBAC set first");
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         AnchorRegistry anchors = new AnchorRegistry();
         console2.log("AnchorRegistry deployed at:", address(anchors));

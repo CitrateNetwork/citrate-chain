@@ -5,12 +5,13 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/EntityRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf12Ontology — Stage 10 broadcast
 /// @notice Deploys the DPF-12 NEW contract (EntityRegistry) to chain
 ///         40204. Deployer self-authorizes as recorder so the E2E
 ///         suite can write without a separate cast send.
-contract DeployDpf12Ontology is ScriptEnv, GovernanceOps {
+contract DeployDpf12Ontology is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address entityRegistry) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -20,7 +21,7 @@ contract DeployDpf12Ontology is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         EntityRegistry er = new EntityRegistry(governance);
         console.log("EntityRegistry:  ", address(er));

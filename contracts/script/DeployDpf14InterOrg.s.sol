@@ -5,11 +5,12 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/CrossOrgEnvelope.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf14InterOrg — Stage 12 broadcast
 /// @notice Deploys CrossOrgEnvelope to chain 40204. Deployer self-
 ///         authorizes as recorder.
-contract DeployDpf14InterOrg is ScriptEnv, GovernanceOps {
+contract DeployDpf14InterOrg is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address crossOrg) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -19,7 +20,7 @@ contract DeployDpf14InterOrg is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         CrossOrgEnvelope env = new CrossOrgEnvelope(governance);
         console.log("CrossOrgEnvelope:  ", address(env));

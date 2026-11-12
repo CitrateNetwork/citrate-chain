@@ -6,6 +6,7 @@ import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/DefensePrimeComplianceRegistry.sol";
 import "../src/defense_prime/RoleGrantTenantIndex.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf11Governance — Stage 9 broadcast
 /// @notice Deploys the DPF-11 NEW contract pair
@@ -21,7 +22,7 @@ import "../src/defense_prime/RoleGrantTenantIndex.sol";
 ///       --rpc-url https://rpc.citrate.ai \
 ///       --private-key $DEPLOYER_PRIVATE_KEY \
 ///       --broadcast --slow
-contract DeployDpf11Governance is ScriptEnv, GovernanceOps {
+contract DeployDpf11Governance is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address compliance, address roleIdx) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -31,7 +32,7 @@ contract DeployDpf11Governance is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         DefensePrimeComplianceRegistry bcr = new DefensePrimeComplianceRegistry(governance);
         console.log("DefensePrimeComplianceRegistry:  ", address(bcr));

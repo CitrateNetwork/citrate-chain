@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import "forge-std/Script.sol";
 import {SupplierRegistry} from "../src/defense_prime/SupplierRegistry.sol";
 import {MoqRegistry} from "../src/defense_prime/MoqRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf06Suppliers — Foundry deployment script for DPF-06 Suppliers + MOQ
 /// @notice Deploys SupplierRegistry and MoqRegistry to chain 40204
@@ -51,7 +52,7 @@ import {MoqRegistry} from "../src/defense_prime/MoqRegistry.sol";
 ///   4. (Operator step) authorize the DPF program's recorder address
 ///      on each registry: `cast send <registry> "setRecorder(address,bool)" \
 ///      <recorder> true --private-key $GOVERNANCE_KEY`
-contract DeployDpf06Suppliers is Script {
+contract DeployDpf06Suppliers is EnvSigner {
     struct DeployedAddresses {
         address supplierRegistry;
         address moqRegistry;
@@ -72,7 +73,7 @@ contract DeployDpf06Suppliers is Script {
     function run() external returns (DeployedAddresses memory addrs) {
         address governance = _governance();
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         // 1. SupplierRegistry — DefensePrime supplier lifecycle + qualification
         //    Constructor: (address initialGovernance), reverts on zero.

@@ -8,6 +8,7 @@ import {ClassificationRegistry} from "../src/rbac/ClassificationRegistry.sol";
 import {MultiSigEnvelope} from "../src/rbac/MultiSigEnvelope.sol";
 import {AgentDecisionRegistryV2} from "../src/rbac/AgentDecisionRegistryV2.sol";
 import {ContradictionLedger} from "../src/rbac/ContradictionLedger.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf02Rbac — Foundry deployment script for DPF-02 RBAC contracts
 /// @notice Deploys all 6 DPF-02 contracts to chain 40204 (Citrate testnet)
@@ -29,7 +30,7 @@ import {ContradictionLedger} from "../src/rbac/ContradictionLedger.sol";
 ///       --broadcast
 ///
 /// After broadcast, append addresses to DEPLOYED_ADDRESSES.md.
-contract DeployDpf02Rbac is Script {
+contract DeployDpf02Rbac is EnvSigner {
     struct DeployedAddresses {
         address tenantHierarchy;
         address roleEscalation;
@@ -55,7 +56,7 @@ contract DeployDpf02Rbac is Script {
     function run() external returns (DeployedAddresses memory addrs) {
         address governance = _governance();
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         // 1. TenantHierarchy — no contract dependencies. Root tenant
         //    initialized lazily by the deployer's first initRoot call
