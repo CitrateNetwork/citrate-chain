@@ -20,3 +20,13 @@ description = "Public OpenPGP fingerprint of DigitalOcean's do-agent apt signing
 # other 40-hex string next to a key-like name is still reported.
 regexTarget = "secret"
 regexes = ['''^902C44B42EA9A17F8578510977B79B3FFAF7EF65$''']
+
+[[allowlists]]
+description = "Public Ethereum trie test vector (ethereum/tests TrieTests/trietest.json)"
+# core/execution/tests/fixtures/ethereum-trie-tests/trietest.json is the upstream conformance
+# fixture for the MPT state root (CV-14). Its "insert-middle-leaf" case stores the value
+# "0123456789012345678901234567890123456789Very_Long" under "key1", which the generic-api-key
+# rule misreads as a credential. Only this exact value, only in this file, is allowed.
+paths = ['''^core/execution/tests/fixtures/ethereum-trie-tests/trietest\.json$''']
+regexTarget = "secret"
+regexes = ['''^0123456789012345678901234567890123456789Very_Long$''']
