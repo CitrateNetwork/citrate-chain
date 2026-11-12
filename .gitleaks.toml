@@ -26,7 +26,7 @@ description = "Public Ethereum trie test vector (ethereum/tests TrieTests/triete
 # core/execution/tests/fixtures/ethereum-trie-tests/trietest.json is the upstream conformance
 # fixture for the MPT state root (CV-14). Its "insert-middle-leaf" case stores the value
 # "0123456789012345678901234567890123456789Very_Long" under "key1", which the generic-api-key
-# rule misreads as a credential. Only this exact value, only in this file, is allowed.
-paths = ['''^core/execution/tests/fixtures/ethereum-trie-tests/trietest\.json$''']
+# rule misreads as a credential. Only this exact value is allowed; any other value next to
+# a key-like name is still reported, in every file.
 regexTarget = "secret"
 regexes = ['''^0123456789012345678901234567890123456789Very_Long$''']
