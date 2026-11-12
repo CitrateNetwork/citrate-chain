@@ -319,68 +319,7 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
         .as_object()
     {
         println!("{}", "Block Information:".bold());
-        println!(
-            "Number: {}",
-            u64::from_str_radix(
-                block["number"]
-                    .as_str()
-                    .unwrap_or("0x0")
-                    .trim_start_matches("0x"),
-                16
-            )
-            .unwrap_or(0)
-        );
-        println!("Hash: {}", block["hash"].as_str().unwrap_or("N/A").cyan());
-        println!("Parent: {}", block["parentHash"].as_str().unwrap_or("N/A"));
-        println!(
-            "Timestamp: {}",
-            u64::from_str_radix(
-                block["timestamp"]
-                    .as_str()
-                    .unwrap_or("0x0")
-                    .trim_start_matches("0x"),
-                16
-            )
-            .unwrap_or(0)
-        );
-        println!("Miner: {}", block["miner"].as_str().unwrap_or("N/A"));
-
-        if let Some(txs) = block["transactions"].as_array() {
-            println!("Transactions: {}", txs.len());
-
-            if !txs.is_empty() && txs.len() <= 5 {
-                println!("\nTransactions:");
-                for tx in txs {
-                    if let Some(hash) = tx["hash"].as_str() {
-                        println!("  • {}", hash);
-                    }
-                }
-            } else if txs.len() > 5 {
-                println!("  (showing first 5)");
-                for tx in txs.iter().take(5) {
-                    if let Some(hash) = tx["hash"].as_str() {
-                        println!("  • {}", hash);
-                    }
-                }
-                println!("  ... and {} more", txs.len().saturating_sub(5));
-            }
-        }
-
-        // GhostDAG specific fields
-        if let Some(merge_parents) = block["mergeParents"].as_array() {
-            if !merge_parents.is_empty() {
-                println!("\nGhostDAG Merge Parents: {}", merge_parents.len());
-                for parent in merge_parents.iter().take(3) {
-                    if let Some(hash) = parent.as_str() {
-                        println!("  • {}", hash);
-                    }
-                }
-            }
-        }
-
-        if let Some(blue_score) = block["blueScore"].as_u64() {
-            println!("Blue Score: {}", blue_score);
-        }
+        print!("{}", render_block(block));
     } else if let Some(error) = result
         .get("error")
         .unwrap_or(&serde_json::Value::Null)
@@ -395,6 +334,76 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The block summary `network block` prints, one line per field.
+fn render_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "Number: {}",
+        u64::from_str_radix(
+            block["number"]
+                .as_str()
+                .unwrap_or("0x0")
+                .trim_start_matches("0x"),
+            16
+        )
+        .unwrap_or(0)
+    ));
+    lines.push(format!("Hash: {}", block["hash"].as_str().unwrap_or("N/A")));
+    lines.push(format!("Parent: {}", block["parentHash"].as_str().unwrap_or("N/A")));
+    lines.push(format!(
+        "Timestamp: {}",
+        u64::from_str_radix(
+            block["timestamp"]
+                .as_str()
+                .unwrap_or("0x0")
+                .trim_start_matches("0x"),
+            16
+        )
+        .unwrap_or(0)
+    ));
+    lines.push(format!("Miner: {}", block["miner"].as_str().unwrap_or("N/A")));
+
+    if let Some(txs) = block["transactions"].as_array() {
+        lines.push(format!("Transactions: {}", txs.len()));
+
+        if !txs.is_empty() && txs.len() <= 5 {
+            lines.push(format!("\nTransactions:"));
+            for tx in txs {
+                if let Some(hash) = tx["hash"].as_str() {
+                    lines.push(format!("  • {}", hash));
+                }
+            }
+        } else if txs.len() > 5 {
+            lines.push(format!("  (showing first 5)"));
+            for tx in txs.iter().take(5) {
+                if let Some(hash) = tx["hash"].as_str() {
+                    lines.push(format!("  • {}", hash));
+                }
+            }
+            lines.push(format!("  ... and {} more", txs.len().saturating_sub(5)));
+        }
+    }
+
+    // GhostDAG specific fields
+    if let Some(merge_parents) = block["mergeParents"].as_array() {
+        if !merge_parents.is_empty() {
+            lines.push(format!("\nGhostDAG Merge Parents: {}", merge_parents.len()));
+            for parent in merge_parents.iter().take(3) {
+                if let Some(hash) = parent.as_str() {
+                    lines.push(format!("  • {}", hash));
+                }
+            }
+        }
+    }
+
+    if let Some(blue_score) = block["blueScore"].as_u64() {
+        lines.push(format!("Blue Score: {}", blue_score));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
@@ -821,4 +830,69 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_block;
+
+    /// Block 7059 of the live r1007 chain (genesis 0xcf686345…), fetched with
+    /// `eth_getBlockByNumber("0x1b93", true)` from https://rpc.citrate.ai on 2026-11-12.
+    /// It holds one native self-transfer. The node names the merge parents
+    /// `mergeParentHashes` and sends `blueScore` as a hex string.
+    const R1007_BLOCK_7059: &str = include_str!("../../tests/fixtures/r1007_block_7059.json");
+
+    fn block() -> serde_json::Map<String, serde_json::Value> {
+        match serde_json::from_str::<serde_json::Value>(R1007_BLOCK_7059) {
+            Ok(serde_json::Value::Object(map)) => map,
+            other => panic!("fixture is not a JSON object: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renders_a_live_r1007_block_without_panicking() {
+        let out = render_block(&block());
+        assert!(out.contains("Number: 7059"), "{out}");
+        assert!(
+            out.contains("Hash: 0xeb9174b8db765758bb4a807f9a10e608f324268b630b6ba21cc0fc743eb6669d"),
+            "{out}"
+        );
+        assert!(out.contains("Transactions: 1"), "{out}");
+        assert!(
+            out.contains("0x4f26db08ecb21144dcdc0080967292085031340b846842ef15b606f6024b3c55"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn shows_the_merge_parents_and_blue_score_the_node_sends() {
+        let b = block();
+        let parents = b
+            .get("mergeParentHashes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let blue = b
+            .get("blueScore")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(u64::MAX);
+        let out = render_block(&b);
+        if parents > 0 {
+            assert!(
+                out.contains(&format!("GhostDAG Merge Parents: {parents}")),
+                "{out}"
+            );
+        }
+        assert!(out.contains(&format!("Blue Score: {blue}")), "{out}");
+    }
+
+    #[test]
+    fn a_block_with_only_a_number_renders_placeholders() {
+        let mut b = serde_json::Map::new();
+        b.insert("number".into(), serde_json::json!("0x2a"));
+        let out = render_block(&b);
+        assert!(out.contains("Number: 42"), "{out}");
+        assert!(out.contains("Hash: N/A"), "{out}");
+    }
 }
