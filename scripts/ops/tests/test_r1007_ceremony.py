@@ -638,6 +638,46 @@ class DevnetTxLoad(unittest.TestCase):
         self.assertIn("expected", text)
 
 
+class SameTip(unittest.TestCase):
+    """same_tip compares hashes near the TIP, and fails when a node lags.
+
+    2026-11-12 P5 on the fix (/root/r1007-p5-fix-051789fb-2353Z): the producers were at
+    height 1000 and the boots at 999, but rpc-1 had synced only to 57. same_tip picked
+    min(heads) - lag = 38 (after the agent's own head was read), the hashes agreed there, and
+    the rpc and health-r1007 gates passed with rpc-1 about 940 blocks behind."""
+
+    def _t(self, heads: dict, hashes: dict | None = None):
+        class T:
+            def agent(_s, h, *args, mutating=True, step=""):
+                if "--at" in args:
+                    at = int(args[args.index("--at") + 1])
+                    return {"hash_at": (hashes or {}).get(h["name"], {}).get(at, f"0x{at:064x}")}
+                return {"head": heads[h["name"]]}
+        return T()
+
+    def hosts(self, names):
+        return [{"name": n} for n in names]
+
+    def test_a_lagging_node_fails_even_if_old_blocks_agree(self):
+        heads = {"citrate-prod-1": 1000, "citrate-prod-2": 1000, "citrate-rpc-1": 57}
+        with self.assertRaises(C.Fail) as e:
+            C.same_tip(self._t(heads), self.hosts(heads), 3)
+        self.assertIn("citrate-rpc-1", str(e.exception))
+        self.assertIn("behind", str(e.exception))
+
+    def test_nodes_within_the_lag_compare_near_the_tip(self):
+        heads = {"citrate-prod-1": 1000, "citrate-boot-1": 999, "citrate-rpc-1": 998}
+        tip = C.same_tip(self._t(heads), self.hosts(heads), 3)
+        self.assertEqual(tip["common"], 995)
+        self.assertGreaterEqual(tip["common"], max(heads.values()) - 2 * 3 - 1)
+
+    def test_a_split_near_the_tip_still_fails(self):
+        heads = {"citrate-prod-1": 1000, "citrate-prod-2": 1000}
+        hashes = {"citrate-prod-2": {997: "0xfork"}}
+        with self.assertRaises(C.Fail):
+            C.same_tip(self._t(heads, hashes), self.hosts(heads), 3)
+
+
 class Agent(unittest.TestCase):
     """node_agent.py's generation slots, in a temp root (proc mode)."""
 
