@@ -5,11 +5,12 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/ReleaseManifestRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf17Release - Stage 15 broadcast (FINAL stage of DPF program)
 /// @notice Deploys ReleaseManifestRegistry. Deployer self-authorizes
 ///         as recorder so CI release runs can broadcast.
-contract DeployDpf17Release is ScriptEnv, GovernanceOps {
+contract DeployDpf17Release is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address rel) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -19,7 +20,7 @@ contract DeployDpf17Release is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv(deployer);
 
         ReleaseManifestRegistry reg = new ReleaseManifestRegistry(governance);
         console.log("ReleaseManifestRegistry:  ", address(reg));

@@ -15,10 +15,12 @@
 )]
 
 // Merkle Patricia Trie implementation
+use crate::state::slot_map::SlotMap;
 use citrate_consensus::types::Hash;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Merkle Patricia Trie node
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -41,43 +43,214 @@ pub enum TrieNode {
 
 // Default now derived above with Empty
 
-/// Merkle Patricia Trie
+/// A contract's storage: its slot set, the standard MPT of it (CV-14) and,
+/// where a legacy root can still be asked for, the legacy structural tree.
 ///
-/// SHAPE INVARIANT. A trie built by inserts alone has one shape per key/value
-/// set, whatever the insert order: a `Leaf` where exactly one key lies under a
-/// prefix, a `Branch` where two or more do, and no `Extension`. `remove` does
-/// not preserve that shape (it can leave an `Extension`, a single-child
-/// `Branch`, or an empty `Branch`), and `encode_node` hashes the shape, so the
-/// structural hash of a trie that has seen a remove depends on its history.
+/// SLOT SET. A persistent map ([`SlotMap`]): cloning a `Trie` (what
+/// `Arc::make_mut` does when a snapshot shares it) copies no slot, and a write
+/// copies one O(log n) path. r1007 storage copy-on-write: before, the clone
+/// copied every slot and the whole legacy tree.
+///
+/// LEGACY TREE. Kept only while a legacy root is reachable (see
+/// [`crate::mpt_state_root::legacy_root_reachable`]). Under the MPT rule from
+/// genesis (the r1007 rule) `StateDB` builds tries without it and drops it on
+/// the first write, so no old-format tree is maintained. It is behind its own
+/// `Arc`, so a clone shares it too; a write under the legacy rule still copies
+/// it when shared (the legacy rule's cost is unchanged).
+///
+/// SHAPE INVARIANT (legacy tree). A tree built by inserts alone has one shape
+/// per key/value set, whatever the insert order: a `Leaf` where exactly one key
+/// lies under a prefix, a `Branch` where two or more do, and no `Extension`.
+/// `remove` does not preserve that shape (it can leave an `Extension`, a
+/// single-child `Branch`, or an empty `Branch`), and `encode_node` hashes the
+/// shape, so the structural hash of a tree that has seen a remove depends on
+/// its history.
 ///
 /// [`Trie::root_hash`] is therefore a function of the key/value set only: for a
 /// trie that has seen a remove it hashes the insert-only shape of the current
 /// set. [`Trie::legacy_root_hash`] is the structural hash, kept for state roots
 /// below the storage-root hardening height (`crate::storage_root_hardening`).
-#[derive(Clone)]
+/// A trie without a legacy tree answers both with the insert-only shape of its
+/// slot set (what a restarted node, which hydrates by inserts, computes).
 pub struct Trie {
+    slots: SlotMap,
+    legacy: Option<Arc<LegacyTree>>,
+    /// The standard secure MPT of the same slots (CV-14), brought up to date
+    /// lazily by [`Trie::mpt_root`]. Behind a lock because a trie is shared by
+    /// `Arc` with snapshots: catching it up never changes the slot set, only
+    /// materializes a pure function of it, so it needs no copy-on-write.
+    mpt: parking_lot::Mutex<StorageMpt>,
+}
+
+/// The legacy structural tree of a trie's slots.
+#[derive(Clone, Default)]
+struct LegacyTree {
     root: TrieNode,
-    cache: HashMap<Vec<u8>, Vec<u8>>,
     /// Set by any `remove`: the shape may no longer be the insert-only shape.
     removed: bool,
 }
 
+/// The MPT of a storage trie and the slot keys changed since it was last
+/// caught up. Invariant: for every key NOT in `pending`, the MPT holds exactly
+/// `encode_storage_value(slots[key])` under keccak256(key) (absent if the slot
+/// is absent or an EVM zero).
+#[derive(Clone, Default)]
+struct StorageMpt {
+    trie: crate::state::mpt::Mpt,
+    pending: std::collections::HashSet<Vec<u8>>,
+}
+
+impl Clone for Trie {
+    /// O(1) in the slot count: the slot set, the legacy tree and the MPT nodes
+    /// are shared; only the (small) set of slots pending an MPT catch-up is
+    /// copied.
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            legacy: self.legacy.clone(),
+            mpt: parking_lot::Mutex::new(self.mpt.lock().clone()),
+        }
+    }
+}
+
 impl Trie {
+    /// A trie that maintains the legacy tree (every legacy root available).
     pub fn new() -> Self {
         Self {
-            root: TrieNode::Empty,
-            cache: HashMap::new(),
-            removed: false,
+            slots: SlotMap::new(),
+            legacy: Some(Arc::new(LegacyTree::default())),
+            mpt: parking_lot::Mutex::new(StorageMpt::default()),
         }
+    }
+
+    /// A trie without the legacy tree, for a process where no legacy root is
+    /// reachable (the MPT rule from genesis).
+    pub fn without_legacy() -> Self {
+        Self {
+            slots: SlotMap::new(),
+            legacy: None,
+            mpt: parking_lot::Mutex::new(StorageMpt::default()),
+        }
+    }
+
+    /// `Trie::new()` where a legacy root is reachable in this process, else
+    /// `Trie::without_legacy()`.
+    pub fn for_current_rule() -> Self {
+        if crate::mpt_state_root::legacy_root_reachable() {
+            Self::new()
+        } else {
+            Self::without_legacy()
+        }
+    }
+
+    /// Stop maintaining the legacy tree (it is never rebuilt; the legacy roots
+    /// then come from the slot set, see the type docs).
+    pub fn drop_legacy(&mut self) {
+        self.legacy = None;
+    }
+
+    /// Whether this trie maintains the legacy tree.
+    pub fn has_legacy_tree(&self) -> bool {
+        self.legacy.is_some()
+    }
+
+    /// The number of resident slots.
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether no slot is resident.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
     }
 
     /// Insert a key-value pair
     pub fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        let nibbles = to_nibbles(&key);
-        // Take the root by value instead of cloning the whole tree on every
-        // insert (the result replaces it either way).
-        self.root = Self::insert_node(std::mem::take(&mut self.root), &nibbles, value.clone());
-        self.cache.insert(key, value);
+        if let Some(legacy) = &mut self.legacy {
+            let legacy = Arc::make_mut(legacy);
+            let nibbles = to_nibbles(&key);
+            // Take the root by value instead of cloning the whole tree on every
+            // insert (the result replaces it either way).
+            legacy.root =
+                Self::insert_node(std::mem::take(&mut legacy.root), &nibbles, value.clone());
+        }
+        self.mpt.get_mut().pending.insert(key.clone());
+        self.slots.insert(key, value);
+    }
+
+    /// The root of the standard secure MPT of this trie's slots (CV-14; see
+    /// `crate::state::mpt_state` for the leaf encoding). Incremental: only the
+    /// slots changed since the last call are re-hashed.
+    pub fn mpt_root(&self) -> [u8; 32] {
+        let mut m = self.mpt.lock();
+        self.catch_up(&mut m);
+        m.trie.root_hash()
+    }
+
+    fn catch_up(&self, m: &mut StorageMpt) {
+        if m.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut m.pending);
+        for key in pending {
+            let path = crate::state::mpt_state::storage_trie_key(&key);
+            match self
+                .slots
+                .get(&key)
+                .and_then(|v| crate::state::mpt_state::encode_storage_value(v))
+            {
+                Some(leaf) => m.trie.insert(&path, &leaf),
+                None => m.trie.remove(&path),
+            }
+        }
+    }
+
+    /// The storage MPT, caught up (cheap: nodes are shared).
+    pub fn mpt(&self) -> crate::state::mpt::Mpt {
+        let mut m = self.mpt.lock();
+        self.catch_up(&mut m);
+        m.trie.clone()
+    }
+
+    /// The from-scratch storage root of this trie's slots (no cache): the
+    /// reference for [`Self::mpt_root`].
+    pub fn reference_mpt_root(&self) -> [u8; 32] {
+        let mut leaves = Vec::with_capacity(self.slots.len());
+        self.slots.for_each(|k, v| {
+            if let Some(leaf) = crate::state::mpt_state::encode_storage_value(v) {
+                leaves.push((crate::state::mpt_state::storage_trie_key(k).to_vec(), leaf));
+            }
+        });
+        crate::state::mpt::root_from_sorted(leaves)
+    }
+
+    /// Install `mpt` as this trie's storage MPT if it holds exactly this
+    /// trie's slots (each leaf the encoding of the resident value). Used to
+    /// reuse persisted trie nodes on restart; `false` (and nothing installed)
+    /// on any difference.
+    pub fn install_mpt_if_matches(&self, mpt: crate::state::mpt::Mpt) -> bool {
+        let mut want: HashMap<[u8; 32], Vec<u8>> = HashMap::with_capacity(self.slots.len());
+        self.slots.for_each(|k, v| {
+            if let Some(leaf) = crate::state::mpt_state::encode_storage_value(v) {
+                want.insert(crate::state::mpt_state::storage_trie_key(k), leaf);
+            }
+        });
+        let have = mpt.entries();
+        if have.len() != want.len() {
+            return false;
+        }
+        for (k, v) in &have {
+            let Ok(k) = <[u8; 32]>::try_from(k.as_slice()) else {
+                return false;
+            };
+            if want.get(&k) != Some(v) {
+                return false;
+            }
+        }
+        let mut m = self.mpt.lock();
+        m.trie = mpt;
+        m.pending.clear();
+        true
     }
 
     fn insert_node(node: TrieNode, key: &[u8], value: Vec<u8>) -> TrieNode {
@@ -149,18 +322,39 @@ impl Trie {
     /// state snapshots and reconcile the durable store. Cloning is intentional:
     /// the caller owns the returned map.
     pub fn entries_map(&self) -> HashMap<Vec<u8>, Vec<u8>> {
-        self.cache.clone()
+        let mut out = HashMap::with_capacity(self.slots.len());
+        self.slots.for_each(|k, v| {
+            out.insert(k.to_vec(), v.to_vec());
+        });
+        out
+    }
+
+    /// Visit every resident slot (in no particular order).
+    pub fn for_each_slot<'a>(&'a self, f: impl FnMut(&'a [u8], &'a [u8])) {
+        self.slots.for_each(f);
+    }
+
+    /// Every slot whose value differs between `self` (before) and `after`, as
+    /// `(key, value in self, value in after)` (`None`: absent). Slots the two
+    /// versions share are skipped unread: O(changed slots x log n).
+    pub fn diff_slots<'a>(
+        &'a self,
+        after: &'a Trie,
+        f: impl FnMut(&'a [u8], Option<&'a [u8]>, Option<&'a [u8]>),
+    ) {
+        self.slots.diff(&after.slots, f);
     }
 
     /// Get a value by key
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        // Check cache first
-        if let Some(value) = self.cache.get(key) {
+        if let Some(value) = self.slots.get(key) {
             return Some(value.clone());
         }
-
+        // The slot set holds every inserted key, so the legacy tree never has
+        // one it lacks; the lookup is kept as it was.
+        let legacy = self.legacy.as_ref()?;
         let nibbles = to_nibbles(key);
-        Self::get_node(&self.root, &nibbles)
+        Self::get_node(&legacy.root, &nibbles)
     }
 
     fn get_node(node: &TrieNode, key: &[u8]) -> Option<Vec<u8>> {
@@ -191,11 +385,15 @@ impl Trie {
 
     /// Remove a key
     pub fn remove(&mut self, key: &[u8]) {
-        let nibbles = to_nibbles(key);
-        self.root = Self::remove_node(std::mem::take(&mut self.root), &nibbles);
-        self.cache.remove(key);
-        // Even a remove of an absent key can reshape a branch on its path.
-        self.removed = true;
+        if let Some(legacy) = &mut self.legacy {
+            let legacy = Arc::make_mut(legacy);
+            let nibbles = to_nibbles(key);
+            legacy.root = Self::remove_node(std::mem::take(&mut legacy.root), &nibbles);
+            // Even a remove of an absent key can reshape a branch on its path.
+            legacy.removed = true;
+        }
+        self.mpt.get_mut().pending.insert(key.to_vec());
+        self.slots.remove(key);
     }
 
     fn remove_node(node: TrieNode, key: &[u8]) -> TrieNode {
@@ -257,31 +455,46 @@ impl Trie {
     /// current set is rebuilt (keys sorted, for a fixed build sequence) and
     /// hashed.
     pub fn root_hash(&self) -> Hash {
-        if !self.removed {
-            return self.legacy_root_hash();
+        match &self.legacy {
+            Some(legacy) if !legacy.removed => Self::hash_tree(&legacy.root),
+            _ => self.insert_only_root_hash(),
         }
-        let mut entries: Vec<(&Vec<u8>, &Vec<u8>)> = self.cache.iter().collect();
+    }
+
+    /// The structural hash of the insert-only shape of the slot set (keys
+    /// sorted, for a fixed build sequence).
+    fn insert_only_root_hash(&self) -> Hash {
+        let mut entries = self.slots.entries();
         entries.sort_unstable();
-        let mut rebuilt = Trie::new();
+        let mut root = TrieNode::Empty;
         for (k, v) in entries {
-            rebuilt.insert(k.clone(), v.clone());
+            root = Self::insert_node(root, &to_nibbles(k), v.to_vec());
         }
-        rebuilt.legacy_root_hash()
+        Self::hash_tree(&root)
     }
 
     /// The structural hash of the trie as built, which depends on its remove
     /// history. Consensus uses it only for state roots below the storage-root
     /// hardening height, so historical blocks keep the root they were produced
     /// with.
+    ///
+    /// A trie without the legacy tree has no history to hash: it answers with
+    /// the insert-only shape of its slot set, as [`Self::root_hash`] does.
     pub fn legacy_root_hash(&self) -> Hash {
-        let encoded = self.encode_node(&self.root);
+        match &self.legacy {
+            Some(legacy) => Self::hash_tree(&legacy.root),
+            None => self.insert_only_root_hash(),
+        }
+    }
+
+    fn hash_tree(root: &TrieNode) -> Hash {
+        let encoded = Self::encode_node(root);
         let mut hasher = Keccak256::new();
         hasher.update(&encoded);
         Hash::new(hasher.finalize().into())
     }
 
-    #[allow(clippy::only_used_in_recursion)]
-    fn encode_node(&self, node: &TrieNode) -> Vec<u8> {
+    fn encode_node(node: &TrieNode) -> Vec<u8> {
         match node {
             TrieNode::Empty => vec![],
 
@@ -293,7 +506,7 @@ impl Trie {
             TrieNode::Branch { children, value } => {
                 let mut items: Vec<Vec<u8>> = Vec::new();
                 for child in children.iter() {
-                    items.push(self.encode_node(child));
+                    items.push(Self::encode_node(child));
                 }
                 if let Some(v) = value {
                     items.push(v.clone());
@@ -305,7 +518,7 @@ impl Trie {
             }
 
             TrieNode::Extension { prefix, node } => {
-                let node_encoded = self.encode_node(node);
+                let node_encoded = Self::encode_node(node);
                 let items: [&[u8]; 2] = [prefix.as_slice(), node_encoded.as_slice()];
                 rlp::encode_list::<&[u8], _>(&items).to_vec()
             }

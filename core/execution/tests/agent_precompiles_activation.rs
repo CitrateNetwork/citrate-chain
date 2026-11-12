@@ -106,6 +106,7 @@ fn call(target: [u8; 20], calldata: Vec<u8>, block_number: u64, gas: Option<u32>
         coinbase: [0x42; 20],
         prevrandao: [0u8; 32],
         block_hashes: HashMap::new(),
+        gas_limit: None,
     };
     let (output, _gas, _logs) = execute_contract_call_with_context(
         state_db,

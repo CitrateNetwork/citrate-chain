@@ -19,10 +19,10 @@ use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::hardening::PbaHardening;
 use citrate_consensus::tip_selection::TipSelector;
 use citrate_consensus::types::{
-    Block, BlockBuilder, BlockHeader, GhostDagParams, Hash, PublicKey, Transaction, VrfProof,
+    Block, BlockBuilder, BlockHeader, ForkChoiceKey, GhostDagParams, Hash, PublicKey, Transaction,
+    VrfProof,
 };
 use citrate_economics::{RewardCalculator, RewardConfig, UnifiedEconomicsManager};
-use citrate_execution::revm_adapter::BlockContext;
 use citrate_execution::Executor;
 use citrate_learning::orchestration::{LearningOrchestrator, PeerEmbedding, PeerProfileStore};
 use citrate_learning::profile::ProfileComputer;
@@ -60,6 +60,114 @@ pub(crate) type VrfProver = Arc<
 /// The production prover: RFC 9381 ECVRF-P256-SHA256.
 pub(crate) fn real_vrf_prover() -> VrfProver {
     Arc::new(citrate_consensus::ecvrf::prove)
+}
+
+/// The wall clock a [`BlockProducer`] reads its slot from, in milliseconds
+/// since the UNIX epoch (r1007 G9). Production always uses
+/// [`system_slot_clock`]; tests that seal several blocks in a row step it one
+/// slot per round instead of sleeping a slot between rounds.
+pub(crate) type SlotClock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// The production slot clock: the system clock.
+pub(crate) fn system_slot_clock() -> SlotClock {
+    Arc::new(|| u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0))
+}
+
+/// The slot clock a new producer starts with: the system clock.
+#[cfg(not(test))]
+fn default_slot_clock() -> SlotClock {
+    system_slot_clock()
+}
+
+/// Test builds only: the unit tests in this binary call `produce_block` back
+/// to back, each call standing for one slot's tick (production ticks once per
+/// slot, `BlockProducer::start`). This clock reads the test thread's simulated
+/// time ([`TestSimClock`]) and never returns a time in the slot of its previous
+/// reading, so consecutive rounds seal consecutive slots without each test
+/// sleeping a slot per block. A test that exercises the same-slot refusal sets
+/// a fixed clock explicitly ([`BlockProducer::with_slot_clock`]).
+#[cfg(test)]
+fn default_slot_clock() -> SlotClock {
+    let sim = TestSimClock::for_this_thread();
+    let system = system_slot_clock();
+    Arc::new(move || sim.next_slot_reading(system()))
+}
+
+/// Test builds only: simulated time for one test thread (each
+/// `#[tokio::test]` runs on a thread of its own). It is the real clock plus an
+/// offset. Every producer built on the thread reads its slots from it, as the
+/// producers of a real fleet share one NTP-synced wall clock, and a reading
+/// that has to move past the previous reading's slot moves the offset, that
+/// is, simulated time, forward. The wall clock the deferred-evidence check
+/// reads in tests ([`AttestedInner`]) includes the same offset, so a block
+/// sealed in a simulated slot is as old to it as it is in real time.
+#[cfg(test)]
+pub(crate) struct TestSimClock {
+    /// (offset ms added to the real clock, last slot reading in ms or 0).
+    state: Mutex<(u64, u64)>,
+}
+
+#[cfg(test)]
+impl TestSimClock {
+    /// The test thread's clock, created on first use.
+    pub(crate) fn for_this_thread() -> Arc<Self> {
+        thread_local! {
+            static SIM: Arc<TestSimClock> = Arc::new(TestSimClock {
+                state: Mutex::new((0, 0)),
+            });
+        }
+        SIM.with(Arc::clone)
+    }
+
+    /// Simulated now (ms), given the real clock `real_ms`.
+    pub(crate) fn now_ms(&self, real_ms: u64) -> u64 {
+        real_ms.saturating_add(self.state.lock().0)
+    }
+
+    /// A producer round's reading: simulated now, or one slot after the
+    /// previous reading if that is later (then simulated time moves to it).
+    /// The thread's first reading is one slot after now: a test genesis is
+    /// stamped with the real clock just before, so a first round in the same
+    /// real second would read the genesis's own slot and G9 would refuse it
+    /// (seen as "the selected parent ... is in slot 0, not before this slot
+    /// (0)" whenever the fixture ran inside one second).
+    fn next_slot_reading(&self, real_ms: u64) -> u64 {
+        let slot_ms = citrate_consensus::slots::SLOT_DURATION_SECS.saturating_mul(1_000);
+        let mut st = self.state.lock();
+        let now = real_ms.saturating_add(st.0);
+        let t = if st.1 == 0 {
+            now.saturating_add(slot_ms)
+        } else {
+            now.max(st.1.saturating_add(slot_ms))
+        };
+        st.0 = t.saturating_sub(real_ms);
+        st.1 = t;
+        t
+    }
+}
+
+/// Test builds only: the wall clock (seconds) a test thread's
+/// [`AttestedInner`] reads: the real clock plus the thread's
+/// [`TestSimClock`] offset. Fixtures that stamp deferred-evidence headers "now"
+/// read it, so the evidence is as old to the gate as the fixture means it to
+/// be however many producer rounds (each one moving simulated time a slot
+/// forward) the test runs, and however fast the host runs them.
+#[cfg(test)]
+pub(crate) fn test_wall_now_secs() -> u64 {
+    let real_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    TestSimClock::for_this_thread().now_ms(real_ms) / 1_000
+}
+
+/// Test builds only: [`AttestedInner`]'s link to the test thread's
+/// [`TestSimClock`] (its `Default` picks up the creating thread's clock).
+#[cfg(test)]
+struct TestSimLink(Arc<TestSimClock>);
+
+#[cfg(test)]
+impl Default for TestSimLink {
+    fn default() -> Self {
+        Self(TestSimClock::for_this_thread())
+    }
 }
 
 /// Generate a real ECVRF-P256-SHA256 proof for block production (WP-Z.1).
@@ -181,9 +289,30 @@ pub struct ProduceCatchupGate {
     /// Per-round scratch: the deferred-evidence watermark (heard-but-unadmitted signed
     /// blocks, see [`AttestedNetworkHead::observe_deferred`]). Wired with the F2 gate.
     deferred_ahead: Option<Arc<AtomicU64>>,
+    /// Per-round scratch: the tip height of the one branch a strict majority of the
+    /// producer set is extending with blocks this node cannot admit (0: no such branch;
+    /// see [`AttestedInner::majority_branch`]). Wired with the F2 gate.
+    deferred_majority_ahead: Option<Arc<AtomicU64>>,
+    /// Raised while the split guard holds production off (see
+    /// [`ProduceCatchupGate::deferred_for_round`]); read by the status surface.
+    split_guard: Arc<AtomicBool>,
+    /// Per-round scratch: the branch this node cannot admit that fork choice ranks
+    /// at least as high as this node's best tip (see [`AttestedInner::contender`]).
+    /// Wired with the F2 gate.
+    contender: Arc<Mutex<Option<Contender>>>,
+    /// CV-5: raised while production is held off because this node cannot
+    /// reconcile with a branch fork choice prefers; read by the status surface.
+    cannot_reconcile: Arc<AtomicBool>,
     /// Set by the sync driver once this node's initial sync after start has completed
     /// (`sync_recovery::initial_sync_complete`). `None` ⇒ no initial-sync condition.
     initial_sync_done: Option<Arc<AtomicBool>>,
+    /// How long deferred evidence alone may hold production off before the gate
+    /// judges whether this node can reconcile with it. Defaults to
+    /// [`DEFERRED_ONLY_REFUSE_MAX`]; shrunk by tests.
+    deferred_refuse_max: Duration,
+    /// CV-7b: set while the applicator holds the applied tip on a dead branch
+    /// (`CanonicalApplicator::dead_branch_handle`). `None` ⇒ not wired.
+    dead_branch: Option<Arc<AtomicBool>>,
 }
 
 /// F2: hysteresis + stall bookkeeping for [`ProduceCatchupGate`].
@@ -192,7 +321,7 @@ struct CatchupBehindState {
     refusing: bool,
     /// Applied tip observed at the previous evaluation; used to detect sync progress.
     last_applied_tip: u64,
-    /// When the applied tip last advanced (an advance resets the stall timer).
+    /// When the applied tip last moved (any move, up or down, resets the stall timer).
     last_progress: Instant,
     /// Set once a >`stall_alert_after` no-progress stall is detected; only the
     /// human-in-command override clears it (NEVER auto-resume after a stall).
@@ -202,6 +331,10 @@ struct CatchupBehindState {
     deferred_only_since: Option<Instant>,
     /// Last time the "sealing despite deferred evidence" warning was logged.
     deferred_only_warned: Option<Instant>,
+    /// Last time the split-guard alarm was logged.
+    split_guard_alarmed: Option<Instant>,
+    /// Last time the CV-5 cannot-reconcile alarm was logged (and a resync asked).
+    unreconciled_alarmed: Option<Instant>,
 }
 
 impl Default for CatchupBehindState {
@@ -213,6 +346,8 @@ impl Default for CatchupBehindState {
             stalled_latch: false,
             deferred_only_since: None,
             deferred_only_warned: None,
+            split_guard_alarmed: None,
+            unreconciled_alarmed: None,
         }
     }
 }
@@ -271,10 +406,60 @@ pub struct AttestedInner {
     /// proposer resets the time; a repeat or a lower height never does, so the same
     /// evidence counts for at most [`DEFERRED_EVIDENCE_TTL`]. Bounded.
     deferred: Mutex<HashMap<PublicKey, (u64, Instant)>>,
+    /// The same deferred blocks one by one, with the parents they name, so the gate
+    /// can tell proposers that extend ONE branch from proposers that each extend their
+    /// own: `block_hash -> DeferredBlock`. First-heard time only; a repeat never
+    /// renews it. Bounded to [`DEFERRED_BLOCK_CAP`] by evicting the oldest.
+    deferred_blocks: Mutex<HashMap<Hash, DeferredBlock>>,
+    /// CV-5: set by the producer gate when it cannot reconcile with a branch it
+    /// hears; taken by the sync tick, which then starts a fork-point search.
+    resync_requested: AtomicBool,
     /// Test clock offset (both the monotonic and the wall clock), so tests can age
     /// evidence without sleeping.
     #[cfg(test)]
     clock_skew: Mutex<Duration>,
+    /// Test builds: the creating test thread's simulated time (r1007 G9: the
+    /// producers' slot clock), added to the wall clock below.
+    #[cfg(test)]
+    sim: TestSimLink,
+    /// Test builds: a harness's own wall clock (ms since the UNIX epoch) in
+    /// place of the real one plus [`Self::sim`], for a harness whose producers
+    /// stamp its simulated time ([`AttestedNetworkHead::with_wall_clock_for_test`]).
+    #[cfg(test)]
+    wall_override: Mutex<Option<SlotClock>>,
+}
+
+/// One heard-but-unadmitted signed block in [`AttestedInner::deferred_blocks`].
+struct DeferredBlock {
+    /// Its selected parent and merge parents (bounded by [`DEFERRED_BLOCK_PARENTS`]).
+    parents: Vec<Hash>,
+    height: u64,
+    /// The blue score its producer claims.
+    blue_score: u64,
+    /// Its fork-choice key from its header (blue work, VRF output, hash: the
+    /// order fork choice ranks tips by, r1007 G8). Claimed, like the score:
+    /// the block cannot be validated without its ancestry.
+    key: ForkChoiceKey,
+    proposer: PublicKey,
+    first_heard: Instant,
+}
+
+/// Cap on [`AttestedInner::deferred_blocks`]. At one block per producer per slot this
+/// is minutes of a large producer set; only the last [`DEFERRED_EVIDENCE_TTL`] counts.
+const DEFERRED_BLOCK_CAP: usize = 2048;
+/// Parents kept per deferred block (the selected parent first).
+const DEFERRED_BLOCK_PARENTS: usize = 16;
+
+/// The branch a strict majority of the producer set is extending with blocks this
+/// node cannot admit ([`AttestedInner::majority_branch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MajorityBranch {
+    /// Highest block height heard on the branch.
+    pub height: u64,
+    /// Highest blue score claimed on the branch (signed by its producer).
+    pub blue_score: u64,
+    /// Distinct proposers with a fresh block on it (equivocators excluded).
+    pub proposers: usize,
 }
 
 /// Deferred ("heard but not admitted") evidence counts only while this fresh.
@@ -284,9 +469,11 @@ pub const DEFERRED_EVIDENCE_TTL: Duration = Duration::from_secs(30);
 /// cannot make the rest of the fleet stop producing. The quorum also scales with the
 /// producer set (see [`deferred_quorum_size`]).
 pub const DEFERRED_EVIDENCE_MIN_PROPOSERS: usize = 2;
-/// Longest a producer refuses on deferred evidence ALONE (no held, chained evidence
-/// says it is behind). Past it the producer seals anyway and warns, until that
-/// evidence stops being the only reason to refuse.
+/// How long deferred evidence holds production off before the gate judges whether
+/// this node can reconcile with it ([`ProduceCatchupGate::deferred_for_round`]).
+/// Past it the producer keeps refusing when it cannot reconcile with a branch fork
+/// choice prefers (CV-5: no "seal anyway"), and stops counting evidence that names
+/// no such branch.
 pub const DEFERRED_ONLY_REFUSE_MAX: Duration = Duration::from_secs(60);
 /// Spacing of the warning logged while sealing despite deferred evidence.
 pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
@@ -298,6 +485,14 @@ pub const DEFERRED_ONLY_WARN_EVERY: Duration = Duration::from_secs(60);
 pub fn deferred_quorum_size(known: usize) -> usize {
     let producers = known.saturating_add(1);
     DEFERRED_EVIDENCE_MIN_PROPOSERS.max(producers.checked_div(3).unwrap_or(0).saturating_add(1))
+}
+/// Distinct proposers that must agree on ONE branch this node cannot admit before the
+/// gate refuses past [`DEFERRED_ONLY_REFUSE_MAX`]: a strict majority of the producer
+/// set (`known` plus this node). Two disjoint branches can never both have one, and
+/// with 2 producers it is unreachable (the other alone is not a majority).
+pub fn deferred_majority_size(known: usize) -> usize {
+    let producers = known.saturating_add(1);
+    producers.checked_div(2).unwrap_or(0).saturating_add(1)
 }
 /// Deferred evidence counts only when its header timestamp is within the TTL plus this
 /// clock allowance of local wall time (and not more than this allowance in the future),
@@ -322,6 +517,13 @@ impl AttestedNetworkHead {
     /// sites through [`AttestedNetworkHead::observe`].
     pub fn handle(&self) -> Arc<AttestedInner> {
         self.inner.clone()
+    }
+
+    /// CV-5: whether the producer gate asked for a resync since the last call
+    /// (it cannot reconcile with a branch it hears). The sync tick takes it and
+    /// starts a fork-point search ([`crate::sync_rejoin::start_resync`]).
+    pub fn take_resync_request(&self) -> bool {
+        self.inner.resync_requested.swap(false, Ordering::SeqCst)
     }
 
     /// The current best attested-ahead height (monitor/telemetry surface). NOTE: this is
@@ -410,7 +612,55 @@ impl AttestedNetworkHead {
                 deferred.insert(proposer, (block.header.height, now));
             }
         }
+        drop(deferred);
+        self.record_deferred_block(block, now);
         true
+    }
+
+    /// Keep `block` (already checked by [`Self::observe_deferred`]) in the per-block
+    /// record the majority-branch check reads. A block already recorded keeps its
+    /// first-heard time. On overflow the oldest entry goes; a re-delivered evicted
+    /// block is bounded by the header-timestamp check, which rejects it once its
+    /// header is older than the TTL plus the clock allowance.
+    fn record_deferred_block(&self, block: &Block, now: Instant) {
+        let hash = block.header.block_hash;
+        let mut blocks = self.inner.deferred_blocks.lock();
+        if blocks.contains_key(&hash) {
+            return;
+        }
+        if blocks.len() >= DEFERRED_BLOCK_CAP {
+            if let Some(oldest) = blocks
+                .iter()
+                .min_by_key(|(_, b)| b.first_heard)
+                .map(|(h, _)| *h)
+            {
+                blocks.remove(&oldest);
+            }
+        }
+        let parents = std::iter::once(block.header.selected_parent_hash)
+            .chain(block.header.merge_parent_hashes.iter().copied())
+            .take(DEFERRED_BLOCK_PARENTS)
+            .collect();
+        blocks.insert(
+            hash,
+            DeferredBlock {
+                parents,
+                height: block.header.height,
+                blue_score: block.header.blue_score,
+                key: ForkChoiceKey::of_header(&block.header),
+                proposer: block.header.proposer_pubkey,
+                first_heard: now,
+            },
+        );
+    }
+
+    /// Test builds: judge deferred-evidence header timestamps against `clock`
+    /// (ms since the UNIX epoch), the same clock the harness's producers stamp
+    /// blocks from (r1007 G9: `BlockProducer::with_slot_clock`).
+    #[cfg(test)]
+    pub(crate) fn with_wall_clock_for_test(self, clock: SlotClock) -> Self {
+        *self.inner.wall_override.lock() = Some(clock);
+        self
     }
 
     /// Advance this record's clock (tests only): ages deferred evidence and moves the
@@ -462,14 +712,18 @@ impl AttestedInner {
 
     /// Wall-clock seconds since the epoch (plus the test offset under `cfg(test)`).
     fn wall_now_secs(&self) -> u64 {
-        let wall = chrono::Utc::now().timestamp().max(0) as u64;
         #[cfg(test)]
         {
-            wall.saturating_add(self.clock_skew.lock().as_secs())
+            let real_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+            let now_ms = match self.wall_override.lock().as_ref() {
+                Some(clock) => clock(),
+                None => self.sim.0.now_ms(real_ms),
+            };
+            (now_ms / 1_000).saturating_add(self.clock_skew.lock().as_secs())
         }
         #[cfg(not(test))]
         {
-            wall
+            chrono::Utc::now().timestamp().max(0) as u64
         }
     }
 
@@ -487,6 +741,226 @@ impl AttestedInner {
         let quorum = deferred_quorum_size(self.known_proposers.lock().len());
         heights.get(quorum.saturating_sub(1)).copied().unwrap_or(0)
     }
+
+    /// The branch a strict majority of the producer set ([`deferred_majority_size`])
+    /// is extending with blocks this node cannot admit, if there is one.
+    ///
+    /// Only blocks first heard within [`DEFERRED_EVIDENCE_TTL`] take part, and only
+    /// those that name no parent this node `holds`: a block that builds on this node's
+    /// own history (even as a merge parent) is no evidence that this node is behind,
+    /// and counting it would let one bridging key count on both sides of a split. Two
+    /// of the remaining blocks are on one branch when one is the other's SELECTED
+    /// parent, directly or through other such blocks: that is the chain fork choice
+    /// follows, and a producer can only build on a block it holds. Merge parents never
+    /// link branches. Producers that each extend their own branch never link, so a
+    /// total split has no majority branch. A proposer with fresh blocks on two
+    /// branches (it signed both, an equivocation) counts on neither.
+    pub(crate) fn majority_branch(
+        &self,
+        now: Instant,
+        holds: impl Fn(&Hash) -> bool,
+    ) -> Option<MajorityBranch> {
+        let needed = deferred_majority_size(self.known_proposers.lock().len());
+        self.deferred_branches(now, |b| b.parents.iter().any(&holds))
+            .into_iter()
+            .filter(|b| b.proposers >= needed)
+            .max_by_key(|b| (b.proposers, b.height))
+            .map(|b| MajorityBranch {
+                height: b.height,
+                blue_score: b.blue_score,
+                proposers: b.proposers,
+            })
+    }
+
+    /// CV-5: the branch this node cannot admit that fork choice would rank at
+    /// least as high as `own_top`, backed by more than a third of the producer set
+    /// ([`deferred_quorum_size`]), if there is one.
+    ///
+    /// `own_top` is this node's best tip by the same header measure the branch is
+    /// judged by: [`ForkChoiceKey`] (blue work, then VRF output, then hash), the
+    /// one order `select_tip`, the rebuild weight path (`outranks_tip`) and this
+    /// gate share, so they cannot disagree on a tie (r1007 07 finding 4). Both
+    /// sides are header values, because the branch cannot be scored without its
+    /// ancestry. Judging both sides by their best tip makes the verdict
+    /// antisymmetric: of two sides that hear each other, at most one finds the
+    /// other preferred.
+    ///
+    /// A branch backed by fewer producers never counts, so one key (or two of
+    /// seven) cannot hold the rest of the fleet off by signing blocks on parents
+    /// nobody serves.
+    ///
+    /// Unlike the majority check, a block that MERGES a block this node holds
+    /// still takes part: a branch that merges this node's blocks while extending
+    /// a selected chain this node lacks is the branch fork choice put this node's
+    /// work under, and the one this node fails to follow. Only a block whose
+    /// SELECTED parent this node holds (it extends this node's own chain) is left
+    /// out.
+    pub(crate) fn contender(
+        &self,
+        now: Instant,
+        holds: impl Fn(&Hash) -> bool,
+        own_top: ForkChoiceKey,
+    ) -> Option<Contender> {
+        let needed = deferred_quorum_size(self.known_proposers.lock().len());
+        self.deferred_branches(now, |b| b.parents.first().is_some_and(&holds))
+            .into_iter()
+            .filter(|b| b.proposers >= needed && b.top.blue_work >= own_top.blue_work)
+            .max_by_key(|b| b.top)
+            .map(|b| Contender {
+                height: b.height,
+                preferred: b.top > own_top,
+            })
+    }
+
+    /// Mark that the producer gate wants the sync driver to resync (a fork-point
+    /// search against a peer whose head this node does not hold). Read once by
+    /// [`AttestedNetworkHead::take_resync_request`].
+    fn request_resync(&self) {
+        self.resync_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// The branches fresh deferred blocks form (see [`Self::majority_branch`] for
+    /// what links). Blocks `excluded` says to leave out take no part.
+    fn deferred_branches(
+        &self,
+        now: Instant,
+        excluded: impl Fn(&DeferredBlock) -> bool,
+    ) -> Vec<DeferredBranch> {
+        let blocks = self.deferred_blocks.lock();
+        let fresh: HashMap<Hash, &DeferredBlock> = blocks
+            .iter()
+            .filter(|(_, b)| now.saturating_duration_since(b.first_heard) < DEFERRED_EVIDENCE_TTL)
+            .filter(|(_, b)| !excluded(b))
+            .map(|(h, b)| (*h, b))
+            .collect();
+        // Undirected selected-parent links between fresh blocks.
+        let mut links: HashMap<Hash, Vec<Hash>> = HashMap::new();
+        for (hash, b) in &fresh {
+            if let Some(parent) = b.parents.first() {
+                if fresh.contains_key(parent) {
+                    links.entry(*hash).or_default().push(*parent);
+                    links.entry(*parent).or_default().push(*hash);
+                }
+            }
+        }
+        // Connected components: proposers, highest height, highest claimed blue
+        // score, and the top block by ForkChoiceKey.
+        struct Component {
+            proposers: HashSet<PublicKey>,
+            height: u64,
+            blue: u64,
+            top: Option<ForkChoiceKey>,
+        }
+        let mut component_of: HashMap<Hash, usize> = HashMap::new();
+        let mut components: Vec<Component> = Vec::new();
+        for start in fresh.keys() {
+            if component_of.contains_key(start) {
+                continue;
+            }
+            let id = components.len();
+            let mut c = Component {
+                proposers: HashSet::new(),
+                height: 0,
+                blue: 0,
+                top: None,
+            };
+            let mut queue = std::collections::VecDeque::from([*start]);
+            component_of.insert(*start, id);
+            while let Some(h) = queue.pop_front() {
+                if let Some(b) = fresh.get(&h) {
+                    c.proposers.insert(b.proposer);
+                    c.height = c.height.max(b.height);
+                    c.blue = c.blue.max(b.blue_score);
+                    if c.top.is_none_or(|t| b.key > t) {
+                        c.top = Some(b.key);
+                    }
+                }
+                for next in links.get(&h).map(Vec::as_slice).unwrap_or(&[]) {
+                    if !component_of.contains_key(next) {
+                        component_of.insert(*next, id);
+                        queue.push_back(*next);
+                    }
+                }
+            }
+            components.push(c);
+        }
+        // r1007 G9 (#184): a component one of whose blocks another component
+        // names as a MERGE parent is in that branch's past, merged into it:
+        // with every producer sealing each slot, a slot's siblings that the
+        // next slot does not select are merged by it, and each is a component
+        // of its own (nobody's selected parent). Such an absorbed component
+        // is not a branch of its own, so its proposers are not "on two
+        // branches" for it. Merge parents still never LINK components, so a
+        // bridging key cannot join two sides, and two branches that never
+        // merge each other (an equivocator's) still count it on none.
+        let mut absorbed = vec![false; components.len()];
+        for (hash, b) in &fresh {
+            let Some(&from) = component_of.get(hash) else {
+                continue;
+            };
+            for m in b.parents.iter().skip(1) {
+                if let Some(&into) = component_of.get(m) {
+                    if into != from {
+                        if let Some(a) = absorbed.get_mut(into) {
+                            *a = true;
+                        }
+                    }
+                }
+            }
+        }
+        // A proposer on more than one branch counts on none.
+        let mut branches_of: HashMap<PublicKey, usize> = HashMap::new();
+        for (id, c) in components.iter().enumerate() {
+            if absorbed.get(id).copied().unwrap_or(false) {
+                continue;
+            }
+            for p in &c.proposers {
+                let n = branches_of.entry(*p).or_insert(0);
+                *n = n.saturating_add(1);
+            }
+        }
+        components
+            .iter()
+            .enumerate()
+            .filter(|(id, _)| !absorbed.get(*id).copied().unwrap_or(false))
+            .map(|(_, c)| c)
+            // Every component holds at least its start block, so it has a top.
+            .filter_map(|c| {
+                Some(DeferredBranch {
+                    height: c.height,
+                    blue_score: c.blue,
+                    top: c.top?,
+                    proposers: c
+                        .proposers
+                        .iter()
+                        .filter(|p| branches_of.get(*p).copied().unwrap_or(0) == 1)
+                        .count(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// One branch of fresh deferred blocks ([`AttestedInner::deferred_branches`]).
+#[derive(Debug, Clone, Copy)]
+struct DeferredBranch {
+    height: u64,
+    /// Highest blue score claimed on the branch.
+    blue_score: u64,
+    /// The branch's top block's key (the largest [`ForkChoiceKey`] on it).
+    top: ForkChoiceKey,
+    /// Distinct proposers with a fresh block on it (equivocators excluded).
+    proposers: usize,
+}
+
+/// A branch this node cannot admit that fork choice ranks at least as high as
+/// this node's own best tip ([`AttestedInner::contender`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contender {
+    /// Highest block height heard on the branch.
+    pub height: u64,
+    /// Fork choice strictly prefers the branch over this node's own best tip.
+    pub preferred: bool,
 }
 
 /// M1 (VERIFY-255-F2-M1): read-only snapshot of the F2 catch-up gate for the node's
@@ -509,6 +983,47 @@ pub struct CatchupGateStatus {
     pub applied_tip: u64,
     /// `attested_ahead - applied_tip` (0 when caught up).
     pub gap: u64,
+    /// True while the split guard holds production off: a majority of producers keep
+    /// extending a branch this node cannot admit, and sealing would fork it off.
+    pub split_guard: bool,
+    /// CV-5: true while production is held off because this node cannot reconcile
+    /// with a branch fork choice prefers (more than a third of the producers on it).
+    pub cannot_reconcile: bool,
+}
+
+/// What deferred evidence means for one round ([`ProduceCatchupGate::deferred_for_round`]).
+#[derive(Debug, Clone, Copy)]
+struct DeferredVerdict {
+    /// The deferred watermark the hysteresis compares against (0: ignored).
+    watermark: u64,
+    /// CV-5: refuse this round whatever the gap (see `deferred_for_round`).
+    cannot_reconcile: bool,
+}
+
+impl DeferredVerdict {
+    fn watermark(watermark: u64) -> Self {
+        Self {
+            watermark,
+            cannot_reconcile: false,
+        }
+    }
+
+    /// CV-5: this node cannot reconcile with a branch fork choice prefers, or a
+    /// majority of the producers extends a branch it cannot admit (the split
+    /// guard; see `deferred_for_round`). Refuse whatever the height gap: the
+    /// branches can be level while this node still cannot follow the preferred
+    /// one (under G9 they stay level: one height per slot on each).
+    fn refuse_if_unreconciled(&self, attested: u64, local_tip: u64) -> anyhow::Result<()> {
+        if !self.cannot_reconcile {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "CV-5: refusing to produce — more than a third of the producers extend a \
+             branch this node cannot admit and fork choice ranks it above this node's own \
+             tip (heard up to {attested}, applied tip {local_tip}). Sealing would grow a \
+             second branch; waiting for sync to admit it."
+        ))
+    }
 }
 
 impl ProduceCatchupGate {
@@ -528,7 +1043,20 @@ impl ProduceCatchupGate {
     ///
     /// Candidates at/below the finalized floor are pruned in passing (bounded record).
     /// No-op unless both the candidate record and the scratch watermark are wired.
+    #[cfg(test)]
     fn recompute_attested_ahead(&self, selected: Option<(Hash, u64)>, storage: &StorageManager) {
+        self.recompute_with_own_top(selected, None, storage);
+    }
+
+    /// [`Self::recompute_attested_ahead`] with this node's best tip by header measure
+    /// (the largest [`ForkChoiceKey`] of its DAG tips; `None`: the selected
+    /// head's). The contender check ([`AttestedInner::contender`]) compares against it.
+    fn recompute_with_own_top(
+        &self,
+        selected: Option<(Hash, u64)>,
+        own_top: Option<ForkChoiceKey>,
+        storage: &StorageManager,
+    ) {
         let (Some(scratch), Some(observed)) = (
             self.attested_ahead.as_ref(),
             self.attested_observed.as_ref(),
@@ -548,6 +1076,10 @@ impl ProduceCatchupGate {
                 if let Some(d) = self.deferred_ahead.as_ref() {
                     d.store(0, Ordering::SeqCst);
                 }
+                if let Some(m) = self.deferred_majority_ahead.as_ref() {
+                    m.store(0, Ordering::SeqCst);
+                }
+                *self.contender.lock() = None;
                 return;
             }
         };
@@ -558,6 +1090,57 @@ impl ProduceCatchupGate {
             let quorum = observed.deferred_quorum_height(observed.now_instant());
             let bounded = quorum.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
             d.store(
+                if bounded > sel_height { bounded } else { 0 },
+                Ordering::SeqCst,
+            );
+        }
+        // The same evidence when a majority of producers agree on one branch, clamped
+        // the same way. It counts only while that branch also claims more blue score
+        // than the selected head carries: fork choice ranks tips by blue score, not
+        // height, and on a merging DAG the heavier branch can be the shorter one. A
+        // branch fork choice would not prefer is not one this node is behind on. Both
+        // sides are header values (the branch cannot be recomputed without its
+        // ancestry), so the comparison is like for like.
+        // CV-5: a branch this node cannot admit that fork choice ranks at least as
+        // high as this node's own best tip. Header measure on both sides, as above.
+        {
+            let own = own_top.unwrap_or_else(|| {
+                storage
+                    .blocks
+                    .get_block(&sel_hash)
+                    .ok()
+                    .flatten()
+                    .map(|b| ForkChoiceKey::of_header(&b.header))
+                    // Unreadable: nothing outranks it (no contender).
+                    .unwrap_or(ForkChoiceKey {
+                        blue_work: u128::MAX,
+                        vrf_output: Hash::new([0xFF; 32]),
+                        hash: sel_hash,
+                    })
+            });
+            *self.contender.lock() = observed.contender(
+                observed.now_instant(),
+                |h| storage.blocks.has_block(h).unwrap_or(false),
+                own,
+            );
+        }
+        if let Some(m) = self.deferred_majority_ahead.as_ref() {
+            let sel_blue = storage
+                .blocks
+                .get_block(&sel_hash)
+                .ok()
+                .flatten()
+                .map(|b| b.header.blue_score)
+                .unwrap_or(u64::MAX);
+            let top = observed
+                .majority_branch(observed.now_instant(), |h| {
+                    storage.blocks.has_block(h).unwrap_or(false)
+                })
+                .filter(|b| b.blue_score > sel_blue)
+                .map(|b| b.height)
+                .unwrap_or(0);
+            let bounded = top.min(sel_height.saturating_add(DEFERRED_EVIDENCE_MAX_LEAD));
+            m.store(
                 if bounded > sel_height { bounded } else { 0 },
                 Ordering::SeqCst,
             );
@@ -696,6 +1279,8 @@ impl ProduceCatchupGate {
             attested_ahead: attested,
             applied_tip: st.last_applied_tip,
             gap: attested.saturating_sub(st.last_applied_tip),
+            split_guard: self.split_guard.load(Ordering::SeqCst),
+            cannot_reconcile: self.cannot_reconcile.load(Ordering::SeqCst),
         }
     }
 
@@ -710,17 +1295,59 @@ impl ProduceCatchupGate {
             .unwrap_or(0)
     }
 
-    /// The deferred watermark this round may use. While deferred evidence ALONE would
-    /// make the producer refuse, that is allowed for [`DEFERRED_ONLY_REFUSE_MAX`]; after
-    /// it the evidence is ignored (the producer seals) with a rate-limited warning, until
-    /// it stops being the only reason to refuse.
-    fn deferred_for_round(&self, st: &mut CatchupBehindState, local_tip: u64, held: u64) -> u64 {
-        let raw = self.deferred_watermark();
+    /// Ask the sync tick for a resync (no-op when the F2 record is not wired).
+    fn request_resync(&self) {
+        if let Some(o) = self.attested_observed.as_ref() {
+            o.request_resync();
+        }
+    }
+
+    /// The majority-branch watermark of the last recompute (0 when not wired or none).
+    fn majority_watermark(&self) -> u64 {
+        self.deferred_majority_ahead
+            .as_ref()
+            .map(|m| m.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// What deferred (heard-but-unadmitted) evidence means for this round.
+    ///
+    /// While deferred evidence is the only reason to refuse, or a branch this node
+    /// cannot admit ranks at least as high as its own best tip (a contender, see
+    /// [`AttestedInner::contender`]), the gate gives sync [`Self::deferred_refuse_max`]
+    /// to admit it, refusing on the deferred watermark as usual. After that:
+    ///   * if a strict majority of the producer set is extending ONE branch this
+    ///     node cannot admit (the majority watermark), the producer keeps refusing
+    ///     and raises the split guard (unchanged from the base);
+    ///   * otherwise, if fork choice strictly prefers a contender backed by more
+    ///     than a third of the producer set over this node's own best tip, this node
+    ///     cannot reconcile (CV-5): it stops sealing until it admits that branch or
+    ///     the branch goes quiet, raises `cannot_reconcile` (metric), logs a
+    ///     rate-limited ERROR and asks the sync tick for a resync. Sealing would only
+    ///     grow a second branch next to the one fork choice prefers. There is no
+    ///     "seal anyway" past the window any more;
+    ///   * otherwise the evidence names no branch fork choice would prefer over this
+    ///     node's own tip (a branch lighter than ours, single-proposer or unlinked
+    ///     blocks, a total split into singletons): this node is not behind on any
+    ///     branch, so the evidence does not hold production off. A branch backed by
+    ///     a third of the producers or fewer never stops the rest, so one key cannot
+    ///     halt the fleet by signing blocks on parents nobody serves.
+    fn deferred_for_round(
+        &self,
+        st: &mut CatchupBehindState,
+        local_tip: u64,
+        held: u64,
+    ) -> DeferredVerdict {
+        let majority = self.majority_watermark();
+        let raw = self.deferred_watermark().max(majority);
+        let contender = *self.contender.lock();
         let deferred_only = raw.saturating_sub(local_tip) > CATCHUP_RESUME_GAP
             && held.saturating_sub(local_tip) <= CATCHUP_RESUME_GAP;
-        if !deferred_only {
+        if !deferred_only && contender.is_none() {
             st.deferred_only_since = None;
-            return raw;
+            self.split_guard.store(false, Ordering::SeqCst);
+            self.cannot_reconcile.store(false, Ordering::SeqCst);
+            return DeferredVerdict::watermark(raw);
         }
         let now = self
             .attested_observed
@@ -728,22 +1355,79 @@ impl ProduceCatchupGate {
             .map(|o| o.now_instant())
             .unwrap_or_else(Instant::now);
         let since = *st.deferred_only_since.get_or_insert(now);
-        if now.saturating_duration_since(since) < DEFERRED_ONLY_REFUSE_MAX {
-            return raw;
+        if now.saturating_duration_since(since) < self.deferred_refuse_max {
+            return DeferredVerdict::watermark(raw);
         }
-        let due = st
-            .deferred_only_warned
-            .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
-        if due {
-            st.deferred_only_warned = Some(now);
-            warn!(
-                "F2/#126: signed blocks this node cannot admit have said it is behind \
-                 (evidence at {raw}, applied tip {local_tip}) for over {}s with nothing it \
-                 holds agreeing; sealing anyway. Check this node's peers and sync.",
-                DEFERRED_ONLY_REFUSE_MAX.as_secs()
-            );
+        if majority.saturating_sub(local_tip) > CATCHUP_RESUME_GAP {
+            self.split_guard.store(true, Ordering::SeqCst);
+            self.cannot_reconcile.store(false, Ordering::SeqCst);
+            let due = st
+                .split_guard_alarmed
+                .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+            if due {
+                st.split_guard_alarmed = Some(now);
+                self.request_resync();
+                error!(
+                    "F2/#126 SPLIT GUARD: a majority of producers keep extending a branch this \
+                     node cannot admit (evidence at {majority}, applied tip {local_tip}) for over \
+                     {}s. NOT sealing on this node's own tip: that would fork it off the network. \
+                     Sync keeps trying; production resumes by itself once this node admits that \
+                     branch or it goes quiet. Check this node's admission errors, peers and sync.",
+                    self.deferred_refuse_max.as_secs()
+                );
+            }
+            // r1007 G9 (#184): refuse whatever the height gap, as for a
+            // contender below. Under G9 a chain gains at most one height per
+            // slot, so a majority branch can stay within the refuse gap of this
+            // node's own tip while this node keeps sealing next to it.
+            return DeferredVerdict {
+                watermark: majority,
+                cannot_reconcile: true,
+            };
         }
-        0
+        self.split_guard.store(false, Ordering::SeqCst);
+        if let Some(c) = contender.filter(|c| c.preferred) {
+            self.cannot_reconcile.store(true, Ordering::SeqCst);
+            let due = st
+                .unreconciled_alarmed
+                .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+            if due {
+                st.unreconciled_alarmed = Some(now);
+                self.request_resync();
+                error!(
+                    "CV-5 CANNOT RECONCILE: more than a third of the producers extend a branch \
+                     this node cannot admit (heard up to height {}, applied tip {local_tip}) and \
+                     fork choice ranks it above this node's own tip, for over {}s. NOT sealing: \
+                     that would grow a second branch. Resync requested; production resumes once \
+                     this node admits that branch or it goes quiet. Check this node's admission \
+                     errors, peers and sync.",
+                    c.height,
+                    self.deferred_refuse_max.as_secs()
+                );
+            }
+            return DeferredVerdict {
+                watermark: raw.max(c.height),
+                cannot_reconcile: true,
+            };
+        }
+        self.cannot_reconcile.store(false, Ordering::SeqCst);
+        if deferred_only {
+            let due = st
+                .deferred_only_warned
+                .is_none_or(|t| now.saturating_duration_since(t) >= DEFERRED_ONLY_WARN_EVERY);
+            if due {
+                st.deferred_only_warned = Some(now);
+                warn!(
+                    "F2/#126: signed blocks this node cannot admit have said it is behind \
+                     (evidence at {raw}, applied tip {local_tip}) for over {}s, but they name no \
+                     branch that fork choice ranks above this node's own tip with more than a \
+                     third of the producers behind it; not holding production on them. Check \
+                     this node's peers and sync.",
+                    self.deferred_refuse_max.as_secs()
+                );
+            }
+        }
+        DeferredVerdict::watermark(0)
     }
 
     /// F2: decide whether the node is too far BEHIND its peers to seal this slot.
@@ -761,7 +1445,8 @@ impl ProduceCatchupGate {
         // kind can latch the stall alert (see `deferred_watermark`).
         let held = attested.load(Ordering::SeqCst);
         let mut st = self.behind.lock();
-        let attested = held.max(self.deferred_for_round(&mut st, local_tip, held));
+        let verdict = self.deferred_for_round(&mut st, local_tip, held);
+        let attested = held.max(verdict.watermark);
         let gap = attested.saturating_sub(local_tip);
         let held_behind = held.saturating_sub(local_tip) > CATCHUP_RESUME_GAP;
 
@@ -786,8 +1471,9 @@ impl ProduceCatchupGate {
             return Ok(());
         }
 
-        // Sync progress (the applied tip advanced) resets the stall timer.
-        if local_tip > st.last_applied_tip {
+        // Sync progress (ANY move of the applied tip, a reorg below it too) resets the
+        // stall timer; see f2_a_reorg_to_a_lower_applied_tip_is_progress_not_a_stall.
+        if local_tip != st.last_applied_tip {
             st.last_applied_tip = local_tip;
             st.last_progress = Instant::now();
         }
@@ -803,6 +1489,8 @@ impl ProduceCatchupGate {
                 self.stall_alert_after.as_secs()
             ));
         }
+
+        verdict.refuse_if_unreconciled(attested, local_tip)?; // CV-5
 
         // Hysteresis on the gap to the best attested-ahead head.
         if st.refusing {
@@ -976,6 +1664,12 @@ pub struct BlockProducer {
     /// the sealed block as the new applied tip before releasing it. `None` disables the
     /// interlock (pre-reroll / execute-on-receive off), preserving legacy behavior.
     applied_tip_lock: Option<Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>>,
+    /// RC-6: the applicator whose advance lock is `applied_tip_lock`, wired by
+    /// [`Self::with_applicator`]. Under that lock, before building, the producer
+    /// advances the applied tip to fork choice's head itself
+    /// (`CanonicalApplicator::advance_to_head_locked`), so it never builds on, or
+    /// skips against, a head the drain task has not applied yet.
+    applicator: Option<Arc<crate::canonical_apply::CanonicalApplicator>>,
 
     /// #126 (producer catch-up gate): when set, the producer refuses to seal while a
     /// spine rebuild is in progress or before the DAG has hydrated after a restart.
@@ -985,9 +1679,21 @@ pub struct BlockProducer {
     /// Producer-side circuit breaker for rounds that panic on the same
     /// mempool transaction (see [`PanicBreaker`]).
     panic_breaker: Mutex<PanicBreaker>,
+    /// r1007 S3-3b (spec 06 §3.7): the BLOCKHASH window of the last block
+    /// this producer sealed, so the next seal reads one new header.
+    recent_chain: crate::mergeset::RecentChain,
 
     /// ECVRF prover for the block VRF. Always [`real_vrf_prover`] outside tests.
     vrf_prover: VrfProver,
+
+    /// r1007 G9: the wall clock the round's slot is read from. Always
+    /// [`system_slot_clock`] outside tests.
+    slot_clock: SlotClock,
+
+    /// r1007 G10: the last slot this producer signed a block for (0 = none;
+    /// slot 0 is genesis's). It never signs two blocks for one slot: that is
+    /// equivocation, colored red and recorded as slashing evidence.
+    last_signed_slot: AtomicU64,
 }
 
 /// PBA-L1a-001: outcome of one supervised production round.
@@ -1294,9 +2000,13 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
+            slot_clock: default_slot_clock(),
+            last_signed_slot: AtomicU64::new(0),
         }
     }
 
@@ -1361,9 +2071,13 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
+            slot_clock: default_slot_clock(),
+            last_signed_slot: AtomicU64::new(0),
         }
     }
 
@@ -1427,9 +2141,13 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
+            slot_clock: default_slot_clock(),
+            last_signed_slot: AtomicU64::new(0),
         }
     }
 
@@ -1572,9 +2290,13 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
+            slot_clock: default_slot_clock(),
+            last_signed_slot: AtomicU64::new(0),
         }
     }
 
@@ -1608,14 +2330,25 @@ impl BlockProducer {
         dag_store: Arc<DagStore>,
         ghostdag: Arc<GhostDag>,
     ) -> Self {
-        // Load existing chain data into DAG so we continue from last tip
+        // Load existing chain data into DAG so we continue from last tip.
+        //
+        // From the DAG pruning floor, not from genesis: below it the DAG store
+        // dropped the blocks on purpose (genesis included). Re-offering them put
+        // them back on a permissive store and, on the strict production store,
+        // failed once per pruned height (no parent to verify the VRF against),
+        // with a warn line each and a fallback-scored fork-choice entry for a
+        // block the DAG no longer holds.
         let latest_height = storage.blocks.get_latest_height().unwrap_or(0);
+        let floor = crate::dag_prune::pruned_below(&dag_store).await;
         if latest_height > 0 {
             info!(
-                "Loading {} blocks from storage into DAG...",
-                latest_height.saturating_add(1)
+                "Loading {} blocks from storage into DAG (heights {}..={}, DAG pruned below {})...",
+                latest_height.saturating_sub(floor).saturating_add(1),
+                floor,
+                latest_height,
+                floor
             );
-            for height in 0..=latest_height {
+            for height in floor..=latest_height {
                 if let Ok(Some(block_hash)) = storage.blocks.get_block_by_height(height) {
                     if let Ok(Some(block)) = storage.blocks.get_block(&block_hash) {
                         // SYNC-S1 D2.3 (R3): a discarded DAG write here left the
@@ -1727,9 +2460,13 @@ impl BlockProducer {
             registry_sync: None,
             emit_v2_headers: false,
             applied_tip_lock: None,
+            applicator: None,
             produce_gate: None,
             panic_breaker: Mutex::new(PanicBreaker::default()),
+            recent_chain: crate::mergeset::RecentChain::default(),
             vrf_prover: real_vrf_prover(),
+            slot_clock: default_slot_clock(),
+            last_signed_slot: AtomicU64::new(0),
         }
     }
 
@@ -1800,6 +2537,15 @@ impl BlockProducer {
         self
     }
 
+    /// Test builds: read the round's slot from `clock` (ms since the UNIX
+    /// epoch), e.g. a harness's simulated time. Production keeps
+    /// [`system_slot_clock`].
+    #[cfg(test)]
+    pub(crate) fn with_slot_clock(mut self, clock: SlotClock) -> Self {
+        self.slot_clock = clock;
+        self
+    }
+
     /// EXECUTE-ON-RECEIVE: seal version-2 headers that commit the coinbase (reroll flag).
     pub fn with_v2_headers(mut self, enabled: bool) -> Self {
         self.emit_v2_headers = enabled;
@@ -1809,11 +2555,28 @@ impl BlockProducer {
     /// EXECUTE-ON-RECEIVE (step 2): share the applied-tip lock with the receive-path
     /// applier. Held across produce→persist so production and reception never race the
     /// executor's snapshot/restore; the sealed block becomes the new applied tip.
+    /// Test-only since RC-6: the node wires the producer with
+    /// [`Self::with_applicator`] (below), which shares the same lock.
+    #[cfg(test)]
     pub fn with_applied_tip_lock(
         mut self,
         lock: Arc<tokio::sync::Mutex<crate::canonical_apply::AppliedState>>,
     ) -> Self {
         self.applied_tip_lock = Some(lock);
+        self
+    }
+
+    /// The node's wiring: share `app`'s advance lock (as [`Self::with_applied_tip_lock`])
+    /// and let the producer advance the applied tip to fork choice's head under that
+    /// lock before each build (RC-6). The drain task applies received blocks off the
+    /// P2P loop, so the applied tip can lag the head by one drain pass; a producer that
+    /// built in that gap sealed a sibling of the head or skipped its slot.
+    pub fn with_applicator(
+        mut self,
+        app: Arc<crate::canonical_apply::CanonicalApplicator>,
+    ) -> Self {
+        self.applied_tip_lock = Some(app.advance_lock());
+        self.applicator = Some(app);
         self
     }
 
@@ -1838,7 +2601,13 @@ impl BlockProducer {
             // candidate below finality is never treated as "ahead".
             finalized_floor: Some(app.finalized_height_handle()),
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
+            contender: Arc::new(Mutex::new(None)),
+            cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
+            dead_branch: Some(app.dead_branch_handle()),
         });
         self
     }
@@ -1859,6 +2628,7 @@ impl BlockProducer {
             gate.attested_ahead = Some(Arc::new(AtomicU64::new(0)));
             gate.attested_observed = Some(attested.handle());
             gate.deferred_ahead = Some(Arc::new(AtomicU64::new(0)));
+            gate.deferred_majority_ahead = Some(Arc::new(AtomicU64::new(0)));
         }
         self
     }
@@ -1890,6 +2660,17 @@ impl BlockProducer {
     pub fn with_catchup_stall_alert_after(mut self, after: Duration) -> Self {
         if let Some(gate) = self.produce_gate.as_mut() {
             gate.stall_alert_after = after;
+        }
+        self
+    }
+
+    /// Shrink the deferred-evidence refuse window (tests only; production uses
+    /// [`DEFERRED_ONLY_REFUSE_MAX`]). The split-heal harness runs in real time, so
+    /// the 60 s window would never elapse inside a run.
+    #[allow(dead_code)]
+    pub fn with_deferred_refuse_window(mut self, window: Duration) -> Self {
+        if let Some(gate) = self.produce_gate.as_mut() {
+            gate.deferred_refuse_max = window;
         }
         self
     }
@@ -1956,7 +2737,26 @@ impl BlockProducer {
         // #310: Skip, not tokio's default Burst — after a round that waited
         // out a long catch-up, resume at the configured block time instead of
         // sealing one block per missed tick back to back.
-        let mut interval = crate::timing::production_interval(self.target_block_time);
+        // r1007 G9 (#184): seal only at slot boundaries. Every producer ticks
+        // on the same wall-clock grid, anchored at the genesis timestamp (the
+        // slot origin), so a round starts as its slot starts. Wait for the
+        // origin: it is known once genesis is in the DAG store.
+        let origin = loop {
+            if let Some(o) = self.dag_store.slot_origin() {
+                break o;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                citrate_consensus::slots::SLOT_DURATION_SECS,
+            ))
+            .await;
+        };
+        let mut interval = crate::timing::production_interval(self.target_block_time, origin);
+        info!(
+            "producer: sealing on the slot grid (slot {} s, every {} s, origin {})",
+            citrate_consensus::slots::SLOT_DURATION_SECS,
+            crate::timing::production_period_secs(self.target_block_time),
+            origin
+        );
         let mut block_count = 0u64;
 
         loop {
@@ -1973,11 +2773,12 @@ impl BlockProducer {
             match self.guard_round(supervised_round(self.clone())).await {
                 RoundOutcome::Produced(block_hash) => {
                     block_count = block_count.saturating_add(1);
+                    // Height and tx count come from the stored block (source:
+                    // `storage.blocks.get_block`, written by the round).
+                    let stored = self.storage.blocks.get_block(&block_hash).ok().flatten();
                     info!(
-                        "Produced block #{} hash={} txs={}",
-                        block_count,
-                        hex::encode(&block_hash.as_bytes()[..8]),
-                        0, // We'll get tx count from block
+                        "{}",
+                        produced_block_line(&block_hash, stored.as_ref(), block_count)
                     );
                 }
                 RoundOutcome::Failed(e) => {
@@ -2064,7 +2865,23 @@ impl BlockProducer {
                         .map(|b| (hash, b.header.height)),
                     Err(_) => None,
                 };
-                gate.recompute_attested_ahead(selected, &self.storage);
+                // CV-5: this node's best tip by header measure, the yardstick the
+                // contender check holds a branch it cannot admit against.
+                let own_top = self
+                    .ghostdag
+                    .get_tips()
+                    .await
+                    .into_iter()
+                    .filter_map(|h| {
+                        self.storage
+                            .blocks
+                            .get_block(&h)
+                            .ok()
+                            .flatten()
+                            .map(|b| ForkChoiceKey::of_header(&b.header))
+                    })
+                    .max();
+                gate.recompute_with_own_top(selected, own_top, &self.storage);
             }
         }
 
@@ -2078,6 +2895,12 @@ impl BlockProducer {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        // RC-6: build on fork choice's head, not on whatever the drain task last
+        // applied. Bounded (`PRODUCER_ADVANCE_MAX_HEIGHTS`); a node further behind is
+        // refused below (F2) and caught up by the drain.
+        if let (Some(app), Some(guard)) = (&self.applicator, applied_guard.as_mut()) {
+            app.advance_to_head_locked(guard).await;
+        }
 
         // Get current tips for parent selection
         let tips = self.dag_store.get_tips().await;
@@ -2147,6 +2970,18 @@ impl BlockProducer {
                      the rebuild will converge the applied tip."
                 ));
             }
+            // CV-7b (H6): never seal on a branch fork choice has left and this
+            // node cannot switch from; the cold resync recovers it.
+            if gate
+                .dead_branch
+                .as_ref()
+                .is_some_and(|d| d.load(Ordering::SeqCst))
+            {
+                return Err(anyhow::anyhow!(
+                    "CV-7b: refusing to produce — the applied tip is on a dead branch \
+                     (dead-branch marker set; see syncState). Skipping this slot."
+                ));
+            }
             if let Some(hydrated) = &gate.dag_hydrated {
                 if !hydrated.load(Ordering::SeqCst) {
                     return Err(anyhow::anyhow!(
@@ -2198,6 +3033,12 @@ impl BlockProducer {
                     attested_now,
                     local_tip,
                 );
+                citrate_api::metrics_server::update_producer_split_guard(
+                    gate.split_guard.load(Ordering::SeqCst),
+                );
+                citrate_api::metrics_server::update_producer_cannot_reconcile(
+                    gate.cannot_reconcile.load(Ordering::SeqCst),
+                );
             }
             gate_result?;
         }
@@ -2219,32 +3060,10 @@ impl BlockProducer {
             }
         }
 
-        // PIL-13: removed the `temp_block` builder + `calculate_blue_set`
-        // call here. The temp_block was only used to feed
-        // calculate_blue_set, which (because BlueSet.blocks is the
-        // cumulative O(N) blue ancestry) walked back O(N) ancestors on cold
-        // cache and OOM'd the box. We derive blue_score from the parent's
-        // header instead.
-        //
-        // PIL-13: derive blue_score from the parent's header instead of
-        // calling calculate_blue_set on a fresh-from-thin-air block.
-        //
-        // Why this is safe for testnet-beta (single-producer pilot):
-        //   * The new block's blue_score is parent.blue_score + 1 + |blue merge
-        //     contributions|.
-        //   * For single-producer chains the merge_parents set is either
-        //     empty or shallow (this producer is the only source of blocks),
-        //     so the +1 approximation matches what the full GhostDAG
-        //     algorithm would yield to within one or two units.
-        //   * The full BlueSet is only an input to calculate_blue_work, and
-        //     that function (see calculate_blue_work below) only reads
-        //     blue_score — the `_blue_set` parameter is unused.
-        //   * select_tip reads only `relation.blue_set.score`, not `.blocks`.
-        //
-        // When multi-validator ships post-pilot, this path needs the full
-        // calculate_blue_set call back, with the BlueSet persistence rework
-        // also in place so it doesn't re-trigger PIL-13. Tracked as a
-        // follow-up below.
+        // PIL-13 / r1007 S3-1: the header's blue_score / blue_work are computed
+        // below by `GhostDag::compute_ghostdag`, which reads headers and the
+        // persisted GHOSTDAG records of the window only (no cumulative blue set,
+        // so nothing O(chain) is materialised), for a block that is not stored.
         //
         // Read parent's height + VRF + blue_score in one storage hit.
         //
@@ -2267,7 +3086,7 @@ impl BlockProducer {
         // Failing loudly is strictly better: a missing selected parent means this
         // node's view is behind, so the correct behaviour is to skip this round
         // and let the sync path fetch the block, not to mint an invalid one.
-        let (last_height, parent_vrf_output, parent_blue_score, parent_blue_work, parent_ts) =
+        let (last_height, parent_vrf_output, parent_blue_score, _parent_blue_work, parent_ts) =
             if selected_parent != Hash::default() {
                 let parent = self
                     .storage
@@ -2300,64 +3119,119 @@ impl BlockProducer {
                 (0, Hash::default(), 0, 0, None)
             };
 
-        // BLUE SCORE — `parent_blue_score + 1`, deliberately.
-        //
-        // REGRESSION HISTORY (2026-07-27): a previous "fix" replaced this with a
-        // real `ghostdag.calculate_blue_set(&candidate)` call whenever
-        // `merge_parents` was non-empty, on the reasoning that GHOSTDAG blue score
-        // is the parent's score plus the blue blocks in the mergeset, so `+1` is an
-        // approximation. The reasoning is right. The implementation was not, and it
-        // walled off the chain.
-        //
-        // `calculate_blue_set` resolves a block through the DAG STORE. The candidate
-        // here has not been stored — it does not exist yet, that is the point of
-        // producing it — so the calculation returned the ancestry's score WITHOUT
-        // counting the new block itself. Live result on 40204: block 4028 was
-        // produced with blue_score 4028, identical to its parent, while
-        // `validate_block_consistency` requires the band `[sp+1, sp+1+|merges|]` =
-        // `[4029, 4030]`. Every follower rejected it:
-        //
-        //     Rejected inconsistent synced block 55f933a0 @ 4028: consistency:
-        //     Header blue_score 4028 outside feasible range [4029, 4030]
-        //
-        // Blocks carrying merge parents are rare on this fleet, so exactly one bad
-        // block was enough — every node stalled at 4027 and retried forever while
-        // the producer ran on alone to 19,000+. A silent, unrecoverable partition.
-        //
-        // `parent_blue_score + 1` is ALWAYS inside the feasible band (it is the
-        // band's minimum), so it can never be rejected. It under-counts a non-empty
-        // mergeset, which is a known, bounded, DOCUMENTED approximation —
-        // `ghostdag.rs::validate_block_consistency` says so explicitly: "the
-        // producer itself currently writes the parent+1 approximation ... exact
-        // k-cluster equality is deliberately deferred to the BlueSet-persistence
-        // rework tracked since PIL-13".
-        //
-        // Making this exact requires that rework — computing the mergeset for a
-        // block that is not yet in the store — not a call into a function whose
-        // contract assumes it is. Until then, in-band and correct beats exact and
-        // rejected.
-        let mut blue_set = citrate_consensus::types::BlueSet::new();
+        // r1007 G9 (#184): this block's slot and timestamp. The round runs at a
+        // slot boundary (`start`), so the block is stamped with the first second
+        // of the current slot, clamped to the parent-relative bound
+        // (PBA-L1b-003). Its slot must exceed every parent's: a selected parent
+        // in this slot or later means this producer already has, or received,
+        // this slot's block on that chain, so it skips; a merge parent in this
+        // slot or later (a concurrent producer's block that arrived early) is
+        // left for the next block to merge.
+        let (slot, block_timestamp) = self.round_slot(parent_ts)?;
+        if selected_parent != Hash::default() {
+            let sp_ts = parent_ts.unwrap_or(0);
+            let sp_slot = self.dag_store.slot_of(sp_ts).unwrap_or(0);
+            if parent_ts.is_some() && sp_slot >= slot {
+                return Err(anyhow::anyhow!(
+                    "G9: the selected parent {selected_parent} is in slot {sp_slot}, not before \
+                     this slot ({slot}); skipping until the next slot"
+                ));
+            }
+        }
+        let mut merge_parents = merge_parents;
+        {
+            let mut kept = Vec::with_capacity(merge_parents.len());
+            for m in merge_parents {
+                let m_slot = match self.dag_store.get_header(&m).await {
+                    Ok(h) => self.dag_store.slot_of(h.timestamp),
+                    Err(_) => None,
+                };
+                match m_slot {
+                    Some(ms) if ms < slot => kept.push(m),
+                    other => debug!(
+                        "producer: not merging {m} (slot {other:?}) into a block of slot {slot}"
+                    ),
+                }
+            }
+            merge_parents = kept;
+        }
+        // G10: never sign two blocks for one slot.
+        let last = self.last_signed_slot.load(Ordering::SeqCst);
+        if last >= slot {
+            return Err(anyhow::anyhow!(
+                "G10: already signed a block for slot {last}; refusing a second block for slot \
+                 {slot} (that is equivocation)"
+            ));
+        }
+
+        // BLUE SCORE. History: until r1007 this was `parent_blue_score + 1`,
+        // deliberately, because exact GHOSTDAG needed the mergeset of a block not
+        // yet in the store and an earlier attempt through `calculate_blue_set`
+        // under-counted it (block 4028 on 40204, 2026-07-27, rejected by every
+        // follower). `compute_ghostdag` takes the parents explicitly, so the
+        // exact value is computable for an unstored block, and admission now
+        // requires it (G7).
         // A block at u64::MAX height/score cannot be extended: refuse to build.
         let next_height = last_height
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("parent height {last_height} cannot be extended"))?;
-        let blue_score = parent_blue_score.checked_add(1).ok_or_else(|| {
-            anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
-        })?;
-        blue_set.score = blue_score;
-        blue_set.work = parent_blue_work; // base; calculate_blue_work below recomputes
+        // r1007 G7 (S3-1, ADR CV-3): the header commits the exact GHOSTDAG
+        // blue_score and blue_work of this block's parents, computed from
+        // headers the way every receiver recomputes them at admission. The
+        // former `parent + 1` (a lower bound inside the old band) is gone with
+        // the band: there is one unit, and a merge block's score counts its
+        // blue mergeset.
+        let (blue_score, blue_work, ghostdag_data) = if selected_parent != Hash::default() {
+            let data = self
+                .ghostdag
+                .compute_ghostdag(selected_parent, &merge_parents, next_height)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "GHOSTDAG record of the block on {selected_parent} unavailable: {e}. \
+                         Refusing to produce."
+                    )
+                })?;
+            (data.blue_score, data.blue_work, Some(data))
+        } else {
+            let score = parent_blue_score.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("parent blue score {parent_blue_score} cannot be extended")
+            })?;
+            (
+                score,
+                citrate_consensus::types::blue_work_for_score(score),
+                None,
+            )
+        };
+        // r1007 G11 (spec 06 §2): the committed pruning point, derived by the
+        // same function admission checks it with (SP's value between
+        // boundaries; the chain block at pp_h(B) when the boundary moves).
+        let pruning_point = if selected_parent != Hash::default() {
+            self.ghostdag
+                .expected_pruning_point(&selected_parent, next_height)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "pruning point of the block on {selected_parent} unavailable: {e}. \
+                         Refusing to produce."
+                    )
+                })?
+        } else {
+            Hash::default()
+        };
 
         // Prove the block VRF FIRST, before selecting transactions or opening an executor
         // round. If proving fails this slot is skipped: no block is built, stored or
         // broadcast, and the mempool and executor are untouched. Never substitute a
         // stand-in proof (peers reject it). Producer-side only; validity is unchanged.
         let proposer_pubkey = PublicKey::new(self.signing_key.verifying_key().to_bytes());
+        // r1007 G9: the alpha binds the slot, not the height.
         let vrf_reveal = match generate_block_vrf(
             &self.vrf_prover,
             &self.signing_key,
             &proposer_pubkey,
             &parent_vrf_output,
-            next_height,
+            slot,
         ) {
             Ok(proof) => proof,
             Err(e) => {
@@ -2370,16 +3244,99 @@ impl BlockProducer {
             }
         };
 
+        // Every executor mutation below is rolled back if the round ends
+        // before its state is persisted (error or panic), so a failed round
+        // never leaves the executor ahead of the applied tip.
+        let round_state = self.executor.begin_production_round();
+
+        // Create block header with GhostDAG consensus data.
+        // EXECUTE-ON-RECEIVE: v2 headers commit the coinbase (reroll flag); v1 keep legacy hashing.
+        let mut header = BlockHeader {
+            version: if self.emit_v2_headers { 2 } else { 1 },
+            block_hash: Hash::default(), // Will be computed
+            selected_parent_hash: selected_parent,
+            merge_parent_hashes: merge_parents,
+            // r1007 G9: the first second of this block's slot, already clamped
+            // to the PBA-L1b-003 bounds by `round_slot` (never before the
+            // selected parent, never past the parent-relative bound).
+            timestamp: block_timestamp,
+            height: next_height,
+            blue_score,
+            blue_work,
+            pruning_point,
+            proposer_pubkey,
+            vrf_reveal,
+            // The §R' import rule requires the canonical base fee; the former inline
+            // "EIP-1559" computation used constant inputs (parent gas used = 0) and
+            // always evaluated to exactly this value.
+            base_fee_per_gas: citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
+            // r1007 S3-3b: the cumulative gas of the accepted mergeset (set
+            // below) under the per-accepting-block budget (spec 06 §3.6).
+            gas_used: 0,
+            gas_limit: citrate_consensus::acceptance::ACCEPT_GAS_LIMIT,
+            // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
+            // Hashed only for v2 (see compute_hash); harmless for v1.
+            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0u8; 20]),
+        };
+
+        // VALIDATOR-S1 §R': base fee is a REROLL CONSTANT under v2. The dynamic
+        // EIP-1559 block above already evaluates to exactly this (it never loads
+        // parent_gas_used), but pin it explicitly so the committed value is
+        // unambiguous and the importer's base-fee check (`settle_block_rewards`) is
+        // exact. See core/execution/src/block_rewards.rs::CANONICAL_BASE_FEE_PER_GAS.
+        if self.emit_v2_headers {
+            header.base_fee_per_gas = citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS;
+        }
+
+        // r1007 S3-3b (ADR CV-4a, spec 06 §3.1/§3.9): this block ACCEPTS its
+        // mergeset. Its header commits the result of executing Mergeset(B)
+        // (SP first, then Mergeset*(B) ascending by key) on post(SP), which is
+        // the state this node holds (MP-S1: SP == applied tip). Its OWN
+        // transactions are not executed now: the chain block that accepts B
+        // runs them. `execute_mergeset` sets the EVM block context (NUMBER /
+        // TIMESTAMP / COINBASE / PREVRANDAO of B, spec 06 §3.7) and settles
+        // emission and fees per recipient block, through the SAME function
+        // every applier runs.
+        let members = crate::mergeset::accepted_members(
+            &self.storage,
+            Some(&self.ghostdag),
+            &header,
+            ghostdag_data.as_ref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("mergeset of the block on {selected_parent}: {e}"))?;
+        let block_hashes = self
+            .recent_chain
+            .block_hashes(
+                &self.storage,
+                selected_parent,
+                next_height.saturating_sub(1),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let calc = &self.reward_calculator;
+        let emission =
+            |height: u64,
+             txs: &[Transaction],
+             receipts: &[citrate_execution::types::TransactionReceipt]| {
+                crate::canonical_apply::canonical_emission(calc, height, txs, receipts)
+            };
+        let mut accepted = self
+            .executor
+            .execute_mergeset(
+                &header,
+                &crate::mergeset::as_accepted(&members),
+                &emission,
+                block_hashes,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("mergeset execution failed: {e}"))?;
+        header.gas_used = accepted.gas_used;
+
         // Get transactions from mempool with AI priority
         let transactions = self.select_transactions_with_ai_priority().await?;
         // Producer-side panic breaker: skip quarantined transactions and, after
         // a panicking round, narrow the candidates to find the culprit.
         let transactions = self.panic_breaker.lock().filter(transactions);
-
-        // Every executor mutation below is rolled back if the round ends
-        // before its state is persisted (error or panic), so a failed round
-        // never leaves the executor ahead of the applied tip.
-        let round_state = self.executor.begin_production_round();
 
         // VALIDATOR-S1 §R': under v2 (execute-on-receive), exclude EIP-1559-invalid
         // txs (`gas_price < canonical base fee`) so a produced block never trips the
@@ -2426,170 +3383,25 @@ impl BlockProducer {
             transactions
         };
 
-        // Blue score and work are already calculated above
-        let blue_work = self.calculate_blue_work(&blue_set, blue_score)?;
-
-        // Create block header with GhostDAG consensus data.
-        // EXECUTE-ON-RECEIVE: v2 headers commit the coinbase (reroll flag); v1 keep legacy hashing.
-        let mut header = BlockHeader {
-            version: if self.emit_v2_headers { 2 } else { 1 },
-            block_hash: Hash::default(), // Will be computed
-            selected_parent_hash: selected_parent,
-            merge_parent_hashes: merge_parents,
-            // PBA-L1b-003: never stamp before the selected parent (a
-            // future-dated tip made every `now`-stamped child invalid: a
-            // permanent halt) and never past the parent-relative bound.
-            timestamp: {
-                let now = chrono::Utc::now().timestamp().max(0) as u64;
-                match parent_ts {
-                    Some(pts) => citrate_consensus::hardening::producer_timestamp(now, pts),
-                    None => now,
-                }
-            },
-            height: next_height,
-            blue_score,
-            blue_work,
-            pruning_point: Hash::default(),
-            proposer_pubkey,
-            vrf_reveal,
-            // The §R' import rule requires the canonical base fee; the former inline
-            // "EIP-1559" computation used constant inputs (parent gas used = 0) and
-            // always evaluated to exactly this value.
-            base_fee_per_gas: citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS,
-            gas_used: 0,           // Will be updated after execution
-            gas_limit: 30_000_000, // 30M gas default
-            // EXECUTE-ON-RECEIVE: commit the beneficiary so receivers can reproduce state_root.
-            // Hashed only for v2 (see compute_hash); harmless for v1.
-            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0u8; 20]),
-        };
-
-        // VALIDATOR-S1 §R': base fee is a REROLL CONSTANT under v2. The dynamic
-        // EIP-1559 block above already evaluates to exactly this (it never loads
-        // parent_gas_used), but pin it explicitly so the committed value is
-        // unambiguous and the importer's base-fee check (`settle_block_rewards`) is
-        // exact. See core/execution/src/block_rewards.rs::CANONICAL_BASE_FEE_PER_GAS.
-        if self.emit_v2_headers {
-            header.base_fee_per_gas = citrate_execution::block_rewards::CANONICAL_BASE_FEE_PER_GAS;
-        }
-
-        // WP-Z.3 / PIN-P1(d): Set block context with the consensus ECVRF
-        // randomness before executing transactions. `header.vrf_reveal.output`
-        // is the RFC 9381 ECVRF beacon for THIS block (`core/consensus/src/vrf.rs`),
-        // and feeding it here is what makes the standard EVM `block.prevrandao`
-        // opcode (0x44) return real consensus randomness in Solidity instead of
-        // the all-zeros default.
-        //
-        // Semantics: this exposes this block's OWN randomness. That is the
-        // idiomatic `block.prevrandao` contract — but a value derived from the
-        // block currently producing it is inherently grindable by the proposer.
-        // Grind-resistant challenge selection (committing now, then reading a
-        // FINALIZED/future block's prevrandao when the challenge resolves) is the
-        // CONSUMER CONTRACT's responsibility (PIN `IPFSIncentives v2`, step (e)).
-        // We intentionally do NOT attempt to solve finality at the VM layer.
-        self.executor.set_block_context(BlockContext {
-            coinbase: self.coinbase.0[0..20].try_into().unwrap_or([0; 20]),
-            prevrandao: *header.vrf_reveal.output.as_bytes(),
-            block_hashes: HashMap::new(),
-        });
-
-        // Execute transactions (state root computed after rewards below)
-        let (_pre_reward_root, executed_transactions, mut receipts) = self
-            .execute_block_transactions(&transactions, &header)
-            .await?;
+        // The block's own list, class-A clean (spec 06 §3.4): pre-checked
+        // against post(B) by the selection above (nonce and balance per
+        // sender), within INCLUDE_GAS_LIMIT by declared gas and the
+        // count/byte caps, so its chain child will execute it.
+        let executed_transactions = self.pack_own_transactions(&transactions);
         #[cfg(test)]
         self.inject_test_fault(&executed_transactions)?;
-        let total_gas_used: u64 = receipts.iter().map(|receipt| receipt.gas_used).sum();
-        header.gas_used = total_gas_used;
 
         let tx_root = self.calculate_tx_root(header.height, &executed_transactions);
-        let receipt_root = self.calculate_receipt_root(&receipts)?;
         let artifact_root = self.calculate_artifact_root(&executed_transactions)?;
-
-        // Apply block rewards BEFORE computing the final state root.
-        // Rewards modify the executor's in-memory state, so state_root must
-        // be computed after this step to include reward balances.
-        let validator_address =
-            citrate_execution::types::Address(self.coinbase.0[0..20].try_into().unwrap_or([0; 20]));
-
-        // SRP-S2 (reward/re-apply state-root purity — ADR-2026-07-21-reapply-reward-purity):
-        // the block reward MUST be a pure function of COMMITTED state, settled through the
-        // ONE shared `Executor::settle_block_rewards` path that the receiver / cold-sync /
-        // restart / reorg roles also use — so producer and receiver credit byte-identical
-        // state and the reward-settled root is reproducible on every node.
-        //
-        // The former node-local "enhanced" reward path (economics staking bonus, f64
-        // reputation, dynamic pricing credited straight to the validator, no treasury, no
-        // §R') was REMOVED here: it read non-consensus state a receiver can never reproduce
-        // and, whenever it was selected (it was gated on the transient `emit_v2_headers`
-        // flag), it poisoned the produced block — the block-2209 split-brain. `use_enhanced`
-        // and the enhanced branch are gone; block rewards NEVER read `economics_manager`.
-        // (economics_manager remains for RPC/telemetry only.)
-        //
-        // The reward reads only header.height, the transactions and (at/after the
-        // supply-hardening height) their executed `receipts` — never state_root — so
-        // this temp block is a safe reward-input carrier. `canonical_block_reward` is
-        // the same rule selection every receive path applies.
-        let temp_block = BlockBuilder::new()
-            .header(header.clone())
-            .tx_root(tx_root)
-            .receipt_root(receipt_root)
-            .artifact_root(artifact_root)
-            .ghostdag_params(self.ghostdag.params().clone())
-            .transactions(executed_transactions.clone())
-            .build_unhashed();
-        // PANIC-S1 D3: an uncomputable reward rejects the block (never panics/saturates).
-        let reward = crate::canonical_apply::canonical_block_reward(
-            &self.reward_calculator,
-            &temp_block,
-            &receipts,
-        )
-        .map_err(|e| anyhow::anyhow!("block reward rejected: {e}"))?;
-        // `basic_credits` mirrors `canonical_apply::reward_credits` exactly:
-        // [(coinbase, validator_reward), (0x11..treasury, treasury_reward)]. Below the
-        // VALIDATOR-S1 activation (or before a snapshot is materialized) this credits only
-        // the basic reward; at/above it, §R' vests the priority-fee share on top.
-        let basic_credits = [
-            (validator_address, reward.validator_reward),
-            (
-                citrate_execution::types::Address([0x11; 20]),
-                reward.treasury_reward,
-            ),
-        ];
-        // Use the GUARDED settle: the producer calls settle WITHOUT the
-        // snapshot/restore that the receiver's `apply_block_inner` wraps it in,
-        // so a settle error (e.g. the absent-proposer reject arm, which fires
-        // AFTER step 1's basic credits are applied) would otherwise leak stray
-        // credits into shared state — and, since production runs with eager
-        // persistence, into the durable store. `settle_block_rewards_guarded`
-        // engages the persistence-defer guard + snapshots world state, so ANY
-        // error leaves both memory and store byte-identical; on success the
-        // credits stay dirty and are persisted by `persist_state_changes` below.
-        //
-        // SRP-S2 hard-fail: a producer that cannot settle from committed state produces
-        // NO block (the `?` aborts production) rather than a poisoned one — it can never
-        // silently diverge onto a node-local reward.
-        self.executor
-            .settle_block_rewards_guarded(
-                header.height,
-                header.coinbase,
-                *header.proposer_pubkey.as_bytes(),
-                header.base_fee_per_gas,
-                &executed_transactions,
-                &receipts,
-                &basic_credits,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("VALIDATOR-S1 §R' reward settlement failed: {e}"))?;
-
-        // NOW compute final state root — includes both tx effects and reward balances
-        let state_root = self.executor.calculate_state_root();
+        let state_root = accepted.state_root;
 
         // Create block with all computed data (hash + signature placeholders — computed next)
         let mut block = BlockBuilder::new()
             .header(header.clone())
             .state_root(state_root)
             .tx_root(tx_root)
-            .receipt_root(receipt_root)
+            .receipt_root(accepted.receipt_root)
+            .accepted_root(accepted.accepted_root)
             .artifact_root(artifact_root)
             .ghostdag_params(self.ghostdag.params().clone())
             .transactions(executed_transactions)
@@ -2619,12 +3431,17 @@ impl BlockProducer {
         // This must happen AFTER execution AND rewards so state_root is final.
         block.header.block_hash = block.compute_hash();
 
-        for receipt in &mut receipts {
-            receipt.block_hash = block.header.block_hash;
-            receipt.block_number = block.header.height;
-        }
+        accepted.stamp(block.header.block_hash, block.header.height);
 
         // WP-G.2: Sign the canonical block hash with the proposer's ed25519 key.
+        // r1007 G10: record the slot first, so no later round signs another
+        // block for it once this one can leave the process. Rounds are
+        // sequential, so `prev_signed_slot` is restored only by this round,
+        // and only where it drops the block before anything is persisted or
+        // broadcast (a signature nobody else ever sees is not equivocation).
+        // Without that, a producer clamped to parent.ts + MAX_TS_ADVANCE after
+        // a long outage would get the same slot every round and never seal.
+        let prev_signed_slot = self.last_signed_slot.fetch_max(slot, Ordering::SeqCst);
         block.signature = crypto::sign_block(&block.header.block_hash, &self.signing_key);
 
         // VALIDATOR-S1 (v5): also sign the height-binding EquivocationVote for THIS block
@@ -2649,6 +3466,8 @@ impl BlockProducer {
         // dropped uncommitted, so the executor rolls back, and the slot is skipped.
         // Any future drift between producer and peer rules then costs one slot.
         if let Err(rule) = self.peer_admission_verdict(&block).await {
+            self.last_signed_slot
+                .store(prev_signed_slot, Ordering::SeqCst);
             citrate_api::metrics_server::record_producer_preseal_reject();
             let d = preseal_reject_log().check();
             if d.suppressed_in_previous_window > 0 {
@@ -2684,6 +3503,8 @@ impl BlockProducer {
         // BEFORE any durable write (nothing has mutated committed state since sealing).
         let post_persist_root = self.executor.calculate_state_root();
         if post_persist_root != block.state_root {
+            self.last_signed_slot
+                .store(prev_signed_slot, Ordering::SeqCst);
             error!(
                 "STATE ROOT MISMATCH before persist: block={} computed={}",
                 block.state_root, post_persist_root
@@ -2718,7 +3539,10 @@ impl BlockProducer {
             .executor
             .persist_state_changes_with_undo(
                 Some((block.header.block_hash, block.header.height)),
-                &citrate_execution::executor::ReceiptIndexBatch::default(),
+                // The receipts of the txs this block executed, under it.
+                &citrate_execution::executor::ReceiptIndexBatch::for_accepting_block(
+                    &block, &accepted,
+                ),
                 models_jobs.as_ref(),
             )
             .await?;
@@ -2759,28 +3583,52 @@ impl BlockProducer {
             });
         }
 
-        // Store transactions and receipts for RPC visibility
+        // r1007 S3-3b: the txs this block executed left the pool whichever
+        // block included them; skipped occurrences are offered back (a nonce
+        // gap or the gas budget can make them valid later).
+        for tx in &accepted.executed {
+            let _ = self.mempool.remove_included(&tx.hash).await;
+        }
+        let skipped: Vec<Transaction> = {
+            let executed: std::collections::HashSet<Hash> =
+                accepted.executed.iter().map(|t| t.hash).collect();
+            let skip_hashes: std::collections::HashSet<Hash> = accepted
+                .occurrences
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o.outcome,
+                        citrate_execution::acceptance::OccurrenceOutcome::Skipped(r)
+                            if r != citrate_execution::acceptance::SkipReason::Invalid
+                    )
+                })
+                .map(|o| o.tx_hash)
+                .collect();
+            members
+                .iter()
+                .flat_map(|(b, _)| b.transactions.iter())
+                .filter(|t| skip_hashes.contains(&t.hash) && !executed.contains(&t.hash))
+                .cloned()
+                .collect()
+        };
+        if !skipped.is_empty() {
+            let _ = self.mempool.reinject_transactions(skipped).await;
+        }
+
+        // Store this block's own transactions for RPC visibility: included,
+        // not yet executed (no receipt until its chain child accepts it).
         if !block.transactions.is_empty() {
-            // Store transactions
             self.storage
                 .transactions
                 .put_transactions(&block.transactions)?;
 
-            // Pair tx hashes with receipts and store
-            let pairs: Vec<(Hash, citrate_execution::types::TransactionReceipt)> = block
-                .transactions
-                .iter()
-                .zip(receipts.iter())
-                .map(|(tx, receipt)| (tx.hash, receipt.clone()))
-                .collect();
-            if !pairs.is_empty() {
-                self.storage.transactions.put_receipts(&pairs)?;
-            }
-
-            // Remove included transactions from mempool
-            for tx in &block.transactions {
-                let _ = self.mempool.remove_transaction(&tx.hash).await;
-            }
+            // r1007 S3-3b: the block's own txs stay in the pool until a block
+            // that accepts them EXECUTES them (removed above, and by the
+            // applicator on every node). Until then neither the state nonce nor
+            // the pool would otherwise account for them, and a wallet asking
+            // for its `pending` nonce would be handed one already in use. The
+            // next block's selection, pre-checked against its post-state, never
+            // re-includes them once they have run.
 
             // Sprint EL-1 (Issue #20): Reconcile nonce map after removing
             // executed transactions. This ensures that if any txs were removed
@@ -2960,6 +3808,39 @@ impl BlockProducer {
         }
     }
 
+    /// r1007 G9: the slot and timestamp of the block this round seals.
+    ///
+    /// The round starts at a slot boundary (the production timer is on the
+    /// slot grid), so the wall clock is read with a small allowance for a tick
+    /// that fires just before the boundary by the wall clock
+    /// ([`crate::timing::SLOT_TICK_EARLY_ALLOWANCE_MS`]). The timestamp is the
+    /// first second of that slot, then clamped by
+    /// `hardening::producer_timestamp` to the selected parent's bounds; the slot
+    /// is that of the clamped timestamp. Source: the producer's slot clock (the
+    /// system clock) and the slot origin held by the DAG store (genesis
+    /// timestamp).
+    fn round_slot(&self, parent_ts: Option<u64>) -> anyhow::Result<(u64, u64)> {
+        let origin = self.dag_store.slot_origin().ok_or_else(|| {
+            anyhow::anyhow!("G9: the slot origin (genesis timestamp) is not known yet")
+        })?;
+        let now_ms = (self.slot_clock)();
+        let now = now_ms
+            .saturating_add(crate::timing::SLOT_TICK_EARLY_ALLOWANCE_MS)
+            .checked_div(1_000)
+            .unwrap_or(0);
+        let now_slot = citrate_consensus::slots::slot_of(now, origin)
+            .ok_or_else(|| anyhow::anyhow!("G9: the clock ({now}) is before genesis ({origin})"))?;
+        let start = citrate_consensus::slots::slot_start(now_slot, origin)
+            .ok_or_else(|| anyhow::anyhow!("G9: slot {now_slot} overflows"))?;
+        let ts = match parent_ts {
+            Some(pts) => citrate_consensus::hardening::producer_timestamp(start, pts),
+            None => start,
+        };
+        let slot = citrate_consensus::slots::slot_of(ts, origin)
+            .ok_or_else(|| anyhow::anyhow!("G9: timestamp {ts} is before genesis ({origin})"))?;
+        Ok((slot, ts))
+    }
+
     /// Whether this node's already-applied tip SUPERSEDES `candidate` — i.e.
     /// `candidate` is a strict ANCESTOR of the applied tip on the node's own
     /// canonical chain. When true, the producer must extend the applied tip rather
@@ -3092,97 +3973,49 @@ impl BlockProducer {
             }
         }
 
-        // MP-DEPTH: never BUILD a block our own validity rule would reject.
-        //
-        // The block we are about to seal sits at selected_parent.height + 1. Once
-        // the rule is active, merging a tip more than MERGE_PARENT_MAX_DEPTH below
-        // that makes the block invalid — and since the producer validates its own
-        // block on the way in, it would refuse its own output and stop producing.
-        // A stale tip lingering in the tip set is enough to trigger it, so this is
-        // a filter rather than an error: drop the too-deep tips, keep sealing.
-        //
-        // Applied unconditionally, not gated on the activation height. Before
-        // activation these merges are legal but pointless (a tip 100+ blocks back
-        // is abandoned, not a live branch), and filtering early means the producer
-        // is already emitting rule-compliant blocks well before enforcement
-        // begins — so activation is a no-op for block production rather than a
-        // cliff.
-        let child_height = self
+        // r1007 G2–G5 (S3-1): never BUILD a block our own validity rule would
+        // reject. Offer every other tip as a merge parent, heaviest first, and
+        // keep each one only while the block stays valid: lighter than the
+        // selected parent (G3: SP is the heaviest parent, so a heavier tip
+        // cannot be merged, it would have to be the selected parent), not in
+        // the past of another parent (G2), the mergeset within
+        // MERGESET_SIZE_LIMIT (G4), every mergeset block in the future of the
+        // merge-depth root (G5). A dropped tip stays in the tip set and is
+        // merged once it fits. This replaces the MP-DEPTH height filter and the
+        // header-score "heaviest parent" filter (`dropped_heavier`), which
+        // compared the producer's `parent + 1` unit against fork choice's.
+        // Without the selected parent's header there is nothing to judge a merge
+        // against: merge nothing (the build below then refuses for want of the
+        // parent, as before).
+        if self.dag_store.get_header(&selected_parent).await.is_err() {
+            debug!(
+                "producer: selected parent {} has no readable header; merging nothing",
+                selected_parent
+            );
+            return Ok((selected_parent, Vec::new()));
+        }
+        let (merge_parents, _data) = match self
             .ghostdag
-            .get_block_height(&selected_parent)
+            .parents_for_new_block(selected_parent, &tip_hashes)
             .await
-            .map(|h| h.saturating_add(1));
-
-        // HEAVIEST-PARENT RULE: never list a merge parent whose HEADER blue_score
-        // exceeds the selected parent's. Receivers enforce exactly that comparison
-        // (`validate_block_consistency`), but fork choice above ranks tips by the
-        // RECOMPUTED score, which also counts blue merge parents, while headers carry
-        // `parent + 1`. Once blocks merge, the two orderings can disagree: fork choice
-        // picks a tip whose header score is below another tip's. Merging that other tip
-        // seals a block every peer rejects, and the producer then builds on it alone.
-        // Like MP-DEPTH this is a filter: the skipped tip stays in the tip set and is
-        // merged once a selected parent at least as heavy exists.
-        let sp_header_score = self
-            .dag_store
-            .get_block(&selected_parent)
-            .await
-            .ok()
-            .map(|b| b.header.blue_score);
-
-        let max_parents = self.ghostdag.params().max_parents;
-        let mut dropped_deep = 0usize;
-        let mut dropped_heavier = 0usize;
-        let mut dropped_unreadable = 0usize;
-        let mut merge_parents: Vec<Hash> = Vec::new();
-        for h in tip_hashes.into_iter().filter(|h| *h != selected_parent) {
-            if merge_parents.len() >= max_parents.saturating_sub(1) {
-                break; // Leave room for the selected parent.
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "cannot derive the GHOSTDAG record of a block on {}: {e}. Skipping \
+                     this production round.",
+                    selected_parent
+                ))
             }
-            // Without the selected parent's header there is nothing to compare
-            // against, and a tip whose header we cannot read is one a receiver may
-            // lack: merge neither. Counted apart from "heavier" so the log says why.
-            let (Some(sp_score), Some(tip)) =
-                (sp_header_score, self.dag_store.get_block(&h).await.ok())
-            else {
-                dropped_unreadable = dropped_unreadable.saturating_add(1);
-                continue;
-            };
-            if tip.header.blue_score > sp_score {
-                dropped_heavier = dropped_heavier.saturating_add(1);
-                continue;
-            }
-            if let Some(child_h) = child_height {
-                if child_h.saturating_sub(tip.header.height)
-                    > citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
-                {
-                    dropped_deep = dropped_deep.saturating_add(1);
-                    continue;
-                }
-            }
-            merge_parents.push(h);
-        }
-        if dropped_heavier > 0 {
+        };
+        let offered = tip_hashes.len().saturating_sub(1);
+        if merge_parents.len() < offered {
             debug!(
-                "producer: left {} tip(s) unmerged whose header blue_score exceeds the selected \
-                 parent's ({:?}); merging them would make our block invalid for every peer",
-                dropped_heavier, sp_header_score
-            );
-        }
-        if dropped_unreadable > 0 {
-            debug!(
-                "producer: left {} tip(s) unmerged because a header could not be read \
-                 (selected parent header readable: {})",
-                dropped_unreadable,
-                sp_header_score.is_some()
-            );
-        }
-        if dropped_deep > 0 {
-            debug!(
-                "MP-DEPTH: dropped {} stale tip(s) more than {} blocks below the block being \
-                 sealed at height {:?} — merging them would make our own block invalid",
-                dropped_deep,
-                citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH,
-                child_height
+                "producer: merging {} of {} other tip(s); the rest would make this block \
+                 invalid (G2-G5) or are heavier than the selected parent {}",
+                merge_parents.len(),
+                offered,
+                selected_parent
             );
         }
 
@@ -3321,93 +4154,56 @@ impl BlockProducer {
         Ok(selected)
     }
 
-    /// Execute all transactions in a block
-    async fn execute_block_transactions(
-        &self,
-        transactions: &[Transaction],
-        header: &BlockHeader,
-    ) -> anyhow::Result<(
-        Hash,
-        Vec<Transaction>,
-        Vec<citrate_execution::types::TransactionReceipt>,
-    )> {
-        let mut executed_transactions = Vec::new();
-        let mut receipts = Vec::new();
-
-        // Create a temporary block for execution context
-        let temp_block = BlockBuilder::new()
-            .header(header.clone())
-            .ghostdag_params(self.ghostdag.params().clone())
-            .build_unhashed();
-
-        // PBA-L1a-004: meter ACTUAL gas. A candidate is admitted when its
-        // declared gas_limit fits what is left of the block; after it runs the
-        // meter is charged only what it used, so the rest of the block stays
-        // available. A deferred sender's later nonces are deferred with it
-        // (they would fail on the nonce gap otherwise) and stay in the mempool.
-        let mut meter = BlockGasMeter::new(PRODUCER_BLOCK_GAS_LIMIT);
-        let mut deferred_senders: std::collections::HashSet<PublicKey> =
+    /// r1007 S3-3b (spec 06 §3.4 class A, §9.3): the block's OWN list from the
+    /// selected candidates, which were pre-checked against post(B) (nonce and
+    /// balance per sender, `select_transactions_with_ai_priority` runs after
+    /// the mergeset execution). Nothing is executed here: B's chain child
+    /// executes B's list. The list fits INCLUDE_GAS_LIMIT by DECLARED gas (the
+    /// stateless rule every importer checks), the count and byte caps, and
+    /// repeats no tx hash and no (sender, nonce). A sender whose next
+    /// candidate does not fit is deferred with all its later nonces (they
+    /// would be skipped on the nonce gap) and stays in the pool.
+    fn pack_own_transactions(&self, candidates: &[Transaction]) -> Vec<Transaction> {
+        let mut out = Vec::new();
+        let mut declared: u64 = 0;
+        let mut deferred: std::collections::HashSet<PublicKey> = std::collections::HashSet::new();
+        let mut hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        let mut sender_nonces: std::collections::HashSet<(PublicKey, u64)> =
             std::collections::HashSet::new();
-        // Count and byte caps over EXECUTED transactions only.
-        let mut executed_window = CandidateWindow::new(MAX_BLOCK_TXS, MAX_BLOCK_BYTES, usize::MAX);
-
-        // Execute candidates in order. A candidate that does not fit what is
-        // left of the block is skipped (its sender's later nonces with it) and
-        // the next is tried, until the block is full.
-        for tx in transactions.iter().take(MAX_BLOCK_CANDIDATES) {
-            if executed_window.is_full() || !meter.fits(MIN_TX_GAS) {
+        let mut window = CandidateWindow::new(MAX_BLOCK_TXS, MAX_BLOCK_BYTES, usize::MAX);
+        for tx in candidates.iter().take(MAX_BLOCK_CANDIDATES) {
+            if window.is_full() {
                 break;
             }
-            if deferred_senders.contains(&tx.from)
-                || !meter.fits(tx.gas_limit)
-                || !executed_window.fits(tx)
+            if deferred.contains(&tx.from)
+                || hashes.contains(&tx.hash)
+                || sender_nonces.contains(&(tx.from, tx.nonce))
+                || !window.fits(tx)
             {
-                deferred_senders.insert(tx.from);
+                deferred.insert(tx.from);
                 continue;
             }
-            match self.executor.execute_transaction(&temp_block, tx).await {
-                Ok(receipt) => {
-                    // A failed transaction is charged its whole declared
-                    // gas (as the sender is); a successful one its use.
-                    meter.charge(if receipt.status {
-                        receipt.gas_used.min(tx.gas_limit)
-                    } else {
-                        tx.gas_limit
-                    });
-                    executed_window.record(tx);
-                    executed_transactions.push(tx.clone());
-                    receipts.push(receipt);
+            match declared.checked_add(tx.gas_limit) {
+                Some(next) if next <= citrate_consensus::acceptance::INCLUDE_GAS_LIMIT => {
+                    declared = next;
                 }
-                Err(e) => {
-                    error!("Failed to execute transaction {}: {}", tx.hash, e);
-
-                    // Sprint EL-1 (Issue #20): Remove failed tx from mempool
-                    // so the sender's nonce is not permanently blocked.
-                    let _ = self.mempool.remove_transaction(&tx.hash).await;
-                    // PBA-L1a-004: a failure before any receipt costs the
-                    // sender nothing on chain, so refuse the sender for a
-                    // while (mempool policy only; block validity unchanged).
-                    self.mempool
-                        .ban_sender(&tx.from, PRE_RECEIPT_FAILURE_BAN)
-                        .await;
-                    deferred_senders.insert(tx.from);
+                _ => {
+                    deferred.insert(tx.from);
+                    continue;
                 }
             }
+            window.record(tx);
+            hashes.insert(tx.hash);
+            sender_nonces.insert((tx.from, tx.nonce));
+            out.push(tx.clone());
         }
-
         debug!(
-            "executed {} txs using {} block gas ({} senders deferred)",
-            executed_transactions.len(),
-            meter.used(),
-            deferred_senders.len()
+            "packed {} own txs declaring {} gas ({} senders deferred)",
+            out.len(),
+            declared,
+            deferred.len()
         );
-
-        // WP-G.4: Compute state root from the executor's in-memory post-execution state.
-        // This uses the state trie that has been updated by transaction execution,
-        // NOT the storage-backed view which still reflects the previous block.
-        let state_root = self.executor.calculate_state_root();
-
-        Ok((state_root, executed_transactions, receipts))
+        out
     }
 
     /// Calculate transaction root. PBA-L1b-002: from the activation height the
@@ -3419,24 +4215,6 @@ impl BlockProducer {
             height,
             transactions,
         )
-    }
-
-    /// Calculate receipt root
-    fn calculate_receipt_root(
-        &self,
-        receipts: &[citrate_execution::types::TransactionReceipt],
-    ) -> anyhow::Result<Hash> {
-        use sha3::{Digest, Sha3_256};
-        let mut hasher = Sha3_256::new();
-
-        for receipt in receipts {
-            hasher.update(receipt.tx_hash.as_bytes());
-            hasher.update([if receipt.status { 1 } else { 0 }]);
-            hasher.update(receipt.gas_used.to_le_bytes());
-        }
-
-        let hash_array: [u8; 32] = hasher.finalize().into();
-        Ok(Hash::new(hash_array))
     }
 
     /// Calculate artifact root for AI models
@@ -3458,19 +4236,6 @@ impl BlockProducer {
 
         let hash_array: [u8; 32] = hasher.finalize().into();
         Ok(Hash::new(hash_array))
-    }
-
-    /// Calculate blue work based on blue set
-    fn calculate_blue_work(
-        &self,
-        _blue_set: &citrate_consensus::types::BlueSet,
-        blue_score: u64,
-    ) -> anyhow::Result<u128> {
-        // SECREM-01 CONS-2/3: delegate to the canonical score→work function
-        // in citrate-consensus. Admission validation rejects any header
-        // whose blue_work deviates from it, so the producer MUST use the
-        // same source of truth or fork itself off.
-        Ok(citrate_consensus::types::blue_work_for_score(blue_score))
     }
 
     // NOTE (VALIDATOR-S1 §R'): `apply_basic_rewards` was REMOVED. Basic reward
@@ -3714,8 +4479,9 @@ impl BlockProducer {
 /// stop), (b) its nonce is the sender's next nonce against state (tracking the
 /// candidates already admitted from that sender), and (c) the sender's balance,
 /// net of the candidates already admitted, covers `gas_limit * gas_price + value`.
-/// Block gas itself is metered on actual use by [`BlockGasMeter`] during
-/// execution, so declared-but-unused gas never holds block space.
+/// r1007 S3-3b: the block's own list is then packed by DECLARED gas within
+/// INCLUDE_GAS_LIMIT (`pack_own_transactions`, the class-A rule importers
+/// check); it is executed by the block's chain child.
 /// Block gas limit the producer fills to (the chain's genesis constant).
 pub(crate) const PRODUCER_BLOCK_GAS_LIMIT: u64 = 30_000_000;
 
@@ -3729,15 +4495,8 @@ pub(crate) const MAX_BLOCK_BYTES: usize = 1_000_000;
 /// for a large pool).
 pub(crate) const MAX_BLOCK_CANDIDATES: usize = 20_000;
 
-/// No transaction runs on less gas than this (intrinsic transfer cost).
-pub(crate) const MIN_TX_GAS: u64 = 21_000;
-
 /// PBA-L1a-004: most transactions one sender may place in one block.
 pub(crate) const MAX_TXS_PER_SENDER_PER_BLOCK: usize = 64;
-
-/// PBA-L1a-004: how long a sender is refused after a transaction of theirs
-/// fails before a receipt exists.
-pub(crate) const PRE_RECEIPT_FAILURE_BAN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// PBA-L1a-004: count / byte / per-sender caps over ADMITTED candidates.
 pub(crate) struct CandidateWindow {
@@ -3784,32 +4543,6 @@ impl CandidateWindow {
 /// AI operations may declare at most a third of the block's gas.
 pub(crate) const MAX_AI_GAS_PER_BLOCK: u64 = PRODUCER_BLOCK_GAS_LIMIT / 3;
 
-/// PBA-L1a-004: block gas metered on ACTUAL use, like geth's gas pool.
-pub(crate) struct BlockGasMeter {
-    limit: u64,
-    used: u64,
-}
-
-impl BlockGasMeter {
-    pub(crate) fn new(limit: u64) -> Self {
-        Self { limit, used: 0 }
-    }
-
-    /// Whether a transaction declaring `gas_limit` may still run.
-    pub(crate) fn fits(&self, gas_limit: u64) -> bool {
-        gas_limit <= self.limit.saturating_sub(self.used)
-    }
-
-    /// Charge what a transaction actually used.
-    pub(crate) fn charge(&mut self, gas_used: u64) {
-        self.used = self.used.saturating_add(gas_used).min(self.limit);
-    }
-
-    pub(crate) fn used(&self) -> u64 {
-        self.used
-    }
-}
-
 /// PBA-N9 (security#134): the outcome of considering a candidate for selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdmitOutcome {
@@ -3826,6 +4559,25 @@ pub(crate) enum AdmitOutcome {
     /// a candidate pooled lets a flood persist to `tx_expiry_secs` (3600s) and
     /// burns selection work every round (the N9 producer half).
     Drop,
+}
+
+/// The info line for a produced block: its height and transaction count from
+/// the stored block, plus this process's produced-block count. If the block
+/// cannot be read back the line says so instead of printing a guessed count.
+pub(crate) fn produced_block_line(hash: &Hash, block: Option<&Block>, produced: u64) -> String {
+    let short = hex::encode(&hash.as_bytes()[..8]);
+    match block {
+        Some(b) => format!(
+            "Produced block height={} hash={} txs={} (produced by this process: {})",
+            b.header.height,
+            short,
+            b.transactions.len(),
+            produced
+        ),
+        None => format!(
+            "Produced block hash={short} (not readable back from storage; produced by this process: {produced})"
+        ),
+    }
 }
 
 /// Per-sender budget state tracked across a single selection pass.
@@ -3949,7 +4701,7 @@ mod tests {
     /// fixtures. Production startup writes and applies this block before the
     /// first producer round; keeping it in the fixture makes A001 exercise the
     /// configured-genesis path rather than the legacy zero-hash sentinel.
-    fn test_genesis() -> Block {
+    pub(super) fn test_genesis() -> Block {
         let mut genesis = BlockBuilder::new()
             .version(2)
             .height(0)
@@ -3973,7 +4725,7 @@ mod tests {
     /// producer fixture. Genesis is seeded before any applicator or producer
     /// can select a parent, so the first block is height 1 with the real
     /// genesis hash.
-    async fn seed_test_genesis(
+    pub(super) async fn seed_test_genesis(
         storage: &StorageManager,
         dag: &DagStore,
         ghostdag: &GhostDag,
@@ -3988,6 +4740,8 @@ mod tests {
             .put_applied_tip(&genesis.header.block_hash, 0)
             .expect("persist test genesis applied tip");
         dag.set_configured_genesis(genesis.header.block_hash);
+        dag.set_slot_origin(&genesis.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         dag.store_block(genesis.clone())
             .await
             .expect("store test genesis in DAG");
@@ -4439,6 +5193,8 @@ mod tests {
             test_signing_key(),
             2,
         );
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         let selected = producer
             .select_transactions_with_ai_priority()
             .await
@@ -4465,22 +5221,6 @@ mod tests {
     #[test]
     fn producer_ai_slice_cap_value() {
         assert_eq!(MAX_AI_GAS_PER_BLOCK, 10_000_000);
-    }
-
-    /// Block gas meter: admission against what is left, charge on actual use.
-    #[test]
-    fn producer_block_gas_meter_charges_actual_use() {
-        let mut m = BlockGasMeter::new(30_000_000);
-        assert!(m.fits(30_000_000));
-        assert!(!m.fits(30_000_001));
-        m.charge(700);
-        assert_eq!(m.used(), 700);
-        assert!(m.fits(29_999_300));
-        assert!(!m.fits(29_999_301));
-        m.charge(u64::MAX);
-        assert_eq!(m.used(), 30_000_000, "saturates at the limit");
-        assert!(m.fits(0));
-        assert!(!m.fits(1));
     }
 
     /// Produce a real block from a funded high-declared-gas candidate plus a
@@ -4536,6 +5276,8 @@ mod tests {
             test_signing_key(),
             2,
         );
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         let hash = producer.produce_block().await.expect("produce");
         let block = storage
             .blocks
@@ -4549,12 +5291,21 @@ mod tests {
         )
     }
 
-    /// PBA-L1a-004: declared-but-unused gas does not hold block space.
+    /// r1007 S3-3b (spec 06 §3.4 class A, §3.6): a block's own list is bounded
+    /// by DECLARED gas (Σ gas_limit ≤ INCLUDE_GAS_LIMIT), the stateless rule
+    /// every importer checks, because the producer no longer executes its own
+    /// list. The higher-fee filler declaring 29.99M is in; the transfer that
+    /// would take the declared sum past 30M waits for the next block. (This
+    /// replaces PBA-L1a-004's refill-after-actual-use, which needs execution
+    /// at seal time; see the spec finding on declared-gas block stuffing.)
     #[tokio::test]
     async fn producer_budget_refill_standard_candidate() {
         let (transfer_in, filler_in) = producer_budget_case(vec![], 101_000_000_000).await;
         assert!(filler_in, "the higher-fee candidate runs first");
-        assert!(transfer_in, "the block is refilled after actual gas use");
+        assert!(
+            !transfer_in,
+            "declared gas counts: the transfer would exceed INCLUDE_GAS_LIMIT"
+        );
     }
 
     /// PBA-L1a-004: a payload the executor runs as a plain call is not treated
@@ -4577,19 +5328,35 @@ mod tests {
             .set_balance(a, U256::from(10u64).pow(U256::from(21u64)));
     }
 
-    fn test_producer(
+    /// A producer over `producer_fixture`'s stores, with the genesis block in
+    /// its DAG (r1007 G9: the slot origin is genesis's timestamp).
+    async fn test_producer(
         storage: &Arc<StorageManager>,
         executor: &Arc<Executor>,
         mempool: &Arc<Mempool>,
     ) -> BlockProducer {
-        BlockProducer::new(
+        let producer = BlockProducer::new(
             storage.clone(),
             executor.clone(),
             mempool.clone(),
             embedded_pubkey(Address([0x44; 20])),
             test_signing_key(),
             2,
-        )
+        );
+        let genesis = test_genesis();
+        let dag = producer.dag_store();
+        dag.set_configured_genesis(genesis.header.block_hash);
+        dag.set_slot_origin(&genesis.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
+        dag.store_block(genesis.clone())
+            .await
+            .expect("store test genesis in DAG");
+        producer
+            .ghostdag()
+            .add_block(&genesis)
+            .await
+            .expect("admit test genesis to GhostDAG");
+        producer
     }
 
     fn producer_fixture() -> (
@@ -4602,6 +5369,19 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(tmp.path(), PruningConfig::default()).expect("storage"));
+        // r1007 G9: a producer builds on genesis (the slot origin), so the
+        // fixture holds it as node startup does: the chain-store half here,
+        // before any applicator reads the durable tip; `test_producer` adds the
+        // DAG half.
+        let genesis = test_genesis();
+        storage
+            .blocks
+            .put_block(&genesis)
+            .expect("persist test genesis");
+        storage
+            .blocks
+            .put_applied_tip(&genesis.header.block_hash, 0)
+            .expect("persist test genesis applied tip");
         let state_db = Arc::new(citrate_execution::StateDB::new());
         let executor = Arc::new(Executor::with_storage_and_chain_id(
             state_db.clone(),
@@ -4628,6 +5408,7 @@ mod tests {
             storage.clone(),
         ));
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app);
         let rebuild = app.rebuild_in_progress_handle();
@@ -4681,7 +5462,7 @@ mod tests {
                 .await
                 .expect("admit");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let sel: Vec<Hash> = producer
             .select_transactions_with_ai_priority()
             .await
@@ -4718,7 +5499,7 @@ mod tests {
                 .await
                 .expect("admit");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let hash = producer.produce_block().await.expect("produce");
         let block = storage
             .blocks
@@ -4772,7 +5553,7 @@ mod tests {
             t.data = data;
             let _ = mempool.add_transaction(t, TxClass::Standard).await;
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
         block.transactions.iter().any(|t| t.hash == honest_tx.hash)
@@ -4876,14 +5657,25 @@ mod tests {
                 .await
                 .expect("candidate admitted");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
-        assert!(
-            block.transactions.iter().any(|t| t.hash == honest_tx.hash),
-            "a transaction that fits the remaining gas is included"
+        // r1007 S3-3b (spec 06 §3.4 class A): the own list is bounded by
+        // DECLARED gas. The top filler declares the whole INCLUDE_GAS_LIMIT,
+        // so nothing else fits this block, the honest transfer included; the
+        // list never exceeds the limit (see the spec finding on declared-gas
+        // block stuffing, which this rule reopens against PBA-L1a-004).
+        let declared: u64 = block.transactions.iter().map(|t| t.gas_limit).sum();
+        assert!(declared <= citrate_consensus::acceptance::INCLUDE_GAS_LIMIT);
+        assert_eq!(
+            block.transactions.len(),
+            1,
+            "one 30M-declared filler fills it"
         );
-        assert!(block.header.gas_used <= PRODUCER_BLOCK_GAS_LIMIT);
+        assert!(
+            !block.transactions.iter().any(|t| t.hash == honest_tx.hash),
+            "the honest transfer does not fit the declared-gas limit"
+        );
     }
 
     /// A transaction that fails after a receipt exists pays for its whole
@@ -4915,7 +5707,7 @@ mod tests {
                 .await
                 .expect("candidate admitted");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
         let declared_total: u64 = block.transactions.iter().map(|t| t.gas_limit).sum();
@@ -4950,7 +5742,7 @@ mod tests {
                 .expect("admit");
             hashes.push(t.hash);
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let bh = producer.produce_block().await.expect("produce");
         let block = storage.blocks.get_block(&bh).expect("read").expect("block");
         // 30M / 21k = 1428 transfers fit by gas; the count cap is not binding.
@@ -5010,7 +5802,7 @@ mod tests {
                 .await
                 .expect("admit");
         }
-        let producer = test_producer(&storage, &executor, &mempool);
+        let producer = test_producer(&storage, &executor, &mempool).await;
         let sel: Vec<Hash> = producer
             .select_transactions_with_ai_priority()
             .await
@@ -5091,6 +5883,8 @@ mod tests {
             signing_key,
             2,
         );
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
 
         let block_hash = producer.produce_block().await.unwrap();
         let block = storage.blocks.get_block(&block_hash).unwrap().unwrap();
@@ -5101,7 +5895,9 @@ mod tests {
             "Only executed txs should be included"
         );
         assert_eq!(block.transactions[0].hash, good_tx.hash);
-        assert_eq!(block.header.gas_used, 21_000);
+        // r1007 S3-3b: the header commits the gas of its accepted mergeset
+        // (genesis carries nothing); its own tx runs in the next block.
+        assert_eq!(block.header.gas_used, 0);
         // PBA-L1b-002: the sealed root is the consensus rule's root for this
         // block (kills `calculate_tx_root -> Default::default()`).
         assert_eq!(
@@ -5114,13 +5910,21 @@ mod tests {
         );
         assert_ne!(block.tx_root, Hash::default());
 
+        assert!(storage
+            .transactions
+            .get_receipt(&good_tx.hash)
+            .unwrap()
+            .is_none());
+        let accepting_hash = producer.produce_block().await.unwrap();
+        let accepting = storage.blocks.get_block(&accepting_hash).unwrap().unwrap();
+        assert_eq!(accepting.header.gas_used, 21_000);
         let good_receipt = storage
             .transactions
             .get_receipt(&good_tx.hash)
             .unwrap()
             .expect("receipt for executed tx");
-        assert_eq!(good_receipt.block_hash, block_hash);
-        assert_eq!(good_receipt.block_number, block.header.height);
+        assert_eq!(good_receipt.block_hash, accepting_hash);
+        assert_eq!(good_receipt.block_number, accepting.header.height);
         assert!(good_receipt.status);
         assert_eq!(good_receipt.gas_used, 21_000);
 
@@ -5233,6 +6037,8 @@ mod tests {
             economics,
         )
         .await;
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
 
         // One empty block at height 1 — post-activation, single-parent: block 2209's shape.
         let block_hash = producer.produce_block().await.expect("produce empty block");
@@ -5254,40 +6060,62 @@ mod tests {
             "canonical base fee (importer base-fee check must pass)"
         );
 
+        // r1007 S3-3b: block 1 accepts nothing rewarded (its parent is the
+        // zero hash); block 2 accepts block 1 and pays its coinbase R(2).
+        let block2_hash = producer.produce_block().await.expect("produce block 2");
+        let sealed2 = storage
+            .blocks
+            .get_block(&block2_hash)
+            .expect("read block")
+            .expect("block present");
+        assert_eq!(sealed2.header.selected_parent_hash, block_hash);
+
         // ── Receiver: independent executor, byte-identical genesis + policy, applying
-        //    the sealed block through the canonical committed-state reward path. ──
+        //    the sealed blocks through the canonical committed-state reward path. ──
         let receiver = Arc::new(Executor::new(Arc::new(citrate_execution::StateDB::new())));
         *receiver.reward_policy_handle().write() = Some(mk_policy());
         receiver.set_validator_activation_height(0);
         let reward = RewardCalculator::new(crate::canonical_apply::canonical_reward_config())
             .calculate_reward(&sealed)
             .expect("canonical reward");
-        let basic_credits = [
-            (Address(sealed.header.coinbase), reward.validator_reward),
-            (Address(TREASURY), reward.treasury_reward),
-        ];
-
-        let got = receiver
-            .apply_block(
-                &sealed,
-                sealed.header.coinbase,
-                &citrate_execution::executor::fixed_reward(&basic_credits),
-            )
+        let calc = RewardCalculator::new(crate::canonical_apply::canonical_reward_config());
+        let emission =
+            |h: u64, t: &[Transaction], r: &[citrate_execution::types::TransactionReceipt]| {
+                crate::canonical_apply::canonical_emission(&calc, h, t, r)
+            };
+        let invariant =
+            "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
+                 canonical committed-state reward path MUST reproduce its state root (the \
+                 block-2209 split-brain was a node-local reward no receiver could reproduce).";
+        let (got, _) = receiver
+            .apply_accepting_block(&sealed, &[], &emission, Default::default(), false, true)
             .await
-            .expect(
-                "SRP-S2 INVARIANT: a fleet node re-applying the producer's block through the \
-                 canonical committed-state reward path MUST reproduce its state root. On `main` \
-                 the producer takes the node-local ENHANCED path (producer.rs `use_enhanced`), \
-                 crediting a reward no receiver can reproduce → StateRootMismatch → the block-2209 \
-                 split-brain.",
-            );
+            .expect(invariant);
         assert_eq!(
             got, sealed.state_root,
             "receiver's committed-state root MUST equal the producer's sealed root"
         );
+        let members = [citrate_execution::acceptance::AcceptedBlock {
+            block: &sealed,
+            color: citrate_consensus::acceptance::InclusionColor::SelectedParent,
+        }];
+        let (got2, _) = receiver
+            .apply_accepting_block(
+                &sealed2,
+                &members,
+                &emission,
+                [(sealed.header.height, *sealed.header.block_hash.as_bytes())]
+                    .into_iter()
+                    .collect(),
+                false,
+                true,
+            )
+            .await
+            .expect(invariant);
+        assert_eq!(got2, sealed2.state_root);
 
         // And the committed reward MUST be the canonical basic block reward (9 SALT to the
-        // validator, 1 SALT to treasury) — not the enhanced 0.01-SALT node-local credit.
+        // validator, 1 SALT to treasury per block) — not the enhanced node-local credit.
         assert_eq!(
             receiver.get_balance(&Address(VALIDATOR)),
             reward.validator_reward,
@@ -5295,8 +6123,8 @@ mod tests {
         );
         assert_eq!(
             receiver.get_balance(&Address(TREASURY)),
-            reward.treasury_reward,
-            "treasury must hold exactly the canonical treasury slice"
+            reward.treasury_reward * U256::from(2u64),
+            "treasury must hold exactly the canonical treasury slice of each block"
         );
     }
 
@@ -5354,6 +6182,8 @@ mod tests {
             2,
         )
         .with_v2_headers(true);
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         let applicator = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
             executor.clone(),
             storage.clone(),
@@ -5440,7 +6270,12 @@ mod tests {
     ///
     /// INVARIANT: the parents the producer picks must satisfy the receiver's linkage
     /// rule, i.e. the block it would seal passes `validate_block_consistency`. A tip
-    /// whose header score does not exceed the selected parent's must still be merged.
+    /// lighter than the selected parent must still be merged.
+    ///
+    /// r1007 (CV-3) removes the two metrics: the header commits the fork-choice
+    /// score. The scenario is kept in its r1007 form: the heavier branch is the
+    /// SHORTER one, and the taller lighter tip is merged (01 H4
+    /// `heavier_shorter_branch_is_still_merged`).
     #[tokio::test]
     async fn producer_never_merges_a_parent_heavier_than_its_selected_parent() {
         use citrate_execution::StateDB;
@@ -5470,31 +6305,38 @@ mod tests {
         let ghostdag = producer.ghostdag();
         let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
 
-        // A peer block as the live producers write it: header blue_score is the
-        // selected parent's header score + 1, whatever it merges.
-        async fn admit(
-            dag: &DagStore,
-            ghostdag: &GhostDag,
-            tag: u8,
-            parent: &Block,
-            merges: &[&Block],
-        ) -> Block {
-            let score = parent.header.blue_score + 1;
+        // A peer block as the r1007 producers write it: the heaviest of `parents`
+        // is the selected parent (G3) and the header commits the GHOSTDAG score
+        // (G7). (Pre-r1007 this fixture wrote `parent + 1`, the second unit.)
+        async fn admit(dag: &DagStore, ghostdag: &GhostDag, tag: u8, parents: &[&Block]) -> Block {
+            let hashes: Vec<Hash> = parents.iter().map(|p| p.header.block_hash).collect();
+            let (sp, merges, height, data) = ghostdag
+                .ghostdag_for_parents(&hashes)
+                .await
+                .expect("valid parents");
+            let sp_ts = parents
+                .iter()
+                .map(|p| p.header.timestamp)
+                .max()
+                .unwrap_or(0);
             let mut blk = BlockBuilder::new()
                 .version(2)
-                .height(parent.header.height + 1)
-                .parent(parent.header.block_hash)
-                .merge_parents(merges.iter().map(|m| m.header.block_hash).collect())
+                .height(height)
+                .parent(sp)
+                .merge_parents(merges)
                 .coinbase([tag; 20])
-                .timestamp(parent.header.timestamp + 1)
+                // r1007 G10: a proposer of its own, so siblings in one slot
+                // are honest width, not equivocation.
+                .proposer(PublicKey::new([tag; 32]))
+                .timestamp(sp_ts + 1)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([tag; 32]),
                 })
                 .transactions(vec![])
                 .state_root(Hash::default())
-                .blue_score(score)
-                .blue_work(citrate_consensus::types::blue_work_for_score(score))
+                .blue_score(data.blue_score)
+                .blue_work(data.blue_work)
                 .build_unhashed();
             blk.header.block_hash = blk.compute_hash();
             dag.store_block(blk.clone())
@@ -5505,24 +6347,25 @@ mod tests {
         }
 
         // Three siblings at height 1.
-        let a1 = admit(&dag, &ghostdag, 0xA1, &genesis, &[]).await;
-        let a2 = admit(&dag, &ghostdag, 0xA2, &genesis, &[]).await;
-        let a3 = admit(&dag, &ghostdag, 0xA3, &genesis, &[]).await;
-        // X @ 2 merges both siblings: header score 2, recomputed score +2 higher.
-        let x = admit(&dag, &ghostdag, 0xB1, &a1, &[&a2, &a3]).await;
-        // Y @ 3 is a plain chain A1 -> B -> Y: header score 3, recomputed lower than X.
-        let b = admit(&dag, &ghostdag, 0xB2, &a1, &[]).await;
-        let y = admit(&dag, &ghostdag, 0xC1, &b, &[]).await;
-        // Z @ 2: a sibling of X with an equal header score (a legitimate merge).
-        let z = admit(&dag, &ghostdag, 0xB3, &a1, &[]).await;
+        let a1 = admit(&dag, &ghostdag, 0xA1, &[&genesis]).await;
+        let a2 = admit(&dag, &ghostdag, 0xA2, &[&genesis]).await;
+        let a3 = admit(&dag, &ghostdag, 0xA3, &[&genesis]).await;
+        // X @ 2 merges all three siblings: score 1 + 3 = 4.
+        let x = admit(&dag, &ghostdag, 0xB1, &[&a1, &a2, &a3]).await;
+        // Y @ 3 is a plain chain A1 -> B -> Y: taller than X, score 3 < 4.
+        let b = admit(&dag, &ghostdag, 0xB2, &[&a1]).await;
+        let y = admit(&dag, &ghostdag, 0xC1, &[&b]).await;
+        // Z @ 2: a sibling of X on A1, score 2.
+        let z = admit(&dag, &ghostdag, 0xB3, &[&a1]).await;
 
-        // Preconditions: fork choice prefers X while Y carries the higher header score.
+        // Preconditions: fork choice prefers X, the heavier SHORTER branch.
         assert_eq!(
             ghostdag.select_tip().await.expect("select_tip"),
             x.header.block_hash,
-            "fork choice must prefer X (more blue merges) for this scenario to apply"
+            "fork choice must prefer X (more blue blocks) for this scenario to apply"
         );
-        assert!(y.header.blue_score > x.header.blue_score);
+        assert!(y.header.height > x.header.height);
+        assert!(y.header.blue_score < x.header.blue_score);
 
         let tips = dag.get_tips().await;
         let (sp, merges) = producer
@@ -5538,36 +6381,44 @@ mod tests {
         for m in &merges {
             let mb = dag.get_block(m).await.expect("merge parent stored");
             assert!(
-                mb.header.blue_score <= sp_block.header.blue_score,
-                "merge parent {} has header blue_score {} above the selected parent's {}: \
-                 every peer rejects this block (selected parent must be the heaviest parent)",
-                m,
-                mb.header.blue_score,
-                sp_block.header.blue_score
+                citrate_consensus::types::ForkChoiceKey::of_header(&mb.header)
+                    < citrate_consensus::types::ForkChoiceKey::of_header(&sp_block.header),
+                "merge parent {m} is heavier than the selected parent: every peer rejects \
+                 this block (G3)"
             );
         }
+        // H4 `heavier_shorter_branch_is_still_merged`: the taller, lighter Y is
+        // merged (pre-r1007 the producer dropped it as "heavier" by header score).
+        assert!(
+            merges.contains(&y.header.block_hash),
+            "the lighter, taller tip Y must be merged"
+        );
         assert!(
             merges.contains(&z.header.block_hash),
-            "a tip whose header score equals the selected parent's must still be merged"
+            "a lighter sibling tip must be merged"
         );
 
         // The receiver's verdict on the header the producer would seal.
-        let score = sp_block.header.blue_score + 1;
+        let data = ghostdag
+            .compute_ghostdag(sp, &merges, sp_block.header.height + 1)
+            .await
+            .expect("record");
+        assert_eq!(data.blue_score, 4 + 1 + 3, "SP X, plus Y, B, Z blue");
         let mut candidate = BlockBuilder::new()
             .version(2)
             .height(sp_block.header.height + 1)
             .parent(sp)
             .merge_parents(merges.clone())
             .coinbase([0x44; 20])
-            .timestamp(sp_block.header.timestamp + 1)
+            .timestamp(y.header.timestamp + 1)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new([0xEE; 32]),
             })
             .transactions(vec![])
             .state_root(Hash::default())
-            .blue_score(score)
-            .blue_work(citrate_consensus::types::blue_work_for_score(score))
+            .blue_score(data.blue_score)
+            .blue_work(data.blue_work)
             .build_unhashed();
         candidate.header.block_hash = candidate.compute_hash();
         ghostdag
@@ -5610,14 +6461,19 @@ mod tests {
         let ghostdag = producer.ghostdag();
         let genesis = seed_test_genesis(&storage, &dag, &ghostdag).await;
 
+        // r1007 G7: every merge parent here is a sibling of the selected parent
+        // and blue (k = 18), so the exact score is SP's + 1 + |merges|.
         fn peer_block(tag: u8, parent: &Block, merges: &[&Block]) -> Block {
-            let score = parent.header.blue_score + 1;
+            let score = parent.header.blue_score + 1 + merges.len() as u64;
             let mut blk = BlockBuilder::new()
                 .version(2)
                 .height(parent.header.height + 1)
                 .parent(parent.header.block_hash)
                 .merge_parents(merges.iter().map(|m| m.header.block_hash).collect())
                 .coinbase([tag; 20])
+                // r1007 G10: a proposer of its own, so siblings in one slot
+                // are honest width, not equivocation.
+                .proposer(PublicKey::new([tag; 32]))
                 .timestamp(parent.header.timestamp + 1)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
@@ -5665,13 +6521,15 @@ mod tests {
 
         // 2. Fork choice selects a block whose header this DAG store does not hold
         //    (registered with GhostDAG only): no merge parent can be judged.
-        let ghost = peer_block(0xB1, &a, &[&b]);
+        // r1007 G3: b (VRF 0xA2) outweighs a (0xA1) at equal work, so it is
+        // the selected parent.
+        let ghost = peer_block(0xB1, &b, &[&a]);
         ghostdag
             .add_block(&ghost)
             .await
             .expect("register with GhostDAG only");
         assert!(dag.get_block(&ghost.header.block_hash).await.is_err());
-        let c = peer_block(0xC1, &b, &[]);
+        let c = peer_block(0xC1, &a, &[]);
         admit(&dag, &ghostdag, &c).await;
         assert_eq!(
             ghostdag.select_tip().await.expect("select_tip"),
@@ -5944,6 +6802,8 @@ mod tests {
             2,
         )
         .with_v2_headers(true);
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag()).await;
         let applicator = Arc::new(crate::canonical_apply::CanonicalApplicator::new(
             executor.clone(),
             storage.clone(),
@@ -6065,10 +6925,10 @@ mod tests {
 
         // ── Node Q: an independent producer that seals a COMPETING block B @ 1 on
         //    the same (empty) genesis with a different coinbase and signing key.
-        //    Tip selection breaks an equal-blue-score tie by SMALLEST hash
-        //    (core/consensus/src/tip_selection.rs — the 2026-08-06 convergence fix
-        //    that aligned the producer's tie-break with the drain's), so we search
-        //    key/coinbase pairs until hash(B) < hash(A) and P's fork-choice
+        //    Tip selection breaks an equal-blue-score tie by the larger
+        //    ForkChoiceKey (r1007 G8; one order for producer and drain since the
+        //    2026-08-06 convergence fix), so we search key/coinbase pairs until
+        //    Key(B) > Key(A) and P's fork-choice
         //    deterministically prefers B. Without that the harness would not
         //    reproduce the live divergence.
         // Stop at the FIRST competitor hashing below A, but search the FULL seed
@@ -6090,14 +6950,18 @@ mod tests {
                 .get_block(&b_hash)
                 .expect("read B")
                 .expect("B present");
-            if candidate.header.block_hash < block_a.header.block_hash {
+            // r1007 G8: fork choice prefers the larger ForkChoiceKey (blue work,
+            // then VRF output, then hash; was: the smaller hash).
+            if citrate_consensus::types::ForkChoiceKey::of_header(&candidate.header)
+                > citrate_consensus::types::ForkChoiceKey::of_header(&block_a.header)
+            {
                 block_b = Some(candidate);
                 break;
             }
         }
         let block_b = block_b.expect(
-            "harness: no competing block hashed below A across the full seed space — \
-             astronomically rare (A below all 255 competitors); re-run",
+            "harness: no competing block keyed above A across the full seed space — \
+             astronomically rare (A above all 255 competitors); re-run",
         );
 
         // Give P the competing block WITHOUT applying it — exactly what the
@@ -6283,15 +7147,32 @@ mod tests {
             .expect("read block")
             .expect("sealed block");
         assert_eq!(block.transactions.len(), 1);
+        // r1007 S3-3b: the tx runs when the next block accepts `block`; the
+        // receipt is stamped with that accepting block.
+        assert!(p_storage
+            .transactions
+            .get_receipt(&tx.hash)
+            .expect("read")
+            .is_none());
+        let accepting = producer
+            .produce_block()
+            .await
+            .expect("produce the accepting block");
+        let acc_block = p_storage
+            .blocks
+            .get_block(&accepting)
+            .expect("read block")
+            .expect("sealed block");
+        let hash = accepting;
 
-        // Producer side: unchanged — its own receipt, stamped with the sealed block.
+        // Producer side: its receipt, stamped with the accepting block.
         let p_receipt = p_storage
             .transactions
             .get_receipt(&tx.hash)
             .expect("read")
             .expect("producer stored its receipt");
         assert_eq!(p_receipt.block_hash, hash);
-        assert_eq!(p_receipt.block_number, block.header.height);
+        assert_eq!(p_receipt.block_number, acc_block.header.height);
 
         // Follower: the real receive path (persist, DAG admit, apply).
         assert!(f_storage
@@ -6299,13 +7180,15 @@ mod tests {
             .get_receipt(&tx.hash)
             .expect("read")
             .is_none());
-        f_storage.blocks.put_block(&block).expect("persist");
-        f_dag.store_block(block.clone()).await.expect("dag");
-        f_ghostdag.add_block(&block).await.expect("ghostdag");
-        assert!(matches!(
-            f_app.apply_received(&block).await,
-            ApplyOutcome::Applied { .. }
-        ));
+        for b in [&block, &acc_block] {
+            f_storage.blocks.put_block(b).expect("persist");
+            f_dag.store_block(b.clone()).await.expect("dag");
+            f_ghostdag.add_block(b).await.expect("ghostdag");
+            assert!(matches!(
+                f_app.apply_received(b).await,
+                ApplyOutcome::Applied { .. }
+            ));
+        }
 
         let f_receipt = f_storage
             .transactions
@@ -6613,7 +7496,13 @@ mod tests {
             attested_observed: None,
             finalized_floor: None,
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
+            contender: Arc::new(Mutex::new(None)),
+            cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
+            dead_branch: None,
         }
     }
 
@@ -6651,6 +7540,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -6708,6 +7598,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
             .with_network_height_gate(&attested);
@@ -6747,6 +7638,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
             .with_network_height_gate(&attested);
@@ -6783,6 +7675,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
             .with_network_height_gate(&attested);
@@ -6903,6 +7796,60 @@ mod tests {
         );
     }
 
+    /// TEST 6c — a reorg that lowers the applied tip is sync progress. After a partition
+    /// heal the minority side re-applies the winning branch in one drain pass (devnet
+    /// fin-p1-k1000-1, p7: reverted 458, applied 426 over 525 s at knob 1000), and the
+    /// winning branch can be heavier but SHORTER, so the applied tip lands below where it
+    /// was (25,864 -> 25,832). The producer, waiting on the advance lock for that whole
+    /// pass, evaluates next with the stall window long expired. A height that only counts
+    /// upward moves read that as "no progress" and latched production off until a human
+    /// override (p7 and p5 never sealed again). Any move of the applied tip is the
+    /// applicator doing sync work; only an applied tip that does not move at all stalls.
+    #[test]
+    fn f2_a_reorg_to_a_lower_applied_tip_is_progress_not_a_stall() {
+        let attested = Arc::new(AtomicU64::new(25_878)); // 14 ahead of tip 25,864
+        let gate = f2_gate(attested.clone(), Duration::from_millis(120));
+        let alert = gate.stall_alert.clone();
+
+        // Behind: refuse, no alert.
+        assert!(gate.evaluate_network_height(25_864).is_err());
+        assert!(!alert.load(Ordering::SeqCst));
+
+        // The drain's reorg runs longer than the stall window; it lands on the
+        // winning branch at a lower height, still behind the network.
+        std::thread::sleep(Duration::from_millis(180));
+        attested.store(25_928, Ordering::SeqCst);
+        let err = gate
+            .evaluate_network_height(25_832)
+            .expect_err("still behind after the reorg: keep refusing");
+        assert!(
+            !alert.load(Ordering::SeqCst),
+            "a reorg that moved the applied tip is sync progress, not a stall: {err}"
+        );
+        assert!(
+            !err.to_string().contains("override"),
+            "no human override may be demanded after a reorg, got: {err}"
+        );
+
+        // It then catches up and resumes by itself.
+        assert!(gate.evaluate_network_height(25_900).is_err());
+        assert!(
+            gate.evaluate_network_height(25_928).is_ok(),
+            "resume once caught up, no override"
+        );
+
+        // An applied tip that does not move at all still latches (the wedge the
+        // latch exists for).
+        attested.store(25_940, Ordering::SeqCst);
+        assert!(gate.evaluate_network_height(25_928).is_err());
+        std::thread::sleep(Duration::from_millis(180));
+        let err = gate
+            .evaluate_network_height(25_928)
+            .expect_err("a tip that never moves while behind stalls");
+        assert!(alert.load(Ordering::SeqCst), "the wedge still latches");
+        assert!(err.to_string().contains("override"), "got: {err}");
+    }
+
     /// TEST 7 — revert-check. The F2 gate must stay WIRED: `produce_block` calls
     /// `evaluate_network_height`, and that check reads the attested watermark
     /// (never `head_height` / `target_height`). Deleting the gate call or the
@@ -6929,7 +7876,8 @@ mod tests {
         let ev = src
             .find("fn evaluate_network_height(")
             .expect("evaluate_network_height present");
-        let ebody = &src[ev..ev + 3000];
+        // The body, up to the hysteresis (it grew by the CV-5 refusal).
+        let ebody = &src[ev..ev + 3400];
         assert!(
             ebody.contains("self.attested_ahead")
                 && ebody.contains("CATCHUP_REFUSE_GAP")
@@ -6981,6 +7929,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7026,6 +7975,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7132,7 +8082,13 @@ mod tests {
             attested_observed: Some(att.handle()),
             finalized_floor: floor.map(|f| Arc::new(AtomicU64::new(f))),
             deferred_ahead: None,
+            deferred_majority_ahead: None,
+            split_guard: Arc::new(AtomicBool::new(false)),
+            contender: Arc::new(Mutex::new(None)),
+            cannot_reconcile: Arc::new(AtomicBool::new(false)),
             initial_sync_done: None,
+            deferred_refuse_max: DEFERRED_ONLY_REFUSE_MAX,
+            dead_branch: None,
         }
     }
 
@@ -7155,6 +8111,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7231,6 +8188,7 @@ mod tests {
         ));
         let attested = AttestedNetworkHead::new();
         let producer = test_producer(&storage, &executor, &mempool)
+            .await
             .with_v2_headers(true)
             .with_applied_tip_lock(app.advance_lock())
             .with_produce_catchup_gate(&app)
@@ -7342,6 +8300,8 @@ mod tests {
                 .put_applied_tip(&genesis.header.block_hash, 0)
                 .expect("genesis applied tip");
             dag.set_configured_genesis(genesis.header.block_hash);
+            dag.set_slot_origin(&genesis.header)
+                .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
             dag.store_block(genesis.clone())
                 .await
                 .expect("genesis in DAG");
@@ -7381,7 +8341,7 @@ mod tests {
             )
             .await
             .with_v2_headers(true)
-            .with_applied_tip_lock(app.advance_lock());
+            .with_applicator(app.clone());
             if gated {
                 // Same chain as main.rs.
                 producer = producer
@@ -7428,7 +8388,10 @@ mod tests {
         /// The gossip `NewBlock` arm of main.rs: admit; on Deferred record the
         /// deferred evidence and run SYNC-S3 against `server` (when given).
         pub(super) async fn gossip(n: &mut N, server: Option<&N>, b: &Block) -> &'static str {
-            match n.adm.admit(b).await {
+            let admitted = n.adm.admit(b).await;
+            // The node's drain task, woken by admission, applies it.
+            n.app.drive_drain().await;
+            match admitted {
                 AdmitOutcome::Admitted { .. } => {
                     n.attested.observe(&n.storage, b);
                     "admitted"
@@ -7484,6 +8447,7 @@ mod tests {
                     attested.observe(&storage, b);
                 })
                 .await;
+            n.app.drive_drain().await;
             let from_answer: Vec<&Block> = fixpoint
                 .deferred
                 .iter()
@@ -7623,13 +8587,12 @@ mod tests {
         }
 
         /// A copy of `blk` signed by node `i` at `height`, with a parent nobody holds and
-        /// a header time `skew_secs` after real time (matching the test clock).
+        /// a header time `skew_secs` after the test wall clock (`test_wall_now_secs`).
         fn unadmittable(blk: &Block, i: u8, height: u64, skew_secs: u64) -> Block {
             let mut x = blk.clone();
             x.header.height = height;
             x.header.selected_parent_hash = Hash::new([0xEE; 32]);
-            x.header.timestamp =
-                (chrono::Utc::now().timestamp().max(0) as u64).saturating_add(skew_secs);
+            x.header.timestamp = crate::producer::test_wall_now_secs().saturating_add(skew_secs);
             resign(x, i)
         }
 
@@ -7752,7 +8715,11 @@ mod tests {
         async fn old_header_timestamp_is_not_evidence() {
             let (_a1, _a2, mut b, t1, t2) = behind_fixture().await;
             // 30 s window + 15 s clock allowance, plus one: literal on purpose.
-            b.attested.advance_clock_for_test(Duration::from_secs(46));
+            // Plus one more (r1007 G9): a producer stamps the first second of
+            // the slot it reads with `SLOT_TICK_EARLY_ALLOWANCE_MS` (250 ms)
+            // added, so its header can be up to one second ahead of the clock
+            // reading it sealed at.
+            b.attested.advance_clock_for_test(Duration::from_secs(47));
             assert!(!b.attested.observe_deferred(&t1));
             assert!(!b.attested.observe_deferred(&t2));
             gossip(&mut b, None, &t1).await;
@@ -8111,6 +9078,927 @@ mod tests {
             );
         }
     }
+
+    /// The seal gate when producers this node cannot follow keep extending a branch.
+    ///
+    /// The 60 s window on deferred-only refusal (`DEFERRED_ONLY_REFUSE_MAX`) exists so
+    /// that unadmittable evidence cannot idle producers network-wide. These tests pin
+    /// where the evidence stops counting past it (no branch fork choice would prefer
+    /// backed by more than a third of the producers: a total split, unlinked blocks, a
+    /// lighter branch) and where B must keep refusing: a majority on one branch it
+    /// cannot admit (the split guard), and, since CV-5, any branch backed by more
+    /// than a third that fork choice ranks above B's tip (cannot reconcile). Sealing
+    /// there only grows a second branch.
+    mod split_guard {
+        use super::seal_gate_and_parent_walk::{applied, gossip, node, produce, N};
+        use super::*;
+
+        /// Seven producers: B (node 7) and six others, all on one chain of 12 blocks
+        /// that B admitted, so all six are known proposers on B. Returns one block
+        /// by each other producer (index `i - 1` for node `i`) as a template.
+        async fn seven() -> (Vec<N>, N, Vec<Block>) {
+            let mut others = Vec::new();
+            for i in 1..=6u8 {
+                others.push(node(i, false).await);
+            }
+            let mut b = node(7, true).await;
+            let mut by: Vec<Option<Block>> = vec![None; 6];
+            for r in 0..12usize {
+                let p = r % 6;
+                let blk = produce(&others[p]).await;
+                for (q, o) in others.iter_mut().enumerate() {
+                    if q != p {
+                        assert_eq!(gossip(o, None, &blk).await, "admitted");
+                    }
+                }
+                assert_eq!(gossip(&mut b, None, &blk).await, "admitted");
+                by[p] = Some(blk);
+            }
+            let templates = by.into_iter().map(|t| t.expect("template")).collect();
+            (others, b, templates)
+        }
+
+        /// A signed block by node `i` at `height` on top of `parent`, with a header
+        /// time `skew_secs` after the test wall clock (`test_wall_now_secs`). Each one is a
+        /// real, hash-bound, signed block; B cannot admit any of them because the
+        /// first parent of each branch is a block B never received.
+        fn signed(templates: &[Block], i: u8, height: u64, parent: Hash, skew_secs: u64) -> Block {
+            let mut x = templates[usize::from(i) - 1].clone();
+            x.header.height = height;
+            // A linear branch: one blue block per height, as fork choice scores it,
+            // with the G7 blue work for that score (the gate ranks by the header's
+            // ForkChoiceKey, blue work first, since S3-1).
+            x.header.blue_score = height;
+            x.header.blue_work = citrate_consensus::types::blue_work_for_score(height);
+            x.header.selected_parent_hash = parent;
+            x.header.merge_parent_hashes = Vec::new();
+            x.header.timestamp = crate::producer::test_wall_now_secs().saturating_add(skew_secs);
+            x.header.block_hash = x.compute_hash();
+            x.signature = crypto::sign_block(
+                &x.header.block_hash,
+                &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+            );
+            x
+        }
+
+        /// One branch B cannot admit, extended by a fixed set of proposers.
+        struct Branch {
+            proposers: Vec<u8>,
+            tip: Hash,
+            height: u64,
+            turn: usize,
+        }
+
+        impl Branch {
+            fn new(proposers: &[u8], root: u8, height: u64) -> Self {
+                Self {
+                    proposers: proposers.to_vec(),
+                    tip: Hash::new([root; 32]),
+                    height,
+                    turn: 0,
+                }
+            }
+
+            /// `k` new blocks on this branch, by its proposers in turn.
+            fn extend(&mut self, templates: &[Block], k: usize, skew: u64) -> Vec<Block> {
+                (0..k)
+                    .map(|_| {
+                        let i = self.proposers[self.turn % self.proposers.len()];
+                        self.turn += 1;
+                        self.height += 1;
+                        let blk = signed(templates, i, self.height, self.tip, skew);
+                        self.tip = blk.header.block_hash;
+                        blk
+                    })
+                    .collect()
+            }
+        }
+
+        /// Deliver blocks to B as gossip; every one must defer (B lacks the parent).
+        async fn hear(b: &mut N, blocks: &[Block]) {
+            for blk in blocks {
+                assert_eq!(gossip(b, None, blk).await, "deferred");
+            }
+        }
+
+        fn cannot_reconcile_on(b: &N) -> bool {
+            b.producer
+                .produce_gate
+                .as_ref()
+                .expect("gate wired")
+                .status_snapshot()
+                .cannot_reconcile
+        }
+
+        fn split_guard_on(b: &N) -> bool {
+            b.producer
+                .produce_gate
+                .as_ref()
+                .expect("gate wired")
+                .status_snapshot()
+                .split_guard
+        }
+
+        /// RED at fe5e82b3. Four of seven producers keep extending ONE branch that B
+        /// cannot admit (B never got its first block). The gate refuses for 60 s and
+        /// then seals on B's own tip every round: B builds a solo branch while a
+        /// majority of the producer set is live on another, which is how one admission
+        /// failure becomes a permanent split. The fix keeps refusing for as long as
+        /// that majority keeps producing, and raises the split guard.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_majority_branch_it_cannot_admit_never_seals_solo() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA1, start.1 + 10);
+            let mut sealed = Vec::new();
+            for step in 0..=18u64 {
+                let t = step * 10;
+                // One block from each proposer first, then two per 10 s: within
+                // the 30 s window all four proposers stay fresh on the branch.
+                let blocks = branch.extend(&templates, if step == 0 { 4 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                if b.producer.produce_block().await.is_ok() {
+                    sealed.push(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                sealed,
+                Vec::<u64>::new(),
+                "B sealed on its own tip while 4 of 7 producers extend a branch it cannot admit"
+            );
+            assert_eq!(applied(&b), start, "B extended a solo branch");
+            assert!(split_guard_on(&b), "the split guard is not raised");
+        }
+
+        /// r1007 G9 (#184): the same majority branch, built the way G9 builds
+        /// it. All four producers seal in every slot at the slot boundary, so
+        /// each slot has four sibling blocks on the same selected parent; the
+        /// next slot's blocks select one of them and merge the other three.
+        /// The merged siblings are nobody's selected parent, so each is a
+        /// one-block "branch" of its own, and their proposers looked like
+        /// proposers on two branches (counted on none). The branch then showed
+        /// one proposer instead of four and B sealed solo after the cap.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_concurrent_siblings_of_one_branch_count_their_proposers() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut tip = Hash::new([0xA9; 32]);
+            let mut height = start.1 + 10;
+            let mut losers: Vec<Hash> = Vec::new();
+            let mut sealed = Vec::new();
+            for step in 0..=18u64 {
+                let t = step * 10;
+                height += 1;
+                let mut slot_blocks = Vec::new();
+                for i in 1..=4u8 {
+                    let mut x = signed(&templates, i, height, tip, t);
+                    x.header.merge_parent_hashes = losers.clone();
+                    x.header.block_hash = x.compute_hash();
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    slot_blocks.push(x);
+                }
+                hear(&mut b, &slot_blocks).await;
+                // The next slot selects one sibling and merges the rest.
+                tip = slot_blocks[0].header.block_hash;
+                losers = slot_blocks[1..]
+                    .iter()
+                    .map(|x| x.header.block_hash)
+                    .collect();
+                if b.producer.produce_block().await.is_ok() {
+                    sealed.push(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                sealed,
+                Vec::<u64>::new(),
+                "B sealed on its own tip while 4 of 7 producers extend a branch it cannot \
+                 admit, sealing concurrently as G9 has them"
+            );
+            assert_eq!(applied(&b), start, "B extended a solo branch");
+            assert!(split_guard_on(&b), "the split guard is not raised");
+        }
+
+        /// r1007 G9 (#184): the majority branch only one or two heights above B.
+        /// Under G9 a chain gains at most one height per slot, so a majority
+        /// that seals every slot next to a B that also seals every slot stays
+        /// within the catch-up refuse gap (3) of B for ever, while fork choice
+        /// prefers it by blue work (four blocks per slot against B's one). The
+        /// split guard was raised but the round still sealed, because only the
+        /// height gap made it refuse. B must not seal next to a majority branch
+        /// it cannot admit, whatever the gap.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_majority_branch_level_with_b_still_stops_b() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let b_blue = b
+                .storage
+                .blocks
+                .get_block(&start.0)
+                .expect("read")
+                .expect("tip")
+                .header
+                .blue_score;
+            let mut tip = Hash::new([0xAB; 32]);
+            let mut losers: Vec<Hash> = Vec::new();
+            let mut sealed = Vec::new();
+            for step in 0..=12u64 {
+                let t = step * 10;
+                // One height above B's tip as it stood, then one per slot.
+                let height = start.1 + 1 + step;
+                let blue = b_blue + 10 + 4 * step;
+                let mut slot_blocks = Vec::new();
+                for i in 1..=4u8 {
+                    let mut x = signed(&templates, i, height, tip, t);
+                    x.header.blue_score = blue;
+                    x.header.blue_work = citrate_consensus::types::blue_work_for_score(blue);
+                    x.header.merge_parent_hashes = losers.clone();
+                    x.header.block_hash = x.compute_hash();
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    slot_blocks.push(x);
+                }
+                hear(&mut b, &slot_blocks).await;
+                tip = slot_blocks[0].header.block_hash;
+                losers = slot_blocks[1..]
+                    .iter()
+                    .map(|x| x.header.block_hash)
+                    .collect();
+                if b.producer.produce_block().await.is_ok() {
+                    sealed.push(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            // Inside the 60 s refuse window the gate refuses on the height gap
+            // only (sync gets that long to admit the branch); past it, never.
+            let late: Vec<u64> = sealed.into_iter().filter(|t| *t > 60).collect();
+            assert_eq!(
+                late,
+                Vec::<u64>::new(),
+                "B sealed next to a majority branch it cannot admit that fork choice prefers, \
+                 because the branch was within the height refuse gap"
+            );
+            assert!(split_guard_on(&b), "the split guard is not raised");
+        }
+
+        /// The guard is bounded by the evidence: once the majority stops producing,
+        /// B seals again within the 30 s evidence window (plus one round). Refusing
+        /// producers produce nothing, so if every producer were refusing, the
+        /// evidence would lapse the same way: the guard cannot stall the network.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_split_guard_resumes_when_the_majority_stops() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA2, start.1 + 10);
+            for step in 0..=9u64 {
+                let blocks = branch.extend(&templates, if step == 0 { 4 } else { 2 }, step * 10);
+                hear(&mut b, &blocks).await;
+                assert!(b.producer.produce_block().await.is_err());
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert!(split_guard_on(&b));
+            // The majority goes quiet.
+            let mut resumed_after = None;
+            for step in 1..=6u64 {
+                if b.producer.produce_block().await.is_ok() {
+                    resumed_after = Some(step * 10);
+                    break;
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let after = resumed_after.expect("B never resumed after the majority stopped");
+            // Literal on purpose: 30 s window + one 10 s round.
+            assert!(after <= 40, "resumed only after {after}s");
+            assert!(!split_guard_on(&b), "the split guard stayed raised");
+        }
+
+        /// Seven solo branches (every producer in the same state): no branch has a
+        /// majority behind it, so the 10-29 cap still applies and B seals after 60 s.
+        /// Refusing here would idle every producer at once.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_total_split_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut solos: Vec<Branch> = (1..=6u8)
+                .map(|i| Branch::new(&[i], 0xB0 + i, start + 10))
+                .collect();
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                for s in solos.iter_mut() {
+                    let blocks = s.extend(&templates, 1, t);
+                    hear(&mut b, &blocks).await;
+                }
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a total split must not idle B past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
+        }
+
+        /// Three of seven agreeing (more than a third, not a majority) on a branch
+        /// fork choice ranks above B's tip. Before CV-5 the 60 s cap applied and B
+        /// sealed on its own tip, growing a second branch next to the one fork
+        /// choice prefers (the 10-29 stranded-minority case, kept live that way).
+        /// CV-5 trades that liveness for safety: B cannot reconcile, so it keeps
+        /// refusing, raises `cannot_reconcile` and asks for a resync. The split
+        /// guard (a majority) stays down; the chain stays live on the three.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_minority_branch_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut branch = Branch::new(&[1, 2, 3], 0xA3, start + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks = branch.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                let r = b.producer.produce_block().await;
+                if t == 0 {
+                    assert!(r.is_err(), "3 of 7 count as evidence at first");
+                }
+                if r.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                first_seal, None,
+                "CV-5: B sealed on its own tip past the window while three of seven extend a \
+                 branch it cannot admit that fork choice prefers"
+            );
+            assert!(!split_guard_on(&b), "three of seven are not a majority");
+            assert!(
+                cannot_reconcile_on(&b),
+                "the cannot-reconcile alarm is not raised"
+            );
+            assert!(
+                b.attested.take_resync_request(),
+                "B did not ask the sync tick for a resync"
+            );
+        }
+
+        /// A proposer that signs on two branches is not counted on either: with it,
+        /// each branch would show four proposers (a "majority" each). Without it
+        /// neither is a majority, so the split guard stays down. Branch P still has
+        /// three honest proposers (more than a third) and fork choice ranks it above
+        /// B's tip, so under CV-5 B cannot reconcile and does not seal.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_equivocating_proposer_counts_on_no_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut p = Branch::new(&[1, 2, 3, 4], 0xA4, start + 10);
+            let mut q = Branch::new(&[4, 5, 6], 0xA5, start + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks = p.extend(&templates, if step == 0 { 4 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                let blocks = q.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                first_seal, None,
+                "CV-5: B sealed next to a branch it cannot admit"
+            );
+            assert!(!split_guard_on(&b), "an equivocator made a majority");
+            assert!(cannot_reconcile_on(&b));
+        }
+
+        /// Blocks from four proposers that do not link to each other (same height
+        /// band, unrelated parents) are not one branch: the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_unlinked_blocks_from_a_majority_are_not_a_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                for i in 1..=4u8 {
+                    let mut root = [0xC0u8; 32];
+                    root[0] = i;
+                    root[1] = step as u8;
+                    let parent = Hash::new(root);
+                    let blk = signed(&templates, i, start + 20 + step, parent, t);
+                    hear(&mut b, std::slice::from_ref(&blk)).await;
+                }
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("unlinked blocks held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// Fork choice ranks by blue score, not height. A majority branch that is
+        /// taller than B's chain but claims LESS blue score than B's selected head
+        /// (B's chain merged more) is not a branch B is behind on: the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_majority_branch_lighter_by_blue_score_keeps_the_cap() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b);
+            let b_blue = b
+                .storage
+                .blocks
+                .get_block(&start.0)
+                .expect("read")
+                .expect("tip")
+                .header
+                .blue_score;
+            let mut branch = Branch::new(&[1, 2, 3, 4], 0xA6, start.1 + 10);
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let blocks: Vec<Block> = branch
+                    .extend(&templates, if step == 0 { 4 } else { 2 }, t)
+                    .into_iter()
+                    .map(|mut x| {
+                        // Taller, but lighter than B's head by fork choice's measure
+                        // (blue work first, G8; the G7 work for the lighter score).
+                        x.header.blue_score = b_blue.saturating_sub(1);
+                        x.header.blue_work =
+                            citrate_consensus::types::blue_work_for_score(b_blue.saturating_sub(1));
+                        x
+                    })
+                    .collect();
+                // Re-link and re-sign after the edit (the branch stays one branch).
+                let mut prev: Option<Hash> = None;
+                let mut relinked = Vec::new();
+                for mut x in blocks {
+                    if let Some(p) = prev {
+                        x.header.selected_parent_hash = p;
+                    }
+                    x.header.block_hash = x.compute_hash();
+                    let i = (1..=6u8)
+                        .find(|i| {
+                            templates[usize::from(*i) - 1].header.proposer_pubkey
+                                == x.header.proposer_pubkey
+                        })
+                        .expect("proposer");
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    prev = Some(x.header.block_hash);
+                    relinked.push(x);
+                }
+                if let Some(p) = prev {
+                    branch.tip = p;
+                }
+                hear(&mut b, &relinked).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("a lighter branch held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+            assert!(!split_guard_on(&b));
+        }
+
+        /// RED at 42feb32c (rvSPLIT probe). A 3-of-7 minority branch plus one key
+        /// (node 4) whose block each round names the branch tip as its selected
+        /// parent AND this node's own tip as a merge parent. Linking through any
+        /// parent counted key 4 on the branch, which made it a "majority" here,
+        /// while the same block also follows this node's own history. For the
+        /// split guard a block that names a parent this node holds does not count,
+        /// and only selected-parent links make a branch: no majority.
+        ///
+        /// CV-5: the branch is still one fork choice ranks above B's tip, extended
+        /// by more than a third of the producers on a selected chain B lacks (it
+        /// even merges B's tip), so B cannot reconcile and does not seal.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_bridging_key_does_not_complete_a_majority() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut branch = Branch::new(&[1, 2, 3], 0xA7, start + 10);
+            let mut first_seal = None;
+            for step in 0..=18u64 {
+                let t = step * 10;
+                let blocks = branch.extend(&templates, if step == 0 { 3 } else { 2 }, t);
+                hear(&mut b, &blocks).await;
+                // Key 4 bridges: selected parent = the branch tip, merge parent =
+                // B's own applied tip (which B holds).
+                branch.height += 1;
+                let mut x = signed(&templates, 4, branch.height, branch.tip, t);
+                x.header.merge_parent_hashes = vec![applied(&b).0];
+                x.header.block_hash = x.compute_hash();
+                x.signature = crypto::sign_block(
+                    &x.header.block_hash,
+                    &Ed25519SigningKey::from_bytes(&[0x64; 32]),
+                );
+                branch.tip = x.header.block_hash;
+                hear(&mut b, std::slice::from_ref(&x)).await;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert_eq!(
+                first_seal, None,
+                "CV-5: B sealed next to a branch it cannot admit"
+            );
+            assert!(!split_guard_on(&b), "a bridging key completed a majority");
+            assert!(cannot_reconcile_on(&b));
+        }
+
+        /// CV-5 liveness: a producer at the tip with no unadmittable evidence keeps
+        /// sealing every round past the refuse window, alone or among peers it
+        /// follows. Here B follows six producers on one chain, then seals alone.
+        #[tokio::test(flavor = "current_thread")]
+        async fn cv5_a_producer_at_the_tip_keeps_sealing() {
+            let (_others, b, _templates) = seven().await;
+            for step in 0..12u64 {
+                b.producer
+                    .produce_block()
+                    .await
+                    .unwrap_or_else(|e| panic!("B at the tip refused at {}s: {e}", step * 10));
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            assert!(!split_guard_on(&b));
+            assert!(!cannot_reconcile_on(&b));
+        }
+
+        /// Merge-parent links alone do not make a branch: four producers whose
+        /// blocks name each other only as merge parents (each selected parent
+        /// is its own unknown block) are four branches, so the cap applies.
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_merge_parent_links_alone_are_not_a_branch() {
+            let (_others, mut b, templates) = seven().await;
+            let start = applied(&b).1;
+            let mut prev: Vec<Hash> = Vec::new();
+            let mut first_seal = None;
+            for step in 0..=12u64 {
+                let t = step * 10;
+                let mut now_round = Vec::new();
+                for i in 1..=4u8 {
+                    let mut root = [0xD0u8; 32];
+                    root[0] = i;
+                    root[1] = step as u8;
+                    let mut x = signed(&templates, i, start + 20 + step, Hash::new(root), t);
+                    x.header.merge_parent_hashes = prev.clone();
+                    x.header.block_hash = x.compute_hash();
+                    x.signature = crypto::sign_block(
+                        &x.header.block_hash,
+                        &Ed25519SigningKey::from_bytes(&[0x60 + i; 32]),
+                    );
+                    hear(&mut b, std::slice::from_ref(&x)).await;
+                    now_round.push(x.header.block_hash);
+                }
+                prev = now_round;
+                if b.producer.produce_block().await.is_ok() && first_seal.is_none() {
+                    first_seal = Some(t);
+                }
+                b.attested.advance_clock_for_test(Duration::from_secs(10));
+            }
+            let at = first_seal.expect("merge-parent links held B off past the cap");
+            assert!((60..=70).contains(&at), "sealed at {at}s");
+        }
+
+        /// A stored-shape block for the contender check: `hash` and `vrf` fill
+        /// every byte of the block hash and the VRF output, blue work is the G7
+        /// value for `blue_score`. Not signed: the check reads recorded blocks.
+        fn keyed(height: u64, parent: Hash, proposer: u8, vrf: u8, hash: u8) -> Block {
+            let mut x = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .proposer(PublicKey::new([proposer; 32]))
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([vrf; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                .build_unhashed();
+            x.header.block_hash = Hash::new([hash; 32]);
+            x
+        }
+
+        /// The gate's verdict on `head`'s recorded branches against this node's
+        /// own best tip `own`.
+        fn gate_contender(head: &AttestedNetworkHead, own: &BlockHeader) -> Option<Contender> {
+            let inner = head.handle();
+            inner.contender(
+                inner.now_instant(),
+                |_| false,
+                ForkChoiceKey::of_header(own),
+            )
+        }
+
+        /// r1007 07 finding 4 (S3-1 against CV-5). Fork choice ranks tips by
+        /// `ForkChoiceKey` (blue work, then VRF output, then hash, spec G8);
+        /// the CV-5 gate must judge a branch it cannot admit by the same order,
+        /// or on an equal-blue-work tie the two disagree about which side is
+        /// preferred: the gate then holds B off a branch fork choice ranks
+        /// below B's tip, or lets B seal next to one fork choice ranks above.
+        ///
+        /// Seven producers, three of them (more than a third) on one branch B
+        /// cannot admit. Its top and B's own tip have equal blue work. In each
+        /// case the VRF order and the hash order point opposite ways.
+        #[test]
+        fn cv5_contender_tie_break_matches_fork_choice() {
+            use citrate_consensus::types::ForkChoiceKey;
+            // (own vrf, own hash, branch-top vrf, branch-top hash)
+            let cases = [
+                // Branch top: larger VRF output, larger hash. Fork choice
+                // prefers the branch; a smaller-hash tie-break prefers B's tip.
+                (0x10u8, 0x01u8, 0xF0u8, 0xF3u8),
+                // Branch top: smaller VRF output, smaller hash. Fork choice
+                // prefers B's tip; a smaller-hash tie-break prefers the branch.
+                (0xF0, 0xF3, 0x10, 0x01),
+            ];
+            for (own_vrf, own_hash, top_vrf, top_hash) in cases {
+                let head = AttestedNetworkHead::new();
+                let inner = head.handle();
+                for i in 1..=6u8 {
+                    inner.known_proposers.lock().insert(PublicKey::new([i; 32]));
+                }
+                let now = inner.now_instant();
+                // A linear branch on a root B never received, by proposers 1..=3.
+                let b1 = keyed(40, Hash::new([0xA0; 32]), 1, 0x30, 0xB1);
+                let b2 = keyed(41, b1.header.block_hash, 2, 0x31, 0xB2);
+                let top = keyed(42, b2.header.block_hash, 3, top_vrf, top_hash);
+                for b in [&b1, &b2, &top] {
+                    head.record_deferred_block(b, now);
+                }
+                // B's own best tip: same height, so the same blue work.
+                let own = keyed(42, Hash::new([0xC0; 32]), 7, own_vrf, own_hash);
+                assert_eq!(own.header.blue_work, top.header.blue_work, "fixture: a tie");
+
+                let fork_choice_prefers_branch =
+                    ForkChoiceKey::of_header(&top.header) > ForkChoiceKey::of_header(&own.header);
+                let verdict = gate_contender(&head, &own.header)
+                    .expect("an equal-work branch backed by three of seven is a contender");
+                assert_eq!(
+                    verdict.preferred, fork_choice_prefers_branch,
+                    "CV-5 gate and fork choice disagree on an equal-blue-work tie \
+                     (own vrf {own_vrf:#x} hash {own_hash:#x}, branch top vrf {top_vrf:#x} \
+                     hash {top_hash:#x})"
+                );
+            }
+        }
+
+        /// The quorum sizes the guard uses: a strict majority of the producer set
+        /// (the node itself plus the known proposers), never satisfiable alone.
+        #[test]
+        fn rcseal_majority_quorum_sizes() {
+            // known proposers -> needed agreeing others (producers = known + 1)
+            assert_eq!(deferred_majority_size(1), 2); // 2 producers: unreachable
+            assert_eq!(deferred_majority_size(2), 2); // 3 producers
+            assert_eq!(deferred_majority_size(3), 3); // 4 producers
+            assert_eq!(deferred_majority_size(6), 4); // 7 producers
+            assert_eq!(deferred_majority_size(7), 5); // 8 producers
+        }
+    }
+
+    /// RC-6 (r1007 devnet, gf-50a09463 vs gc-28e13057 at knob 0, 2026-11-10). With the
+    /// drain task applying received blocks, a producer whose drain had not yet run sealed
+    /// on (or skipped against) an applied tip one block behind fork choice's head: 3.3
+    /// blocks per height against 2.05, and 10-32% fewer heights per minute. The producer
+    /// holds the state-advance lock for its whole build, so it must first advance the
+    /// applied tip to fork choice's head itself, then build on that head.
+    mod advance_before_build {
+        use super::seal_gate_and_parent_walk::{applied, node, produce};
+
+        #[tokio::test]
+        async fn rc6_red_producer_builds_on_a_received_block_the_drain_has_not_applied() {
+            let a = node(1, false).await;
+            let b = node(7, false).await;
+            let a1 = produce(&a).await;
+            // B stores A's block; its drain task has not run yet.
+            assert!(matches!(
+                b.adm.admit(&a1).await,
+                crate::admission::AdmitOutcome::Admitted { .. }
+            ));
+            assert_eq!(
+                applied(&b).1,
+                0,
+                "precondition: the drain has not applied a1"
+            );
+            let sealed = b.producer.produce_block().await;
+            let h = sealed.expect(
+                "B skipped its slot: it sealed against an applied tip one block behind fork \
+                 choice's head instead of advancing to it first",
+            );
+            let blk = b
+                .storage
+                .blocks
+                .get_block(&h)
+                .expect("read")
+                .expect("stored");
+            assert_eq!(
+                blk.selected_parent(),
+                a1.header.block_hash,
+                "B's block must extend the head it had received, not be a sibling of it"
+            );
+            assert_eq!(blk.header.height, a1.header.height + 1);
+        }
+    }
+
+    /// r1006 2026-11-01, prod-3 after the reseed: one node serving catch-up
+    /// `GetBlocks` to six peers for ten minutes shed `NewBlock` (inbound queue
+    /// full), its own sync requests timed out, it dropped six peers for those
+    /// timeouts, and it forked off alone. This runs that load through the
+    /// node's inbound path (`PeerManager::forward_incoming` into the production
+    /// 512-slot queue), drains it the way the message loop does (each
+    /// `GetBlocks` served by `block_serve::serve_blocks`, the `NewBlock`
+    /// admitted by `BlockAdmission::admit`), and applies the sync driver's
+    /// timeout-drop rule to the producer whose block just arrived.
+    mod serving_load {
+        use super::seal_gate_and_parent_walk::{applied, gossip, node, produce};
+        use super::*;
+        use citrate_network::peer::{Direction, Peer, PeerInfo, PeerManagerConfig};
+        use citrate_network::PeerId;
+        use tokio::sync::mpsc;
+
+        /// The far ends of a test connection, held open for the test's length.
+        type Ends = (mpsc::Receiver<NetworkMessage>, mpsc::Sender<NetworkMessage>);
+
+        async fn connect(pm: &PeerManager, id: &str, ip: u8, ends: &mut Vec<Ends>) -> PeerId {
+            let pid = PeerId::new(id.to_string());
+            let addr = std::net::SocketAddr::from(([10, 0, 0, ip], 30303));
+            let (send_tx, send_rx) = mpsc::channel(256);
+            let (recv_tx, recv_rx) = mpsc::channel(1);
+            let peer = Peer::new(
+                PeerInfo::new(pid.clone(), addr, Direction::Inbound),
+                send_tx,
+                recv_rx,
+            );
+            ends.push((send_rx, recv_tx));
+            pm.add_peer(Arc::new(peer)).await.expect("add peer");
+            pid
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_node_serving_six_catchups_still_admits_gossip_and_keeps_its_peers() {
+            let a = node(1, false).await;
+            let mut server = node(3, false).await;
+            for _ in 0..20 {
+                let blk = produce(&a).await;
+                assert_eq!(gossip(&mut server, None, &blk).await, "admitted");
+            }
+            let pm = PeerManager::new(PeerManagerConfig::default());
+            let (tx, mut rx) = mpsc::channel(512); // main.rs inbound queue
+            pm.set_incoming(tx).await;
+            let mut ends = Vec::new();
+            let producer = connect(&pm, "prod-1", 1, &mut ends).await;
+            let mut catchups = Vec::new();
+            for i in 0..6u8 {
+                catchups.push(connect(&pm, &format!("catchup-{i}"), 10 + i, &mut ends).await);
+            }
+            // The six catching-up nodes ask faster than one loop serves.
+            let genesis = server
+                .storage
+                .blocks
+                .get_block_by_height(0)
+                .expect("read")
+                .expect("genesis");
+            for _ in 0..100 {
+                for c in &catchups {
+                    pm.forward_incoming(
+                        c.clone(),
+                        NetworkMessage::GetBlocks {
+                            from: genesis,
+                            count: 32,
+                            step: 1,
+                        },
+                    )
+                    .await;
+                }
+            }
+            // The producer seals and gossips its block into that queue.
+            let blk = produce(&a).await;
+            pm.forward_incoming(producer.clone(), NetworkMessage::NewBlock { block: blk })
+                .await;
+            // The message loop drains in arrival order.
+            let mut served = 0usize;
+            let mut admitted = false;
+            while let Ok((_pid, msg)) = rx.try_recv() {
+                match msg {
+                    NetworkMessage::GetBlocks { from, count, .. } => {
+                        let _ = crate::block_serve::serve_blocks(&server.storage, &from, count);
+                        served += 1;
+                    }
+                    NetworkMessage::NewBlock { block } => {
+                        admitted = gossip(&mut server, None, &block).await == "admitted";
+                    }
+                    _ => {}
+                }
+            }
+            assert!(served > 0, "the catch-up requests were served");
+            assert!(
+                admitted,
+                "the serving node never admitted the gossiped block ({:?} shed)",
+                pm.inbound_drops_by_kind()
+            );
+            assert_eq!(applied(&server), applied(&a), "the server fell behind");
+            // Its own sync requests to the producer timed out under that load; the
+            // producer's connection just delivered a block, so it is kept.
+            let (total, _, _) = pm.get_peer_counts().await;
+            assert!(
+                !crate::sync_peer::drop_after_timeouts(
+                    crate::sync_peer::DROP_AFTER_TIMEOUTS,
+                    total,
+                    pm.get_peer(&producer).is_some(),
+                    pm.last_inbound_age(&producer),
+                ),
+                "dropped the producer that just gossiped a block, for timeouts caused by load"
+            );
+        }
+    }
+
+    /// rcBLUE-2 (g), r1006 2026-11-01: "Validated and imported 32/32
+    /// (305850-305881)" three times in 12 s, and SYNCSCORE Barren on every peer.
+    /// Blocks this node admitted are stored above its applied tip while apply
+    /// lags (the drain is held). The 2 s tick anchors at the applied tip, so
+    /// every tick asked for the same range, admitted nothing and scored the
+    /// peer Barren. This runs the tick's anchor decision and the Blocks arm's
+    /// scoring against real storage, `serve_blocks` and `admit_to_fixpoint`.
+    mod admission_ahead_of_apply {
+        use super::seal_gate_and_parent_walk::{applied, node, produce};
+        use super::*;
+        use crate::admission::BlockAdmission;
+        use crate::sync_peer::{classify_serve, ServeQuality};
+        use crate::sync_recovery::{answer_anchor_was_stale, answer_is_held_ahead, TipReask};
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn rcseal_red_admission_ahead_of_apply_does_not_reask_or_score_barren() {
+            let a = node(1, false).await;
+            let b = node(7, false).await;
+            let mut chain = Vec::new();
+            for _ in 0..64 {
+                chain.push(produce(&a).await);
+            }
+            // B admits all 64 (stored, in its DAG) but applies none: an
+            // admission path with no applicator, as when the drain is held.
+            let held_drain = BlockAdmission::new(
+                b.storage.clone(),
+                b.producer.dag_store.clone(),
+                b.producer.ghostdag.clone(),
+                None,
+            );
+            let fp = held_drain.admit_to_fixpoint(chain, |_, _| {}).await;
+            assert_eq!(fp.newly_admitted, 64);
+            let start = applied(&b);
+            assert_eq!(start.1, 0, "precondition: nothing applied");
+
+            let mut reask = TipReask::new();
+            let mut now = std::time::Instant::now();
+            let mut sent = Vec::new();
+            let mut qualities = Vec::new();
+            for _tick in 0..6 {
+                let (tip_hash, tip_height) = applied(&b);
+                // Mode::Tip: the anchor is the applied tip.
+                let anchor = tip_hash;
+                if !reask.hold(anchor, tip_hash, now) {
+                    sent.push(anchor);
+                    let resp = crate::block_serve::serve_blocks(&a.storage, &anchor, 32);
+                    let served = resp.len();
+                    let top = resp.iter().map(|x| x.header.height).max();
+                    let fp = b.adm.admit_to_fixpoint(resp, |_, _| {}).await;
+                    let (now_hash, applied_now) = applied(&b);
+                    let held = answer_is_held_ahead(
+                        top,
+                        fp.newly_admitted,
+                        fp.deferred.len(),
+                        applied_now,
+                    );
+                    reask.note_answer(now_hash, held, now);
+                    let stale = answer_anchor_was_stale(tip_height, applied_now, served) || held;
+                    qualities.push(classify_serve(fp.newly_admitted, 64, 32, stale));
+                }
+                now += Duration::from_secs(2);
+            }
+            assert_eq!(applied(&b), start, "precondition: apply never moved");
+            assert_eq!(
+                sent.len(),
+                1,
+                "the same GetBlocks range was asked {} times in 12 s",
+                sent.len()
+            );
+            assert!(
+                !qualities.contains(&ServeQuality::Barren),
+                "a peer serving exactly what was asked was scored Barren: {qualities:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8303,13 +10191,23 @@ mod pba_l1b_003_producer_timestamp {
             .find("let mut header = BlockHeader {")
             .expect("producer header construction");
         let body = &src[hdr..hdr + 1_500];
+        // r1007 G9: the header carries the slot timestamp `round_slot`
+        // computed, and `round_slot` is where the PBA-L1b-003 clamp lives.
         assert!(
-            body.contains("hardening::producer_timestamp(now, pts)"),
-            "PBA-L1b-003: header.timestamp must be producer_timestamp(now, parent.ts)"
+            body.contains("timestamp: block_timestamp,"),
+            "PBA-L1b-003 / G9: header.timestamp must be round_slot's clamped slot start"
         );
         assert!(
             !body.contains("timestamp: chrono::Utc::now().timestamp() as u64"),
             "PBA-L1b-003: bare `now` stamping reintroduced"
+        );
+        let rs = src
+            .find("fn round_slot(&self, parent_ts: Option<u64>)")
+            .expect("round_slot");
+        let rs_body = &src[rs..rs + 1_600];
+        assert!(
+            rs_body.contains("hardening::producer_timestamp(start, pts)"),
+            "PBA-L1b-003: the slot start must go through producer_timestamp(start, parent.ts)"
         );
     }
 }
@@ -8324,7 +10222,11 @@ mod pba_l1b_001_producer_filter {
         let sel = src
             .find("let transactions = self.select_transactions_with_ai_priority().await?;")
             .expect("selection");
-        let hdr = src.find("let mut header = BlockHeader {").expect("header");
+        // r1007 S3-3b: selection runs after the mergeset execution (it is
+        // pre-checked against post(B)); the own list is fixed by the packing.
+        let hdr = src
+            .find("let executed_transactions = self.pack_own_transactions(&transactions);")
+            .expect("packing");
         let window = &src[sel..hdr];
         assert!(
             window.contains("tx_auth::verify_for_block(&t, chain_id)"),
@@ -8659,6 +10561,9 @@ mod producer_panic_breaker {
             citrate_consensus::crypto::generate_keypair(),
             2,
         ));
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        super::tests::seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag())
+            .await;
         Node {
             _dir: dir,
             storage,
@@ -8798,6 +10703,8 @@ mod producer_panic_breaker {
             }
         }
         assert!(mined, "the transaction is mined once the fault clears");
+        // r1007 S3-3b: the block that included it is accepted by the next.
+        assert!(matches!(n.round().await, RoundOutcome::Produced(_)));
         assert_eq!(
             n.executor.get_balance(&RECIPIENT),
             to_before + U256::from(5u64),
@@ -8942,6 +10849,9 @@ mod producer_vrf_fail_closed {
             Ed25519SigningKey::from_bytes(&[42u8; 32]),
             2,
         );
+        // r1007 G9: the producer builds on genesis, which fixes the slot origin.
+        super::tests::seed_test_genesis(&storage, &producer.dag_store(), &producer.ghostdag())
+            .await;
         producer.vrf_prover = prover;
         Node {
             _dir: dir,
@@ -8992,6 +10902,13 @@ mod producer_vrf_fail_closed {
             .flatten()
     }
 
+    /// The parent VRF output of a block sealed on the fixture genesis.
+    fn genesis_vrf() -> Hash {
+        super::tests::test_genesis().header.vrf_reveal.output
+    }
+
+    /// r1007 G9: the alpha binds the block's time slot (from the fixture
+    /// genesis's timestamp), not its height.
     fn assert_real_ecvrf(block: &Block, parent_vrf: &Hash) {
         let proof = &block.header.vrf_reveal;
         assert_eq!(
@@ -8999,10 +10916,15 @@ mod producer_vrf_fail_closed {
             114,
             "sealed proof must be a full ECVRF proof"
         );
+        let slot = citrate_consensus::slots::slot_of(
+            block.header.timestamp,
+            super::tests::test_genesis().header.timestamp,
+        )
+        .expect("a sealed block has a slot");
         let mut alpha = Vec::with_capacity(72);
         alpha.extend_from_slice(block.header.proposer_pubkey.as_bytes());
         alpha.extend_from_slice(parent_vrf.as_bytes());
-        alpha.extend_from_slice(&block.header.height.to_le_bytes());
+        alpha.extend_from_slice(&slot.to_le_bytes());
         let ecvrf = citrate_consensus::ecvrf::EcvrfProof::from_bytes(&proof.proof)
             .expect("decodes as ECVRF");
         let beta = citrate_consensus::ecvrf::verify(&alpha, &ecvrf).expect("ECVRF verifies");
@@ -9039,9 +10961,12 @@ mod producer_vrf_fail_closed {
             None,
             "no block may be stored for a slot whose VRF prove failed"
         );
-        assert!(
-            n.producer.dag_store.get_tips().await.is_empty(),
-            "no block may enter the DAG for a skipped slot"
+        // r1007: the fixture's DAG holds genesis (the slot origin); a skipped
+        // slot adds nothing to it.
+        assert_eq!(
+            n.producer.dag_store.get_tips().await.len(),
+            1,
+            "no block may enter the DAG for a skipped slot (genesis is the only tip)"
         );
         assert!(
             next_broadcast(&mut n.peer_rx).await.is_none(),
@@ -9064,6 +10989,98 @@ mod producer_vrf_fail_closed {
             citrate_api::metrics_server::producer_vrf_prove_failures() >= failures_before + 1.0,
             "the skip must be counted on citrate_producer_vrf_prove_failures_total"
         );
+    }
+
+    /// A clock fixed at `ms` milliseconds since the UNIX epoch.
+    fn fixed_clock(ms: Arc<AtomicU64>) -> SlotClock {
+        Arc::new(move || ms.load(Ordering::SeqCst))
+    }
+
+    /// #184 / r1007 G9: a round seals at its slot boundary: the header carries
+    /// the first second of the slot the clock is in (a tick a few ms early
+    /// counts for the slot it was scheduled for), and the VRF alpha binds that
+    /// slot, not the height.
+    #[tokio::test]
+    async fn a_block_is_stamped_at_its_slot_start_with_a_slot_bound_vrf() {
+        let g = super::tests::test_genesis().header.timestamp;
+        let slot_ms = citrate_consensus::slots::SLOT_DURATION_SECS * 1_000;
+        let ms = Arc::new(AtomicU64::new(g * 1_000 + 7 * slot_ms + 300));
+        let mut n = node(real_vrf_prover()).await;
+        n.producer = n.producer.with_slot_clock(fixed_clock(ms.clone()));
+        let hash = n.producer.produce_block().await.expect("slot 7");
+        let b = n
+            .storage
+            .blocks
+            .get_block(&hash)
+            .expect("read")
+            .expect("stored");
+        assert_eq!(b.header.height, 1);
+        assert_eq!(
+            b.header.timestamp,
+            g + 7 * citrate_consensus::slots::SLOT_DURATION_SECS,
+            "stamped at the first second of slot 7"
+        );
+        assert_real_ecvrf(&b, &genesis_vrf());
+
+        // A tick that fires just before the boundary of slot 9 seals slot 9.
+        ms.store(
+            g * 1_000 + 9 * slot_ms - (crate::timing::SLOT_TICK_EARLY_ALLOWANCE_MS - 50),
+            Ordering::SeqCst,
+        );
+        let hash = n.producer.produce_block().await.expect("slot 9");
+        let b = n
+            .storage
+            .blocks
+            .get_block(&hash)
+            .expect("read")
+            .expect("stored");
+        assert_eq!(
+            citrate_consensus::slots::slot_of(b.header.timestamp, g),
+            Some(9)
+        );
+    }
+
+    /// #184 / r1007 G9, G10: one block per proposer per slot. A second round
+    /// in the slot of its own last block seals nothing (its selected parent is
+    /// in that slot) and signs nothing. The next slot seals normally.
+    #[tokio::test]
+    async fn a_second_round_in_the_same_slot_seals_nothing() {
+        let g = super::tests::test_genesis().header.timestamp;
+        let slot_ms = citrate_consensus::slots::SLOT_DURATION_SECS * 1_000;
+        let ms = Arc::new(AtomicU64::new(g * 1_000 + 3 * slot_ms));
+        let mut n = node(real_vrf_prover()).await;
+        n.producer = n.producer.with_slot_clock(fixed_clock(ms.clone()));
+        let first = n.producer.produce_block().await.expect("slot 3");
+        let _ = next_broadcast(&mut n.peer_rx).await;
+
+        ms.fetch_add(slot_ms / 2, Ordering::SeqCst); // still slot 3
+        let err = n
+            .producer
+            .produce_block()
+            .await
+            .expect_err("a second block in slot 3 must not be sealed");
+        assert!(err.to_string().contains("G9"), "named the slot rule: {err}");
+        assert_eq!(
+            n.storage.blocks.get_block_by_height(2).expect("read"),
+            None,
+            "nothing sealed on top of slot 3 within slot 3"
+        );
+        assert!(next_broadcast(&mut n.peer_rx).await.is_none());
+
+        // The refused round signed nothing: the last signed slot is still 3.
+        assert_eq!(n.producer.last_signed_slot.load(Ordering::SeqCst), 3);
+
+        ms.store(g * 1_000 + 4 * slot_ms, Ordering::SeqCst);
+        let second = n.producer.produce_block().await.expect("slot 4");
+        let b = n
+            .storage
+            .blocks
+            .get_block(&second)
+            .expect("read")
+            .expect("stored");
+        assert_eq!(b.header.height, 2);
+        assert_eq!(b.header.selected_parent_hash, first);
+        assert_eq!(n.producer.last_signed_slot.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]
@@ -9096,7 +11113,7 @@ mod producer_vrf_fail_closed {
             "the skipped slot left no gap or block"
         );
         assert_eq!(block.transactions.len(), 1, "the pending tx is included");
-        assert_real_ecvrf(&block, &Hash::default());
+        assert_real_ecvrf(&block, &genesis_vrf());
         match next_broadcast(&mut n.peer_rx).await {
             Some(NetworkMessage::NewBlock { block: sent }) => {
                 assert_eq!(sent.header.block_hash, hash)
@@ -9253,7 +11270,11 @@ mod producer_vrf_fail_closed {
             "the skip must name the output mismatch, got: {err:#}"
         );
         assert_eq!(n.storage.blocks.get_block_by_height(1).expect("read"), None);
-        assert!(n.producer.dag_store.get_tips().await.is_empty());
+        assert_eq!(
+            n.producer.dag_store.get_tips().await.len(),
+            1,
+            "genesis only"
+        );
         assert!(next_broadcast(&mut n.peer_rx).await.is_none());
     }
 
