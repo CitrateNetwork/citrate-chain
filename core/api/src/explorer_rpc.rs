@@ -620,9 +620,9 @@ pub fn logs_bloom<'a>(
                 .unwrap_or(0);
             let bit = usize::from(u16::from_be_bytes([hi, lo]) & 2047);
             let byte = 255usize.saturating_sub(bit / 8);
-            let mask = 1u8
-                .checked_shl(u32::try_from(bit % 8).unwrap_or(0))
-                .unwrap_or(0);
+            // The bit within its byte (bit % 8 < 8), as a table lookup.
+            const BIT: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+            let mask = BIT.get(bit % 8).copied().unwrap_or(0);
             if let Some(b) = bloom.get_mut(byte) {
                 *b |= mask;
             }
@@ -844,4 +844,53 @@ pub fn register_explorer_methods(
         };
         block_receipts_json(&st, &block)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::logs_bloom;
+    use citrate_consensus::types::Hash;
+    use citrate_execution::types::{Address, Log};
+    use sha3::{Digest, Keccak256};
+
+    /// The yellow-paper bloom (§4.3.1) written independently with plain shifts:
+    /// for each item, three 11-bit indices from the first six bytes of its
+    /// keccak256, bit `b` set at byte `255 - b / 8`, mask `1 << (b % 8)`.
+    fn reference(items: &[Vec<u8>]) -> [u8; 256] {
+        let mut bloom = [0u8; 256];
+        for item in items {
+            let h: [u8; 32] = Keccak256::digest(item).into();
+            for i in 0..3 {
+                let b = ((usize::from(h[2 * i]) << 8) | usize::from(h[2 * i + 1])) & 2047;
+                bloom[255 - b / 8] |= 1u8 << (b % 8);
+            }
+        }
+        bloom
+    }
+
+    #[test]
+    fn logs_bloom_matches_the_yellow_paper_bloom() {
+        assert_eq!(logs_bloom(std::iter::empty::<&Log>()), [0u8; 256], "no logs, empty bloom");
+        let logs = vec![
+            Log {
+                address: Address([0x11; 20]),
+                topics: vec![Hash::new([0x22; 32]), Hash::new([0x33; 32])],
+                data: vec![1, 2, 3],
+            },
+            Log {
+                address: Address([0xAB; 20]),
+                topics: vec![],
+                data: vec![],
+            },
+        ];
+        let items: Vec<Vec<u8>> = vec![
+            vec![0x11; 20],
+            vec![0x22; 32],
+            vec![0x33; 32],
+            vec![0xAB; 20],
+        ];
+        let got = logs_bloom(&logs);
+        assert_eq!(got, reference(&items), "address and every topic, data not included");
+        assert!(got.iter().map(|b| b.count_ones()).sum::<u32>() <= 12);
+    }
 }
