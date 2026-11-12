@@ -44,8 +44,9 @@ const ROOT_BOOK: &str = include_str!("../../../contracts/addresses/40204.json");
 /// Options shared by every command that signs a transaction.
 #[derive(Args, Debug, Clone, Default)]
 pub struct SignerArgs {
-    /// Keystore account to sign with (its address). Without it the key comes
-    /// from the PRIVATE_KEY environment variable, then the config's default_account.
+    /// Sign with this keystore key: the address of a key in the CLI keystore
+    /// (`account create` / `account import`). Without it the key comes from the
+    /// PRIVATE_KEY environment variable, then the config's default_account.
     #[arg(long)]
     pub account: Option<String>,
 
@@ -57,8 +58,8 @@ pub struct SignerArgs {
     #[arg(long)]
     pub gas_limit: Option<u64>,
 
-    /// Sign even if the node is not chain 40204 at the expected genesis
-    /// (for a local development chain).
+    /// Sign for a node whose chain id is not 40204 (a local development chain).
+    /// A chain-40204 node at another genesis is always refused.
     #[arg(long)]
     pub allow_foreign_chain: bool,
 
@@ -87,30 +88,81 @@ pub const DEFAULT_MAX_FEE_SALT: &str = "1";
 
 /// Refuse a gas price or fee above the caps; return the fee in wei.
 pub fn check_fee(
-    _gas_limit: u64,
-    _gas_price_wei: u64,
-    _max_gas_price_wei: u64,
-    _max_fee_wei: u128,
+    gas_limit: u64,
+    gas_price_wei: u64,
+    max_gas_price_wei: u64,
+    max_fee_wei: u128,
 ) -> Result<u128> {
-    Ok(0)
+    if gas_price_wei > max_gas_price_wei {
+        anyhow::bail!(
+            "Refusing to sign: gas price {} gwei is above --max-gas-price {} gwei",
+            format_gwei(gas_price_wei),
+            format_gwei(max_gas_price_wei)
+        );
+    }
+    let fee = u128::from(gas_limit).saturating_mul(u128::from(gas_price_wei));
+    if fee > max_fee_wei {
+        anyhow::bail!(
+            "Refusing to sign: the fee ({gas_limit} gas x {} gwei = {} SALT) is above \
+             --max-fee {} SALT",
+            format_gwei(gas_price_wei),
+            format_salt(fee),
+            format_salt(max_fee_wei)
+        );
+    }
+    Ok(fee)
 }
 
 /// Whether to send after showing the fee. `answer` is the reply typed at the prompt.
-pub fn confirm_decision(_yes: bool, _interactive: bool, _answer: Option<&str>) -> Result<bool> {
-    Ok(true)
+pub fn confirm_decision(yes: bool, interactive: bool, answer: Option<&str>) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !interactive {
+        anyhow::bail!(
+            "Not sent: confirmation needs a terminal. Pass --yes to send without confirming."
+        );
+    }
+    let a = answer.unwrap_or("").trim().to_ascii_lowercase();
+    Ok(a == "y" || a == "yes")
+}
+
+fn format_units(amount: u128, decimals: u32) -> String {
+    // `unit` is 10^9 or 10^18, never zero, so checked_div/checked_rem never fail.
+    let unit = 10u128.pow(decimals);
+    let whole = amount.checked_div(unit).unwrap_or(0);
+    let frac = amount.checked_rem(unit).unwrap_or(0);
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac = format!("{frac:0width$}", width = decimals as usize);
+    format!("{whole}.{}", frac.trim_end_matches('0'))
 }
 
 /// A wei amount as SALT, exact (no floating point).
 pub fn format_salt(wei: u128) -> String {
-    wei.to_string()
+    format_units(wei, 18)
+}
+
+fn format_gwei(wei: u64) -> String {
+    format_units(u128::from(wei), 9)
 }
 
 /// A warning when PRIVATE_KEY signs for an account other than the config's default.
 pub fn env_default_mismatch_warning(
-    _key: &SigningKey,
-    _default_account: Option<&str>,
+    key: &SigningKey,
+    default_account: Option<&str>,
 ) -> Option<String> {
-    None
+    let default = parse_address(default_account?).ok()?;
+    let signer = address_of(key);
+    if signer == default {
+        return None;
+    }
+    Some(format!(
+        "Warning: {PRIVATE_KEY_ENV} signs for 0x{}, not the configured default_account 0x{}.",
+        hex::encode(signer),
+        hex::encode(default)
+    ))
 }
 
 /// The genesis hash in the root address book.
@@ -123,27 +175,33 @@ pub fn expected_genesis() -> Result<String> {
         .context("contracts/addresses/40204.json has no genesisHash")
 }
 
-/// Refuse to sign for a node that is not the expected chain, unless overridden.
+/// Refuse to sign for a node that is not the expected chain.
+///
+/// A node that reports chain 40204 must be at the expected genesis, always:
+/// a 40204 transaction signed against another genesis (an old network, a
+/// fork) is replayable on the live chain. `--allow-foreign-chain` only lets the
+/// CLI sign for a different chain id, whose genesis it does not know.
 pub fn check_chain(
     node_chain_id: u64,
     node_genesis: &str,
     expected_genesis: &str,
     allow_foreign: bool,
 ) -> Result<()> {
-    if allow_foreign {
+    if node_chain_id == EXPECTED_CHAIN_ID {
+        if !node_genesis.eq_ignore_ascii_case(expected_genesis) {
+            anyhow::bail!(
+                "Refusing to sign: the node reports chain {EXPECTED_CHAIN_ID} but its genesis is \
+                 {node_genesis}, not {expected_genesis} (contracts/addresses/40204.json). A \
+                 transaction signed for it would be valid on the live chain. Point --rpc at a \
+                 live node, or update the CLI. --allow-foreign-chain does not override this."
+            );
+        }
         return Ok(());
     }
-    if node_chain_id != EXPECTED_CHAIN_ID {
+    if !allow_foreign {
         anyhow::bail!(
             "Refusing to sign: the node serves chain {node_chain_id}, not chain \
              {EXPECTED_CHAIN_ID}. Pass --allow-foreign-chain to sign for it anyway."
-        );
-    }
-    if !node_genesis.eq_ignore_ascii_case(expected_genesis) {
-        anyhow::bail!(
-            "Refusing to sign: the node's genesis is {node_genesis}, but this CLI expects \
-             {expected_genesis} (contracts/addresses/40204.json). Update the CLI, or pass \
-             --allow-foreign-chain to sign for this chain anyway."
         );
     }
     Ok(())
@@ -153,8 +211,9 @@ pub fn check_chain(
 pub fn parse_secret_hex(hex_key: &str) -> Result<SigningKey> {
     let trimmed = hex_key.trim();
     let raw = Zeroizing::new(
+        // hex's error names the offending character and its position; never pass it on.
         hex::decode(trimmed.strip_prefix("0x").unwrap_or(trimmed))
-            .context("the private key is not hex")?,
+            .map_err(|_| anyhow::anyhow!("the private key is not valid hex"))?,
     );
     let bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
         anyhow::anyhow!(
@@ -357,6 +416,18 @@ pub async fn sign_and_send(
     )?;
     let from = address_of(&key);
     let from_hex = format!("0x{}", hex::encode(from));
+    let env_set = std::env::var(PRIVATE_KEY_ENV).is_ok_and(|k| !k.trim().is_empty());
+    if args.account.is_none() && env_set {
+        if let Some(w) = env_default_mismatch_warning(&key, config.default_account.as_deref()) {
+            eprintln!("{w}");
+        }
+    }
+    let max_gas_price_wei = args
+        .max_gas_price
+        .checked_mul(1_000_000_000)
+        .context("--max-gas-price is too large")?;
+    let max_fee_wei =
+        crate::commands::account::parse_salt_amount(&args.max_fee).context("--max-fee")?;
 
     let client = reqwest::Client::new();
     let chain_id = hex_u64(
@@ -391,10 +462,15 @@ pub async fn sign_and_send(
         .await?,
         "eth_getTransactionCount",
     )?;
-    let gas_price = hex_u64(
-        &rpc(&client, config, "eth_gasPrice", json!([])).await?,
-        "eth_gasPrice",
-    )?;
+    let gas_price = match args.gas_price {
+        Some(gwei) => gwei
+            .checked_mul(1_000_000_000)
+            .context("--gas-price is too large")?,
+        None => hex_u64(
+            &rpc(&client, config, "eth_gasPrice", json!([])).await?,
+            "eth_gasPrice",
+        )?,
+    };
     let gas_limit = match args.gas_limit {
         Some(g) => g,
         None => {
@@ -414,6 +490,31 @@ pub async fn sign_and_send(
         }
     };
 
+    let fee = check_fee(gas_limit, gas_price, max_gas_price_wei, max_fee_wei)?;
+    eprintln!("Chain:     {chain_id}");
+    eprintln!("From:      {from_hex} (nonce {nonce})");
+    match to {
+        Some(t) => eprintln!("To:        0x{}", hex::encode(t)),
+        None => eprintln!("To:        (contract creation)"),
+    }
+    eprintln!("Value:     {} SALT", format_salt(value));
+    eprintln!("Gas:       {gas_limit} at {} gwei", format_gwei(gas_price));
+    eprintln!("Max fee:   {} SALT", format_salt(fee));
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let answer = if !args.yes && interactive {
+        eprint!("Send? [y/N] ");
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("Failed to read the confirmation")?;
+        Some(line)
+    } else {
+        None
+    };
+    if !confirm_decision(args.yes, interactive, answer.as_deref())? {
+        anyhow::bail!("Cancelled; nothing was sent.");
+    }
+
     let params = TxParams {
         nonce,
         gas_price,
@@ -427,7 +528,7 @@ pub async fn sign_and_send(
         .as_str()
         .map(str::to_string)
         .context("eth_sendRawTransaction returned no hash")?;
-    eprintln!("Sent {hash} from {from_hex} (nonce {nonce}, gas {gas_limit} at {gas_price} wei)");
+    eprintln!("Sent {hash}");
 
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

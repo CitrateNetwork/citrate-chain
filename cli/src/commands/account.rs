@@ -174,7 +174,7 @@ pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
 }
 
 /// Parse a SALT amount ("1", "0.001", "2.5") into wei without floating point.
-fn parse_salt_amount(amount: &str) -> Result<u128> {
+pub(crate) fn parse_salt_amount(amount: &str) -> Result<u128> {
     let a = amount.trim();
     let (whole, frac) = a.split_once('.').unwrap_or((a, ""));
     if whole.is_empty() && frac.is_empty() {
