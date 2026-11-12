@@ -43,9 +43,11 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The ceremony's phases in order. P4V (DeployV060Genesis) runs only in a GENESIS_V060=1 run.
+PHASE_ORDER = ["P0", "P1", "P2", "P3", "P3L", "P4", "P4V", "P5", "P6", "P7"]
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
 ENV_FNS = r"env(?:Address|Uint|Int|String|Bool|Bytes32|Bytes|Or|Exists)?"
-PHASE_MARK = re.compile(r"^# -{8,} (P[0-9]L?)\s*$", re.M)
+PHASE_MARK = re.compile(r"^# -{8,} (P[0-9][LV]?)\s*$", re.M)
 
 
 def die(msg, code=2):
@@ -251,14 +253,14 @@ def phase_scripts(repo):
     except OSError as e:
         die(f"cannot read the ceremony scripts: {e}", 1)
     marks = list(PHASE_MARK.finditer(ce))
-    if [m.group(1) for m in marks] != ["P0", "P1", "P2", "P3", "P3L", "P4", "P5", "P6", "P7"]:
-        die(f"{ce_path}: expected one '# ---- Pn' section marker per phase P0..P7 (and P3L after P3)", 1)
+    if [m.group(1) for m in marks] != PHASE_ORDER:
+        die(f"{ce_path}: expected one '# ---- Pn' section marker per phase P0..P7 (and P3L after P3, P4V after P4)", 1)
     gm = re.search(r'^GENESIS_MEMBERSHIP_SCRIPT=([\w./]+)\s*$', ce, re.M)
     out, problems, rg_phases = {}, [], []
     for i, m in enumerate(marks):
         sec = ce[m.end() : marks[i + 1].start() if i + 1 < len(marks) else len(ce)]
         sec = "\n".join(l for l in sec.splitlines() if not l.lstrip().startswith("#"))
-        found = re.findall(r"forge_phase\s+P[0-9]L?\s+([\w/]+\.s\.sol)", sec)
+        found = re.findall(r"forge_phase\s+P[0-9][LV]?\s+([\w/]+\.s\.sol)", sec)
         found += re.findall(r"\bscript/([\w/]+\.s\.sol)", sec)
         if re.search(r'\bbash\s+"\$REGENESIS"', sec):
             rg_phases.append(m.group(1))
@@ -361,7 +363,7 @@ def check_spec(repo, spec):
                 problems.append(f"{k} is classed p0-bash but the P0 section of genesis_ceremony.sh never names it")
         if c == "set" and not re.search(r"(?:^|[\s;(])(?:export\s+)?(?:[A-Z_]+=\S*\s+)*" + re.escape(k) + r"=", ce + "\n" + rg, re.M):
             problems.append(f"{k} is classed set but neither genesis_ceremony.sh nor regenesis.sh assigns it")
-        if c == "late" and e.get("available_after") not in ("P1", "P2", "P3", "P3L"):
+        if c == "late" and e.get("available_after") not in ("P1", "P2", "P3", "P3L", "P4"):
             problems.append(f"{k}: a late input needs available_after P1..P3")
         if c == "p0" and e.get("type") not in ("address", "uint", "path"):
             problems.append(f"{k}: a p0 input needs a type")
@@ -376,7 +378,7 @@ def check_spec(repo, spec):
 def preflight(spec, run_phases, started_after, deployer):
     """Problems with the environment for the phases this invocation runs."""
     inputs, env, problems = spec["inputs"], os.environ, []
-    order = ["P0", "P1", "P2", "P3", "P3L", "P4", "P5", "P6", "P7"]
+    order = PHASE_ORDER
     dep = (deployer or "").lower()
     seen_vals = {}
     for k, e in sorted(inputs.items()):
@@ -410,10 +412,142 @@ def preflight(spec, run_phases, started_after, deployer):
             seen_vals[k] = v.lower()
         elif t == "uint" and not re.fullmatch(r"[0-9]+", v):
             problems.append(f"{k} ({v}) is not an unsigned integer")
+    problems += retired_key_problems(inputs, env, dep)
     for g in spec.get("distinct", []):
         vals = [(k, seen_vals[k]) for k in g if k in seen_vals]
         if len({x for _, x in vals}) != len(vals):
             problems.append(f"{', '.join(g)} must be distinct addresses (got {', '.join(f'{k}={x}' for k, x in vals)})")
+    return problems
+
+
+VETO_WINDOW = 24 * 3600
+COUNCIL_ROLES = ("GOV_OWNERS", "GRD_OWNERS")
+FALLBACK_TO_DEPLOYER = ("RELAYER", "SIGNER_1", "SIGNER_2", "SIGNER_3")
+# Block-0 accounts that are funded (base allocations) but are not ceremony role inputs. The
+# inventory may tag them so the GO-K step 3 alloc check knows them; they grant no seat.
+BLOCK0_ACCOUNT_TAGS = ("FAUCET", "TEAM")
+
+
+def _address_list(raw, key, problems):
+    out = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if not ADDR.fullmatch(x) or int(x, 16) == 0:
+            problems.append(f"{key}: {x!r} is not a nonzero address")
+            continue
+        out.add(x.lower())
+    return out
+
+
+def role_inputs(inputs):
+    """The role-holding address inputs: every address-typed p0/late input that is not a
+    contract ("kind": "contract", checked against the ceremony's books instead), plus the
+    council owner lists. These names are the role vocabulary of GENESIS_KEY_INVENTORY."""
+    roles = [k for k, e in sorted(inputs.items())
+             if e.get("class") in ("p0", "late") and e.get("type", "address") == "address" and e.get("kind") != "contract"]
+    return roles + list(COUNCIL_ROLES)
+
+
+def key_inventory(raw, vocabulary, problems):
+    """GENESIS_KEY_INVENTORY: role-tagged JSON {address: [roles]} (fed #467 section 0.6).
+    Returns {lowercase address: set(roles)}; problems name every malformed part."""
+    repeated = []
+
+    def once(pairs):  # json.loads keeps the last of two equal keys; refuse them instead
+        out = {}
+        for k, v in pairs:
+            if k in out:
+                repeated.append(k)
+            out[k] = v
+        return out
+
+    try:
+        d = json.loads(raw, object_pairs_hook=once)
+    except ValueError:
+        d = None
+    for k in repeated:
+        problems.append(f"GENESIS_KEY_INVENTORY: {k.lower() if isinstance(k, str) else k} appears more than once")
+    if not isinstance(d, dict) or not d:
+        problems.append("GENESIS_KEY_INVENTORY is not a JSON object {address: [roles]} with at least one key")
+        return {}
+    inv = {}
+    for a, roles in d.items():
+        if not isinstance(a, str) or not ADDR.fullmatch(a) or int(a, 16) == 0:
+            problems.append(f"GENESIS_KEY_INVENTORY: {a!r} is not a nonzero address")
+            continue
+        if not isinstance(roles, list) or not roles or not all(isinstance(r, str) for r in roles):
+            problems.append(f"GENESIS_KEY_INVENTORY: {a} needs a non-empty list of role names")
+            continue
+        for r in roles:
+            if r not in vocabulary:
+                problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} has an unknown role {r!r} (known: {', '.join(vocabulary)})")
+        if a.lower() in inv:
+            problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} appears more than once")
+        inv[a.lower()] = set(roles)
+    return inv
+
+
+def retired_key_problems(inputs, env, deployer):
+    """Keys of the 0.6.0 ceremony genesis (fed #467 section 0.6 steps 3-4; D-K3, owner 2026-11-10).
+
+    An entry with "required_with": K must be set when K=1. With GENESIS_V060=1:
+      - GENESIS_KEY_INVENTORY is role-tagged JSON {address: [roles]}, roles from role_inputs();
+      - every role-holding address input, and every council owner, must be on it WITH that
+        role. There is no exemption for a producer staker: stakers sign nothing before S4-5
+        (section 0.1), so none may hold a ceremony role. Stakers stay allowed only as funded
+        or referenced block-0 accounts, which the alloc check (section 0.6 step 3) covers;
+      - contract inputs ("kind": "contract", e.g. PATRONAGE_MEMBERSHIP) are not keys: the phase
+        that reads one checks it against this run's books;
+      - none of them, nor the deployer, may be on GENESIS_RETIRED_KEYS (an extra denylist);
+      - the deployer is the throwaway ceremony key: never on the inventory, no other seat;
+      - GRD_MIN_DELAY plus GENESIS_GUARDIAN_VETO_MARGIN must fit in the 24 h veto window."""
+    problems = []
+    for k, e in sorted(inputs.items()):
+        w = e.get("required_with")
+        if w and env.get(w, "") == "1" and not env.get(k, "").strip():
+            problems.append(f"{k} is not set; {w}=1 requires it ({e['why']})")
+    if env.get("GENESIS_V060", "") != "1":
+        return problems
+    retired = _address_list(env["GENESIS_RETIRED_KEYS"], "GENESIS_RETIRED_KEYS", problems) if env.get("GENESIS_RETIRED_KEYS", "").strip() else set()
+    # DeployEduStack falls back to the deployer for these when unset; refuse that here, before
+    # anything is sent, whichever phases this invocation runs.
+    for k in FALLBACK_TO_DEPLOYER:
+        if not env.get(k, "").strip():
+            problems.append(f"{k} is not set; in a 0.6.0 run it would fall back to the deployer (DeployEduStack), which may hold no seat")
+    vocabulary = role_inputs(inputs)
+    raw_inv = env.get("GENESIS_KEY_INVENTORY", "").strip()
+    inventory = key_inventory(raw_inv, vocabulary + list(BLOCK0_ACCOUNT_TAGS), problems) if raw_inv else None
+    named = []
+    for k in vocabulary:
+        if k in COUNCIL_ROLES:
+            named += [(k, x.strip()) for x in env.get(k, "").split(",") if x.strip()]
+        elif env.get(k, "").strip():
+            named.append((k, env[k].strip()))
+    deps = [(k, env[k].strip()) for k in ("DEPLOYER_ADDRESS", "CEREMONY_DEPLOYER_ADDRESS") if env.get(k, "").strip()]
+    if deployer:
+        deps.append(("the deployer", deployer))
+    for k, v in named + deps:
+        if v.lower() in retired:
+            problems.append(f"{k} ({v}) is a key retired at the r1007 ceremony (D-K3); the 0.6.0 genesis needs a new one")
+    if inventory is not None:
+        dep_set = {v.lower() for _, v in deps}
+        for k, v in named:
+            lv = v.lower()
+            if lv in dep_set:
+                problems.append(f"{k} ({v}) is the deployer; the throwaway ceremony key may hold no other seat")
+            elif k not in inventory.get(lv, set()):
+                problems.append(f"{k} ({v}) is not in GENESIS_KEY_INVENTORY with role {k}")
+    for k, e in sorted(inputs.items()):
+        dv, v = e.get("decided"), env.get(k, "").strip()
+        if dv is not None and v and v != dv:
+            problems.append(f"{k} is {v}; the owner decided {dv} ({e.get('decided_by', 'owner')})")
+    margin = env.get("GENESIS_GUARDIAN_VETO_MARGIN", "").strip()
+    delay = env.get("GRD_MIN_DELAY", "").strip()
+    if margin:
+        if not re.fullmatch(r"[0-9]+", margin) or int(margin) == 0:
+            problems.append(f"GENESIS_GUARDIAN_VETO_MARGIN ({margin}) must be an unsigned integer above zero")
+        elif re.fullmatch(r"[0-9]+", delay) and int(delay) + int(margin) > VETO_WINDOW:
+            problems.append(f"GRD_MIN_DELAY ({delay}) plus GENESIS_GUARDIAN_VETO_MARGIN ({margin}) exceeds the 24 h ProviderRegistry veto window")
     return problems
 
 

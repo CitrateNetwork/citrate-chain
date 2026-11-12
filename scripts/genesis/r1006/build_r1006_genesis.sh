@@ -14,6 +14,8 @@
 #   alloc      turn a dump into the committed allocation (see emit_alloc.py):
 #                build_r1006_genesis.sh alloc --work DIR [--out FILE]
 #                  [--orangeseed-tree CHAIN389_CHECKOUT | --orangeseed FILE]
+#              --stakers FILE: required with GENESIS_V060=1, which runs the GO-K step 3 check
+#              (scripts/genesis/v060/alloc_keys_check.py) on the alloc and removes it on failure.
 #              --orangeseed-tree runs chain#389's GenesisOrangeSeed for this run's
 #              GovernanceTimelock (FOUNDRY_SOLC must name solc 0.8.36 when offline).
 #
@@ -49,7 +51,7 @@ log() { echo "[r1006 $(date -u +%H:%M:%S)] $*" >&2; }
 
 cmd="${1:-}"; shift || true
 NODE="" DUMP="" WORK="" INPUTS="$HERE/inputs.placeholder.env" REF=HEAD OUT=""
-ORANGESEED="" ORANGESEED_TREE=""
+ORANGESEED="" ORANGESEED_TREE="" STAKERS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -61,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --solc) SOLC_BIN="$2"; shift 2 ;;
     --orangeseed) ORANGESEED="$2"; shift 2 ;;
     --orangeseed-tree) ORANGESEED_TREE="$2"; shift 2 ;;
+    --stakers) STAKERS="$2"; shift 2 ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -122,8 +125,27 @@ case "$cmd" in
       cp "$ORANGESEED_TREE/contracts/genesis/orangeseed.json" "$WORK/orangeseed.json"
       ORANGESEED="$WORK/orangeseed.json"
     fi
-    exec "$PY" "$HERE/emit_alloc.py" --dump "$WORK/dump.json" --inputs "$WORK/inputs.env" \
-      --manifest "$WORK/book/ceremony-run.json" --book "$WORK/book/40204.json" ${ORANGESEED:+--orangeseed "$ORANGESEED" --governance-book "$WORK/book/governance.json"} --out "${OUT:-$WORK/alloc.json}"
+    # The 0.6.0 ceremony genesis (GENESIS_V060=1): GO-K step 3 (fed #467 section 0.6) is a required
+    # render step. Every EOA the alloc funds or references must be in GENESIS_KEY_INVENTORY, be a
+    # producer staker from --stakers (required here, no built-in path), or be the deployer with
+    # balance 0; a failing check removes the alloc.
+    if [[ "${GENESIS_V060:-}" == 1 ]]; then
+      [[ -n "$STAKERS" && -f "$STAKERS" ]] || die "GENESIS_V060=1 needs --stakers FILE (the producer set's validators.json) for the GO-K step 3 check"
+      [[ -n "${GENESIS_KEY_INVENTORY:-}" ]] || die "GENESIS_V060=1 needs GENESIS_KEY_INVENTORY for the GO-K step 3 check"
+      dep=$(jq -r '.deployer' "$WORK/devnet.json" 2>/dev/null) || dep=""
+      [[ "$dep" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "no deployer in $WORK/devnet.json"
+    fi
+    out="${OUT:-$WORK/alloc.json}"
+    "$PY" "$HERE/emit_alloc.py" --dump "$WORK/dump.json" --inputs "$WORK/inputs.env" \
+      --manifest "$WORK/book/ceremony-run.json" --book "$WORK/book/40204.json" ${ORANGESEED:+--orangeseed "$ORANGESEED" --governance-book "$WORK/book/governance.json"} --out "$out" || exit $?
+    if [[ "${GENESIS_V060:-}" == 1 ]]; then
+      python3 "$HERE/../v060/alloc_keys_check.py" --alloc "$out" --key-inventory "$GENESIS_KEY_INVENTORY" \
+        --stakers "$STAKERS" --deployer "$dep" --retired-keys "${GENESIS_RETIRED_KEYS:-}" || {
+        rm -f "$out"
+        die "GO-K step 3 failed: $out removed (see GOK3-FAIL above)"
+      }
+    fi
+    exit 0
     ;;
   _inner) ;;
   *) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//' >&2; exit 1 ;;

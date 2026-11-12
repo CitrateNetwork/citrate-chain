@@ -1,0 +1,10 @@
+{
+  "chainId": 40204,
+  "genesisHash": "0xa3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4",
+  "block": 648047,
+  "probed_at": "2026-11-09T16:34:08Z",
+  "book_deployedAt": "2026-01-01T00:00:00Z",
+  "with_code_count": 112,
+  "codeless": [],
+  "precompiles_codeless_by_design": 21
+}

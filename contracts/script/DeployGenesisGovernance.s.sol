@@ -11,6 +11,9 @@ import "./lib/GenesisProfile.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {MultisigProposer} from "../src/genesis/MultisigProposer.sol";
 import {GuardianCanceller} from "../src/genesis/GuardianCanceller.sol";
+import {GuardianCancellerV2} from "../src/genesis/GuardianCancellerV2.sol";
+import {ProviderRegistry} from "../src/amc/ProviderRegistry.sol";
+import {V060GovernanceSpec} from "./lib/V060GovernanceSpec.sol";
 
 /// @title DeployGenesisGovernance: GOVERNANCE and GUARDIAN for the betanet genesis (C2 D5 / G3)
 /// @notice For each council: an OZ v5.7.0 `TimelockController` (the delay) fronted by a
@@ -85,6 +88,28 @@ import {GuardianCanceller} from "../src/genesis/GuardianCanceller.sol";
 ///         n >= 5, m > n/2, minDelay >= 48 hours; GUARDIAN m >= 2, n >= 3, m > n/2; and the
 ///         GUARDIAN delay shorter than the GOVERNANCE delay, so a veto can land in time.
 ///
+///         Optional: GENESIS_V060=1 is the 0.6.0 ceremony genesis. It always runs the genesis
+///         profile, and it builds that genesis's guardian veto
+///         (owner decision Q21, 2026-11-09): step 3 deploys ProviderRegistry{salt
+///         "Genesis.ProviderRegistry"}(GOVERNANCE timelock, guardian = GUARDIAN timelock, 24 h)
+///         and GuardianCancellerV2{salt "Genesis.GuardianCancellerV2"}(GOVERNANCE timelock,
+///         GUARDIAN timelock, that registry), and step 4 grants CANCELLER to v2. v1 is not
+///         deployed and holds no seat. The book lists the v2 address as GuardianCanceller (the
+///         seat), the registry as ProviderRegistry, and `params.guardianCancellerVersion` = 2.
+///         Unset or 0 is the r1006/r1007 ceremony, byte for byte. Values other than 0 / 1 are
+///         rejected.
+///         With GENESIS_V060=1 three key parameters are required, none with a default
+///         (V060GovernanceSpec.KeyParams; fed #467 section 0.6, D-K3):
+///           GENESIS_KEY_INVENTORY         the r1007 key inventory, role-tagged JSON
+///                                         {address: [roles]}; every council owner must be on it
+///                                         with role GOV_OWNERS / GRD_OWNERS (an allowlist)
+///           GENESIS_RETIRED_KEYS          the retired r1006 non-producer keys; no council owner
+///                                         and not the deployer may be on it (a denylist)
+///           GENESIS_GUARDIAN_VETO_MARGIN  seconds; GRD_MIN_DELAY plus this must fit inside the
+///                                         ProviderRegistry veto window (24 h)
+///         The run refuses all of this before broadcasting. The deployer is the throwaway
+///         ceremony key: it is not on the inventory, and it ends with no role.
+///
 ///         Dry run:  forge script script/DeployGenesisGovernance.s.sol --rpc-url <rpc>
 ///         Then:     ADDRESS_BOOK=genesis/governance.json forge script script/CheckDeployedAdmins.s.sol --rpc-url <rpc>
 contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook, GenesisProfile {
@@ -130,6 +155,13 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
 
     RunProfile public runProfile;
 
+    /// @notice The last `deployWith` built the v2 guardian veto (GENESIS_V060=1).
+    bool public cancellerV2;
+    /// @notice The block-0 ProviderRegistry GuardianCancellerV2 commits to (v2 mode only).
+    address public providerRegistry;
+    /// @notice GENESIS_GUARDIAN_VETO_MARGIN of the last 0.6.0 run (recorded in the book).
+    uint256 public guardianVetoMargin;
+
     function run() external returns (Deployed memory d) {
         address deployer = deployerAddress();
         Council memory gov = _councilFromEnv("GOV");
@@ -137,9 +169,18 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         bool allowShared = _envFlag("ALLOW_SHARED_HOLDERS");
         bool allowWeak = _envFlag("ALLOW_WEAK_GOVERNANCE");
         bool genesisProfile = _envFlag("GENESIS_PROFILE");
+        bool v060 = _envFlag("GENESIS_V060");
         // Resolve the output path before broadcasting, so a missing one fails first.
         vm.envString("GENESIS_GOVERNANCE_OUT");
-        d = deployWith(deployer, gov, grd, allowShared, allowWeak, genesisProfile);
+        if (v060) {
+            V060GovernanceSpec.KeyParams memory k;
+            (k.governanceOwners, k.guardianOwners) = inventoryRoles(vm.envOr("GENESIS_KEY_INVENTORY", string("")));
+            k.retiredKeys = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
+            k.guardianVetoMargin = vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0));
+            d = deployWithV060(deployer, gov, grd, allowShared, allowWeak, k);
+        } else {
+            d = deployWith(deployer, gov, grd, allowShared, allowWeak, genesisProfile);
+        }
         _writeBook("GENESIS_GOVERNANCE_OUT", bookJson(deployer, d, gov, grd));
     }
 
@@ -161,6 +202,47 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         bool allowWeak,
         bool genesisProfile
     ) public returns (Deployed memory d) {
+        cancellerV2 = false;
+        guardianVetoMargin = 0;
+        return _deploy(deployer, gov, grd, allowShared, allowWeak, genesisProfile);
+    }
+
+    /// @notice The 0.6.0 ceremony genesis (GENESIS_V060=1): the genesis profile on any chain id,
+    ///         and the v2 guardian veto (ProviderRegistry and GuardianCancellerV2 in place of
+    ///         GuardianCanceller v1). `k` are the key parameters (KeyParams): every council owner
+    ///         must be on the key inventory and off the retired list, the deployer off the retired
+    ///         list, and the GUARDIAN delay plus the veto margin inside the registry's veto
+    ///         window. The override flags are refused, as on every genesis run.
+    function deployWithV060(
+        address deployer,
+        Council memory gov,
+        Council memory grd,
+        bool allowShared,
+        bool allowWeak,
+        V060GovernanceSpec.KeyParams memory k
+    ) public returns (Deployed memory d) {
+        V060GovernanceSpec.requireKeyParams(k);
+        V060GovernanceSpec.requireNotRetired("deployer", deployer, k.retiredKeys);
+        for (uint256 i = 0; i < gov.owners.length; i++) {
+            V060GovernanceSpec.requireKnownKey("GOVERNANCE owner", "GOV_OWNERS", gov.owners[i], k.governanceOwners, k);
+        }
+        for (uint256 i = 0; i < grd.owners.length; i++) {
+            V060GovernanceSpec.requireKnownKey("GUARDIAN owner", "GRD_OWNERS", grd.owners[i], k.guardianOwners, k);
+        }
+        V060GovernanceSpec.requireVetoMargin(grd.minDelay, k.guardianVetoMargin);
+        guardianVetoMargin = k.guardianVetoMargin;
+        cancellerV2 = true;
+        return _deploy(deployer, gov, grd, allowShared, allowWeak, true);
+    }
+
+    function _deploy(
+        address deployer,
+        Council memory gov,
+        Council memory grd,
+        bool allowShared,
+        bool allowWeak,
+        bool genesisProfile
+    ) internal returns (Deployed memory d) {
         require(deployer != address(0), "deployer must be set");
         // Node chain id vs simulated chain id, before anything else (GenesisProfile).
         ChainProfile memory cp = _resolveChainProfile(genesisProfile);
@@ -191,6 +273,8 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         console.log("Chain ID:", block.chainid);
         console.log("Genesis profile:", genesis);
         console.log("Node chain id checked:", cp.nodeChecked);
+        console.log("Guardian canceller v2:", cancellerV2);
+        providerRegistry = address(0);
         runProfile = RunProfile({
             genesis: genesis,
             nodeChecked: cp.nodeChecked,
@@ -205,7 +289,11 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         _requireNotOwner("GUARDIAN", grd, broadcaster);
         (d.governanceTimelock, d.governanceMultisig) = _deployCouncil(GOV_TIMELOCK, GOV_MULTISIG, gov, deployer);
         (d.guardianTimelock, d.guardianMultisig) = _deployCouncil(GRD_TIMELOCK, GRD_MULTISIG, grd, deployer);
-        d.guardianCanceller = _deployCanceller(d.governanceTimelock, d.guardianTimelock);
+        if (cancellerV2) {
+            (providerRegistry, d.guardianCanceller) = _deployCancellerV2(d.governanceTimelock, d.guardianTimelock);
+        } else {
+            d.guardianCanceller = _deployCanceller(d.governanceTimelock, d.guardianTimelock);
+        }
         _handOver(d.governanceTimelock, d.governanceMultisig, deployer, d.guardianCanceller);
         _handOver(d.guardianTimelock, d.guardianMultisig, deployer, address(0));
         vm.stopBroadcast();
@@ -235,13 +323,15 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         view
         returns (string memory)
     {
-        string[] memory names = new string[](5);
-        address[] memory addrs = new address[](5);
+        bool v2 = cancellerV2;
+        string[] memory names = new string[](v2 ? 6 : 5);
+        address[] memory addrs = new address[](v2 ? 6 : 5);
         (names[0], addrs[0]) = ("GovernanceTimelock", d.governanceTimelock);
         (names[1], addrs[1]) = ("GovernanceMultisig", d.governanceMultisig);
         (names[2], addrs[2]) = ("GuardianTimelock", d.guardianTimelock);
         (names[3], addrs[3]) = ("GuardianMultisig", d.guardianMultisig);
         (names[4], addrs[4]) = ("GuardianCanceller", d.guardianCanceller);
+        if (v2) (names[5], addrs[5]) = ("ProviderRegistry", providerRegistry);
         string memory params = string.concat(
             '"governance":{"threshold":',
             vm.toString(gov.threshold),
@@ -260,6 +350,11 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
             ',"proposalTtl":',
             vm.toString(grd.proposalTtl),
             '},"guardianCancelsGovernance":true,"guardianRemovalExemptFromVeto":true,',
+            v2
+                ? string.concat(
+                    '"guardianCancellerVersion":2,"guardianVetoMargin":', vm.toString(guardianVetoMargin), ","
+                )
+                : "",
             _profileJson()
         );
         return _bookJson(deployer, names, addrs, params);
@@ -395,6 +490,24 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
             : address(new GuardianCanceller{salt: Salts.salt(GRD_CANCELLER)}(govTl, grdTl));
     }
 
+    /// @notice CREATE2 ProviderRegistry(governance timelock, guardian timelock, 24 h), then
+    ///         GuardianCancellerV2(governance timelock, guardian timelock, that registry); each is
+    ///         reused when live. The registry's guardian at block 0 is the guardian council (Q9 a).
+    function _deployCancellerV2(address govTl, address grdTl) internal returns (address registry, address c) {
+        bytes memory regInit = V060GovernanceSpec.providerRegistryInit(govTl, grdTl);
+        registry = _isLive(V060GovernanceSpec.PROVIDER_REGISTRY, regInit)
+            ? _create2Address(V060GovernanceSpec.PROVIDER_REGISTRY, regInit)
+            : address(
+                new ProviderRegistry{salt: Salts.salt(V060GovernanceSpec.PROVIDER_REGISTRY)}(
+                    govTl, grdTl, V060GovernanceSpec.PROVIDER_VETO_WINDOW
+                )
+            );
+        bytes memory init = V060GovernanceSpec.guardianCancellerV2Init(govTl, grdTl, registry);
+        c = _isLive(V060GovernanceSpec.GUARDIAN_CANCELLER_V2, init)
+            ? _create2Address(V060GovernanceSpec.GUARDIAN_CANCELLER_V2, init)
+            : address(new GuardianCancellerV2{salt: Salts.salt(V060GovernanceSpec.GUARDIAN_CANCELLER_V2)}(govTl, grdTl, registry));
+    }
+
     /// @notice Hand `tl` to `ms` (and, when `canceller` is nonzero, CANCELLER only to it), then
     ///         renounce the deployer's admin. Runs only while the deployer still administers the
     ///         timelock; on a re-run after hand-over it is skipped and the postconditions
@@ -417,6 +530,20 @@ contract DeployGenesisGovernance is ScriptEnv, AdminChecks, Create2Deploy, Genes
         GuardianCanceller c = GuardianCanceller(d.guardianCanceller);
         require(c.governanceTimelock() == d.governanceTimelock, "GUARDIAN: canceller cancels on another timelock");
         require(c.guardian() == d.guardianTimelock, "GUARDIAN: canceller answers to another guardian");
+        if (cancellerV2) {
+            ProviderRegistry r = ProviderRegistry(providerRegistry);
+            require(
+                GuardianCancellerV2(d.guardianCanceller).providerRegistry() == providerRegistry,
+                "GUARDIAN: v2 canceller protects another registry"
+            );
+            require(r.governance() == d.governanceTimelock, "GUARDIAN: registry answers to another governance");
+            require(r.guardian() == d.guardianTimelock, "GUARDIAN: registry guardian is not the guardian council");
+            address v1 = _create2Address(
+                GRD_CANCELLER,
+                abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(d.governanceTimelock, d.guardianTimelock))
+            );
+            require(!gt.hasRole(TIMELOCK_CANCELLER_ROLE, v1), "GUARDIAN: v1 canceller holds CANCELLER in the v2 genesis");
+        }
         require(
             gt.hasRole(TIMELOCK_CANCELLER_ROLE, d.guardianCanceller),
             "GUARDIAN: guardian canceller cannot cancel GOVERNANCE operations"
