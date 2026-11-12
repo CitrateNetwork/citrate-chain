@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import {
-  chainId, genesisHash, contracts, aaStack, precompiles, memberSBT, membershipVault,
+  chainId, genesisHash, accounts, contracts, aaStack, precompiles, memberSBT, membershipVault,
   flatten, getAddress, checkDrift, raw,
 } from '../src/index.mjs'
 
@@ -20,8 +20,14 @@ test('exports match the embedded canonical snapshot', () => {
   assert.equal(membershipVault, embedded.MembershipStakeVault)
 })
 
-test('the snapshot is the r1006 network book', () => {
-  assert.equal(genesisHash, '0xa3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4')
+test('the snapshot is the r1007 network book', () => {
+  assert.equal(genesisHash, '0xcf68634502b4fca1e977ac8dd35aa006bb40c04208d5cd55f1c2b508bba96631')
+  // r1007 post-genesis contracts are new: TenantHierarchy is the r1007 deployer's nonce 0
+  assert.equal(getAddress('TenantHierarchy'), '0x92f2bc7e1b33841de1b138fe28cf202222562cc3')
+  // operator EOAs are exported apart from contracts and never resolve through getAddress
+  assert.equal(accounts.Bundler, '0x7e711E78ca7636f2307E91bCB6855e64F591F7ea')
+  assert.equal(accounts.Faucet, '0x61F9Fb46631c14728De21E683DB69BA6f771F385')
+  assert.throws(() => getAddress('Bundler'), /unknown contract/)
   assert.equal(genesisHash, embedded.genesisHash)
   // post-genesis registries are folded into contracts under their own keys
   assert.match(getAddress('Quorum.AnchorRegistry'), /^0x[0-9a-f]{40}$/)
