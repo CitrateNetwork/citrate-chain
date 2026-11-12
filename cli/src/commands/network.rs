@@ -313,18 +313,10 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(block) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(block) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Block Information:".bold());
         print!("{}", render_block(block));
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -337,7 +329,11 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
 }
 
 /// The block summary `network block` prints, one line per field.
-fn render_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
+///
+/// `block` is the `eth_getBlockByNumber` result. It is indexed as a `Value`, so a
+/// field the node does not send reads as null and prints a placeholder instead
+/// of panicking.
+fn render_block(block: &serde_json::Value) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
         "Number: {}",
@@ -351,7 +347,10 @@ fn render_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
         .unwrap_or(0)
     ));
     lines.push(format!("Hash: {}", block["hash"].as_str().unwrap_or("N/A")));
-    lines.push(format!("Parent: {}", block["parentHash"].as_str().unwrap_or("N/A")));
+    lines.push(format!(
+        "Parent: {}",
+        block["parentHash"].as_str().unwrap_or("N/A")
+    ));
     lines.push(format!(
         "Timestamp: {}",
         u64::from_str_radix(
@@ -363,20 +362,23 @@ fn render_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
         )
         .unwrap_or(0)
     ));
-    lines.push(format!("Miner: {}", block["miner"].as_str().unwrap_or("N/A")));
+    lines.push(format!(
+        "Miner: {}",
+        block["miner"].as_str().unwrap_or("N/A")
+    ));
 
     if let Some(txs) = block["transactions"].as_array() {
         lines.push(format!("Transactions: {}", txs.len()));
 
         if !txs.is_empty() && txs.len() <= 5 {
-            lines.push(format!("\nTransactions:"));
+            lines.push("\nTransactions:".to_string());
             for tx in txs {
                 if let Some(hash) = tx["hash"].as_str() {
                     lines.push(format!("  • {}", hash));
                 }
             }
         } else if txs.len() > 5 {
-            lines.push(format!("  (showing first 5)"));
+            lines.push("  (showing first 5)".to_string());
             for tx in txs.iter().take(5) {
                 if let Some(hash) = tx["hash"].as_str() {
                     lines.push(format!("  • {}", hash));
@@ -386,8 +388,12 @@ fn render_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
         }
     }
 
-    // GhostDAG specific fields
-    if let Some(merge_parents) = block["mergeParents"].as_array() {
+    // GhostDAG specific fields. The node sends `mergeParentHashes`; older
+    // nodes sent `mergeParents`.
+    let merge_parents = block["mergeParentHashes"]
+        .as_array()
+        .or_else(|| block["mergeParents"].as_array());
+    if let Some(merge_parents) = merge_parents {
         if !merge_parents.is_empty() {
             lines.push(format!("\nGhostDAG Merge Parents: {}", merge_parents.len()));
             for parent in merge_parents.iter().take(3) {
@@ -398,7 +404,13 @@ fn render_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
         }
     }
 
-    if let Some(blue_score) = block["blueScore"].as_u64() {
+    // `blueScore` is a hex quantity like every other number in the response.
+    let blue_score = block["blueScore"].as_u64().or_else(|| {
+        block["blueScore"]
+            .as_str()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    });
+    if let Some(blue_score) = blue_score {
         lines.push(format!("Blue Score: {}", blue_score));
     }
     let mut out = lines.join("\n");
@@ -423,11 +435,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(tx) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(tx) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Transaction Details:".bold());
         println!("Hash: {}", tx["hash"].as_str().unwrap_or("N/A").cyan());
         println!("From: {}", tx["from"].as_str().unwrap_or("N/A"));
@@ -496,11 +504,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
             let receipt_result: serde_json::Value = receipt_response.json().await?;
 
-            if let Some(receipt) = receipt_result
-                .get("result")
-                .unwrap_or(&serde_json::Value::Null)
-                .as_object()
-            {
+            if let Some(receipt) = receipt_result.get("result").filter(|v| v.is_object()) {
                 println!("\nReceipt:");
 
                 let status = receipt["status"].as_str().unwrap_or("0x0");
@@ -535,11 +539,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -579,11 +579,7 @@ async fn get_gas_price(config: &Config) -> Result<()> {
         println!("  {} wei", price);
         println!("  {} gwei", price as f64 / 1e9);
         println!("  {} ETH", price as f64 / 1e18);
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -660,11 +656,7 @@ async fn get_peers(config: &Config) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -693,11 +685,7 @@ async fn get_sync_status(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(sync) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(sync) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Sync Status: SYNCING".yellow().bold());
 
         if let Some(current) = sync["currentBlock"].as_str() {
@@ -734,11 +722,7 @@ async fn get_sync_status(config: &Config) -> Result<()> {
     {
         println!("{}", "Sync Status: SYNCED".green().bold());
         println!("Node is fully synchronized with the network");
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -768,11 +752,7 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(stats) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(stats) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "DAG Statistics:".bold());
         // A null field is one the node does not track (citrate_getDagStats);
         // show it as such instead of as 0.
@@ -803,11 +783,7 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         // Method might not be available
         if error["message"]
             .as_str()
@@ -842,9 +818,9 @@ mod tests {
     /// `mergeParentHashes` and sends `blueScore` as a hex string.
     const R1007_BLOCK_7059: &str = include_str!("../../tests/fixtures/r1007_block_7059.json");
 
-    fn block() -> serde_json::Map<String, serde_json::Value> {
+    fn block() -> serde_json::Value {
         match serde_json::from_str::<serde_json::Value>(R1007_BLOCK_7059) {
-            Ok(serde_json::Value::Object(map)) => map,
+            Ok(v) if v.is_object() => v,
             other => panic!("fixture is not a JSON object: {other:?}"),
         }
     }
@@ -854,7 +830,9 @@ mod tests {
         let out = render_block(&block());
         assert!(out.contains("Number: 7059"), "{out}");
         assert!(
-            out.contains("Hash: 0xeb9174b8db765758bb4a807f9a10e608f324268b630b6ba21cc0fc743eb6669d"),
+            out.contains(
+                "Hash: 0xeb9174b8db765758bb4a807f9a10e608f324268b630b6ba21cc0fc743eb6669d"
+            ),
             "{out}"
         );
         assert!(out.contains("Transactions: 1"), "{out}");
@@ -889,8 +867,7 @@ mod tests {
 
     #[test]
     fn a_block_with_only_a_number_renders_placeholders() {
-        let mut b = serde_json::Map::new();
-        b.insert("number".into(), serde_json::json!("0x2a"));
+        let b = serde_json::json!({ "number": "0x2a" });
         let out = render_block(&b);
         assert!(out.contains("Number: 42"), "{out}");
         assert!(out.contains("Hash: N/A"), "{out}");
