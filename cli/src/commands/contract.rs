@@ -348,16 +348,7 @@ async fn deploy_contract(
     };
 
     // Constructor arguments are not ABI-encoded here; refuse rather than drop them.
-    if let Some(args_str) = args {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&args_str).context("Invalid constructor arguments JSON")?;
-        if parsed.as_array().is_none_or(|a| !a.is_empty()) {
-            anyhow::bail!(
-                "--args is not supported for deploy: append the ABI-encoded constructor \
-                 arguments to the bytecode (e.g. `cast abi-encode`)"
-            );
-        }
-    }
+    check_deploy_args(args.as_deref())?;
     let code = hex::decode(&bytecode).context("Contract file is not hex bytecode")?;
     let value_wei = value.parse::<u128>().context("Invalid value")?;
 
@@ -439,6 +430,22 @@ async fn call_contract(
                     println!("  Event: {}", topic0.as_str().unwrap_or("Unknown"));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// `contract deploy --args`: constructor arguments are not ABI-encoded by the CLI,
+/// so anything but an empty array is refused rather than silently dropped.
+fn check_deploy_args(args: Option<&str>) -> Result<()> {
+    if let Some(args_str) = args {
+        let parsed: serde_json::Value =
+            serde_json::from_str(args_str).context("Invalid constructor arguments JSON")?;
+        if parsed.as_array().is_none_or(|a| !a.is_empty()) {
+            anyhow::bail!(
+                "--args is not supported for deploy: append the ABI-encoded constructor \
+                 arguments to the bytecode (e.g. `cast abi-encode`)"
+            );
         }
     }
     Ok(())
@@ -922,7 +929,22 @@ fn encode_method_call(method_sig: &str, args: serde_json::Value) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
+    use super::check_deploy_args;
     use super::encode_method_call;
+
+    #[test]
+    fn deploy_refuses_constructor_args_it_would_drop() {
+        assert!(check_deploy_args(None).is_ok());
+        assert!(check_deploy_args(Some("[]")).is_ok());
+        let err = check_deploy_args(Some("[7, \"hello\"]"))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("not supported"), "{err}");
+        assert!(err.contains("ABI-encoded"), "{err}");
+        assert!(check_deploy_args(Some("{\"a\":1}")).is_err());
+        assert!(check_deploy_args(Some("not json")).is_err());
+    }
     use sha3::{Digest, Keccak256};
 
     #[test]

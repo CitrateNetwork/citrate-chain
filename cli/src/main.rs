@@ -290,6 +290,13 @@ mod tests {
             "/tmp/pw",
             "--gas-limit",
             "60000",
+            "--gas-price",
+            "2",
+            "--max-gas-price",
+            "50",
+            "--max-fee",
+            "0.5",
+            "--yes",
         ];
         let with = |base: &[&str]| {
             let mut v: Vec<&str> = base.to_vec();
@@ -324,5 +331,23 @@ mod tests {
                 "{bad:?} took a key on argv"
             );
         }
+    }
+
+    /// `--account` names a key in the CLI keystore, not an arbitrary address.
+    #[test]
+    fn account_flag_help_says_it_is_a_keystore_key() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("account")
+            .and_then(|a| a.find_subcommand_mut("send"))
+            .map(|s| s.render_long_help().to_string())
+            .unwrap_or_default();
+        let line = help
+            .lines()
+            .skip_while(|l| !l.contains("--account"))
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(line.contains("keystore key"), "{line}");
     }
 }

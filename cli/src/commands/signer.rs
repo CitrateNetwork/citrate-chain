@@ -61,6 +61,56 @@ pub struct SignerArgs {
     /// (for a local development chain).
     #[arg(long)]
     pub allow_foreign_chain: bool,
+
+    /// Gas price in gwei. Read from eth_gasPrice when omitted.
+    #[arg(long, value_name = "GWEI")]
+    pub gas_price: Option<u64>,
+
+    /// Refuse to sign above this gas price, in gwei.
+    #[arg(long, value_name = "GWEI", default_value_t = DEFAULT_MAX_GAS_PRICE_GWEI)]
+    pub max_gas_price: u64,
+
+    /// Refuse to sign when the fee (gas limit x gas price) is above this, in SALT.
+    #[arg(long, value_name = "SALT", default_value = DEFAULT_MAX_FEE_SALT)]
+    pub max_fee: String,
+
+    /// Send without asking for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Default `--max-gas-price`, in gwei (r1007 charges 1 gwei).
+pub const DEFAULT_MAX_GAS_PRICE_GWEI: u64 = 100;
+
+/// Default `--max-fee`, in SALT.
+pub const DEFAULT_MAX_FEE_SALT: &str = "1";
+
+/// Refuse a gas price or fee above the caps; return the fee in wei.
+pub fn check_fee(
+    _gas_limit: u64,
+    _gas_price_wei: u64,
+    _max_gas_price_wei: u64,
+    _max_fee_wei: u128,
+) -> Result<u128> {
+    Ok(0)
+}
+
+/// Whether to send after showing the fee. `answer` is the reply typed at the prompt.
+pub fn confirm_decision(_yes: bool, _interactive: bool, _answer: Option<&str>) -> Result<bool> {
+    Ok(true)
+}
+
+/// A wei amount as SALT, exact (no floating point).
+pub fn format_salt(wei: u128) -> String {
+    wei.to_string()
+}
+
+/// A warning when PRIVATE_KEY signs for an account other than the config's default.
+pub fn env_default_mismatch_warning(
+    _key: &SigningKey,
+    _default_account: Option<&str>,
+) -> Option<String> {
+    None
 }
 
 /// The genesis hash in the root address book.
@@ -438,14 +488,105 @@ mod tests {
     }
 
     #[test]
-    fn refuses_another_genesis_unless_overridden() {
-        let err = check_chain(40204, R1006_GENESIS, R1007_GENESIS, false)
+    fn a_40204_node_at_another_genesis_is_refused_even_with_the_flag() {
+        // A 40204 transaction signed against another genesis (r1006, a fork) is
+        // replayable on the live chain, so the flag must not wave it through.
+        for allow in [false, true] {
+            let err = check_chain(40204, R1006_GENESIS, R1007_GENESIS, allow)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains(R1006_GENESIS), "allow={allow}: {err}");
+            assert!(err.contains(R1007_GENESIS), "allow={allow}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_flag_only_allows_another_chain_id() {
+        assert!(check_chain(31337, R1006_GENESIS, R1007_GENESIS, true).is_ok());
+        assert!(check_chain(31337, R1006_GENESIS, R1007_GENESIS, false).is_err());
+    }
+
+    #[test]
+    fn fees_above_the_caps_are_refused() {
+        let gwei = 1_000_000_000u64;
+        let one_salt = 1_000_000_000_000_000_000u128;
+        assert_eq!(
+            check_fee(21_000, gwei, 100 * gwei, one_salt).ok(),
+            Some(21_000_000_000_000)
+        );
+        let price = check_fee(21_000, 101 * gwei, 100 * gwei, one_salt)
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        assert!(err.contains(R1006_GENESIS), "{err}");
-        assert!(err.contains(R1007_GENESIS), "{err}");
-        assert!(check_chain(40204, R1006_GENESIS, R1007_GENESIS, true).is_ok());
+        assert!(price.contains("--max-gas-price"), "{price}");
+        // 3,000,000 gas at 100 gwei is 0.3 SALT: over a 0.1 SALT cap.
+        let fee = check_fee(3_000_000, 100 * gwei, 100 * gwei, one_salt / 10)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(fee.contains("--max-fee"), "{fee}");
+        assert!(fee.contains("0.3 SALT"), "{fee}");
+        // No overflow at the extremes.
+        assert!(check_fee(u64::MAX, u64::MAX, u64::MAX, u128::MAX).is_ok());
+    }
+
+    #[test]
+    fn salt_formats_exactly() {
+        assert_eq!(format_salt(0), "0");
+        assert_eq!(format_salt(1_000_000_000_000_000_000), "1");
+        assert_eq!(format_salt(21_000_000_000_000), "0.000021");
+        assert_eq!(format_salt(1), "0.000000000000000001");
+        assert_eq!(format_salt(2_500_000_000_000_000_000), "2.5");
+    }
+
+    #[test]
+    fn sending_needs_yes_or_a_typed_confirmation() {
+        assert_eq!(confirm_decision(true, false, None).ok(), Some(true));
+        assert_eq!(confirm_decision(false, true, Some("y")).ok(), Some(true));
+        assert_eq!(
+            confirm_decision(false, true, Some("YES\n")).ok(),
+            Some(true)
+        );
+        assert_eq!(confirm_decision(false, true, Some("")).ok(), Some(false));
+        assert_eq!(confirm_decision(false, true, Some("n")).ok(), Some(false));
+        let err = confirm_decision(false, false, None)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    #[test]
+    fn warns_when_private_key_is_not_the_default_account() {
+        let addr = hex::encode(address_of(&test_key()));
+        assert!(env_default_mismatch_warning(&test_key(), None).is_none());
+        assert!(env_default_mismatch_warning(&test_key(), Some(&format!("0x{addr}"))).is_none());
+        let w = env_default_mismatch_warning(
+            &test_key(),
+            Some("0x1111111111111111111111111111111111111111"),
+        )
+        .unwrap_or_default();
+        assert!(w.contains(PRIVATE_KEY_ENV), "{w}");
+        assert!(w.contains(&addr), "{w}");
+        assert!(
+            w.contains("0x1111111111111111111111111111111111111111"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_key_is_not_echoed_in_the_error() {
+        let mut bad = "42".repeat(32);
+        bad.replace_range(10..11, "q");
+        let err = parse_secret_hex(&bad)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(!err.is_empty());
+        assert!(!err.contains('q'), "{err}");
+        assert!(!err.contains("position"), "{err}");
+        assert!(!err.contains("4242"), "{err}");
     }
 
     #[test]
