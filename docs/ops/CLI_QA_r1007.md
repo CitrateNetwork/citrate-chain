@@ -37,10 +37,20 @@ export CITRATE_RPC=https://rpc.citrate.ai      # or pass --rpc on each command
 target/release/citrate-cli network status       # expect Chain ID 40204, Genesis 0xcf686345…6631
 ```
 
-`citrate-cli` reads chain data and manages a local ed25519 keystore. It does **not** sign transactions. Its write
-commands send `eth_sendTransaction`, which public nodes refuse. To move SALT, use `citrate-wallet send`, which signs
-locally. Both tools use the same keystore format, so a key exported from one (`account export --out`) imports into
-the other with the same address.
+`citrate-cli` reads chain data and manages a local ed25519 keystore. On main today its write commands send
+`eth_sendTransaction`, which public nodes refuse. With #471 merged, `account send`, `contract deploy`,
+`contract call` and the `governance` writes sign locally and use `eth_sendRawTransaction`:
+
+```bash
+citrate-cli account create --password-file ~/.citrate/pw
+citrate-cli account send --to 0xRECIPIENT --amount 0.001 --account 0xYOUR_ADDRESS --password-file ~/.citrate/pw
+citrate-cli contract call 0xCONTRACT "deposit()" --value 1000 --account 0xYOUR_ADDRESS --password-file ~/.citrate/pw
+# or, with no keystore: PRIVATE_KEY=<64 hex chars> citrate-cli account send --to 0xRECIPIENT --amount 0.001
+```
+
+The signer refuses a node that is not chain 40204 at the genesis in `contracts/addresses/40204.json`, unless you
+pass `--allow-foreign-chain`. `citrate-wallet send` also signs locally. Both tools use the same key format, so a key
+exported from one (`account export --out`) imports into the other with the same address.
 
 ## Matrix
 
@@ -64,15 +74,16 @@ it (red test first, then a live re-run of the fixed build). Errors are quoted as
 | `account balance <addr>` | PASS | The unit is now SALT (#468). |
 | `account export --out` | PASS | It writes the file with mode 0600, and refuses stdout without `--confirm-stdout`. |
 | `account import --key-file` | PASS | Same address in a second keystore. A duplicate import refuses: `Account already exists in keystore`. |
-| nonce | NO COMMAND | The CLI has no nonce command. `citrate-wallet list` shows the nonce. |
+| nonce | NO COMMAND | The CLI has no nonce command. `citrate-wallet list` shows the nonce, and the #471 signer prints the nonce it used. |
 | `contract code <addr>` | PASS | WrappedSALT `0xaa91…c906`, 5101 bytes. |
 | `contract read <addr> <sig>` | PASS | `totalSupply()`, `balanceOf(address)` and `symbol()` return. Strings print raw ABI hex, not decoded. |
-| `contract call` / `deploy` | FAIL (by design), message FIXED #468 | `eth_sendTransaction is disabled`. There is no local signer. The error now names the next step. |
+| `contract call` / `deploy` | FAIL, FIXED #471 | It failed with `eth_sendTransaction is disabled` (#468 added a next step to the message). #471 signs locally: WrappedSALT `deposit()` with value 1000, tx `0x136d3b30…8ab4`, block 8802, success, and `balanceOf` reads back 1000. `deploy` was not run live. |
+| `account send` (new in #471) | PASS on #471 | Keystore key: tx `0xdc9b3d59…60af`, block 8800. `PRIVATE_KEY` env: tx `0x8c8d33b0…6aea`, block 8808. An unfunded key gets the node's `Insufficient funds`. With no key source, the CLI prints how to give one. |
 | `contract verify-get` | PASS | `No verified source on the explorer for 0xaa91…`. |
 | `contract verify-status <guid>` | PASS | A bogus guid gets `Unknown UID`. |
 | `contract verify-list` | PASS | 0 records. `verify` itself was not run (no contract to submit). |
 | `governance get-param` | FAIL, partly FIXED #468 | It failed with `Missing default account` for a read. It now sends no `from`, and the precompile at `0x…1003` answers `execution reverted: Access denied` (node side, open). |
-| `governance set-admin` / `queue-param` / `execute-param` | FAIL (by design) | Same `eth_sendTransaction` path as `contract call`. Not attempted. |
+| `governance set-admin` / `queue-param` / `execute-param` | FIXED #471 (not run live) | These sign through the same signer as `contract call`. Not attempted on the live chain. |
 | `model list` | PASS | `No models found`. |
 | `model info <id>` | PASS | It needs a 32-byte id. `0x01` gets `Invalid model ID format`. |
 | `model search <q>` | PASS | It queries HuggingFace. The hints say `citrate model download`, but the binary is `citrate-cli`. |
@@ -106,19 +117,18 @@ Prompts are interactive only: the wallet has no password-file or stdin flag. Scr
 
 ## Open findings (not fixed here)
 
-1. **Node RPC (`core/api/src/eth_rpc.rs`, `pubkey_hex_to_evm_address`):** for a native ed25519 transaction,
-   `eth_getTransactionByHash` and full `eth_getBlockByNumber` report `from` as the first 20 bytes of the public key
-   (`0x10ebe0d8…4c94`). The account that pays and holds the balance is `keccak(pubkey)[12..]` (`0xbc6a39c7…43bb`).
-   Explorers and SDKs that read `from` show the wrong sender. This needs a chain lane decision and a node release.
-2. **There is no local signer in citrate-cli.** Contract, governance and model writes cannot reach a public node.
-   Fixing that means signing in the CLI (EIP-155 secp256k1, or the native ed25519 format the wallet uses). That
-   is a feature, outside this QA pass.
+1. **Node RPC `from` for native transactions:** filed as #473 for the r1007 point release.
+   `eth_getTransactionByHash` and full blocks report the pubkey prefix (`0x10ebe0d8…4c94`), not the paying account
+   (`0xbc6a39c7…43bb`).
+2. **Model writes:** `model deploy` and `update` use the operator-gated `citrate_deployModel` and `citrate_updateModel`
+   RPCs, not transactions. The public RPC answers `Unauthorized: CITRATE_OPERATOR_TOKEN not configured`. Moving them
+   onto signed ModelRegistry calls is a separate change.
 3. **The governance precompile** answers `Access denied` to an unauthenticated `get-param` read.
-4. **Distribution:** cut an r1007 release from `release.yml`, then fix the Homebrew formula's binary names, version
-   and digests before the tap is published.
+4. **Distribution:** releases and the tap are held until the owner decides where CLI binaries are published.
+   #472 corrects the Homebrew formula's names and adds a merge-gate check against `release.yml`. The digests stay
+   fail closed.
 5. **Naming:** clap's `name = "citrate"` makes `--version` print `citrate 0.4.0`, and the `model search` hints say
-   `citrate …`, but the binary is `citrate-cli`, and `citrate` is the node. The `/chain/cli` page in citrate-docs
-   says `cargo build -p citrate-cli` "produces the `citrate` binary".
+   `citrate …`. The citrate-docs `/chain/cli` fix is on branch `docs/cli-binary-name` (see the PR table).
 
 ## PRs from this pass (citrate-chain)
 
@@ -127,6 +137,8 @@ Prompts are interactive only: the wallet has no password-file or stdin flag. Scr
 | #467 | `fix/cli-block-render-r1007` | `network block` panic; `[]` on a Map replaced at 16 RPC-result sites |
 | #468 | `fix/cli-r1007-guidance` | status chain and genesis, get-param without an account, next steps for refused sends and unreachable nodes, SALT units |
 | #469 | `fix/wallet-gas-flag-clash` | wallet `-g` clash; gas flags reach the transaction |
+| #471 | `feat/cli-local-signer` | local signer: `account send`, contract and governance writes through `eth_sendRawTransaction` (stacked on #467 and #468) |
+| #472 | `fix/homebrew-formula-names` | Homebrew formula names, asset URLs and README; merge-gate check |
 
 #467 and #468 both edit `cli/src/commands/network.rs`. The second to merge needs a rebase, and the conflict is one
 hunk in `get_gas_price`.
