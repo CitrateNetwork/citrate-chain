@@ -647,3 +647,47 @@ fn latt_to_wei(latt: f64) -> U256 {
     let wei = (latt * wei_per_latt as f64) as u128;
     U256::from(wei)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::{CommandFactory, Parser};
+
+    /// clap reports a short-flag clash only through its debug assertions. A release
+    /// build silently routes the value to whichever argument wins (see #448 for the
+    /// same check on citrate-cli).
+    #[test]
+    fn wallet_command_tree_has_no_flag_clashes() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn send_reads_gas_price_and_gas_limit_into_their_own_fields() {
+        let cli = Cli::try_parse_from([
+            "citrate-wallet",
+            "send",
+            "--from",
+            "0",
+            "--to",
+            "0xbc6a39c7d861a8f3d791f8a025051e7eac7043bb",
+            "--amount",
+            "0.001",
+            "--gas-price",
+            "2",
+            "--gas-limit",
+            "30000",
+        ]);
+        match cli.map(|c| c.command) {
+            Ok(Commands::Send {
+                gas_price,
+                gas_limit,
+                ..
+            }) => {
+                assert_eq!(gas_price, Some(2));
+                assert_eq!(gas_limit, Some(30000));
+            }
+            Ok(_) => panic!("parsed into another subcommand"),
+            Err(e) => panic!("send did not parse: {e}"),
+        }
+    }
+}
