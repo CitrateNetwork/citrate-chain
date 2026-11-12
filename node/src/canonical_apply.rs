@@ -7564,6 +7564,45 @@ pub(crate) mod tests {
         );
     }
 
+    /// Two fixture blocks at the same height on the same parent with different
+    /// own transactions are two blocks: two hashes, and the shared registry
+    /// keeps each body under its own hash. (They used to share one hash, and a
+    /// test running alongside could overwrite the other's body.)
+    #[test]
+    fn fixture_blocks_with_different_bodies_have_different_hashes() {
+        let parent = Hash::new([0x77; 32]);
+        let to_bob = mk_block_txs(
+            2,
+            parent,
+            Hash::default(),
+            VRF_OUT,
+            vec![transfer(ALICE, BOB, 1_000, 1)],
+        );
+        let to_carol = mk_block_txs(
+            2,
+            parent,
+            Hash::default(),
+            VRF_OUT,
+            vec![transfer(ALICE, CAROL, 1_000, 1)],
+        );
+        assert_ne!(
+            to_bob.header.block_hash, to_carol.header.block_hash,
+            "different bodies, different blocks"
+        );
+        let reg = sealed_registry().lock();
+        for (block, to) in [(&to_bob, BOB), (&to_carol, CAROL)] {
+            let kept = reg
+                .get(&block.header.block_hash)
+                .expect("registered under its own hash");
+            assert_eq!(kept.transactions.len(), 1);
+            assert_eq!(
+                kept.transactions.first().and_then(|t| t.to),
+                Some(embedded(to)),
+                "its own body"
+            );
+        }
+    }
+
     /// The external reads never change the working set: not its accounts, not
     /// its dirty set, not the state root (the fold covers every RESIDENT
     /// account, so a read that made an account resident could move it).
