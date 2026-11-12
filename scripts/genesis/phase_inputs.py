@@ -43,9 +43,11 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The ceremony's phases in order. P4V (DeployV060Genesis) runs only in a GENESIS_V060=1 run.
+PHASE_ORDER = ["P0", "P1", "P2", "P3", "P3L", "P4", "P4V", "P5", "P6", "P7"]
 ADDR = re.compile(r"0x[0-9a-fA-F]{40}")
 ENV_FNS = r"env(?:Address|Uint|Int|String|Bool|Bytes32|Bytes|Or|Exists)?"
-PHASE_MARK = re.compile(r"^# -{8,} (P[0-9]L?)\s*$", re.M)
+PHASE_MARK = re.compile(r"^# -{8,} (P[0-9][LV]?)\s*$", re.M)
 
 
 def die(msg, code=2):
@@ -251,14 +253,14 @@ def phase_scripts(repo):
     except OSError as e:
         die(f"cannot read the ceremony scripts: {e}", 1)
     marks = list(PHASE_MARK.finditer(ce))
-    if [m.group(1) for m in marks] != ["P0", "P1", "P2", "P3", "P3L", "P4", "P5", "P6", "P7"]:
-        die(f"{ce_path}: expected one '# ---- Pn' section marker per phase P0..P7 (and P3L after P3)", 1)
+    if [m.group(1) for m in marks] != PHASE_ORDER:
+        die(f"{ce_path}: expected one '# ---- Pn' section marker per phase P0..P7 (and P3L after P3, P4V after P4)", 1)
     gm = re.search(r'^GENESIS_MEMBERSHIP_SCRIPT=([\w./]+)\s*$', ce, re.M)
     out, problems, rg_phases = {}, [], []
     for i, m in enumerate(marks):
         sec = ce[m.end() : marks[i + 1].start() if i + 1 < len(marks) else len(ce)]
         sec = "\n".join(l for l in sec.splitlines() if not l.lstrip().startswith("#"))
-        found = re.findall(r"forge_phase\s+P[0-9]L?\s+([\w/]+\.s\.sol)", sec)
+        found = re.findall(r"forge_phase\s+P[0-9][LV]?\s+([\w/]+\.s\.sol)", sec)
         found += re.findall(r"\bscript/([\w/]+\.s\.sol)", sec)
         if re.search(r'\bbash\s+"\$REGENESIS"', sec):
             rg_phases.append(m.group(1))
@@ -361,7 +363,7 @@ def check_spec(repo, spec):
                 problems.append(f"{k} is classed p0-bash but the P0 section of genesis_ceremony.sh never names it")
         if c == "set" and not re.search(r"(?:^|[\s;(])(?:export\s+)?(?:[A-Z_]+=\S*\s+)*" + re.escape(k) + r"=", ce + "\n" + rg, re.M):
             problems.append(f"{k} is classed set but neither genesis_ceremony.sh nor regenesis.sh assigns it")
-        if c == "late" and e.get("available_after") not in ("P1", "P2", "P3", "P3L"):
+        if c == "late" and e.get("available_after") not in ("P1", "P2", "P3", "P3L", "P4"):
             problems.append(f"{k}: a late input needs available_after P1..P3")
         if c == "p0" and e.get("type") not in ("address", "uint", "path"):
             problems.append(f"{k}: a p0 input needs a type")
@@ -376,7 +378,7 @@ def check_spec(repo, spec):
 def preflight(spec, run_phases, started_after, deployer):
     """Problems with the environment for the phases this invocation runs."""
     inputs, env, problems = spec["inputs"], os.environ, []
-    order = ["P0", "P1", "P2", "P3", "P3L", "P4", "P5", "P6", "P7"]
+    order = PHASE_ORDER
     dep = (deployer or "").lower()
     seen_vals = {}
     for k, e in sorted(inputs.items()):
@@ -420,6 +422,10 @@ def preflight(spec, run_phases, started_after, deployer):
 
 VETO_WINDOW = 24 * 3600
 COUNCIL_ROLES = ("GOV_OWNERS", "GRD_OWNERS")
+FALLBACK_TO_DEPLOYER = ("RELAYER", "SIGNER_1", "SIGNER_2", "SIGNER_3")
+# Block-0 accounts that are funded (base allocations) but are not ceremony role inputs. The
+# inventory may tag them so the GO-K step 3 alloc check knows them; they grant no seat.
+BLOCK0_ACCOUNT_TAGS = ("FAUCET", "TEAM")
 
 
 def _address_list(raw, key, problems):
@@ -445,10 +451,22 @@ def role_inputs(inputs):
 def key_inventory(raw, vocabulary, problems):
     """GENESIS_KEY_INVENTORY: role-tagged JSON {address: [roles]} (fed #467 section 0.6).
     Returns {lowercase address: set(roles)}; problems name every malformed part."""
+    repeated = []
+
+    def once(pairs):  # json.loads keeps the last of two equal keys; refuse them instead
+        out = {}
+        for k, v in pairs:
+            if k in out:
+                repeated.append(k)
+            out[k] = v
+        return out
+
     try:
-        d = json.loads(raw)
+        d = json.loads(raw, object_pairs_hook=once)
     except ValueError:
         d = None
+    for k in repeated:
+        problems.append(f"GENESIS_KEY_INVENTORY: {k.lower() if isinstance(k, str) else k} appears more than once")
     if not isinstance(d, dict) or not d:
         problems.append("GENESIS_KEY_INVENTORY is not a JSON object {address: [roles]} with at least one key")
         return {}
@@ -464,7 +482,7 @@ def key_inventory(raw, vocabulary, problems):
             if r not in vocabulary:
                 problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} has an unknown role {r!r} (known: {', '.join(vocabulary)})")
         if a.lower() in inv:
-            problems.append(f"GENESIS_KEY_INVENTORY: {a} appears more than once")
+            problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} appears more than once")
         inv[a.lower()] = set(roles)
     return inv
 
@@ -491,9 +509,14 @@ def retired_key_problems(inputs, env, deployer):
     if env.get("GENESIS_V060", "") != "1":
         return problems
     retired = _address_list(env["GENESIS_RETIRED_KEYS"], "GENESIS_RETIRED_KEYS", problems) if env.get("GENESIS_RETIRED_KEYS", "").strip() else set()
+    # DeployEduStack falls back to the deployer for these when unset; refuse that here, before
+    # anything is sent, whichever phases this invocation runs.
+    for k in FALLBACK_TO_DEPLOYER:
+        if not env.get(k, "").strip():
+            problems.append(f"{k} is not set; in a 0.6.0 run it would fall back to the deployer (DeployEduStack), which may hold no seat")
     vocabulary = role_inputs(inputs)
     raw_inv = env.get("GENESIS_KEY_INVENTORY", "").strip()
-    inventory = key_inventory(raw_inv, vocabulary, problems) if raw_inv else None
+    inventory = key_inventory(raw_inv, vocabulary + list(BLOCK0_ACCOUNT_TAGS), problems) if raw_inv else None
     named = []
     for k in vocabulary:
         if k in COUNCIL_ROLES:

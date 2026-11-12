@@ -821,4 +821,43 @@ contract V060GenesisSpecTest is Test {
         assertEq(r.length, 1);
         assertEq(r[0], address(0xB0));
     }
+
+    /// An exactly repeated address in the inventory JSON is an error, not a silent merge (JSON
+    /// parsers keep one of the two entries).
+    function test_an_exactly_repeated_inventory_address_is_refused() public {
+        DeployV060Genesis s = _builder();
+        string memory a = vm.toString(address(0xA0));
+        string memory inv = string.concat('{"', a, '":["GOV_OWNERS"],"', a, '":["GRD_OWNERS"]}');
+        vm.expectRevert(bytes(string.concat("GENESIS_KEY_INVENTORY: ", a, " appears more than once")));
+        s.inventoryRoles(inv);
+    }
+
+    /// The same address in two spellings (checksummed and lower case) is refused too.
+    function test_a_repeated_inventory_address_in_another_case_is_refused() public {
+        DeployV060Genesis s = _builder();
+        address who = 0x00000000000000000000000000000000000aBCdE;
+        string memory inv = string.concat(
+            '{"', vm.toString(who), '":["GOV_OWNERS"],"0x00000000000000000000000000000000000abcde":["GRD_OWNERS"]}'
+        );
+        vm.expectRevert(bytes(string.concat("GENESIS_KEY_INVENTORY: ", vm.toString(who), " appears more than once")));
+        s.inventoryRoles(inv);
+    }
+
+    /// verify() re-reads the CANCELLER seat: a grant to v1's CREATE2 address after the build
+    /// (here by the GOVERNANCE timelock itself) is caught.
+    function test_verify_catches_canceller_granted_to_v1_after_the_build() public {
+        (DeployV060Genesis s, DeployV060Genesis.Deployed memory d) = _build();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        s.verify(i, d);
+        TimelockController gt = TimelockController(payable(gov.governanceTimelock));
+        address v1 = _at(
+            "Genesis.GuardianCanceller",
+            abi.encodePacked(type(GuardianCanceller).creationCode, abi.encode(gov.governanceTimelock, gov.guardianTimelock))
+        );
+        bytes32 role = gt.CANCELLER_ROLE();
+        vm.prank(gov.governanceTimelock);
+        gt.grantRole(role, v1);
+        vm.expectRevert(bytes("GuardianCanceller v1 holds CANCELLER on GOVERNANCE"));
+        s.verify(i, d);
+    }
 }

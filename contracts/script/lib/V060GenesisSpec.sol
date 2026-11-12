@@ -27,7 +27,8 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/
 ///         P1, the AA stack of P2, the HUP registries of P3L, the FederatedRoundLedger of P4),
 ///         except for the fixed values here and the coordinator bonds.
 ///
-///         Fixed values (owner decisions in the V60-S0 sprint file, GEN-PARAMS):
+///         Fixed values (owner decisions in the V60-S0 sprint file, GEN-PARAMS; the 24 h window,
+///         the 90-day backfill and the GUARDIAN-timelock guardian seats confirmed 2026-11-11):
 ///           TaskVerifier review window      72 h (Q7)
 ///           ProviderRegistry veto window    24 h (chain #400 deploy profile)
 ///           UsageReceipts max backfill      90 days (chain #400 deploy profile)
@@ -40,10 +41,14 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/
 ///         timelocks) are ceremony inputs, and the scripts refuse to run without the list of
 ///         retired r1006 keys (`PENDING_RETIRED_KEYS`) or with any of those accounts on it.
 ///
-///         Pending: the WorkMarket coordinator bonds (`minCoordinatorBond_`,
-///         `defaultCoordinatorBond_`) wait on the tokenomics decision. There is no default here:
-///         DeployV060Genesis refuses to build without both (`PENDING_COORDINATOR_BONDS`), and
-///         WorkMarket's address is unknown until they are fixed, because they are in its init code.
+///         Coordinator bonds (`minCoordinatorBond_`, `defaultCoordinatorBond_`): decided by the
+///         owner on 2026-11-11 as REHEARSAL values, 100 SALT and 1,000 SALT, to revisit with
+///         tokenomics before the 0.6.0 ceremony genesis. They are ceremony inputs, recorded in
+///         scripts/genesis/phase_inputs.json (`decided`, enforced at P0) and
+///         scripts/genesis/v060/inputs.v060.env, never a default here: DeployV060Genesis refuses
+///         to build without both (`PENDING_COORDINATOR_BONDS`). They are in WorkMarket's init
+///         code, so its address moves if they are revisited: the 0.6.0 address book is
+///         PROVISIONAL (WorkMarket's address) until the bonds are final.
 library V060GenesisSpec {
     // CREATE2 salt names (Salts.salt(name)). The "Genesis." prefix is the P1 convention.
     string internal constant FL_ROUND_VERIFIER = "Genesis.FLRoundVerifier";
@@ -59,7 +64,7 @@ library V060GenesisSpec {
     uint32 internal constant USAGE_MAX_BACKFILL_DAYS = 90;
 
     string internal constant PENDING_COORDINATOR_BONDS =
-        "PENDING PARAMETER: the WorkMarket coordinator bonds wait on the tokenomics decision; set WORKMARKET_MIN_COORDINATOR_BOND and WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei, min > 0, default >= min)";
+        "REQUIRED INPUT: the WorkMarket coordinator bonds; set WORKMARKET_MIN_COORDINATOR_BOND and WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei, min > 0, default >= min; owner 2026-11-11 rehearsal values 100 / 1,000 SALT, scripts/genesis/v060/inputs.v060.env)";
 
     function flRoundVerifierInit(address federatedRoundLedger) internal pure returns (bytes memory) {
         return abi.encodePacked(
