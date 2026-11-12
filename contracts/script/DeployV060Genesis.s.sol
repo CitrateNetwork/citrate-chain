@@ -317,6 +317,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         k.retiredKeys = vm.envOr("GENESIS_RETIRED_KEYS", ",", new address[](0));
         k.guardianVetoMargin = vm.envOr("GENESIS_GUARDIAN_VETO_MARGIN", uint256(0));
         k.v060Deployers = inventoryRole(vm.envOr("GENESIS_KEY_INVENTORY", string("")), "V060_DEPLOYER");
+        k.v060DeployersOnly = inventoryOnlyRole(vm.envOr("GENESIS_KEY_INVENTORY", string("")), "V060_DEPLOYER");
         V060GovernanceSpec.requireKeyParams(k);
     }
 
@@ -502,7 +503,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     function deployLive(address deployer, Inputs memory i, Rotation memory rot) public returns (Deployed memory d) {
         require(deployer != address(0), "deployer must be set");
         V060GovernanceSpec.requireKeyParams(i.keys);
-        V060GovernanceSpec.requireLiveDeployer(deployer, i.keys);
+        V060GovernanceSpec.requirePureLiveDeployer(deployer, i.keys);
         Deployed memory p = predict(i);
         _resolveChainProfile(true);
         _checkKeys(deployer, i);
@@ -602,9 +603,10 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         // Complete holder sets: each timelock's council, and v1 as GOVERNANCE's one extra canceller.
         address[] memory extra = new address[](1);
         extra[0] = v1;
-        string memory h = _timelockHolderProblem(i.governanceTimelock, i.governanceMultisig, extra);
+        // The block-0 state proof AND the post-genesis role logs (#464 review P2-2).
+        string memory h = _liveTimelockHolderProblem(i.governanceTimelock, i.governanceMultisig, extra);
         require(bytes(h).length == 0, string.concat("GOVERNANCE timelock: ", h));
-        h = _timelockHolderProblem(i.guardianTimelock, i.guardianMultisig, new address[](0));
+        h = _liveTimelockHolderProblem(i.guardianTimelock, i.guardianMultisig, new address[](0));
         require(bytes(h).length == 0, string.concat("GUARDIAN timelock: ", h));
         _checkReadInputs(i);
     }

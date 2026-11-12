@@ -481,6 +481,9 @@ def key_inventory(raw, vocabulary, problems):
         if not isinstance(roles, list) or not roles or not all(isinstance(r, str) for r in roles):
             problems.append(f"GENESIS_KEY_INVENTORY: {a} needs a non-empty list of role names")
             continue
+        pg = sorted(set(roles) & set(POSTGENESIS_TAGS))
+        if pg and set(roles) - set(POSTGENESIS_TAGS):
+            problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} mixes a post-genesis tag ({', '.join(pg)}) with a ceremony role; a post-genesis key holds no ceremony role")
         for r in roles:
             if r not in vocabulary:
                 problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} has an unknown role {r!r} (known: {', '.join(vocabulary)})")

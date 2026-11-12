@@ -133,8 +133,8 @@ def main():
     def judge(who, how, where):
         if who in retired:
             problems.append(f"{where} {how} {who}, a key retired at the r1007 ceremony (D-K3)")
-        elif who in known and known[who] and known[who] <= POSTGENESIS_TAGS:
-            problems.append(f"{where} {how} {who}, which is a post-genesis key ({', '.join(sorted(known[who]))}) and must not appear in block 0")
+        elif who in known and known[who] & POSTGENESIS_TAGS:
+            problems.append(f"{where} {how} {who}, which is a post-genesis key ({', '.join(sorted(known[who] & POSTGENESIS_TAGS))}) and must not appear in block 0")
         elif who in known or who in staker_set:
             return
         elif who == deployer:

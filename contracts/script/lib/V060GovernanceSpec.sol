@@ -42,6 +42,8 @@ library V060GovernanceSpec {
         uint256 guardianVetoMargin;
         /// the inventory's keys with role V060_DEPLOYER (a post-genesis key; live mode only)
         address[] v060Deployers;
+        /// those of them whose ONLY tag is V060_DEPLOYER (no ceremony role beside it; #464 P2-1)
+        address[] v060DeployersOnly;
     }
 
     string internal constant PENDING_KEY_INVENTORY =
@@ -72,6 +74,15 @@ library V060GovernanceSpec {
             if (k.v060Deployers[i] == deployer) return;
         }
         revert("deployer is not in GENESIS_KEY_INVENTORY with role V060_DEPLOYER");
+    }
+
+    /// @notice ... and carries no other tag (a post-genesis key never doubles as a ceremony role).
+    function requirePureLiveDeployer(address deployer, KeyParams memory k) internal pure {
+        requireLiveDeployer(deployer, k);
+        for (uint256 i = 0; i < k.v060DeployersOnly.length; i++) {
+            if (k.v060DeployersOnly[i] == deployer) return;
+        }
+        revert("deployer carries a ceremony role beside V060_DEPLOYER");
     }
 
     /// @notice Reverts unless all three key parameters are given (none has a default).

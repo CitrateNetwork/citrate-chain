@@ -314,6 +314,31 @@ abstract contract GenesisProfile is Script, AdminChecks {
         }
     }
 
+    /// @notice The keys whose ONLY tag is `role` (for a post-genesis key: no ceremony role beside it).
+    function inventoryOnlyRole(string memory json, string memory role) public view returns (address[] memory out) {
+        address[] memory tagged = inventoryRole(json, role);
+        bool[] memory pure_ = new bool[](tagged.length);
+        uint256 n;
+        for (uint256 i = 0; i < tagged.length; i++) {
+            string[] memory roles = vm.parseJsonStringArray(json, string.concat("$['", _inventoryKeyOf(json, tagged[i]), "']"));
+            if (roles.length == 1) (pure_[i], n) = (true, n + 1);
+        }
+        out = new address[](n);
+        n = 0;
+        for (uint256 i = 0; i < tagged.length; i++) {
+            if (pure_[i]) out[n++] = tagged[i];
+        }
+    }
+
+    /// @notice The JSON key (as spelled in the inventory) of address `who`.
+    function _inventoryKeyOf(string memory json, address who) internal view returns (string memory) {
+        string[] memory keys = vm.parseJsonKeys(json, "$");
+        for (uint256 i = 0; i < keys.length; i++) {
+            if (vm.parseAddress(keys[i]) == who) return keys[i];
+        }
+        revert("GENESIS_KEY_INVENTORY: address not found");
+    }
+
     /// @notice How many times `needle` occurs in `hay` (non-overlapping).
     function _occurrences(string memory hay, string memory needle) internal pure returns (uint256 n) {
         bytes memory h = bytes(hay);

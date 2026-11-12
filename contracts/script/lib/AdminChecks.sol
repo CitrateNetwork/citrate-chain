@@ -857,6 +857,49 @@ abstract contract AdminChecks {
         return "";
     }
 
+    /// @notice The holder sets of a timelock on a LIVE chain whose contracts are in block 0
+    ///         (r1007): the block-0 proof `_timelockHolderProblem` gives (genesis-chain mode
+    ///         proves the sets from the block-0 state, which cannot see a slot written after
+    ///         genesis), plus a replay of every RoleGranted / RoleRevoked the node has logged for
+    ///         the timelock (block 1 to the head; block 0 has none). For each (role, account) the
+    ///         logs touch, the live `hasRole` must equal the expectation: DEFAULT_ADMIN only the
+    ///         timelock, PROPOSER and EXECUTOR only the council, CANCELLER the council plus
+    ///         `extraCancellers`. #464 review P2-2.
+    function _liveTimelockHolderProblem(address timelock, address council, address[] memory extraCancellers)
+        internal
+        returns (string memory)
+    {
+        string memory p = _timelockHolderProblem(timelock, council, extraCancellers);
+        if (bytes(p).length != 0) return p;
+        (bool ok, string memory why, RoleEvent[] memory events) = _timelockRoleHistory(timelock);
+        if (!ok) return why;
+        for (uint256 i = 0; i < events.length; i++) {
+            RoleEvent memory e = events[i];
+            if ((e.kind != HISTORY_GRANT && e.kind != HISTORY_REVOKE) || !_isTimelockRole(e.role)) continue;
+            bool expected;
+            if (e.role == DEFAULT_ADMIN_ROLE) {
+                expected = e.account == timelock;
+            } else if (e.role == TIMELOCK_CANCELLER_ROLE) {
+                expected = e.account == council;
+                for (uint256 k = 0; k < extraCancellers.length; k++) {
+                    if (extraCancellers[k] == e.account) expected = true;
+                }
+            } else {
+                expected = e.account == council;
+            }
+            (bool okR, bool has) =
+                _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", e.role, e.account));
+            if (!okR) return "hasRole unreadable";
+            if (has && !expected) {
+                return "post-genesis role change: an account outside the expected holder set holds a timelock role (RoleGranted after block 0)";
+            }
+            if (!has && expected) {
+                return "post-genesis role change: an expected holder no longer holds its timelock role (RoleRevoked after block 0)";
+            }
+        }
+        return "";
+    }
+
     /// @notice A council whose owners were rotated in storage after its ceremony (r1007's block 0
     ///         is r1006's state with every non-producer key replaced, rotate_keys.py: the owner
     ///         array elements and the `isOwner` keys at slot 1; threshold and TTL unchanged).

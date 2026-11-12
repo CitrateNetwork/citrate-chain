@@ -430,14 +430,13 @@ contract V060LivePostGenesisRolesTest is Test {
         );
     }
 
-    /// A post-genesis revocation of an expected holder is caught too.
-    function test_a_post_genesis_revocation_is_caught_from_the_logs() public {
+    /// A post-genesis revocation of an expected holder is caught too: the block-0 state proof
+    /// already reads hasRole for every expected holder, so it refuses first.
+    function test_a_post_genesis_revocation_is_caught() public {
         vm.prank(address(tl));
         tl.revokeRole(CANCELLER, council);
         archive.absorb();
-        assertEq(
-            h.live(address(tl), council, new address[](0)),
-            "post-genesis role change: an expected holder no longer holds its timelock role (RoleRevoked after block 0)"
-        );
+        assertEq(h.stateOnly(address(tl), council, new address[](0)), "CANCELLER_ROLE: an expected holder does not hold it");
+        assertEq(h.live(address(tl), council, new address[](0)), "CANCELLER_ROLE: an expected holder does not hold it");
     }
 }
