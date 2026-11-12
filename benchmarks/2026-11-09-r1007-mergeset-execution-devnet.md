@@ -44,7 +44,7 @@ Ground truth matched in every run.
 - **Latency** is one block longer (about +1.9 s). This is by design (spec 06 D6): a block's own
   transactions are executed by the chain block that accepts it, one slot later.
 - **High rate per sender** (64 signers, about 4.7 tx/s each): the head refuses 89% of
-  submissions with "nonce N is more than 16 ahead of the sender's committed nonce" (PBA-L1a-001).
+  submissions with "nonce N is more than 16 ahead of the sender's committed nonce".
   - Cause: the mempool measures the 16-nonce window from the committed (accepted) nonce, which
     now lags inclusion by a block, so the window fills sooner.
   - The 834 timeouts follow from that: a refused nonce leaves a gap, and the sender's later,
