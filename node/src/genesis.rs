@@ -798,10 +798,11 @@ mod tests {
             .await
             .expect("the configured genesis must be admitted by the strict store");
         // Re-offered again (a second startup pass): already present, not invalid.
-        match dag.store_block(genesis).await {
-            Err(citrate_consensus::DagStoreError::BlockExists(_)) => {}
-            other => panic!("a re-offered genesis must be BlockExists, got {other:?}"),
-        }
+        let again = dag.store_block(genesis).await;
+        assert!(
+            matches!(again, Err(citrate_consensus::DagStoreError::BlockExists(_))),
+            "a re-offered genesis must be BlockExists, got {again:?}"
+        );
     }
 
     /// The exemption is by identity, not by the hash field: a height-0 block
