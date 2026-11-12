@@ -175,6 +175,15 @@ async fn call_precompile(config: &Config, data_hex: String) -> Result<()> {
     Ok(())
 }
 
+/// The call object for a read of the governance precompile.
+fn eth_call_object(from: Option<&str>, to: &str, data: &str) -> Result<serde_json::Value> {
+    Ok(json!({
+        "from": from.context("Missing default account")?,
+        "to": to,
+        "data": data
+    }))
+}
+
 async fn eth_call_precompile(config: &Config, data_hex: String) -> Result<String> {
     let to = precompile_address();
     let resp = reqwest::Client::new()
@@ -182,11 +191,7 @@ async fn eth_call_precompile(config: &Config, data_hex: String) -> Result<String
         .json(&json!({
             "jsonrpc":"2.0",
             "method":"eth_call",
-            "params":[{
-                "from": config.default_account.as_ref().context("Missing default account")?,
-                "to": to,
-                "data": data_hex
-            }, "latest"],
+            "params":[eth_call_object(config.default_account.as_deref(), &to, &data_hex)?, "latest"],
             "id": 1
         }))
         .send()
@@ -205,6 +210,20 @@ async fn eth_call_precompile(config: &Config, data_hex: String) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `governance get-param` is a read; it must work with no default account.
+    #[test]
+    fn get_param_call_needs_no_default_account() {
+        let obj = match eth_call_object(None, "0x0000000000000000000000000000000000001003", "0x01")
+        {
+            Ok(v) => v,
+            Err(e) => panic!("read refused without a default account: {e}"),
+        };
+        assert!(obj.get("from").is_none(), "{obj}");
+        assert_eq!(obj["to"], "0x0000000000000000000000000000000000001003");
+        let with = eth_call_object(Some("0xabc"), "0x1003", "0x").unwrap_or_default();
+        assert_eq!(with["from"], "0xabc");
+    }
 
     #[test]
     fn test_precompile_address_is_fixed() {
