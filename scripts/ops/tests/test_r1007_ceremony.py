@@ -37,6 +37,11 @@ SRC = P.load(REPO)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_guard  # noqa: E402
 
+# Sandbox: HOME points at a temp dir for this process and every tool it starts, so no test
+# can read or write the developer's real ~/.citrate*, ~/.ssh or ~/.foundry.
+_HOME_DIR = tempfile.mkdtemp(prefix="r1007-home-")
+os.environ["HOME"] = _HOME_DIR
+
 # Every ssh-transport test uses this copy of the committed fleet: the same hosts, with ssh
 # aliases that cannot resolve (RFC 2606 .invalid). ceremony.HERE points at its directory, so
 # the tool's "committed fleet" checks accept it (fed #467 round 3).
