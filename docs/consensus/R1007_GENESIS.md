@@ -3,7 +3,7 @@ created: 2026-11-09
 branch: r1007/s3-6-genesis
 author: Claude Opus 5.5 (lane S3-6 GENESIS WIRING) for Larry Klosowski
 status: draft for second-reviewer review (Matr0xshka, kurtatwork); owner parameters decided 2026-11-09; D-K3 done 2026-11-11 (fresh role keys, §1.1); the block-0 hash is the candidate at the canonical genesis timestamp (the ceremony stamps its own)
-amended: 2026-11-10 on r1007/genesis-candidate-2 (lane CHAIN-INTEG): D-K3 pending parameters §1.1, integration items §5.1-§5.3 done; 2026-11-11 on r1007/integ-followups: the fresh-keys alloc (§1.1), R1007_GENESIS re-pinned (§1, §2), ceremony render (§5)
+amended: 2026-11-10 on r1007/genesis-candidate-2 (lane CHAIN-INTEG): D-K3 pending parameters §1.1, integration items §5.1-§5.3 done; 2026-11-11 on r1007/integ-followups: the fresh-keys alloc (§1.1), R1007_GENESIS re-pinned (§1, §2), ceremony render (§5); 2026-11-12 on r1007/genesis-ceremony-2: block 0 re-stamped at T0 = 2026-11-12T17:00:00Z (§1)
 adr: ADR-2026-11-03-chain-convergence-r1007 CV-2, CV-7a, CV-8, CV-12, CV-13, CV-14
 planset: 2026-11-03-r1007-v060 05 S3-6, 06 §1.2
 ---
@@ -38,7 +38,7 @@ Code:
 | State root of block 0 | standard MPT root (CV-14), with activation 0 covering block 0 itself | STATE_ROOT_MPT.md §1 |
 | Genesis header | the shared canonical genesis block (`create_canonical_genesis_block`, version 1, timestamp `CANONICAL_GENESIS_TIMESTAMP` = 1,767,225,600 = 2026-01-01T00:00:00Z) | unchanged from r1006 |
 | Supply split | unchanged: mining pool = 1T SALT − pre-allocations (the note holds no balance) | `GenesisConfig::r1006` |
-| Block-0 hash | `0x7e1bf92b7a39d7338e9772db5ab886808167452a45bef8ec75a1d05850c2be3b` | **stamped for the ceremony**: the fresh-keys alloc at `GENESIS_TIMESTAMP` = 1794438000 (T0 = 2026-11-11T23:00:00Z), `stamp_genesis.py --at 1794438000 --repin`. Unstamped (canonical timestamp) it was `0x33438940…01ef` |
+| Block-0 hash | `0xdb25bee2bb35aac027afb0b58097301bb840ca87552061c1bbdcbc7be404c478` | **stamped for the ceremony**: the fresh-keys alloc at `GENESIS_TIMESTAMP` = 1794502800 (T0 = 2026-11-12T17:00:00Z, owner's pick), `stamp_genesis.py --at 1794502800 --repin`. The 2026-11-11 23:00Z stamp (`0x7e1bf92b…be3b`) was not cut: the ceremony was held for the reorg read-through fix. Unstamped (canonical timestamp) it was `0x33438940…01ef` |
 
 **Every block-0 contract address is unchanged from r1006.** That includes `CitrateMemberSBT`
 `0x8831…060d`, `MembershipStakeVault` `0xd663…555e` and `ValidatorRegistry` `0xf511…31cd`,
