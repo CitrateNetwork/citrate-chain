@@ -169,19 +169,24 @@ async fn call_precompile(config: &Config, data_hex: String) -> Result<()> {
         .send()
         .await?;
     let v: serde_json::Value = resp.json().await?;
-    if v.get("error").is_some() {
-        anyhow::bail!(v.to_string());
+    if let Some(err) = v.get("error") {
+        let message = err["message"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!(
+            "Governance call failed: {}",
+            super::rpc_hint::explain_send_error(message)
+        );
     }
     Ok(())
 }
 
-/// The call object for a read of the governance precompile.
+/// The call object for a read of the governance precompile. A read needs no
+/// sender, so `from` is set only when a default account is configured.
 fn eth_call_object(from: Option<&str>, to: &str, data: &str) -> Result<serde_json::Value> {
-    Ok(json!({
-        "from": from.context("Missing default account")?,
-        "to": to,
-        "data": data
-    }))
+    let mut obj = json!({ "to": to, "data": data });
+    if let (Some(from), Some(map)) = (from, obj.as_object_mut()) {
+        map.insert("from".into(), json!(from));
+    }
+    Ok(obj)
 }
 
 async fn eth_call_precompile(config: &Config, data_hex: String) -> Result<String> {

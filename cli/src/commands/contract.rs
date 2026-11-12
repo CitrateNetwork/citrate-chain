@@ -422,7 +422,9 @@ async fn deploy_contract(
     {
         anyhow::bail!(
             "Deployment failed: {}",
-            error["message"].as_str().unwrap_or("Unknown error")
+            super::rpc_hint::explain_send_error(
+                error["message"].as_str().unwrap_or("Unknown error")
+            )
         );
     } else {
         anyhow::bail!("Unexpected response from RPC");
@@ -538,7 +540,9 @@ async fn call_contract(
     {
         anyhow::bail!(
             "Call failed: {}",
-            error["message"].as_str().unwrap_or("Unknown error")
+            super::rpc_hint::explain_send_error(
+                error["message"].as_str().unwrap_or("Unknown error")
+            )
         );
     } else {
         anyhow::bail!("Unexpected response from RPC");
@@ -619,7 +623,9 @@ async fn read_contract(
     {
         anyhow::bail!(
             "Call failed: {}",
-            error["message"].as_str().unwrap_or("Unknown error")
+            super::rpc_hint::explain_send_error(
+                error["message"].as_str().unwrap_or("Unknown error")
+            )
         );
     } else {
         anyhow::bail!("Unexpected response from RPC");

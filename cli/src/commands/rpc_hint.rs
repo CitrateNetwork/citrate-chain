@@ -8,23 +8,89 @@
 pub const PUBLIC_RPC: &str = "https://rpc.citrate.ai";
 
 /// The message a write command reports for a JSON-RPC error.
+///
+/// The write commands send `eth_sendTransaction`, which asks the node to sign.
+/// Public nodes refuse it, so that error gets the next step appended. Every
+/// other message is returned unchanged.
 pub fn explain_send_error(message: &str) -> String {
-    message.to_string()
+    if message.contains("eth_sendTransaction is disabled") {
+        format!(
+            "{message}\n\nThis command sends an unsigned transaction for the node to sign \
+             (eth_sendTransaction); citrate-cli does not sign transactions itself. Public \
+             endpoints such as {PUBLIC_RPC} refuse that. To move SALT, use \
+             `citrate-wallet send`, which signs locally. For contract and governance writes, \
+             point --rpc at a local development node that has eth_sendTransaction enabled."
+        )
+    } else {
+        message.to_string()
+    }
 }
 
-/// A hint to print when a command could not reach the RPC endpoint at all.
-pub fn connect_failure_hint(_err: &anyhow::Error, _endpoint: &str) -> Option<String> {
-    None
+/// A hint to print when a command could not reach the RPC endpoint at all
+/// (connection refused, DNS failure, timeout while connecting).
+pub fn connect_failure_hint(err: &anyhow::Error, endpoint: &str) -> Option<String> {
+    let is_connect = err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect())
+    });
+    if !is_connect {
+        return None;
+    }
+    Some(format!(
+        "Could not reach a node at {endpoint}. To use the public network, pass \
+         --rpc {PUBLIC_RPC} or set CITRATE_RPC={PUBLIC_RPC}. To use your own node, \
+         start it first or set rpc_endpoint in ~/.citrate/config.json."
+    ))
 }
 
 /// The lines `network status` prints about which chain the endpoint serves.
+///
+/// * `node_chain_id`: the node's `eth_chainId`, if it answered.
+/// * `config_chain_id`: the chain id in the CLI config.
+/// * `node_genesis`: the hash of the node's block 0, if it answered.
+/// * `book_genesis`: the genesis hash in the vendored federation contract
+///   (`cli/federation-contract.json`), which `devx` reads its addresses from.
 pub fn chain_lines(
-    _node_chain_id: Option<u64>,
+    node_chain_id: Option<u64>,
     config_chain_id: u64,
-    _node_genesis: Option<&str>,
-    _book_genesis: Option<&str>,
+    node_genesis: Option<&str>,
+    book_genesis: Option<&str>,
 ) -> Vec<String> {
-    vec![format!("Chain ID: {}", config_chain_id)]
+    let mut lines = Vec::new();
+    match node_chain_id {
+        Some(id) => {
+            lines.push(format!("Chain ID: {id}"));
+            if id != config_chain_id {
+                lines.push(format!(
+                    "WARNING: the node serves chain {id}, but the CLI config expects chain \
+                     {config_chain_id}."
+                ));
+            }
+        }
+        None => lines.push(format!(
+            "Chain ID: unknown (the node did not answer eth_chainId; config expects \
+             {config_chain_id})"
+        )),
+    }
+    if let Some(genesis) = node_genesis {
+        match book_genesis {
+            Some(book) if book.eq_ignore_ascii_case(genesis) => {
+                lines.push(format!(
+                    "Genesis: {genesis} (matches the vendored address book)"
+                ));
+            }
+            Some(book) => {
+                lines.push(format!("Genesis: {genesis}"));
+                lines.push(format!(
+                    "WARNING: the vendored address book is for genesis {book}. The addresses \
+                     `devx contract` and `devx predict-address` use may be stale for this chain."
+                ));
+            }
+            None => lines.push(format!("Genesis: {genesis}")),
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
