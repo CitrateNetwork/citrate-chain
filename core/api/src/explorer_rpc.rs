@@ -870,7 +870,11 @@ mod tests {
 
     #[test]
     fn logs_bloom_matches_the_yellow_paper_bloom() {
-        assert_eq!(logs_bloom(std::iter::empty::<&Log>()), [0u8; 256], "no logs, empty bloom");
+        assert_eq!(
+            logs_bloom(std::iter::empty::<&Log>()),
+            [0u8; 256],
+            "no logs, empty bloom"
+        );
         let logs = vec![
             Log {
                 address: Address([0x11; 20]),
@@ -890,7 +894,11 @@ mod tests {
             vec![0xAB; 20],
         ];
         let got = logs_bloom(&logs);
-        assert_eq!(got, reference(&items), "address and every topic, data not included");
+        assert_eq!(
+            got,
+            reference(&items),
+            "address and every topic, data not included"
+        );
         assert!(got.iter().map(|b| b.count_ones()).sum::<u32>() <= 12);
     }
 }
