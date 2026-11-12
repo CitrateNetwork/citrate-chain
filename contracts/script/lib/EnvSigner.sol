@@ -17,6 +17,12 @@ import "forge-std/Script.sol";
 ///         nonces creates the same contracts at the same addresses, so this changes no address
 ///         and no deployed bytecode. The hooks are virtual so tests can supply a key without
 ///         vm.setEnv, which is process-global and would leak into tests running in parallel.
+///
+///         This copy (public main, for the 0.6.0 live mode) is the signer part of
+///         env-key-signing-2's EnvSigner. It leaves out `_requireRootGovernance`, which the
+///         live mode does not use and which branches on a bare `block.chainid` (the
+///         forge-chainid-profile tripwire): a script that needs it resolves the chain through
+///         GenesisProfile._resolveChainProfile instead.
 abstract contract EnvSigner is Script {
     function _envSignerKey() internal view virtual returns (uint256) {
         return vm.envOr("PRIVATE_KEY", uint256(0));
@@ -57,14 +63,5 @@ abstract contract EnvSigner is Script {
         require(_scriptSender() == expected, "EnvSigner: run forge with --sender EXPECTED_SENDER");
         require(deployer == address(0) || deployer == expected, "EnvSigner: EXPECTED_SENDER is not the script's deployer");
         vm.startBroadcast(key);
-    }
-
-    /// On 40204 the root governance must be named explicitly and must not be the sender: no
-    /// fallback to msg.sender, which would make the deployer the governance of what it deploys.
-    function _requireRootGovernance(address governance) internal view {
-        require(
-            block.chainid != 40204 || (governance != address(0) && governance != _scriptSender()),
-            "ROOT_GOVERNANCE must be set to a non-deployer address on 40204"
-        );
     }
 }
