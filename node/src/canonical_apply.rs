@@ -4751,6 +4751,19 @@ pub(crate) mod tests {
     /// mergeset that carries no transaction (the reward-only fixture chains),
     /// the ACCEPT gas limit and its hash, registered for [`seal_mergeset`].
     pub(crate) fn finish_fixture(mut b: Block) -> Block {
+        // The fixture registry below is process-wide and keyed by block hash.
+        // Below the PBA activation the hash commits to `tx_root` but not to the
+        // body, and fixture txs carry no `hash`, so two tests sealing the same
+        // height on the same parent with DIFFERENT own transactions used to get
+        // the same block hash: the second overwrote the first in the registry,
+        // and the first test then sealed its next block on the other test's
+        // body (a replay that does not reproduce, a branch that does not
+        // apply), only when the two tests ran at the same time. Commit the
+        // fixture's own transactions (the post-activation content root), so a
+        // different body is a different block. Empty blocks keep the default.
+        if !b.transactions.is_empty() && b.tx_root == Hash::default() {
+            b.tx_root = citrate_consensus::tx_auth::tx_root_v2(&b.transactions);
+        }
         b.header.gas_limit = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
         set_linear_ghostdag(&mut b);
         b.accepted_root = citrate_execution::acceptance::accepted_root(&[]);
