@@ -43,6 +43,11 @@ import {EnvSigner} from "./lib/EnvSigner.sol";
 /// these bind immutably to a dead address. Pass it explicitly rather than
 /// reading a book, so the ceremony cannot silently inherit a stale pin.
 contract DeployQuorumS6 is EnvSigner {
+    /// ROOT_GOVERNANCE (required). Virtual so the EnvSigner tests can supply it without vm.setEnv.
+    function _governance() internal view virtual returns (address) {
+        return vm.envAddress("ROOT_GOVERNANCE");
+    }
+
     struct Deployed {
         address anchorRegistry;
         address meetingRegistry;
@@ -55,7 +60,8 @@ contract DeployQuorumS6 is EnvSigner {
     }
 
     function run() external returns (Deployed memory out) {
-        address governance = vm.envAddress("ROOT_GOVERNANCE");
+        address governance = _governance();
+        _requireRootGovernance(governance);
         address tenants = vm.envAddress("TENANT_HIERARCHY");
 
         // Fail closed rather than deploy something permanently pointed at

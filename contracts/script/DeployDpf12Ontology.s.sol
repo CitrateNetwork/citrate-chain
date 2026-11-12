@@ -21,7 +21,7 @@ contract DeployDpf12Ontology is ScriptEnv, GovernanceOps, EnvSigner {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        _startBroadcastEnv();
+        _startBroadcastEnv(deployer);
 
         EntityRegistry er = new EntityRegistry(governance);
         console.log("EntityRegistry:  ", address(er));

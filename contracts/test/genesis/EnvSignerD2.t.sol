@@ -42,6 +42,7 @@ interface IH {
     function setSigner(uint256 key, address expected) external;
     function setDeployer(address deployer_) external;
     function setGovernance(address gov) external;
+    function setCaller(address caller) external;
 }
 
 contract H_DeployDpf02Rbac is DeployDpf02Rbac {
@@ -49,12 +50,15 @@ contract H_DeployDpf02Rbac is DeployDpf02Rbac {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
     function _envExpectedSender() internal view override returns (address) { return e; }
-    function _governance() internal view override returns (address) { return g == address(0) ? msg.sender : g; }
+    function _governance() internal view override returns (address) { return g == address(0) ? _scriptSender() : g; }
 }
 
 contract H_DeployDpf06Suppliers is DeployDpf06Suppliers {
@@ -62,12 +66,15 @@ contract H_DeployDpf06Suppliers is DeployDpf06Suppliers {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
     function _envExpectedSender() internal view override returns (address) { return e; }
-    function _governance() internal view override returns (address) { return g == address(0) ? msg.sender : g; }
+    function _governance() internal view override returns (address) { return g == address(0) ? _scriptSender() : g; }
 }
 
 contract H_DeployDpf07FL is DeployDpf07FL {
@@ -75,12 +82,15 @@ contract H_DeployDpf07FL is DeployDpf07FL {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
     function _envExpectedSender() internal view override returns (address) { return e; }
-    function _governance() internal view override returns (address) { return g == address(0) ? msg.sender : g; }
+    function _governance() internal view override returns (address) { return g == address(0) ? _scriptSender() : g; }
 }
 
 contract H_DeployQuorumS6 is DeployQuorumS6 {
@@ -88,12 +98,15 @@ contract H_DeployQuorumS6 is DeployQuorumS6 {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
     function _envExpectedSender() internal view override returns (address) { return e; }
-    function _governance() internal view override returns (address) { return g == address(0) ? msg.sender : g; }
+    function _governance() internal view override returns (address) { return g == address(0) ? _scriptSender() : g; }
 }
 
 contract H_DeployDpf05Provenance is DeployDpf05Provenance {
@@ -101,12 +114,15 @@ contract H_DeployDpf05Provenance is DeployDpf05Provenance {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
     function _envExpectedSender() internal view override returns (address) { return e; }
-    function _governance() internal view override returns (address) { return g == address(0) ? msg.sender : g; }
+    function _governance() internal view override returns (address) { return g == address(0) ? _scriptSender() : g; }
 }
 
 contract H_DeployDpf09AppsContracts is DeployDpf09AppsContracts {
@@ -114,7 +130,10 @@ contract H_DeployDpf09AppsContracts is DeployDpf09AppsContracts {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -127,7 +146,10 @@ contract H_DeployDpf10Assistant is DeployDpf10Assistant {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -140,7 +162,10 @@ contract H_DeployDpf11Governance is DeployDpf11Governance {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -153,7 +178,10 @@ contract H_DeployDpf12Ontology is DeployDpf12Ontology {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -166,7 +194,10 @@ contract H_DeployDpf13Procurement is DeployDpf13Procurement {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -179,7 +210,10 @@ contract H_DeployDpf14InterOrg is DeployDpf14InterOrg {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -192,7 +226,10 @@ contract H_DeployDpf15Compliance is DeployDpf15Compliance {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -205,7 +242,10 @@ contract H_DeployDpf16Sponsor is DeployDpf16Sponsor {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -218,7 +258,10 @@ contract H_DeployDpf17Release is DeployDpf17Release {
     address internal e;
     address internal d;
     address internal g;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setDeployer(address deployer_) external { d = deployer_; }
     function setGovernance(address gov) external { g = gov; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
@@ -232,7 +275,10 @@ contract H_Send is SendWithEnvKey {
     address internal t;
     uint256 internal v;
     bytes internal dd;
+    address internal c;
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
+    function setCaller(address caller) external { c = caller; }
+    function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
     function setCall(address to, uint256 value, bytes calldata data) external { t = to; v = value; dd = data; }
     function _envSignerKey() internal view override returns (uint256) { return k; }
     function _envExpectedSender() internal view override returns (address) { return e; }
@@ -275,7 +321,7 @@ contract EnvSignerD2Test is Test {
     }
 
     function _run(address h, address caller) internal {
-        vm.prank(caller, caller);
+        IH(h).setCaller(caller);
         (bool ok, bytes memory ret) = h.call(abi.encodeWithSignature("run()"));
         if (!ok) {
             assembly { revert(add(ret, 32), mload(ret)) }
@@ -375,8 +421,8 @@ contract EnvSignerD2Test is Test {
         H_DeployDpf13Procurement h = new H_DeployDpf13Procurement();
         h.setSigner(PK, makeAddr("someone-else"));
         h.setDeployer(makeAddr("someone-else"));
+        h.setCaller(makeAddr("someone-else"));
         vm.expectRevert(bytes("EnvSigner: PRIVATE_KEY does not belong to EXPECTED_SENDER"));
-        vm.prank(makeAddr("someone-else"), makeAddr("someone-else"));
         h.run();
     }
 
@@ -393,8 +439,8 @@ contract EnvSignerD2Test is Test {
         address signer = vm.addr(PK);
         h.setSigner(PK, signer);
         h.setGovernance(multisig);
+        h.setCaller(SENDER);
         vm.expectRevert(bytes("EnvSigner: run forge with --sender EXPECTED_SENDER"));
-        vm.prank(SENDER, SENDER);
         h.run();
     }
 
@@ -403,8 +449,8 @@ contract EnvSignerD2Test is Test {
         address signer = vm.addr(PK);
         h.setSigner(PK, signer);
         h.setDeployer(SENDER);
+        h.setCaller(signer);
         vm.expectRevert(bytes("EnvSigner: EXPECTED_SENDER is not the script's deployer"));
-        vm.prank(signer, signer);
         h.run();
     }
 
@@ -414,14 +460,14 @@ contract EnvSignerD2Test is Test {
         address signer = vm.addr(PK);
         h.setSigner(PK, signer);
         h.setGovernance(address(0)); // unset: the old fallback to msg.sender
+        h.setCaller(signer);
         vm.expectRevert(bytes("ROOT_GOVERNANCE must be set to a non-deployer address on 40204"));
-        vm.prank(signer, signer);
         h.run();
         H_DeployDpf02Rbac h2 = new H_DeployDpf02Rbac();
         h2.setSigner(PK, signer);
         h2.setGovernance(signer);
+        h2.setCaller(signer);
         vm.expectRevert(bytes("ROOT_GOVERNANCE must be set to a non-deployer address on 40204"));
-        vm.prank(signer, signer);
         h2.run();
     }
 
@@ -432,7 +478,7 @@ contract EnvSignerD2Test is Test {
         s.setSigner(PK, signer);
         s.setCall(to, 2 ether, "");
         uint64 n0 = vm.getNonce(signer);
-        vm.prank(signer, signer);
+        s.setCaller(signer);
         s.run();
         assertEq(to.balance, 2 ether, "value arrived");
         assertEq(vm.getNonce(signer), n0 + 1, "one transaction from the signer");
@@ -443,7 +489,7 @@ contract EnvSignerD2Test is Test {
         Sink sink = new Sink();
         s.setSigner(PK, vm.addr(PK));
         s.setCall(address(sink), 1 ether, abi.encodeCall(Sink.poke, (42)));
-        vm.prank(vm.addr(PK), vm.addr(PK));
+        s.setCaller(vm.addr(PK));
         s.run();
         assertEq(sink.last(), 42);
         assertEq(address(sink).balance, 1 ether);
@@ -455,20 +501,20 @@ contract EnvSignerD2Test is Test {
         address signer = vm.addr(PK);
         s.setSigner(PK, makeAddr("treasury"));
         s.setCall(makeAddr("x"), 1, "");
+        s.setCaller(makeAddr("treasury"));
         vm.expectRevert(bytes("EnvSigner: PRIVATE_KEY does not belong to EXPECTED_SENDER"));
-        vm.prank(makeAddr("treasury"), makeAddr("treasury"));
         s.run();
         s.setSigner(PK, signer);
+        s.setCaller(SENDER);
         vm.expectRevert(bytes("EnvSigner: run forge with --sender EXPECTED_SENDER"));
-        vm.prank(SENDER, SENDER);
         s.run();
         s.setCall(address(sink), 1, "");
+        s.setCaller(signer);
         vm.expectRevert(bytes("SendWithEnvKey: plain transfer to a contract; pass DATA"));
-        vm.prank(signer, signer);
         s.run();
         s.setCall(makeAddr("eoa"), 0, abi.encodeCall(Sink.poke, (1)));
+        s.setCaller(signer);
         vm.expectRevert(bytes("SendWithEnvKey: DATA for an account without code"));
-        vm.prank(signer, signer);
         s.run();
         s.setSigner(0, address(0));
         vm.expectRevert(bytes("SendWithEnvKey: PRIVATE_KEY is required"));

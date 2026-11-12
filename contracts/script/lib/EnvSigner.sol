@@ -26,8 +26,26 @@ abstract contract EnvSigner is Script {
         return vm.envOr("EXPECTED_SENDER", address(0));
     }
 
+    /// The script's sender: msg.sender, which forge sets from `--sender`. Virtual only so tests
+    /// can supply it, because a prank cannot be combined with a broadcast.
+    function _scriptSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
     /// Start broadcasting: from the env key when one is set (guarded), else as before.
     function _startBroadcastEnv() internal {
+        _startBroadcastEnv(address(0));
+    }
+
+    /// The same, for scripts with a declared deployer (ScriptEnv.deployerAddress()): with an
+    /// env key, EXPECTED_SENDER must also be that deployer.
+    ///
+    /// Guards with PRIVATE_KEY set:
+    ///   - EXPECTED_SENDER is set, and the key's address equals it;
+    ///   - the script's msg.sender equals it: run forge with `--sender $EXPECTED_SENDER`, so the
+    ///     simulation and the broadcast agree on who sends;
+    ///   - if `deployer` is non-zero, it equals EXPECTED_SENDER.
+    function _startBroadcastEnv(address deployer) internal {
         uint256 key = _envSignerKey();
         if (key == 0) {
             vm.startBroadcast();
@@ -36,6 +54,17 @@ abstract contract EnvSigner is Script {
         address expected = _envExpectedSender();
         require(expected != address(0), "EnvSigner: PRIVATE_KEY is set but EXPECTED_SENDER is not");
         require(vm.addr(key) == expected, "EnvSigner: PRIVATE_KEY does not belong to EXPECTED_SENDER");
+        require(_scriptSender() == expected, "EnvSigner: run forge with --sender EXPECTED_SENDER");
+        require(deployer == address(0) || deployer == expected, "EnvSigner: EXPECTED_SENDER is not the script's deployer");
         vm.startBroadcast(key);
+    }
+
+    /// On 40204 the root governance must be named explicitly and must not be the sender: no
+    /// fallback to msg.sender, which would make the deployer the governance of what it deploys.
+    function _requireRootGovernance(address governance) internal view {
+        require(
+            block.chainid != 40204 || (governance != address(0) && governance != _scriptSender()),
+            "ROOT_GOVERNANCE must be set to a non-deployer address on 40204"
+        );
     }
 }

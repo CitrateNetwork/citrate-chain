@@ -61,7 +61,7 @@ contract DeployDpf05Provenance is EnvSigner {
     ///         In dry-run this is `msg.sender`; in live broadcast it
     ///         must be the root-tenant multi-sig executor passed via
     ///         env `ROOT_GOVERNANCE`.
-    function _governance() internal view returns (address) {
+    function _governance() internal view virtual returns (address) {
         try vm.envAddress("ROOT_GOVERNANCE") returns (address g) {
             return g;
         } catch {
@@ -71,6 +71,7 @@ contract DeployDpf05Provenance is EnvSigner {
 
     function run() external returns (DeployedAddresses memory addrs) {
         address governance = _governance();
+        _requireRootGovernance(governance);
 
         _startBroadcastEnv();
 

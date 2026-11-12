@@ -45,7 +45,7 @@ contract DeployDpf02Rbac is EnvSigner {
     ///         mode this is the script's `msg.sender`; in live mode
     ///         it should be the root-tenant multi-sig executor address
     ///         (passed via env `ROOT_GOVERNANCE`).
-    function _governance() internal view returns (address) {
+    function _governance() internal view virtual returns (address) {
         try vm.envAddress("ROOT_GOVERNANCE") returns (address g) {
             return g;
         } catch {
@@ -55,6 +55,7 @@ contract DeployDpf02Rbac is EnvSigner {
 
     function run() external returns (DeployedAddresses memory addrs) {
         address governance = _governance();
+        _requireRootGovernance(governance);
 
         _startBroadcastEnv();
 
