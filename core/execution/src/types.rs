@@ -479,6 +479,31 @@ pub struct TransactionReceipt {
     /// bincode) is the right price for forward-compat.
     #[serde(default)]
     pub revert_reason: Option<String>,
+    /// r1007 S3-3b (spec 06 §3.11): where the transaction was executed under
+    /// mergeset acceptance. `block_hash` / `block_number` above then name the
+    /// ACCEPTING chain block; this names the block that INCLUDED the
+    /// transaction and the receipt's position in the accepting block's
+    /// execution list. `None` for receipts built outside mergeset acceptance
+    /// (simulation, the legacy single-block apply).
+    #[serde(default)]
+    pub acceptance: Option<ReceiptAcceptance>,
+}
+
+/// The acceptance fields of a receipt (spec 06 §3.11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptAcceptance {
+    /// The DAG block whose own list carried the transaction.
+    pub including_block_hash: Hash,
+    /// That block's DAG height (not a chain index).
+    pub including_block_height: u64,
+    /// The including block's color relative to the accepting block.
+    pub inclusion_color: citrate_consensus::acceptance::InclusionColor,
+    /// Position in the accepting block's execution list (executed txs only).
+    pub transaction_index: u64,
+    /// Gas used by this and every earlier executed tx of the accepting block.
+    pub cumulative_gas_used: u64,
+    /// Index of this receipt's first log among the accepting block's logs.
+    pub first_log_index: u64,
 }
 
 /// Event log
@@ -655,4 +680,25 @@ pub enum ExecutionError {
     InvalidBlockBody(String),
     #[error("Arithmetic overflow: {0}")]
     Overflow(&'static str),
+
+    /// r1007 S3-3b (spec 06 §3.10): executing a chain block's mergeset on
+    /// post(SP) did not reproduce one of the block's commitments
+    /// (`accepted_root`, `receipt_root`, `gas_used` or `gas_limit`; a wrong
+    /// `state_root` is [`Self::StateRootMismatch`]). The block is disqualified
+    /// from the chain; world state is left untouched.
+    #[error("Acceptance commitment mismatch: {field}: block claims {expected}, execution produced {got}")]
+    AcceptanceCommitmentMismatch {
+        field: &'static str,
+        expected: String,
+        got: String,
+    },
+
+    /// A node-local input to applying a chain block could not be read: a
+    /// mergeset member's body, its GHOSTDAG record, or the BLOCKHASH window
+    /// (lead decision 2026-11-09). Says nothing about the block itself, so it
+    /// never disqualifies it (spec 06 §3.10): the node retries once the input
+    /// is available (sync, repair, restart). Distinct from
+    /// [`Self::InvalidBlockBody`], a fault of the block's own data.
+    #[error("Apply input unavailable on this node: {0}")]
+    ApplyInputUnavailable(String),
 }

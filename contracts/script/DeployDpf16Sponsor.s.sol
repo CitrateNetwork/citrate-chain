@@ -5,12 +5,13 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/SponsorEvidenceRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf16Sponsor — Stage 14 broadcast
 /// @notice Deploys SponsorEvidenceRegistry. Deployer self-authorizes
 ///         as recorder so the evidence-bundle anchoring script can
 ///         broadcast without separate cast send.
-contract DeployDpf16Sponsor is ScriptEnv, GovernanceOps {
+contract DeployDpf16Sponsor is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address sponsor) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -20,7 +21,7 @@ contract DeployDpf16Sponsor is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv(deployer);
 
         SponsorEvidenceRegistry reg = new SponsorEvidenceRegistry(governance);
         console.log("SponsorEvidenceRegistry:  ", address(reg));

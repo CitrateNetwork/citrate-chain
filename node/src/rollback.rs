@@ -385,6 +385,8 @@ mod tests {
             let dag = citrate_consensus::dag_store::DagStore::persistent_with_strict_vrf(kv, false)
                 .expect("dag");
             dag.set_configured_genesis(genesis().header.block_hash);
+            dag.set_slot_origin(&genesis().header)
+                .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
             for b in fleet[3..].iter().chain(other.iter()) {
                 dag.store_block(b.clone()).await.expect("dag store");
                 storage.blocks.put_block(b).expect("chain store");

@@ -698,6 +698,7 @@ impl RpcServer {
         // network height the sync driver has seen, so a stalled follower reads as
         // "syncing", not a bare "false". Falls back to the register_eth_methods stub
         // behaviour (false) when no sync signal is wired or we are at the tip.
+        let sync_highest_for_identity = sync_highest.clone();
         {
             let storage_syncing = storage.clone();
             io_handler.add_sync_method("eth_syncing", move |_params: jsonrpc_core::Params| {
@@ -1420,11 +1421,12 @@ impl RpcServer {
 
         // web3_clientVersion, citrate_nodeIdentity and citrate_getDagStats: the
         // node's real build + consensus identity (crate::node_rpc).
-        node_rpc::register_node_methods(
+        node_rpc::register_node_methods_with_sync(
             &mut io_handler,
             storage.clone(),
             chain_id,
             node_identity.map(Arc::new),
+            sync_highest_for_identity,
         );
 
         // eth_chainId (compatibility)
@@ -2178,25 +2180,21 @@ impl RpcServer {
             }
         });
 
-        // net_peerInfo: detailed peer info (id, addr, direction)
+        // net_peerInfo: per-peer id, addr, direction, state, and the last-known
+        // head (height + tip hash) the sync scoring reads (S3-7, core#605).
+        // Data source: PeerManager → PeerInfo (see NetworkApi::get_peer_info).
         let peers_info_mgr = peer_manager.clone();
         io_handler.add_sync_method("net_peerInfo", move |_params: Params| {
             rpc_request("net_peerInfo");
-            let peers = peers_info_mgr.get_all_peers();
-            let mut arr = Vec::new();
-            for p in peers {
-                let info = block_on(p.info.read());
-                let dir = match info.direction {
-                    citrate_network::peer::Direction::Inbound => "inbound",
-                    citrate_network::peer::Direction::Outbound => "outbound",
-                };
-                arr.push(serde_json::json!({
-                    "id": info.id.to_string(),
-                    "addr": info.addr.to_string(),
-                    "direction": dir,
-                }));
+            let api = NetworkApi::new(peers_info_mgr.clone(), chain_id);
+            match block_on(api.get_peer_info()) {
+                Ok(arr) => Ok(Value::Array(arr)),
+                Err(e) => Err(jsonrpc_core::Error {
+                    code: jsonrpc_core::ErrorCode::InternalError,
+                    message: format!("peer info unavailable: {e}"),
+                    data: None,
+                }),
             }
-            Ok(Value::Array(arr))
         });
 
         // citrate_getModel
@@ -2849,6 +2847,17 @@ impl RpcServer {
 
     /// Spawn the RPC server on a dedicated OS thread and return a CloseHandle and JoinHandle.
     /// If startup fails (e.g., port already in use), returns an error instead of panicking.
+    /// Register `citrate_getFinalityStatus` (spec 06 §5.5) over the view the
+    /// node's finality driver publishes into `cell` (data source:
+    /// `CheckpointManager`, see [`crate::finality_status`]).
+    pub fn with_finality_status(
+        mut self,
+        cell: Arc<crate::finality_status::FinalityStatusCell>,
+    ) -> Self {
+        crate::finality_status::register_finality_status(&mut self.io_handler, cell);
+        self
+    }
+
     pub fn spawn(self) -> Result<(CloseHandle, std::thread::JoinHandle<()>)> {
         let listen_addr = self.config.listen_addr;
         let threads = self.config.threads;

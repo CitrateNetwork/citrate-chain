@@ -35,6 +35,18 @@ EXTENDS Naturals, FiniteSets, TLC
 \*   Reorg        node/src/canonical_apply.rs reorg_to: Rejected when the fork point is
 \*                below the floor (I4); the floor is first raised to a registered
 \*                certificate whose block is canonical (effective_floor)
+\*   SyncCert     node/src/finality_sync.rs CertificateSync::process (Stage 1b): node n is
+\*                offered node m's finalized certificate for h above n's latest finalized
+\*                height. It verifies against n's own committee (it has a quorum:
+\*                FinalizedHasQuorum). Block canonical on n: installed through
+\*                CheckpointManager::install_synced_certificate, whose FinalizationGuard
+\*                raises the floor (and registers it) in the same step (CertSync =
+\*                "guarded"). Another block canonical at h (a VERIFIED sibling; owner Q1 on
+\*                #332): safety stop and alarm, not installed — or, if the reorg raced in
+\*                after the read-only pre-check, installed by the guard WITH the stop.
+\*                CertSync = "unguarded" is #332 @ 354908b: installed with no floor until
+\*                the next VerifyFloor, a sibling refused without a stop.
+\*                CertSync = "off": no sync (single-node configs, older mutations)
 \*   Restart      process restart: pending checkpoints, the floor (an in-memory atomic),
 \*                the registered certificates and the verifier state are lost; certificates
 \*                and the signed-vote record persist; FloorVerifier::boot_check runs before
@@ -84,6 +96,10 @@ EXTENDS Naturals, FiniteSets, TLC
 \*                                        registration reviewed on #335 @ 5236d2b): TLC MUST
 \*                                        find Restart -> boot -> Reorg reverting an older
 \*                                        finalized, canonical block.
+\*   CheckpointFinalitySafety_syncnoguard.cfg the _strict check with CertSync = "unguarded"
+\*                                        (#332 @ 354908b: the synced certificate becomes
+\*                                        visible before the floor rises): TLC MUST find
+\*                                        SyncCert -> Reorg reverting the synced block.
 \*   CheckpointFinalitySafety_committees.cfg 5 voters (f = 1), committees of 4 per
 \*                                        candidate: TLC MUST find an S1 violation with no
 \*                                        honest equivocation — two siblings finalized by
@@ -100,8 +116,10 @@ CONSTANTS
     CommitteeSize,  \* committee size per candidate (config.committee_size)
     SyncFloor,      \* TRUE: the floor is raised / finality halted AT finalization
                     \* (FinalizationGuard); FALSE: only by the verifier's poll
-    BootRegLimit    \* how many stored certificates (highest first) the boot check
+    BootRegLimit,   \* how many stored certificates (highest first) the boot check
                     \* consults; the code consults all (>= Cardinality(Heights))
+    CertSync        \* Stage 1b certificate sync: "off", "guarded" (the code: the
+                    \* install runs the FinalizationGuard), "unguarded" (mutation)
 
 Voters == Nodes \cup Byz
 
@@ -119,6 +137,7 @@ ASSUME None \notin Hashes
 ASSUME DurableRecord \in BOOLEAN
 ASSUME SyncFloor \in BOOLEAN
 ASSUME BootRegLimit \in Nat \ {0}
+ASSUME CertSync \in {"off", "guarded", "unguarded"}
 
 VARIABLES
     canon,      \* canon[n][h]: the block at height h on node n's applied chain
@@ -274,6 +293,41 @@ Reorg(n, h0, c) ==
     /\ floor' = [floor EXCEPT ![n] = EffFloor(n)]
     /\ UNCHANGED <<sent, pending, fin, halted, booting, reg>>
 
+\* Stage 1b certificate sync: node n is offered node m's certificate for h
+\* (see the header). Installing drops n's pending state at or below h
+\* (CheckpointManager::prune_at_or_below).
+SyncCert(n, m, h) ==
+    LET x == fin[m][h]
+        installed == [fin EXCEPT ![n][h] = x]
+        pruned == [pending EXCEPT ![n] = [k \in Heights |-> IF k <= h THEN None ELSE @[k]]]
+    IN
+    /\ CertSync # "off"
+    /\ n # m
+    /\ ~booting[n]
+    /\ x # None
+    /\ h > LatestFin(n)
+    /\ IF CertSync = "guarded"
+       THEN IF canon[n][h] = x
+            THEN /\ fin' = installed
+                 /\ pending' = pruned
+                 /\ reg' = [reg EXCEPT ![n] = @ \cup {h}]
+                 /\ floor' = [floor EXCEPT ![n] = Max(@, h)]
+                 /\ UNCHANGED halted
+            ELSE /\ halted' = [halted EXCEPT ![n] = TRUE]
+                 /\ UNCHANGED floor
+                 /\ \/ UNCHANGED <<fin, pending, reg>>
+                    \/ /\ fin' = installed
+                       /\ pending' = pruned
+                       /\ reg' = [reg EXCEPT ![n] = @ \cup {h}]
+       ELSE \* "unguarded": #332 @ 354908b.
+            /\ UNCHANGED <<floor, halted, reg>>
+            /\ \/ /\ canon[n][h] = x
+                  /\ fin' = installed
+                  /\ pending' = pruned
+               \/ /\ canon[n][h] # x
+                  /\ UNCHANGED <<fin, pending>>
+    /\ UNCHANGED <<canon, sent, booting>>
+
 \* Process restart: memory is lost, persisted records are kept.
 Restart(n) ==
     /\ pending' = [pending EXCEPT ![n] = [h \in Heights |-> None]]
@@ -291,6 +345,7 @@ Next ==
         \/ VerifyFloor(n)
         \/ BootNoCertificate(n)
         \/ \E h0 \in Heights, c \in [Heights -> Hashes] : Reorg(n, h0, c)
+        \/ \E m \in Nodes, h \in Heights : SyncCert(n, m, h)
         \/ Restart(n)
 
 Spec == Init /\ [][Next]_vars

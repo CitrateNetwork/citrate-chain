@@ -262,6 +262,11 @@ fn test_network_message_serialization_roundtrip_checkpoint_vote() {
     let msg = NetworkMessage::CheckpointVote {
         height: 500,
         block_hash: Hash::new([0xFF; 32]),
+        binding: citrate_consensus::checkpoint::VoteBinding {
+            epoch: 1,
+            state_root: Hash::new([0x51; 32]),
+            accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+        },
         voter_pubkey: vec![1, 2, 3],
         signature: vec![4, 5, 6],
     };

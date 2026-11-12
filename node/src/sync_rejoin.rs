@@ -171,6 +171,11 @@ pub enum Answer {
     Unconnected,
     /// Nothing new and nothing unconnected: every served block was already held.
     Known,
+    /// As [`Answer::Known`], with the highest served block (all held). The node
+    /// can hold a middle stretch of a branch it cannot apply yet (stored from
+    /// gossip and missing-parent walks while the parts above and below were
+    /// not); in a follow, `Held` above the cursor moves the cursor past it.
+    Held { highest: (Hash, u64) },
 }
 
 /// Classify an answer from what admission did with it.
@@ -187,6 +192,25 @@ pub fn classify(
         Some(highest) if newly_admitted > 0 => Answer::Progress { highest },
         _ if empty || deferred > 0 => Answer::Unconnected,
         _ => Answer::Known,
+    }
+}
+
+/// [`classify`], given also the highest block served in the answer (validated,
+/// held or not): an answer with nothing new and nothing unconnected is
+/// [`Answer::Held`] when it served any block.
+pub fn classify_answer(
+    empty: bool,
+    newly_admitted: usize,
+    highest_admitted: Option<(Hash, u64)>,
+    deferred: usize,
+    highest_served: Option<(Hash, u64)>,
+) -> Answer {
+    match (
+        classify(empty, newly_admitted, highest_admitted, deferred),
+        highest_served,
+    ) {
+        (Answer::Known, Some(highest)) => Answer::Held { highest },
+        (answer, _) => answer,
     }
 }
 
@@ -265,7 +289,7 @@ pub struct RejoinTracker {
     /// give-up owes no rejoin backoff (the split gate rate-limits pulls).
     split: bool,
     /// The applied height a split pull started at; its follow stops
-    /// `SPLIT_PULL_HEIGHT_BAND + MAX_REORG_DEPTH` above it.
+    /// `SPLIT_PULL_HEIGHT_BAND + SNAPSHOT_RING_DEPTH` above it.
     split_top: u64,
     /// Requests the running probe has sent (or skipped while its anchor was
     /// pending), against [`search_request_cap`].
@@ -285,6 +309,16 @@ pub struct RejoinTracker {
     pin_live_at: Option<Instant>,
     /// The pinned peer gave a consumed answer since `pin_live_at`.
     pin_answered: bool,
+    /// Peers whose pinned search went silent (no matching answer for
+    /// [`MAX_UNANSWERED`] rounds). A search is not pinned to them again until
+    /// the node has caught up or a search elsewhere found the fork point.
+    silent: Vec<String>,
+    /// A search is wanted against a peer other than the silent ones, from
+    /// this top: set when a pinned search went silent (or a silent peer's
+    /// strikes would have started one). [`choose_source`] pins it to another
+    /// peer ahead on the next tick, or, with none, applies the ordinary
+    /// backoff.
+    failover: Option<u64>,
 }
 
 impl Default for RejoinTracker {
@@ -314,6 +348,8 @@ impl RejoinTracker {
             follow_unsent: false,
             pin_live_at: None,
             pin_answered: false,
+            silent: Vec::new(),
+            failover: None,
         }
     }
 
@@ -442,7 +478,7 @@ impl RejoinTracker {
             self.unanswered = self.unanswered.saturating_add(1);
             if self.unanswered >= MAX_UNANSWERED {
                 self.unanswered = 0;
-                out = self.give_up(anchor.1);
+                out = self.silent_give_up(anchor.1);
             }
         }
         self.asked = Some((peer.to_string(), anchor.0, anchor.1));
@@ -482,7 +518,7 @@ impl RejoinTracker {
         self.unanswered = self.unanswered.saturating_add(1);
         if self.unanswered >= MAX_UNANSWERED {
             self.unanswered = 0;
-            return self.give_up(at);
+            return self.silent_give_up(at);
         }
         self.count_probe_request(at)
     }
@@ -532,14 +568,29 @@ impl RejoinTracker {
         anchor_height: u64,
     ) -> Option<Transition> {
         let from = self.answered_by.take();
+        // A follow that meets a stretch of blocks it already holds moves on to the
+        // highest one served (`block_serve` serves by height, every branch), so
+        // it reaches the missing blocks above the stretch; anywhere else, or when
+        // the answer reaches no higher than the cursor, held is Known.
+        let answer = match (&self.mode, answer) {
+            (Mode::Follow { cursor }, Answer::Held { highest }) if highest.1 > cursor.1 => {
+                Answer::Progress { highest }
+            }
+            (_, Answer::Held { .. }) => Answer::Known,
+            (_, other) => other,
+        };
         let behind = behind || self.target_behind || self.split;
         if !behind {
             self.give_ups = 0;
             self.cooldown = 0;
+            self.silent.clear();
+            self.failover = None;
             return self.reset("caught up");
         }
         match (self.mode.clone(), answer) {
-            (Mode::Tip { .. }, Answer::Progress { .. }) | (Mode::Tip { .. }, Answer::Known) => {
+            (Mode::Tip { .. }, Answer::Progress { .. })
+            | (Mode::Tip { .. }, Answer::Known)
+            | (Mode::Tip { .. }, Answer::Held { .. }) => {
                 // Only the striking peer's own answer clears its strikes.
                 if self.strike_peer == from {
                     self.mode = Mode::Tip { strikes: 0 };
@@ -563,6 +614,18 @@ impl RejoinTracker {
                     return None;
                 }
                 let top = anchor_height;
+                // A search is never pinned to a peer that went silent on the
+                // last one: ask for it elsewhere (see `choose_source`).
+                if self
+                    .strike_peer
+                    .as_ref()
+                    .is_some_and(|p| self.silent.contains(p))
+                {
+                    self.strike_peer = None;
+                    self.mode = Mode::Tip { strikes: 0 };
+                    self.failover = Some(top);
+                    return None;
+                }
                 self.peer = self.strike_peer.take();
                 self.start_search(top);
                 self.mode = Mode::Probe {
@@ -586,11 +649,13 @@ impl RejoinTracker {
                 };
                 let was_following = previous.is_some();
                 // A split pull fetches a sibling branch, never a catch-up: its
-                // follow stops past the band plus the reorg window.
+                // follow stops past the band plus the snapshot ring (the reorg
+                // window before S3-4; unchanged when the undo window grew, so a
+                // split pull fetches no more than before).
                 let split_limit = self
                     .split_top
                     .saturating_add(crate::sync_peer::SPLIT_PULL_HEIGHT_BAND)
-                    .saturating_add(crate::canonical_apply::MAX_REORG_DEPTH);
+                    .saturating_add(crate::canonical_apply::SNAPSHOT_RING_DEPTH);
                 if self.split && cursor.1 > split_limit {
                     return self.give_up(cursor.1);
                 }
@@ -610,8 +675,10 @@ impl RejoinTracker {
                         }
                     }
                 }
-                // The search found the fork point: no backoff owed.
+                // The search found the fork point: no backoff owed, and the
+                // peers that went silent on earlier searches may be asked again.
                 self.give_ups = 0;
+                self.silent.clear();
                 self.mode = Mode::Follow { cursor };
                 if was_following {
                     None
@@ -741,12 +808,64 @@ impl RejoinTracker {
             // must not wait behind this one.
             return Some(Transition::GaveUp { at });
         }
+        self.back_off();
+        Some(Transition::GaveUp { at })
+    }
+
+    /// The rejoin backoff after a search that failed on its merits.
+    fn back_off(&mut self) {
         let shift = self.give_ups.min(31);
         self.cooldown = BACKOFF_BASE_ANSWERS
             .saturating_mul(2u32.saturating_pow(shift))
             .min(BACKOFF_MAX_ANSWERS);
         self.give_ups = self.give_ups.saturating_add(1);
+    }
+
+    /// The running search's peer stopped answering ([`MAX_UNANSWERED`]
+    /// rounds). That says nothing about the fork point, so no backoff yet:
+    /// the peer is marked silent and [`choose_source`] carries the search to
+    /// another peer ahead on the next tick (or backs off when there is none).
+    /// A split pull ends as before (its gate rate-limits pulls).
+    fn silent_give_up(&mut self, at: u64) -> Option<Transition> {
+        if self.split {
+            return self.give_up(at);
+        }
+        let top = match &self.mode {
+            Mode::Probe { top, .. } => *top,
+            Mode::Follow { cursor } => cursor.1,
+            Mode::Tip { .. } => at,
+        };
+        if let Some(p) = self.peer.take() {
+            if !self.silent.contains(&p) {
+                self.silent.push(p);
+            }
+        }
+        self.mode = Mode::Tip { strikes: 0 };
+        self.strike_peer = None;
+        self.clear_pin_clock();
+        self.failover = Some(top);
         Some(Transition::GaveUp { at })
+    }
+
+    /// Pin the wanted search ([`Self::failover`]) to `peer`, from the applied
+    /// height `top`.
+    fn start_failover_probe(&mut self, peer: &str, top: u64) -> Option<Transition> {
+        self.failover = None;
+        if top == 0 {
+            return None;
+        }
+        self.peer = Some(peer.to_string());
+        self.strike_peer = None;
+        self.unanswered = 0;
+        self.start_search(top);
+        self.mode = Mode::Probe {
+            top,
+            unconnected: top,
+            known: None,
+            step: 1,
+            height: top.saturating_sub(1),
+        };
+        Some(Transition::StartedProbe { top })
     }
 }
 
@@ -817,6 +936,26 @@ pub fn choose_source(
             None => transition = tracker.abandon(),
         }
     }
+    // A search whose peer went silent moves to another peer ahead at once
+    // (never back to a silent one); with none, it ends with the ordinary
+    // backoff.
+    if tracker.failover.is_some() && matches!(tracker.mode, Mode::Tip { .. }) {
+        let others: Vec<SyncCandidate> = candidates
+            .iter()
+            .filter(|c| !tracker.silent.contains(&c.id))
+            .cloned()
+            .collect();
+        match selector.select(&others, applied.1) {
+            Some(c) => {
+                let started = tracker.start_failover_probe(&c.id, applied.1);
+                return (Source::Pinned(c.id.clone()), transition.or(started));
+            }
+            None => {
+                tracker.failover = None;
+                tracker.back_off();
+            }
+        }
+    }
     if let Some(c) = selector.select(candidates, applied.1) {
         return (Source::Ahead(c.id.clone()), transition);
     }
@@ -830,6 +969,33 @@ pub fn choose_source(
         }
         None => (Source::Nobody, transition),
     }
+}
+
+/// CV-5 resync: the producer gate cannot reconcile with a branch it hears
+/// (`AttestedNetworkHead::take_resync_request`). Unless a search is already
+/// running (that is the resync), start a fork-point search against the
+/// connected peer advertising the highest head this node does not hold
+/// (ties: the smallest id). `holds(h)` says whether this node stores `h`.
+/// Fetching only, like any split pull: the blocks go through admission.
+pub fn start_resync(
+    tracker: &mut RejoinTracker,
+    split: &[SplitCandidate],
+    applied: (Hash, u64),
+    holds: impl Fn(&Hash) -> bool,
+) -> Option<Transition> {
+    if !tracker.can_start_split(applied.1) {
+        return None;
+    }
+    let unknown = Hash::new([0u8; 32]);
+    let peer = split
+        .iter()
+        .filter(|c| c.head_hash != unknown && c.head_hash != applied.0 && !holds(&c.head_hash))
+        .max_by(|a, b| {
+            a.head_height
+                .cmp(&b.head_height)
+                .then_with(|| b.id.cmp(&a.id))
+        })?;
+    tracker.start_split_pull(&peer.id, applied.1)
 }
 
 /// Bound on `SYNCREJOIN` info lines: [`REJOIN_LOG_PER_WINDOW`] per
@@ -943,14 +1109,22 @@ mod tests {
             .blue_score(height)
             .blue_work(blue_work_for_score(height))
             .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            // G11: the committed pruning point (zero below 10,050).
+            .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
             .build_unhashed();
         b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
             PbaHardening::off(),
             height,
             &b.transactions,
         );
+        // r1007 S3-3b: the commitments of an accepted mergeset with no
+        // transaction, under the ACCEPT gas limit.
+        b.header.gas_limit = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
+        b.accepted_root = citrate_execution::acceptance::accepted_root(&[]);
+        b.receipt_root = citrate_execution::acceptance::receipt_root(&[]);
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
+        crate::g11_test_seal::record(&b);
         b
     }
 
@@ -989,13 +1163,18 @@ mod tests {
                 coinbase: CB,
                 prevrandao: [0x5A; 32],
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let provisional = seal(key, height, Hash::default(), Hash::default());
             let r = rewards.calculate_reward(&provisional).expect("reward");
-            for (addr, amt) in [
-                (Address(CB), r.validator_reward),
-                (treasury, r.treasury_reward),
-            ] {
+            // r1007 S3-3b: R(h)'s validator part goes to the accepted blues
+            // with a proposer (all pay CB); block 1 accepts only genesis.
+            let validator = if height == 1 {
+                U256::zero()
+            } else {
+                r.validator_reward
+            };
+            for (addr, amt) in [(Address(CB), validator), (treasury, r.treasury_reward)] {
                 if amt > U256::zero() {
                     let bal = exec.get_balance(&addr);
                     exec.set_balance(&addr, bal + amt);
@@ -1085,6 +1264,8 @@ mod tests {
             .expect("tip");
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         dag.set_configured_genesis(g.header.block_hash);
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         dag.store_block(g.clone()).await.expect("genesis dag");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         ghostdag.add_block(g).await.expect("genesis ghostdag");
@@ -1124,6 +1305,8 @@ mod tests {
         };
         let fx = n.admission.admit_to_fixpoint(own.to_vec(), |_, _| {}).await;
         assert_eq!(fx.newly_admitted, own.len(), "own blocks admit");
+        // The node's drain task, woken by admission, applies them.
+        n.app.drive_drain().await;
         assert_eq!(
             n.applied(),
             own.last().map(|b| (h(b), b.header.height)),
@@ -1165,6 +1348,10 @@ mod tests {
             .expect("validate");
         let mut pending = node.sync.drain_validated_blocks().await;
         let verified: HashSet<Hash> = pending.iter().map(h).collect();
+        let highest_served = pending
+            .iter()
+            .max_by_key(|b| b.header.height)
+            .map(|b| (h(b), b.header.height));
         let answered = tracker.take_answer(from, &received, &verified);
         let reprocessed = !pending.is_empty();
         if reprocessed {
@@ -1172,6 +1359,8 @@ mod tests {
             pending = bound_orphan_buffer(pending);
         }
         let fx = node.admission.admit_to_fixpoint(pending, |_, _| {}).await;
+        // The node's drain task, woken by admission, applies what was admitted.
+        node.app.drive_drain().await;
         let deferred = fx
             .deferred
             .iter()
@@ -1183,11 +1372,12 @@ mod tests {
         node.app.drive_drain().await;
         let applied_now = node.applied().expect("applied tip").1;
         if let Some(ah) = answered {
-            let verdict = classify(
+            let verdict = classify_answer(
                 received.is_empty(),
                 fx.newly_admitted,
                 fx.highest_admitted,
                 deferred,
+                highest_served,
             );
             tracker.on_answer(verdict, network_height > applied_now, ah);
         }
@@ -1600,7 +1790,14 @@ mod tests {
         let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
         let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag load"));
         dag.set_configured_genesis(g.header.block_hash);
-        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
+        // As main.rs wires it: the G11 walk reads pruned headers from the chain store.
+        let ghostdag = Arc::new(
+            GhostDag::new(GhostDagParams::default(), dag.clone()).with_ancestry_headers(Arc::new(
+                crate::dag_prune::ChainStoreHeaders(storage.clone()),
+            )),
+        );
         let executor = Arc::new(Executor::with_storage_and_chain_id(
             Arc::new(StateDB::new()),
             Some(storage.state.clone()),
@@ -1644,16 +1841,17 @@ mod tests {
     }
 
     /// A node that applied `own`, its DAG store pruned to the last
-    /// `dag_prune::MIN_RETAIN_BLOCKS` when `prune`, restarted. Returns the
+    /// [`HARNESS_PRUNE_RETAIN`] blocks when `prune`, restarted. Returns the
     /// restarted node and its storage dir.
     async fn restarted_node(net: &Net, own: &[Block], prune: bool) -> (Node, tempfile::TempDir) {
-        restarted_node_retaining(
-            net,
-            own,
-            prune.then_some(crate::dag_prune::MIN_RETAIN_BLOCKS),
-        )
-        .await
+        restarted_node_retaining(net, own, prune.then_some(HARNESS_PRUNE_RETAIN)).await
     }
+
+    /// The retain window `restarted_node` prunes to: the node's floor before
+    /// S3-4 (1,000), below today's (`dag_prune::MIN_RETAIN_BLOCKS` = the
+    /// 10,000-height undo window), so these fixtures stay a few thousand
+    /// blocks long.
+    const HARNESS_PRUNE_RETAIN: u64 = 1_000;
 
     /// [`restarted_node`] with the DAG store pruned to the last `retain`
     /// blocks (any window, below the node's configured minimum too).
@@ -1880,7 +2078,7 @@ mod tests {
     }
 
     /// A restarted node on the canonical chain hears of a sibling of its tip
-    /// (same height, same score, smaller hash: the fork-choice tie-break
+    /// (same height, same score, larger ForkChoiceKey: the fork-choice tie-break
     /// prefers it until the tip's children arrive). The durable applied tip
     /// must never go below the restart tip's parent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1997,12 +2195,13 @@ mod tests {
     }
 
     /// A same-height sibling of `tip` sealed by a fresh key whose hash is
-    /// smaller: equal blue score, so the fork-choice tie-break prefers it.
+    /// larger (same VRF output): equal blue score, so the fork-choice
+    /// tie-break (r1007 G8, the larger ForkChoiceKey) prefers it.
     fn tie_winning_sibling(tip: &Block, parent: Hash) -> Block {
         loop {
             let k = crypto::generate_keypair();
             let b = seal(&k, tip.header.height, parent, tip.state_root);
-            if h(&b) < h(tip) {
+            if h(&b) > h(tip) {
                 break b;
             }
         }
@@ -2076,7 +2275,9 @@ mod tests {
             barren,
             h(main_tip),
             network_tip,
-            200,
+            // The heavier branch is a whole window long (S3-4): ~10,100 blocks
+            // to fetch at ~31 a round.
+            800,
         )
         .await;
         let lowest = watch.finish();
@@ -2100,14 +2301,16 @@ mod tests {
     async fn runtime_rebuild_refuses_an_equal_weight_head() {
         // An equal-length rival branch forking deeper than the reorg window:
         // only a rebuild from genesis could switch to it.
-        let fork = 1_200u64 - crate::canonical_apply::MAX_REORG_DEPTH - 5;
-        let net = net(fork, 1_200, 1_200);
+        let fork = 95u64;
+        let top = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
+        let net = net(fork, top, top);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
         let (n, _ndir) = restarted_node(&net, &own, false).await;
         let fx = n
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(
             fx.newly_admitted,
             net.main.len(),
@@ -2118,13 +2321,10 @@ mod tests {
         n.app.maybe_runtime_rebuild(h(rival)).await;
         let lowest = watch.finish();
         assert!(
-            lowest >= 1_200,
+            lowest >= top,
             "rebuilt toward an equal-weight head: {lowest}"
         );
-        assert_eq!(
-            n.applied(),
-            Some((h(net.side.last().expect("side")), 1_200))
-        );
+        assert_eq!(n.applied(), Some((h(net.side.last().expect("side")), top)));
     }
 
     /// The rebuild itself re-checks the prune floor: asked to rebuild toward
@@ -2132,16 +2332,18 @@ mod tests {
     /// tip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_rebuild_refuses_on_a_pruned_node() {
-        // The node's own branch is deeper than the reorg window.
+        // The node's own branch is deeper than the reorg window, its DAG store
+        // pruned at the fork point (so the heavier branch still admits).
         let fork = 1_199u64;
         let side_tip = fork + crate::canonical_apply::MAX_REORG_DEPTH + 5;
         let net = net(fork, side_tip, side_tip + 40);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
-        let (n, _ndir) = restarted_node(&net, &own, true).await;
+        let (n, _ndir) = restarted_node_retaining(&net, &own, Some(side_tip - fork)).await;
         let fx = n
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2170,6 +2372,7 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
         let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
@@ -2188,10 +2391,14 @@ mod tests {
     }
 
     /// The same pruned node (150 retained) with its fork point deeper than the
-    /// reorg window (105 below its tip): still refused, as before. The node keeps its tip
-    /// and its state; an operator resync moves it.
+    /// in-memory snapshot ring (105 below its tip; the whole reorg window
+    /// before S3-4, when this was refused and the node kept its dead branch,
+    /// root cause H6). Since S3-4 the undo window is the prune retention, so
+    /// the restarted node switches in place from its undo records: the
+    /// durable tip never goes below the fork point (no rebuild from genesis,
+    /// which it refuses), and it ends on the heavier chain's state.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pruned_restart_deeper_than_the_window_still_refuses() {
+    async fn pruned_restart_deeper_than_the_ring_switches_from_the_undo_records() {
         let fork = 395u64;
         let net = net(fork, 500, 530);
         let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
@@ -2200,15 +2407,202 @@ mod tests {
             .admission
             .admit_to_fixpoint(net.main.clone(), |_, _| {})
             .await;
+        n.app.drive_drain().await;
         assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
-        let own_tip = net.side.last().expect("side");
-        let root = n.executor.calculate_state_root();
+        let main_tip = net.main.last().expect("main");
         let watch = TipWatch::start(n.storage.clone());
         n.app.drive_drain().await;
         let lowest = watch.finish();
-        assert_eq!(lowest, 500, "the durable tip never moved");
-        assert_eq!(n.applied(), Some((h(own_tip), 500)));
-        assert_eq!(n.executor.calculate_state_root(), root);
+        assert!(
+            lowest >= fork,
+            "the switch went below the fork point {fork}: lowest durable tip {lowest}"
+        );
+        assert_eq!(n.applied(), Some((h(main_tip), 530)));
+        assert_eq!(n.executor.calculate_state_root(), main_tip.state_root);
+        assert!(
+            n.app.wedge().expect("read").is_none(),
+            "no dead-branch marker"
+        );
+    }
+
+    /// H6 (ADR-2026-11-03 CV-7, the r1006 bootnodes on 2026-11-03). A node
+    /// with its DAG store pruned to the fleet's retention (10,000) is forked
+    /// deeper than it: its own branch runs `MAX_REORG_DEPTH + 100` above the
+    /// fork point and the network's heavier chain reaches it (the fork-point
+    /// search found it). The undo records cover `MAX_REORG_DEPTH` = 10,000
+    /// heights (the retention, S3-4; 100 before) and the rebuild from genesis
+    /// is refused on a pruned store (`RebuildDecision::RefusePruned`), so the
+    /// switch can never happen in place. Before CV-7b/c the applied tip stayed on the dead branch for
+    /// good and the node kept serving and advertising it as its chain.
+    ///
+    /// It must recover with no operator action:
+    /// (a) the refused switch marks the branch dead, durably: the node stops
+    ///     serving it as current (`serve_blocks` / `serve_headers`), stops
+    ///     advertising it as its head, and the producer gate is raised;
+    /// (b) `syncState` reports `wedged` with the fork depth;
+    /// (c) after the grace period the guarded cold resync moves the chain
+    ///     database aside (kept, not deleted), keeps the node identity, and
+    ///     the restarted node syncs from genesis via its peer onto the
+    ///     network's chain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pruned_node_forked_beyond_undo_window_recovers() {
+        use crate::cold_resync::{self, Decision, Policy};
+        // S3-4: deeper than the undo window (= the retention, 10,000), on a
+        // store pruned to that retention, so the fork point is below the DAG
+        // prune floor too.
+        let depth = crate::canonical_apply::MAX_REORG_DEPTH + 100;
+        let fork = 100u64;
+        let side_tip = fork + depth;
+        let main_tip_height = side_tip + 50;
+        let net = net(fork, side_tip, main_tip_height);
+        let own: Vec<Block> = net.prefix.iter().chain(net.side.iter()).cloned().collect();
+        // Pruned exactly at the fork point (the fixture's pre-S3-4 shape): a
+        // retention of `depth` (above the 10,000 floor), so the network's
+        // branch is above the floor and admits.
+        let (n, ndir) = restarted_node_retaining(&net, &own, Some(depth)).await;
+        let fx = n
+            .admission
+            .admit_to_fixpoint(net.main.clone(), |_, _| {})
+            .await;
+        n.app.drive_drain().await;
+        assert_eq!(fx.newly_admitted, net.main.len(), "fixture: main admits");
+        let main_tip = net.main.last().expect("main");
+        let dead_tip = net.side.last().expect("side");
+        let fork_hash = h(net.prefix.last().expect("prefix"));
+        n.app.drive_drain().await;
+        assert_eq!(
+            n.applied(),
+            Some((h(dead_tip), side_tip)),
+            "fixture: the switch is refused on the pruned node"
+        );
+
+        // (a) The dead branch is marked, durably.
+        let wedge = n
+            .app
+            .wedge()
+            .expect("marker read")
+            .expect("the refused switch marks the applied branch dead");
+        assert_eq!(
+            (wedge.dead_tip, wedge.dead_tip_height),
+            (h(dead_tip), side_tip)
+        );
+        assert_eq!((wedge.fork_point, wedge.fork_height), (fork_hash, fork));
+        assert_eq!(
+            (wedge.head, wedge.head_height),
+            (h(main_tip), main_tip_height)
+        );
+        assert_eq!(wedge.fork_depth(), depth);
+        assert!(
+            n.app
+                .dead_branch_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the producer gate's dead-branch flag is raised"
+        );
+        let reopened = CanonicalApplicator::new(n.executor.clone(), n.storage.clone());
+        assert!(
+            reopened
+                .dead_branch_handle()
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the marker survives a restart"
+        );
+        drop(reopened);
+        let side: HashSet<Hash> = net.side.iter().map(h).collect();
+        let served = block_serve::serve_blocks(&n.storage, &fork_hash, 512);
+        assert!(
+            served.iter().all(|b| !side.contains(&h(b))),
+            "a dead-branch block was served as this node's chain"
+        );
+        assert!(
+            served.iter().any(|b| b.header.height > fork),
+            "the network's blocks the node holds are still served"
+        );
+        assert!(
+            block_serve::serve_headers(&n.storage, &fork_hash, 2_048).is_empty(),
+            "headers above the fork point come from the dead branch's height index"
+        );
+        assert_eq!(
+            cold_resync::advertised_head(&n.storage),
+            Some((fork_hash, fork)),
+            "the node advertises its fork point, not the dead tip"
+        );
+
+        // (b) syncState over RPC.
+        let state = citrate_api::node_rpc::sync_state_json(&n.storage, Some(main_tip_height))
+            .expect("syncState");
+        assert_eq!(state["state"], "wedged", "{state}");
+        assert_eq!(state["forkDepth"], depth, "{state}");
+        assert_eq!(state["appliedHeight"], side_tip, "{state}");
+
+        // (c) The guarded cold resync: not before the grace period, then a
+        // request the next start carries out.
+        let policy = Policy::from(&crate::config::RecoveryConfig::default());
+        assert!(matches!(
+            cold_resync::evaluate(&n.app, ndir.path(), policy, false, wedge.since_unix)
+                .expect("evaluate"),
+            Decision::Waiting { .. }
+        ));
+        let now = wedge.since_unix + policy.after_secs;
+        assert!(matches!(
+            cold_resync::evaluate(&n.app, ndir.path(), policy, false, now).expect("evaluate"),
+            Decision::Resync(_)
+        ));
+        std::fs::write(ndir.path().join("noise.key"), b"node identity").expect("identity");
+        // The process exits (every handle on the chain database closes) and
+        // the supervisor starts it again: start_node runs apply_pending
+        // before it opens the chain database.
+        drop(n);
+        let aside = cold_resync::apply_pending_at(ndir.path(), policy, now + 1)
+            .expect("apply")
+            .expect("the chain database is moved aside");
+        assert_eq!(
+            std::fs::read(ndir.path().join("noise.key")).expect("identity kept"),
+            b"node identity"
+        );
+        {
+            let old = StorageManager::new(&aside, PruningConfig::default()).expect("aside opens");
+            assert_eq!(
+                old.blocks.get_applied_tip().expect("read"),
+                Some((h(dead_tip), side_tip)),
+                "the old chain database is kept intact"
+            );
+        }
+        let storage = Arc::new(
+            StorageManager::new(ndir.path(), PruningConfig::default()).expect("fresh store"),
+        );
+        assert_eq!(
+            storage.blocks.get_applied_tip().expect("read"),
+            None,
+            "the node starts on an empty chain database"
+        );
+        storage.blocks.put_block(&net.genesis).expect("genesis");
+        storage
+            .blocks
+            .put_applied_tip(&h(&net.genesis), 0)
+            .expect("genesis tip");
+        let (fresh, _dag) = wire_persistent(storage, &net.genesis, None).await;
+        let pdir = tempfile::tempdir().expect("tempdir");
+        let peer = peer_store(&net, false, pdir.path());
+        let mut tracker = RejoinTracker::new();
+        let run = drive(
+            &fresh,
+            &mut tracker,
+            &peer,
+            h(main_tip),
+            main_tip_height,
+            400,
+        )
+        .await;
+        assert_eq!(
+            fresh.applied(),
+            Some((h(main_tip), main_tip_height)),
+            "the resynced node did not reach the network's chain after {} rounds",
+            run.rounds
+        );
+        assert_eq!(fresh.executor.calculate_state_root(), main_tip.state_root);
+        assert!(fresh.app.wedge().expect("read").is_none());
+        let state = citrate_api::node_rpc::sync_state_json(&fresh.storage, Some(main_tip_height))
+            .expect("syncState");
+        assert_eq!(state["state"], "synced", "{state}");
     }
 
     /// The node's applicator is built with the DAG prune floor wired, on the
@@ -2228,9 +2622,21 @@ mod tests {
                 && stmt.contains(".with_dag_prune_floor(shared_dag_store.clone())"),
             "the applicator must be built with the DAG prune floor: {stmt}"
         );
+        let gd = src
+            .find("let shared_ghostdag = ")
+            .and_then(|at| src.get(at..))
+            .and_then(|t| t.find(';').and_then(|end| t.get(..end)))
+            .expect("shared_ghostdag statement");
         assert!(
-            src.contains("GhostDag::new(\n        GhostDagParams::default(),\n        shared_dag_store.clone(),"),
-            "fork choice and the prune floor must read the same DAG store"
+            gd.contains("GhostDag::new(GhostDagParams::default(), shared_dag_store.clone())"),
+            "fork choice and the prune floor must read the same DAG store: {gd}"
+        );
+        // G11: the pruning-point walk reads headers the DAG prune dropped
+        // from the chain store, so a pruned node admits what an unpruned does.
+        assert!(
+            gd.contains(".with_ancestry_headers(")
+                && gd.contains("ChainStoreHeaders(storage.clone())"),
+            "the shared GhostDag must read pruned ancestry from the chain store: {gd}"
         );
     }
 
@@ -2491,6 +2897,77 @@ mod tests {
         assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
     }
 
+    /// RED (r1007 devnet gf-p2-k0-1, 2026-11-10): after a 600 s singleton
+    /// partition at knob 0, p2's split pull found the fork point (~26,805) and
+    /// then stopped 10-60 blocks above it on an answer of blocks it already held,
+    /// every time, while the hole it needed sat at ~27,078-27,101: more than the
+    /// missing-parent walk's window below the applied tip (`BeyondWindow`). The
+    /// branches never reconverged. A follow that meets a held stretch must
+    /// move past it to the highest block served, not end.
+    #[test]
+    fn follow_moves_past_a_held_stretch() {
+        let mut t = RejoinTracker::new();
+        t.on_answer(Answer::Unconnected, true, 10);
+        t.on_answer(Answer::Unconnected, true, 10);
+        t.on_answer(
+            Answer::Progress {
+                highest: (hx(5), 20),
+            },
+            true,
+            9,
+        );
+        assert_eq!(
+            t.on_answer(
+                Answer::Held {
+                    highest: (hx(7), 52)
+                },
+                true,
+                20
+            ),
+            None,
+            "the follow ended on a held stretch below the branch it pulls"
+        );
+        assert_eq!(
+            t.mode(),
+            &Mode::Follow {
+                cursor: (hx(7), 52)
+            }
+        );
+        assert_eq!(t.anchor((hx(1), 10), |_| None), (hx(7), 52));
+        // At the top of what the peer holds the answer reaches no higher: done.
+        assert_eq!(
+            t.on_answer(
+                Answer::Held {
+                    highest: (hx(7), 52)
+                },
+                true,
+                52
+            ),
+            Some(Transition::Finished { from: "follow" })
+        );
+    }
+
+    #[test]
+    fn classify_answers_with_the_highest_served_block() {
+        assert_eq!(
+            classify_answer(false, 0, None, 0, Some((hx(3), 40))),
+            Answer::Held {
+                highest: (hx(3), 40)
+            }
+        );
+        assert_eq!(classify_answer(false, 0, None, 0, None), Answer::Known);
+        assert_eq!(
+            classify_answer(false, 0, None, 2, Some((hx(3), 40))),
+            Answer::Unconnected
+        );
+        assert_eq!(
+            classify_answer(false, 1, Some((hx(2), 38)), 0, Some((hx(3), 40))),
+            Answer::Progress {
+                highest: (hx(2), 38)
+            }
+        );
+    }
+
     #[test]
     fn classify_answers() {
         assert_eq!(classify(true, 0, None, 0), Answer::Unconnected);
@@ -2658,32 +3135,37 @@ mod tests {
         extend(key, h(g), 1, n, r)
     }
 
-    /// A block at `height` on `parent` sealed by `key` whose hash sorts on the
-    /// `below` side of `than` (fork choice breaks equal-score ties toward the
-    /// SMALLEST hash). Same transactions and coinbase as the chain, so the
+    /// A block at `height` on `parent` sealed by `key` whose ForkChoiceKey is
+    /// above `than`'s when `wins` (fork choice breaks equal-score ties toward
+    /// the larger key, r1007 G8), below it otherwise. Same transactions and coinbase as the chain, so the
     /// same state root.
     fn sibling(
         key: &ed25519_dalek::SigningKey,
         height: u64,
         parent: Hash,
         root: Hash,
-        than: Hash,
-        below: bool,
+        than: &Block,
+        wins: bool,
     ) -> Block {
+        // r1007 G8: the tie-break is the ForkChoiceKey (VRF output before the
+        // hash); `wins` asks for a sibling whose key is above `than`'s.
+        let than = citrate_consensus::types::ForkChoiceKey::of_header(&than.header);
         for salt in 1..=u16::MAX {
             let mut b = seal(key, height, parent, root);
             // Vary the VRF output (no transactions read it) rather than the
             // timestamp, which must stay parent-monotonic for its children.
             let mut out = [0x5A; 32];
-            out[..2].copy_from_slice(&salt.to_be_bytes());
+            out[30..].copy_from_slice(&salt.to_be_bytes());
             b.header.vrf_reveal.output = Hash::new(out);
             b.header.block_hash = b.compute_hash();
             b.signature = crypto::sign_block(&b.header.block_hash, key);
-            if (b.header.block_hash < than) == below {
+            crate::g11_test_seal::record(&b);
+            let key_of_b = citrate_consensus::types::ForkChoiceKey::of_header(&b.header);
+            if key_of_b != than && (key_of_b > than) == wins {
                 return b;
             }
         }
-        panic!("no sibling hash on the requested side");
+        panic!("no sibling key on the requested side");
     }
 
     /// The node after a restart, built the way `start_node` builds one over an
@@ -2702,6 +3184,8 @@ mod tests {
         let point = tip_height.saturating_sub(retain);
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         dag.set_configured_genesis(h(g));
+        dag.set_slot_origin(&g.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         // Producer rehydration: every stored height is registered with GhostDAG;
         // only the retained range is in the DAG store (below the pruning point
@@ -2798,7 +3282,7 @@ mod tests {
     /// advertises a higher head and answers the tip anchor with nothing (it
     /// never held the node's tip); when the fork-point search probes below the
     /// tip it serves a validly signed sibling of the tip that fork choice ranks
-    /// first (equal score, smaller hash). The restart keeps the reorg window,
+    /// first (equal score, larger ForkChoiceKey). The restart keeps the reorg window,
     /// so the node follows the tie-break as a running node does: a one-block
     /// reorg. An equal-weight head never starts a from-genesis rebuild (owner
     /// decision 2026-10-28): the durable applied tip never goes below the fork
@@ -2813,13 +3297,13 @@ mod tests {
         let own = chain(&key, &g, RESTART_TIP, &r);
         let tip = own.last().expect("tip").clone();
         let parent = own[own.len() - 2].header.block_hash;
-        // Validly signed by another proposer, same height and parent, smaller hash.
+        // Validly signed by another proposer, same height and parent, larger key.
         let rival = sibling(
             &other,
             RESTART_TIP,
             parent,
             r[RESTART_TIP as usize],
-            h(&tip),
+            &tip,
             true,
         );
         let net = Net {
@@ -2959,7 +3443,7 @@ mod tests {
             next.header.height,
             next.selected_parent(),
             next.state_root,
-            h(next),
+            next,
             false,
         );
         n.storage.blocks.put_block(&rival).expect("put");
@@ -3008,7 +3492,7 @@ mod tests {
             RESTART_TIP,
             parent,
             r[RESTART_TIP as usize],
-            h(&tip),
+            &tip,
             false,
         );
         let mut heavier = vec![rival.clone()];
@@ -3066,8 +3550,8 @@ mod tests {
         // Known to fork choice (stored + scored), not applied: the tip's
         // equal-score siblings on both sides of the hash tie-break, and a
         // heavier branch on the losing one.
-        let wins = sibling(&other, 30, tip.selected_parent(), r[30], h(&tip), true);
-        let loses = sibling(&other, 30, tip.selected_parent(), r[30], h(&tip), false);
+        let wins = sibling(&other, 30, tip.selected_parent(), r[30], &tip, true);
+        let loses = sibling(&other, 30, tip.selected_parent(), r[30], &tip, false);
         let heavier = extend(&other, h(&loses), 31, 32, &r);
         for b in [&wins, &loses].into_iter().chain(heavier.iter()) {
             n.storage.blocks.put_block(b).expect("put");
@@ -3451,7 +3935,7 @@ mod tests {
     /// Seal the block `m` would produce now, as the producer does: drain, the
     /// initial-sync gate (#126), fork choice's tip as the selected parent and
     /// only when it is the applied tip (MP-S1), the other tips as merge
-    /// parents (heaviest-parent and MP-DEPTH filters). `None` when the
+    /// parents (`GhostDag::parents_for_new_block`, r1007 G2-G5). `None` when the
     /// producer would refuse.
     async fn mesh_produce(
         m: &MeshNode,
@@ -3475,22 +3959,17 @@ mod tests {
         }
         let sp = m.node.storage.blocks.get_block(&sp_hash).ok()??;
         let height = sp.header.height + 1;
-        let mut merges = Vec::new();
-        for tip in m.node.ghostdag.get_tips().await {
-            if tip == sp_hash || merges.len() + 1 >= GhostDagParams::default().max_parents {
-                continue;
-            }
-            let Ok(Some(b)) = m.node.storage.blocks.get_block(&tip) else {
-                continue;
-            };
-            if b.header.blue_score <= sp.header.blue_score
-                && height - b.header.height <= citrate_consensus::ghostdag::MERGE_PARENT_MAX_DEPTH
-            {
-                merges.push(tip);
-            }
-        }
-        merges.sort();
-        let score = sp.header.blue_score + 1;
+        // r1007 (S3-1): the producer's own merge-parent choice (G2-G5) and the
+        // exact GHOSTDAG score (G7), replacing the old header-score and MP-DEPTH
+        // filters and the `parent + 1` score.
+        let tips = m.node.ghostdag.get_tips().await;
+        let (merges, data) = m
+            .node
+            .ghostdag
+            .parents_for_new_block(sp_hash, &tips)
+            .await
+            .ok()?;
+        let score = data.blue_score;
         let mut b = BlockBuilder::new()
             .version(2)
             .height(height)
@@ -3507,14 +3986,21 @@ mod tests {
             .blue_score(score)
             .blue_work(blue_work_for_score(score))
             .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            .pruning_point(crate::g11_test_seal::pruning_point(height, sp_hash))
             .build_unhashed();
         b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
             PbaHardening::off(),
             height,
             &b.transactions,
         );
+        // r1007 S3-3b: the commitments of an accepted mergeset with no
+        // transaction, under the ACCEPT gas limit.
+        b.header.gas_limit = citrate_consensus::acceptance::ACCEPT_GAS_LIMIT;
+        b.accepted_root = citrate_execution::acceptance::accepted_root(&[]);
+        b.receipt_root = citrate_execution::acceptance::receipt_root(&[]);
         b.header.block_hash = b.compute_hash();
         b.signature = crypto::sign_block(&b.header.block_hash, key);
+        crate::g11_test_seal::record(&b);
         Some(b)
     }
 
@@ -3965,6 +4451,53 @@ mod tests {
         assert_eq!(src, Source::Nobody);
     }
 
+    /// CV-5 resync: a request starts a fork-point search pinned to the peer
+    /// advertising the highest head this node does not hold; a held head, our
+    /// own tip and an unknown head never qualify; a running search is left as
+    /// it is (it already is the resync).
+    #[test]
+    fn a_resync_request_searches_against_the_highest_unheld_head() {
+        let applied = (hx(1), 40);
+        let split = [
+            SplitCandidate {
+                id: "held".into(),
+                head_height: 90,
+                head_hash: hx(7),
+            },
+            SplitCandidate {
+                id: "low".into(),
+                head_height: 45,
+                head_hash: hx(8),
+            },
+            SplitCandidate {
+                id: "high".into(),
+                head_height: 60,
+                head_hash: hx(9),
+            },
+            SplitCandidate {
+                id: "ours".into(),
+                head_height: 99,
+                head_hash: hx(1),
+            },
+            SplitCandidate {
+                id: "unknown".into(),
+                head_height: 99,
+                head_hash: Hash::new([0u8; 32]),
+            },
+        ];
+        let holds = |h: &Hash| *h == hx(7);
+        let mut t = RejoinTracker::new();
+        assert!(start_resync(&mut t, &split, applied, holds).is_some());
+        assert_eq!(t.search_peer(), Some("high"));
+        // A search is running: a second request changes nothing.
+        assert!(start_resync(&mut t, &split, applied, holds).is_none());
+        assert_eq!(t.search_peer(), Some("high"));
+        // Nobody advertises a head we lack: nothing to search against.
+        let mut idle = RejoinTracker::new();
+        assert!(start_resync(&mut idle, &split[..1], applied, holds).is_none());
+        assert_eq!(idle.search_peer(), None);
+    }
+
     /// A split pull is a search against one peer: while it runs, the tick
     /// keeps asking that peer even when the selector would pick another, an
     /// equal-height answer does not end it as "caught up", a peer ahead takes
@@ -4097,6 +4630,111 @@ mod tests {
         assert_eq!(t.search_peer(), None);
     }
 
+    /// The r1006 bootnodes, 2026-11-03 20:00Z to 11-04 01:30Z (boot journals,
+    /// read-only): `SYNCREJOIN GaveUp { at: 298381 } (re-sends to a silent
+    /// peer)` 11x on boot-1, 33x on boot-2, 8x on boot-3, each followed by a
+    /// `SYNCPEER switched`. A fork-point search pinned to a peer that stops
+    /// answering gave up with the rejoin backoff, so the next search, against
+    /// any peer, first had to sit out the cooldown, and the strikes that
+    /// start it had to come from one peer twice in a row.
+    ///
+    /// A silent peer is not evidence about the fork point. While another
+    /// connected peer is ahead, the search must move to it on the next tick,
+    /// with no backoff, and must not go back to the silent peer.
+    #[test]
+    fn a_search_pinned_to_a_silent_peer_fails_over_to_another_peer_ahead() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let applied = (hx(1), 1_000u64);
+        let cands = [
+            SyncCandidate {
+                id: "silent".into(),
+                head_height: 1_200,
+            },
+            SyncCandidate {
+                id: "live".into(),
+                head_height: 1_200,
+            },
+        ];
+        t.note_sync_target(1_200, applied.1);
+        // Two unconnected tip answers from "silent" start a search pinned to it.
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        assert_eq!(t.search_peer(), Some("silent"));
+        let now = Instant::now();
+        let (src, _) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(src, Source::Pinned("silent".into()));
+        let a = t.anchor(applied, |_| Some(hx(2)));
+        assert_eq!(t.note_asked("silent", a), None);
+        // It never answers: every later tick its anchor is still pending.
+        let mut ended = None;
+        for _ in 0..MAX_UNANSWERED {
+            if let Some(tr) = t.note_unsent("silent") {
+                ended = Some(tr);
+                break;
+            }
+        }
+        assert!(ended.is_some(), "a silent pin must end: {:?}", t.mode());
+        assert_eq!(
+            t.cooldown(),
+            0,
+            "a silent peer is not a failed search: no rejoin backoff"
+        );
+        // The next tick carries the search to the other peer ahead, at once.
+        let (src, tr) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(
+            src,
+            Source::Pinned("live".into()),
+            "the search did not fail over: {tr:?} mode={:?}",
+            t.mode()
+        );
+        assert!(matches!(t.mode(), Mode::Probe { .. }), "{:?}", t.mode());
+        // Ending that search never re-pins the silent peer while "live" is
+        // still ahead.
+        let _ = t.abandon();
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        assert_ne!(t.search_peer(), Some("silent"), "{:?}", t.mode());
+    }
+
+    /// With no other peer ahead, a silent pin ends with the ordinary backoff.
+    #[test]
+    fn a_silent_pin_with_no_other_peer_ahead_backs_off() {
+        let mut t = RejoinTracker::new();
+        let sel = SyncPeerSelector::new();
+        let mut gate = SplitPullGate::new();
+        let applied = (hx(1), 1_000u64);
+        let cands = [SyncCandidate {
+            id: "silent".into(),
+            head_height: 1_200,
+        }];
+        t.note_sync_target(1_200, applied.1);
+        for _ in 0..PROBE_AFTER_STRIKES {
+            t.note_asked("silent", applied);
+            assert_eq!(t.take_answer("silent", &[], &HashSet::new()), Some(1_000));
+            t.on_answer(Answer::Unconnected, true, 1_000);
+        }
+        let now = Instant::now();
+        let a = t.anchor(applied, |_| Some(hx(2)));
+        t.note_asked("silent", a);
+        for _ in 0..MAX_UNANSWERED {
+            if t.note_unsent("silent").is_some() {
+                break;
+            }
+        }
+        let (src, _) = choose_source(&mut t, &sel, &mut gate, &cands, &[], applied, |_| true, now);
+        assert_eq!(src, Source::Ahead("silent".into()));
+        assert_eq!(t.mode(), &Mode::Tip { strikes: 0 });
+        assert_eq!(t.cooldown(), BACKOFF_BASE_ANSWERS);
+    }
+
     /// P1-2: a slow peer answering one request in seven keeps `unanswered`
     /// below its limit forever. The search still ends within its request cap,
     /// which is sized to the search's own log bound.
@@ -4128,7 +4766,7 @@ mod tests {
     #[test]
     fn an_endless_follow_ends_within_its_bound() {
         use crate::sync_peer::SPLIT_PULL_HEIGHT_BAND;
-        let depth = crate::canonical_apply::MAX_REORG_DEPTH;
+        let depth = crate::canonical_apply::SNAPSHOT_RING_DEPTH;
         for split in [true, false] {
             let mut t = RejoinTracker::new();
             let top = 500u64;

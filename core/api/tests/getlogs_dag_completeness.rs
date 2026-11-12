@@ -83,6 +83,7 @@ fn put_receipt(storage: &StorageManager, b: &Block, t: &Transaction, tag: u8, lo
         eth_tx_type: 0,
         effective_gas_price: 2_000_000_000,
         revert_reason: None,
+        acceptance: None,
     };
     storage
         .transactions
