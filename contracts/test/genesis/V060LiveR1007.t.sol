@@ -127,6 +127,8 @@ contract V060LiveR1007Test is Test {
         k.guardianVetoMargin = 2 hours;
         k.v060Deployers = new address[](1);
         k.v060Deployers[0] = SENDER;
+        k.v060DeployersOnly = new address[](1);
+        k.v060DeployersOnly[0] = SENDER;
     }
 
     function _inputs() internal view returns (DeployV060Genesis.Inputs memory i) {
@@ -305,5 +307,137 @@ contract V060LiveR1007Test is Test {
         (r.toGrd[0], r.toGrd[1]) = (r.toGrd[1], r.toGrd[0]);
         _expectRevert(bytes("GuardianMultisig: owners() is not exactly the rotated set, in order"));
         s.deployLive(liveDeployer, _inputs(), r);
+    }
+
+    // #464 review P2-1: a key tagged both V060_DEPLOYER and a ceremony role is refused as the
+    // live deployer (and, in the shell suite, in block 0 and by the preflight).
+
+    function test_live_mode_refuses_a_deployer_that_also_carries_a_ceremony_role() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        i.keys.v060DeployersOnly = new address[](0); // SENDER is tagged V060_DEPLOYER and something else
+        _expectRevert(bytes("deployer carries a ceremony role beside V060_DEPLOYER"));
+        s.deployLive(liveDeployer, i, _rot());
+    }
+
+    function test_the_inventory_json_tells_a_pure_deployer_from_a_mixed_one() public {
+        DeployV060Genesis s = _builder();
+        string memory inv = string.concat(
+            '{"', vm.toString(address(0xD1)), '":["V060_DEPLOYER"],"', vm.toString(address(0xD2)),
+            '":["V060_DEPLOYER","GOV_OWNERS"]}'
+        );
+        address[] memory tagged = s.inventoryRole(inv, "V060_DEPLOYER");
+        address[] memory only = s.inventoryOnlyRole(inv, "V060_DEPLOYER");
+        assertEq(tagged.length, 2);
+        assertEq(only.length, 1);
+        assertEq(only[0], address(0xD1));
+    }
+}
+
+/// #464 review P2-2: on r1007 the holder sets are proved from the block-0 state (genesis-chain
+/// mode), which cannot see a role granted after genesis (it writes a slot the alloc does not
+/// hold). The live mode also replays the timelocks' post-genesis RoleGranted / RoleRevoked logs.
+contract PostGenesisRoleHarness is AdminChecks, RecordedRoleHistory {
+    string public allocPath;
+
+    function setAllocPath(string memory p) external {
+        allocPath = p;
+    }
+
+    function _genesisChainMode(address) internal pure override returns (bool) {
+        return true;
+    }
+
+    function _genesisAllocPath() internal view override returns (string memory) {
+        return allocPath;
+    }
+
+    function _timelockRoleHistory(address timelock)
+        internal
+        override(AdminChecks, RecordedRoleHistory)
+        returns (bool, string memory, RoleEvent[] memory)
+    {
+        return RecordedRoleHistory._timelockRoleHistory(timelock);
+    }
+
+    function stateOnly(address timelock, address council, address[] memory extra) external returns (string memory) {
+        return _timelockHolderProblem(timelock, council, extra);
+    }
+
+    function live(address timelock, address council, address[] memory extra) external returns (string memory) {
+        return _liveTimelockHolderProblem(timelock, council, extra);
+    }
+}
+
+contract V060LivePostGenesisRolesTest is Test {
+    PostGenesisRoleHarness h;
+    RoleLogArchive archive;
+    TimelockController tl;
+    address council = address(0xC0C0);
+    address intruder = address(0xBAD);
+    bytes32 constant PROPOSER = keccak256("PROPOSER_ROLE");
+    bytes32 constant CANCELLER = keccak256("CANCELLER_ROLE");
+
+    function setUp() public {
+        vm.createDir("genesis", true);
+        h = new PostGenesisRoleHarness();
+        address[] memory p = new address[](1);
+        p[0] = council;
+        tl = new TimelockController(2 days, p, p, address(0));
+        // Block 0: the timelock is in the alloc; its constructor logs are not on chain.
+        _writeAlloc();
+        vm.recordLogs(); // from here on: the post-genesis logs the live mode replays
+        archive = new RoleLogArchive();
+        h.useArchive(archive);
+    }
+
+    function _roleSlot(bytes32 role, address who) internal pure returns (bytes32) {
+        return keccak256(abi.encode(who, keccak256(abi.encode(role, uint256(0)))));
+    }
+
+    function _writeAlloc() internal {
+        string memory path = string.concat("genesis/test-v060-postgenesis-", vm.toString(address(this)), ".json");
+        h.setAllocPath(path);
+        bytes32[5] memory slots = [
+            bytes32(uint256(2)),
+            _roleSlot(bytes32(0), address(tl)),
+            _roleSlot(PROPOSER, council),
+            _roleSlot(keccak256("EXECUTOR_ROLE"), council),
+            _roleSlot(CANCELLER, council)
+        ];
+        string memory st = "{";
+        for (uint256 i = 0; i < 5; i++) {
+            st = string.concat(st, i == 0 ? "" : ",", '"', vm.toString(slots[i]), '":"', vm.toString(vm.load(address(tl), slots[i])), '"');
+        }
+        vm.writeFile(path, string.concat('{"alloc":{"', vm.toLowercase(vm.toString(address(tl))), '":{"storage":', st, "}}}}"));
+    }
+
+    function test_a_clean_chain_passes_both() public {
+        archive.absorb();
+        assertEq(h.stateOnly(address(tl), council, new address[](0)), "");
+        assertEq(h.live(address(tl), council, new address[](0)), "");
+    }
+
+    /// The state proof alone misses a post-genesis grant; the live check catches it from the logs.
+    function test_a_post_genesis_grant_is_caught_from_the_logs() public {
+        vm.prank(address(tl));
+        tl.grantRole(PROPOSER, intruder);
+        archive.absorb();
+        assertEq(h.stateOnly(address(tl), council, new address[](0)), "", "the block-0 state alone does not see it");
+        assertEq(
+            h.live(address(tl), council, new address[](0)),
+            "post-genesis role change: an account outside the expected holder set holds a timelock role (RoleGranted after block 0)"
+        );
+    }
+
+    /// A post-genesis revocation of an expected holder is caught too.
+    function test_a_post_genesis_revocation_is_caught_from_the_logs() public {
+        vm.prank(address(tl));
+        tl.revokeRole(CANCELLER, council);
+        archive.absorb();
+        assertEq(
+            h.live(address(tl), council, new address[](0)),
+            "post-genesis role change: an expected holder no longer holds its timelock role (RoleRevoked after block 0)"
+        );
     }
 }
