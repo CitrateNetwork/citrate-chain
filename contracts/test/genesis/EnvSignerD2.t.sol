@@ -51,6 +51,11 @@ contract H_DeployDpf02Rbac is DeployDpf02Rbac {
     address internal d;
     address internal g;
     address internal c;
+    bool internal hasNode;
+    uint256 internal nodeId;
+    /// Stands in for the node behind --rpc-url (what eth_chainId returns).
+    function setNode(uint256 id) external { hasNode = true; nodeId = id; }
+    function _nodeChainId() internal view override returns (bool, uint256) { return (hasNode, nodeId); }
     function setSigner(uint256 key, address expected) external { k = key; e = expected; }
     function setCaller(address caller) external { c = caller; }
     function _scriptSender() internal view override returns (address) { return c == address(0) ? msg.sender : c; }
@@ -458,17 +463,47 @@ contract EnvSignerD2Test is Test {
         vm.chainId(40204);
         H_DeployDpf02Rbac h = new H_DeployDpf02Rbac();
         address signer = vm.addr(PK);
+        h.setNode(40204);
         h.setSigner(PK, signer);
         h.setGovernance(address(0)); // unset: the old fallback to msg.sender
         h.setCaller(signer);
         vm.expectRevert(bytes("ROOT_GOVERNANCE must be set to a non-deployer address on 40204"));
         h.run();
         H_DeployDpf02Rbac h2 = new H_DeployDpf02Rbac();
+        h2.setNode(40204);
         h2.setSigner(PK, signer);
         h2.setGovernance(signer);
         h2.setCaller(signer);
         vm.expectRevert(bytes("ROOT_GOVERNANCE must be set to a non-deployer address on 40204"));
         h2.run();
+    }
+
+    /// The 40204 guard follows the node, not forge's simulated chain id: a run with
+    /// `--chain-id 1` against a 40204 node must not slip past it with no governance.
+    function test_rootGovernance_aSteeredChainIdDoesNotSkipThe40204Guard() public {
+        vm.chainId(1); // what `forge script --chain-id 1` simulates
+        H_DeployDpf02Rbac h = new H_DeployDpf02Rbac();
+        address signer = vm.addr(PK);
+        h.setNode(40204); // the node the run broadcasts to
+        h.setSigner(PK, signer);
+        h.setGovernance(address(0));
+        h.setCaller(signer);
+        vm.expectRevert(
+            bytes("chain id mismatch: node reports 40204, forge simulates 1 (drop --chain-id / --chain / FOUNDRY_CHAIN_ID)")
+        );
+        h.run();
+    }
+
+    /// On 40204 with no node to ask, the guard refuses instead of trusting block.chainid.
+    function test_rootGovernance_on40204NeedsTheNode() public {
+        vm.chainId(40204);
+        H_DeployDpf02Rbac h = new H_DeployDpf02Rbac();
+        address signer = vm.addr(PK);
+        h.setSigner(PK, signer);
+        h.setGovernance(makeAddr("multisig"));
+        h.setCaller(signer);
+        vm.expectRevert(bytes("genesis profile needs a live node: run with --rpc-url (eth_chainId unavailable)"));
+        h.run();
     }
 
     function test_send_transfersValueFromTheEnvKey() public {
