@@ -85,6 +85,8 @@
     "CMO_PORTAL_SEED_E2E": {"class": "unset", "phases": ["P3L"], "why": "dev-only sample data (DeployComplianceRegistry refuses it on 40204)"},
     "E2E_CMO_ADMIN": {"class": "unset", "phases": ["P3L"], "why": "dev-only sample data (DeployComplianceRegistry)"},
     "E2E_DISTRICT_ADMIN": {"class": "unset", "phases": ["P3L"], "why": "dev-only sample data (DeployComplianceRegistry)"},
-    "E2E_SCHOOL_ADMIN": {"class": "unset", "phases": ["P3L"], "why": "dev-only sample data (DeployComplianceRegistry)"}
+    "E2E_SCHOOL_ADMIN": {"class": "unset", "phases": ["P3L"], "why": "dev-only sample data (DeployComplianceRegistry)"},
+    "PRIVATE_KEY": {"class": "unset", "phases": ["P4V"], "why": "the ceremony signs with its keystore (--account); EnvSigner's env-held key is for the r1007 live mode (DeployV060Live, fed #561 D2c) only, so a ceremony runs without it"},
+    "EXPECTED_SENDER": {"class": "unset", "phases": ["P4V"], "why": "EnvSigner's wrong-key guard for the r1007 live mode only (DeployV060Live); a ceremony signs with its keystore and runs without it"}
   }
 }

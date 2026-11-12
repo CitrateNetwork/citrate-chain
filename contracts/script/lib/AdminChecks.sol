@@ -857,6 +857,126 @@ abstract contract AdminChecks {
         return "";
     }
 
+    /// @notice The holder sets of a timelock on a LIVE chain whose contracts are in block 0
+    ///         (r1007): the block-0 proof `_timelockHolderProblem` gives (genesis-chain mode
+    ///         proves the sets from the block-0 state, which cannot see a slot written after
+    ///         genesis), plus a replay of every RoleGranted / RoleRevoked the node has logged for
+    ///         the timelock (block 1 to the head; block 0 has none). For each (role, account) the
+    ///         logs touch, the live `hasRole` must equal the expectation: DEFAULT_ADMIN only the
+    ///         timelock, PROPOSER and EXECUTOR only the council, CANCELLER the council plus
+    ///         `extraCancellers`. #464 review P2-2.
+    function _liveTimelockHolderProblem(address timelock, address council, address[] memory extraCancellers)
+        internal
+        returns (string memory)
+    {
+        string memory p = _timelockHolderProblem(timelock, council, extraCancellers);
+        if (bytes(p).length != 0) return p;
+        (bool ok, string memory why, RoleEvent[] memory events) = _timelockRoleHistory(timelock);
+        if (!ok) return why;
+        for (uint256 i = 0; i < events.length; i++) {
+            RoleEvent memory e = events[i];
+            if ((e.kind != HISTORY_GRANT && e.kind != HISTORY_REVOKE) || !_isTimelockRole(e.role)) continue;
+            bool expected;
+            if (e.role == DEFAULT_ADMIN_ROLE) {
+                expected = e.account == timelock;
+            } else if (e.role == TIMELOCK_CANCELLER_ROLE) {
+                expected = e.account == council;
+                for (uint256 k = 0; k < extraCancellers.length; k++) {
+                    if (extraCancellers[k] == e.account) expected = true;
+                }
+            } else {
+                expected = e.account == council;
+            }
+            (bool okR, bool has) =
+                _readBool(timelock, abi.encodeWithSignature("hasRole(bytes32,address)", e.role, e.account));
+            if (!okR) return "hasRole unreadable";
+            if (has && !expected) {
+                return "post-genesis role change: an account outside the expected holder set holds a timelock role (RoleGranted after block 0)";
+            }
+            if (!has && expected) {
+                return "post-genesis role change: an expected holder no longer holds its timelock role (RoleRevoked after block 0)";
+            }
+        }
+        return "";
+    }
+
+    /// @notice A council whose owners were rotated in storage after its ceremony (r1007's block 0
+    ///         is r1006's state with every non-producer key replaced, rotate_keys.py: the owner
+    ///         array elements and the `isOwner` keys at slot 1; threshold and TTL unchanged).
+    ///           fromGov / fromGrd  the constructor owners the council addresses commit to (r1006,
+    ///                              scripts/genesis/r1006/inputs.r1006.env), in order
+    ///           toGov / toGrd      the rotated owners (r1007, scripts/genesis/r1007/inputs.r1007.env),
+    ///                              in order
+    struct Rotation {
+        address[] fromGov;
+        address[] fromGrd;
+        address[] toGov;
+        address[] toGrd;
+    }
+
+    /// @notice Empty when `multisig` is the ceremony's MultisigProposer for `timelock`, deployed
+    ///         under `saltName` with the constructor owners `fromOwners`, and since rotated to
+    ///         exactly `toOwners`. Two legs (CHAIN-INTEG, 2026-11-11):
+    ///           1. provenance: the CREATE2 address for (timelock, fromOwners, its threshold, its
+    ///              TTL), and this build's runtime code for those immutables (owners are storage,
+    ///              so the rotation leaves the code hash alone);
+    ///           2. the rotation: `owners()` is exactly `toOwners`, in order, and `isOwner`
+    ///              (what authorizes a signer) is false for every removed original owner and
+    ///              true for every rotated one.
+    ///         `_multisigProposerProblem` (provenance over the CURRENT owners) cannot hold on a
+    ///         rotated council: its address commits to the original owners. Never reverts on a
+    ///         contract that answers; an unreadable one is a problem.
+    function _rotatedMultisigProblem(
+        address multisig,
+        address timelock,
+        string memory saltName,
+        address[] memory fromOwners,
+        address[] memory toOwners
+    ) internal returns (string memory) {
+        if (multisig.code.length == 0) return "no code at address";
+        (bool okT, bytes memory rt) = multisig.staticcall(abi.encodeWithSignature("threshold()"));
+        if (!okT || rt.length != 32) return "threshold() unreadable";
+        (bool okL, bytes memory rl) = multisig.staticcall(abi.encodeWithSignature("proposalTtl()"));
+        if (!okL || rl.length != 32) return "proposalTtl() unreadable";
+        (bool okO, bytes memory ro) = multisig.staticcall(abi.encodeWithSignature("owners()"));
+        if (!okO || ro.length < 64) return "owners() unreadable";
+        uint256 threshold = abi.decode(rt, (uint256));
+        uint256 ttl = abi.decode(rl, (uint256));
+        bytes memory init = _multisigProposerInitCode(timelock, fromOwners, threshold, ttl);
+        if (_ceremonyCreate2Address(saltName, init) != multisig) {
+            return "not the MultisigProposer the ceremony deployed for these original owners, threshold and TTL";
+        }
+        // On a chain whose block 0 copied the account (r1007), the address alone does not prove
+        // the code: compare it with this build's instance for the same immutables.
+        if (multisig.codehash != address(new MultisigProposer(timelock, fromOwners, threshold, ttl)).codehash) {
+            return "runtime code is not this build's MultisigProposer for its timelock, threshold and TTL";
+        }
+        address[] memory owners = abi.decode(ro, (address[]));
+        if (keccak256(abi.encode(owners)) != keccak256(abi.encode(toOwners))) {
+            return "owners() is not exactly the rotated set, in order";
+        }
+        // isOwner is what authorizes a signer (rotate_keys.py rewrites its keys at slot 1):
+        // every removed original owner false, every rotated owner true. #464 review P2-1.
+        for (uint256 i = 0; i < fromOwners.length; i++) {
+            bool kept;
+            for (uint256 j = 0; j < toOwners.length; j++) {
+                if (toOwners[j] == fromOwners[i]) kept = true;
+            }
+            if (kept) continue;
+            (bool okI, bool authorized) =
+                _readBool(multisig, abi.encodeWithSignature("isOwner(address)", fromOwners[i]));
+            if (!okI) return "isOwner unreadable";
+            if (authorized) return "isOwner still authorizes a removed original owner";
+        }
+        for (uint256 j = 0; j < toOwners.length; j++) {
+            (bool okI, bool authorized) =
+                _readBool(multisig, abi.encodeWithSignature("isOwner(address)", toOwners[j]));
+            if (!okI) return "isOwner unreadable";
+            if (!authorized) return "isOwner does not authorize a rotated owner";
+        }
+        return "";
+    }
+
     /// @notice Revert unless `_multisigProposerProblem` is empty (see there).
     function _assertMultisigProposer(string memory name, address multisig, address timelock, string memory saltName)
         internal

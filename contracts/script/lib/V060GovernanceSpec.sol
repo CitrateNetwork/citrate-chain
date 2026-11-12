@@ -40,6 +40,10 @@ library V060GovernanceSpec {
         address[] guardianOwners;
         address[] retiredKeys;
         uint256 guardianVetoMargin;
+        /// the inventory's keys with role V060_DEPLOYER (a post-genesis key; live mode only)
+        address[] v060Deployers;
+        /// those of them whose ONLY tag is V060_DEPLOYER (no ceremony role beside it; #464 P2-1)
+        address[] v060DeployersOnly;
     }
 
     string internal constant PENDING_KEY_INVENTORY =
@@ -53,6 +57,33 @@ library V060GovernanceSpec {
         "GENESIS_GUARDIAN_VETO_MARGIN is not the owner's decided value (7200 s, owner 2026-11-11)";
     string internal constant VETO_MARGIN_TOO_SMALL =
         "GUARDIAN timelock: minDelay plus GENESIS_GUARDIAN_VETO_MARGIN must fit inside the ProviderRegistry veto window (24 h)";
+
+    string internal constant PENDING_V060_DEPLOYER =
+        "PENDING PARAMETER: the live mode needs a GENESIS_KEY_INVENTORY key with role V060_DEPLOYER (the r1007 V060_DEPLOYER, lead decision fed #561)";
+
+    /// The salt of the r1007 canceller-swap batch on the GOVERNANCE timelock (fed #561 section 3.1).
+    bytes32 internal constant SWAP_SALT = keccak256("r1007.v060.d2c.canceller-v2");
+    string internal constant SWAP_NEEDS_V2_CODE =
+        "GuardianCancellerV2 has no code with this build's code hash at its predicted address: queue the swap only after D2c's receipts (fed #561 review)";
+
+    /// @notice Live mode (r1007, post-genesis): the deployer is on the inventory with role
+    ///         V060_DEPLOYER (a key that holds no block-0 seat).
+    function requireLiveDeployer(address deployer, KeyParams memory k) internal pure {
+        require(k.v060Deployers.length != 0, PENDING_V060_DEPLOYER);
+        for (uint256 i = 0; i < k.v060Deployers.length; i++) {
+            if (k.v060Deployers[i] == deployer) return;
+        }
+        revert("deployer is not in GENESIS_KEY_INVENTORY with role V060_DEPLOYER");
+    }
+
+    /// @notice ... and carries no other tag (a post-genesis key never doubles as a ceremony role).
+    function requirePureLiveDeployer(address deployer, KeyParams memory k) internal pure {
+        requireLiveDeployer(deployer, k);
+        for (uint256 i = 0; i < k.v060DeployersOnly.length; i++) {
+            if (k.v060DeployersOnly[i] == deployer) return;
+        }
+        revert("deployer carries a ceremony role beside V060_DEPLOYER");
+    }
 
     /// @notice Reverts unless all three key parameters are given (none has a default).
     function requireKeyParams(KeyParams memory k) internal pure {

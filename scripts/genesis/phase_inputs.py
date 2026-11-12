@@ -426,6 +426,9 @@ FALLBACK_TO_DEPLOYER = ("RELAYER", "SIGNER_1", "SIGNER_2", "SIGNER_3")
 # Block-0 accounts that are funded (base allocations) but are not ceremony role inputs. The
 # inventory may tag them so the GO-K step 3 alloc check knows them; they grant no seat.
 BLOCK0_ACCOUNT_TAGS = ("FAUCET", "TEAM")
+# Post-genesis keys (lead decision on fed #561): known to the inventory, but they hold no block-0
+# seat and no ceremony role, and the alloc check refuses them in block 0.
+POSTGENESIS_TAGS = ("POSTGENESIS_DEPLOYER", "DPF_OPERATOR", "BUNDLER", "RADAR_DEPLOYER", "CHATBOT_RELAYER", "V060_DEPLOYER")
 
 
 def _address_list(raw, key, problems):
@@ -478,6 +481,9 @@ def key_inventory(raw, vocabulary, problems):
         if not isinstance(roles, list) or not roles or not all(isinstance(r, str) for r in roles):
             problems.append(f"GENESIS_KEY_INVENTORY: {a} needs a non-empty list of role names")
             continue
+        pg = sorted(set(roles) & set(POSTGENESIS_TAGS))
+        if pg and set(roles) - set(POSTGENESIS_TAGS):
+            problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} mixes a post-genesis tag ({', '.join(pg)}) with a ceremony role; a post-genesis key holds no ceremony role")
         for r in roles:
             if r not in vocabulary:
                 problems.append(f"GENESIS_KEY_INVENTORY: {a.lower()} has an unknown role {r!r} (known: {', '.join(vocabulary)})")
@@ -516,7 +522,7 @@ def retired_key_problems(inputs, env, deployer):
             problems.append(f"{k} is not set; in a 0.6.0 run it would fall back to the deployer (DeployEduStack), which may hold no seat")
     vocabulary = role_inputs(inputs)
     raw_inv = env.get("GENESIS_KEY_INVENTORY", "").strip()
-    inventory = key_inventory(raw_inv, vocabulary + list(BLOCK0_ACCOUNT_TAGS), problems) if raw_inv else None
+    inventory = key_inventory(raw_inv, vocabulary + list(BLOCK0_ACCOUNT_TAGS) + list(POSTGENESIS_TAGS), problems) if raw_inv else None
     named = []
     for k in vocabulary:
         if k in COUNCIL_ROLES:
