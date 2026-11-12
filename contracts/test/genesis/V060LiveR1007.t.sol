@@ -21,6 +21,27 @@ import {RoleLogArchive, RecordedRoleHistory} from "./RoleHistoryHarness.sol";
 import {GovernanceWithNode, NodeStub} from "./NodeChainIdHarness.sol";
 
 contract V060LiveWithNode is DeployV060Genesis, RecordedRoleHistory, NodeStub {
+    // EnvSigner hooks (the env-held key; vm.setEnv would leak into parallel tests).
+    uint256 internal envKey;
+    address internal envExpected;
+    address internal envSender;
+
+    function setEnvSigner(uint256 k, address expected, address sender) external {
+        (envKey, envExpected, envSender) = (k, expected, sender);
+    }
+
+    function _envSignerKey() internal view override returns (uint256) {
+        return envKey;
+    }
+
+    function _envExpectedSender() internal view override returns (address) {
+        return envExpected;
+    }
+
+    function _scriptSender() internal view override returns (address) {
+        return envSender;
+    }
+
     function _timelockRoleHistory(address timelock)
         internal
         override(AdminChecks, RecordedRoleHistory)
@@ -52,6 +73,7 @@ contract V060LiveR1007Test is Test {
     address constant SENDER = 0x1804c8AB1F12E6bbf3894d4083f33e07309d1f38; // forge default sender
     address constant FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     uint128 constant MIN_BOND = 100 ether; // owner 2026-11-11 (rehearsal values)
+    uint256 constant LIVE_KEY = 0xA11CE; // test-only key for the env-key signing path
     uint128 constant DEFAULT_BOND = 1000 ether;
 
     RoleLogArchive internal archive;
@@ -82,7 +104,7 @@ contract V060LiveR1007Test is Test {
         CitrateMemberSBT member = new CitrateMemberSBT(gov.governanceTimelock);
         orgSbt = new OrganizationSBT(gov.governanceTimelock);
         agentSbt = new AgentSBT(gov.governanceTimelock, orgSbt, IERC721(address(member)));
-        liveDeployer = SENDER;
+        liveDeployer = vm.addr(LIVE_KEY); // the r1007 V060_DEPLOYER stand-in (env-held key)
     }
 
     function _addrs(uint256 base, uint256 n) internal pure returns (address[] memory o) {
@@ -120,15 +142,15 @@ contract V060LiveR1007Test is Test {
         a = address(bytes20(ret));
     }
 
-    function _keys() internal pure returns (V060GovernanceSpec.KeyParams memory k) {
+    function _keys() internal view returns (V060GovernanceSpec.KeyParams memory k) {
         k.governanceOwners = _addrs(0xE000, 5);
         k.guardianOwners = _addrs(0xF000, 3);
         k.retiredKeys = _addrs(0xA000, 5); // the rotated-out "r1006" owners
         k.guardianVetoMargin = 2 hours;
         k.v060Deployers = new address[](1);
-        k.v060Deployers[0] = SENDER;
+        k.v060Deployers[0] = vm.addr(LIVE_KEY);
         k.v060DeployersOnly = new address[](1);
-        k.v060DeployersOnly[0] = SENDER;
+        k.v060DeployersOnly[0] = vm.addr(LIVE_KEY);
     }
 
     function _inputs() internal view returns (DeployV060Genesis.Inputs memory i) {
@@ -158,6 +180,7 @@ contract V060LiveR1007Test is Test {
     function _builder() internal returns (DeployV060Genesis s) {
         V060LiveWithNode h = new V060LiveWithNode();
         h.useArchive(archive);
+        h.setEnvSigner(LIVE_KEY, liveDeployer, liveDeployer);
         archive.absorb();
         s = h;
     }
@@ -331,6 +354,55 @@ contract V060LiveR1007Test is Test {
         assertEq(tagged.length, 2);
         assertEq(only.length, 1);
         assertEq(only[0], address(0xD1));
+    }
+
+    // BerryManifold #464 P2-1: the rotation must also have rewritten isOwner, which is what
+    // authorizes a signer; owners() alone is not enough.
+
+    function test_live_mode_refuses_a_rotation_that_left_a_removed_owner_authorized() public {
+        vm.store(gov.governanceMultisig, keccak256(abi.encode(address(uint160(0xA002)), uint256(1))), bytes32(uint256(1)));
+        DeployV060Genesis s = _builder();
+        _expectRevert(bytes("GovernanceMultisig: isOwner still authorizes a removed original owner"));
+        s.deployLive(liveDeployer, _inputs(), _rot());
+    }
+
+    function test_live_mode_refuses_a_rotation_that_did_not_authorize_a_new_owner() public {
+        vm.store(gov.guardianMultisig, keccak256(abi.encode(address(uint160(0xF001)), uint256(1))), bytes32(0));
+        DeployV060Genesis s = _builder();
+        _expectRevert(bytes("GuardianMultisig: isOwner does not authorize a rotated owner"));
+        s.deployLive(liveDeployer, _inputs(), _rot());
+    }
+
+    // BerryManifold #464 P2-2: the live mode signs only from an env-held key (EnvSigner), with the
+    // expected-sender and deployer guards; there is no CLI-wallet path.
+
+    function test_live_mode_refuses_without_an_env_key() public {
+        V060LiveWithNode h = V060LiveWithNode(address(_builder()));
+        h.setEnvSigner(0, liveDeployer, liveDeployer);
+        _expectRevert(bytes("live mode signs only from an env-held key: set PRIVATE_KEY (op run) and EXPECTED_SENDER"));
+        h.deployLive(liveDeployer, _inputs(), _rot());
+    }
+
+    function test_live_mode_refuses_a_key_that_is_not_the_expected_sender() public {
+        V060LiveWithNode h = V060LiveWithNode(address(_builder()));
+        h.setEnvSigner(0xB0B, liveDeployer, liveDeployer);
+        _expectRevert(bytes("EnvSigner: PRIVATE_KEY does not belong to EXPECTED_SENDER"));
+        h.deployLive(liveDeployer, _inputs(), _rot());
+    }
+
+    function test_live_mode_refuses_a_forge_sender_other_than_the_expected_one() public {
+        V060LiveWithNode h = V060LiveWithNode(address(_builder()));
+        h.setEnvSigner(LIVE_KEY, liveDeployer, SENDER);
+        _expectRevert(bytes("EnvSigner: run forge with --sender EXPECTED_SENDER"));
+        h.deployLive(liveDeployer, _inputs(), _rot());
+    }
+
+    function test_live_mode_refuses_an_expected_sender_that_is_not_the_deployer() public {
+        address other = vm.addr(0xC0DE);
+        V060LiveWithNode h = V060LiveWithNode(address(_builder()));
+        h.setEnvSigner(0xC0DE, other, other);
+        _expectRevert(bytes("EnvSigner: EXPECTED_SENDER is not the script's deployer"));
+        h.deployLive(liveDeployer, _inputs(), _rot());
     }
 }
 
