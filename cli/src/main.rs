@@ -277,4 +277,77 @@ mod tests {
         );
         assert_eq!(cli.verbose, 2);
     }
+
+    /// Every write command signs locally: it takes the keystore account and a
+    /// password file, and never a key on the command line.
+    #[test]
+    fn write_commands_take_signer_options_and_no_key_flag() {
+        let addr = "0xbc6a39c7d861a8f3d791f8a025051e7eac7043bb";
+        let signer = [
+            "--account",
+            addr,
+            "--password-file",
+            "/tmp/pw",
+            "--gas-limit",
+            "60000",
+            "--gas-price",
+            "2",
+            "--max-gas-price",
+            "50",
+            "--max-fee",
+            "0.5",
+            "--yes",
+        ];
+        let with = |base: &[&str]| {
+            let mut v: Vec<&str> = base.to_vec();
+            v.extend_from_slice(&signer);
+            v.push("--allow-foreign-chain");
+            v.iter().map(|s| s.to_string()).collect::<Vec<String>>()
+        };
+        for base in [
+            vec![
+                "citrate", "account", "send", "--to", addr, "--amount", "0.001",
+            ],
+            vec![
+                "citrate",
+                "contract",
+                "call",
+                addr,
+                "deposit()",
+                "--value",
+                "5",
+            ],
+            vec!["citrate", "contract", "deploy", "c.bin"],
+            vec!["citrate", "governance", "set-admin", addr],
+            vec!["citrate", "governance", "queue-param", "k", "v", "100"],
+            vec!["citrate", "governance", "execute-param", "k"],
+        ] {
+            let args = with(&base);
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?} did not parse");
+            let mut bad = base.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+            bad.extend(["--private-key".to_string(), "00".repeat(32)]);
+            assert!(
+                Cli::try_parse_from(&bad).is_err(),
+                "{bad:?} took a key on argv"
+            );
+        }
+    }
+
+    /// `--account` names a key in the CLI keystore, not an arbitrary address.
+    #[test]
+    fn account_flag_help_says_it_is_a_keystore_key() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("account")
+            .and_then(|a| a.find_subcommand_mut("send"))
+            .map(|s| s.render_long_help().to_string())
+            .unwrap_or_default();
+        let line = help
+            .lines()
+            .skip_while(|l| !l.contains("--account"))
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(line.contains("keystore key"), "{line}");
+    }
 }

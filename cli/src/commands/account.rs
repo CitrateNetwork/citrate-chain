@@ -36,6 +36,20 @@ pub enum AccountCommands {
     /// List all accounts
     List,
 
+    /// Send SALT, signed locally (keystore account or PRIVATE_KEY)
+    Send {
+        /// Recipient address
+        #[arg(long)]
+        to: String,
+
+        /// Amount in SALT (up to 18 decimals), e.g. 0.001
+        #[arg(long)]
+        amount: String,
+
+        #[command(flatten)]
+        signer: crate::commands::signer::SignerArgs,
+    },
+
     /// Get account balance
     Balance {
         /// Account address
@@ -127,6 +141,9 @@ pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
         AccountCommands::List => {
             list_accounts(config)?;
         }
+        AccountCommands::Send { to, amount, signer } => {
+            send_salt(config, &to, &amount, &signer).await?;
+        }
         AccountCommands::Balance { address } => {
             get_balance(config, &address).await?;
         }
@@ -151,6 +168,81 @@ pub async fn execute(cmd: AccountCommands, config: &Config) -> Result<()> {
         } => {
             let password = resolve_password(password, password_file, "Enter keystore password: ")?;
             export_account(config, &address, out, confirm_stdout, password)?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a SALT amount ("1", "0.001", "2.5") into wei without floating point.
+pub(crate) fn parse_salt_amount(amount: &str) -> Result<u128> {
+    let a = amount.trim();
+    let (whole, frac) = a.split_once('.').unwrap_or((a, ""));
+    if whole.is_empty() && frac.is_empty() {
+        anyhow::bail!("Invalid amount {amount:?}");
+    }
+    if !whole.chars().all(|c| c.is_ascii_digit()) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        anyhow::bail!("Invalid amount {amount:?}: use a decimal number of SALT, e.g. 0.001");
+    }
+    if frac.len() > 18 {
+        anyhow::bail!("Invalid amount {amount:?}: SALT has 18 decimals");
+    }
+    let whole_wei = if whole.is_empty() {
+        0u128
+    } else {
+        whole
+            .parse::<u128>()
+            .context("amount is too large")?
+            .checked_mul(1_000_000_000_000_000_000)
+            .context("amount is too large")?
+    };
+    let frac_wei = if frac.is_empty() {
+        0u128
+    } else {
+        format!("{frac:0<18}")
+            .parse::<u128>()
+            .context("amount fraction")?
+    };
+    whole_wei
+        .checked_add(frac_wei)
+        .context("amount is too large")
+}
+
+/// `account send`: a plain SALT transfer through the local signer.
+async fn send_salt(
+    config: &Config,
+    to: &str,
+    amount: &str,
+    signer_args: &crate::commands::signer::SignerArgs,
+) -> Result<()> {
+    let value = parse_salt_amount(amount)?;
+    let t = to.trim();
+    let to_bytes: [u8; 20] = hex::decode(t.strip_prefix("0x").unwrap_or(t))
+        .with_context(|| format!("Invalid recipient {to}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Recipient {to} is not 20 bytes"))?;
+    let sent = crate::commands::signer::sign_and_send(
+        config,
+        signer_args,
+        Some(to_bytes),
+        value,
+        Vec::new(),
+    )
+    .await?;
+    println!("Transaction: {}", sent.hash.cyan());
+    if !crate::commands::signer::receipt_ok(&sent.receipt) {
+        anyhow::bail!(
+            "Transfer failed (receipt status {:?})",
+            sent.receipt.get("status")
+        );
+    }
+    println!("{}", "✓ Transfer confirmed".green());
+    println!("From: 0x{}", hex::encode(sent.from));
+    println!("To: 0x{}", hex::encode(to_bytes));
+    println!("Amount: {} SALT ({} wei)", amount.trim(), value);
+    if let Some(block) = sent.receipt.get("blockNumber").and_then(|v| v.as_str()) {
+        if let Ok(n) = u64::from_str_radix(block.trim_start_matches("0x"), 16) {
+            println!("Block: {}", n);
         }
     }
     Ok(())
@@ -611,6 +703,19 @@ fn derive_address(pubkey: &[u8; 32]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn salt_amounts_parse_to_exact_wei() {
+        assert_eq!(parse_salt_amount("1").ok(), Some(1_000_000_000_000_000_000));
+        assert_eq!(parse_salt_amount("0.001").ok(), Some(1_000_000_000_000_000));
+        assert_eq!(parse_salt_amount(".5").ok(), Some(500_000_000_000_000_000));
+        assert_eq!(parse_salt_amount("0.000000000000000001").ok(), Some(1));
+        assert!(parse_salt_amount("0.0000000000000000001").is_err());
+        assert!(parse_salt_amount("1e3").is_err());
+        assert!(parse_salt_amount("-1").is_err());
+        assert!(parse_salt_amount("").is_err());
+        assert!(parse_salt_amount("340282366920938463464").is_err());
+    }
 
     #[test]
     fn test_derive_address_embedded_evm() {
