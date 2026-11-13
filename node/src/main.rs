@@ -31,15 +31,17 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod adapters;
 mod admission;
 mod artifact;
 mod block_serve;
+mod boot_state;
 pub mod bundled_model;
 mod canonical_apply;
+mod cold_resync;
 mod commands;
 mod config;
 mod consensus_manifest;
@@ -72,21 +74,34 @@ mod dag_prune;
 mod finality_adversarial_tests;
 mod finality_driver;
 mod finality_floor;
+mod finality_sync;
+#[cfg(test)]
+mod g11_test_seal;
 mod genesis;
+mod gossip_hold;
 mod hardening_rejoin;
 mod host_identity;
 mod inference;
 pub mod logging;
 mod memory_bounds;
+mod mergeset;
+#[cfg(test)]
+mod mergeset_tests;
 pub mod metrics;
 mod model_manager;
 mod model_verifier;
 mod network_inference;
+mod panic_hook;
 mod persistent_dag;
 mod producer;
 mod registration_proof;
 mod registry_sync;
 mod rollback;
+mod serve_plane;
+#[cfg(test)]
+mod serve_plane_tests;
+mod shutdown;
+mod slot_stats;
 #[cfg(test)]
 mod split_heal_tests;
 mod startup_guards;
@@ -94,6 +109,8 @@ mod sync_peer;
 mod sync_recovery;
 mod sync_rejoin;
 mod timing;
+#[cfg(test)]
+mod tx_inclusion_tests;
 
 use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
@@ -314,6 +331,13 @@ enum Commands {
         staker: Option<String>,
     },
 
+    /// Delete every disqualified-from-chain root mark (spec 06 §3.10) from
+    /// this node's DAG store. Run it with the node stopped. Safe: a block that
+    /// is still bad is disqualified again when the applied chain reaches it and
+    /// its commitments fail again; marks a local fault wrote (state corruption)
+    /// are gone. Prints the number of marks removed.
+    ClearDisqualified,
+
     /// Roll this node's stored chain back to a height. Run it with the node
     /// stopped. Removes every block above --to-height and any other block at
     /// it, keeps --keep there, and refuses the removed branch from peers from
@@ -471,8 +495,18 @@ fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
     })
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // The panic hook first, before the runtime and its worker threads exist, so
+    // every panic in any task leaves a timestamped PANIC line in the node log
+    // (panic_hook.rs; it logs and runs the default hook, it does not abort).
+    panic_hook::install();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(node_main())
+}
+
+async fn node_main() -> Result<()> {
     // Initialize structured logging
     // Uses LOG_FORMAT env var (json, pretty, compact) and RUST_LOG for levels
     let log_config = logging::LogConfig::from_env();
@@ -580,10 +614,8 @@ async fn main() -> Result<()> {
                     .and_then(|st| st.blocks.get_block_by_height(0).ok().flatten())
                     .map(|h| *h.as_bytes())
             });
-            let cmd_genesis: Option<[u8; 32]> = from_data_dir.or_else(|| {
-                (profile.as_deref() == Some(genesis::R1006_PROFILE))
-                    .then_some(citrate_consensus::hardening::R1006_GENESIS)
-            });
+            let cmd_genesis: Option<[u8; 32]> =
+                from_data_dir.or_else(|| genesis::compiled_genesis_for_profile(profile.as_deref()));
             let g = cmd_genesis.as_ref();
             // Publish every height exactly as start_node does, then report the ONE
             // manifest a node reports (ConsensusManifest::for_node).
@@ -615,6 +647,14 @@ async fn main() -> Result<()> {
                 storage_root_configured,
             )
             .map_err(|e| anyhow::anyhow!("{}", e))?;
+            citrate_execution::mpt_state_root::init_for_genesis(
+                chain_id,
+                g,
+                file_cfg
+                    .as_ref()
+                    .and_then(|c| c.chain.mpt_state_root_height),
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             let manifest = consensus_manifest::ConsensusManifest::for_node(profile.as_deref(), g);
             // The activation heights compiled into this release (a node on a
             // pinned chain runs that height; see the start-up banner for the
@@ -632,6 +672,13 @@ async fn main() -> Result<()> {
                         serde_json::Value::String(format!(
                             "0x{}",
                             hex::encode(citrate_consensus::hardening::R1006_GENESIS)
+                        )),
+                    );
+                    obj.insert(
+                        "r1007_genesis".into(),
+                        serde_json::Value::String(format!(
+                            "0x{}",
+                            hex::encode(citrate_consensus::hardening::R1007_GENESIS)
                         )),
                     );
                 }
@@ -656,6 +703,34 @@ async fn main() -> Result<()> {
         }
         Some(Commands::GenesisInfo) => {
             show_genesis_info()?;
+            return Ok(());
+        }
+        Some(Commands::ClearDisqualified) => {
+            let data_dir = match cli.data_dir.clone() {
+                Some(d) => d,
+                None => {
+                    let path = resolve_config_path(cli.config.clone()).ok_or_else(|| {
+                        anyhow::anyhow!("no node config found; pass --config or --data-dir")
+                    })?;
+                    NodeConfig::from_file(&path)?.storage.data_dir
+                }
+            };
+            // Opening the data directory fails while the node runs (RocksDB LOCK).
+            let storage = StorageManager::with_config(
+                &data_dir,
+                StorageConfig {
+                    pruning: PruningConfig {
+                        auto_prune: false,
+                        ..PruningConfig::default()
+                    },
+                    encryption: at_rest_encryption_from_env()?,
+                },
+            )?;
+            let removed = clear_disqualified_marks(&storage)?;
+            println!(
+                "removed {removed} disqualified-from-chain mark(s) from {}",
+                data_dir.display()
+            );
             return Ok(());
         }
         Some(Commands::Rollback {
@@ -902,9 +977,17 @@ async fn main() -> Result<()> {
         };
 
         let genesis_profile = config.chain.genesis_profile.as_deref();
-        if genesis_profile == Some(genesis::R1006_PROFILE) {
+        // r1007 is built from the r1006 ceremony state, so it is bootable exactly when r1006 is.
+        if genesis_profile == Some(genesis::R1006_PROFILE)
+            || genesis_profile == Some(genesis::R1007_PROFILE)
+        {
             genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
         }
+        publish_mpt_rule_for_genesis_build(
+            config.chain.chain_id,
+            genesis_profile,
+            config.chain.mpt_state_root_height,
+        )?;
         genesis::initialize_genesis_state_with_profile(
             probe_storage,
             executor,
@@ -1136,6 +1219,30 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
     Ok(())
 }
 
+/// CV-14, r1007 genesis rule (lead decision 2026-11-09): activation 0 roots
+/// block 0 itself under the MPT state root, so the rule is published before a
+/// genesis is BUILT. It is resolved exactly as start_node resolves it, for the
+/// block 0 the build is meant to produce: the profile's compiled genesis when
+/// this release pins one (`genesis::compiled_genesis_for_profile`), else an
+/// unknown genesis (the env or config value decides; on a release chain id with
+/// no genesis known a per-node height is refused). start_node then re-resolves
+/// for the block 0 it loads and publishes the same value.
+fn publish_mpt_rule_for_genesis_build(
+    chain_id: u64,
+    profile: Option<&str>,
+    configured: Option<u64>,
+) -> Result<()> {
+    let genesis = genesis::compiled_genesis_for_profile(profile);
+    let (height, source) =
+        citrate_execution::mpt_state_root::init_for_genesis(chain_id, genesis.as_ref(), configured)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match height {
+        Some(h) => info!("Genesis build: MPT state root active from height {h} (source: {source})"),
+        None => info!("Genesis build: MPT state root not scheduled (source: {source})"),
+    }
+    Ok(())
+}
+
 async fn init_chain(chain_id: u64) -> Result<()> {
     info!("Initializing new chain with ID {}", chain_id);
 
@@ -1159,6 +1266,7 @@ async fn init_chain(chain_id: u64) -> Result<()> {
         ..Default::default()
     };
 
+    publish_mpt_rule_for_genesis_build(chain_id, None, None)?;
     let genesis_hash = initialize_genesis_state(storage.clone(), executor, &genesis_config).await?;
 
     info!(
@@ -1227,6 +1335,11 @@ async fn run_devnet(
                 ..Default::default()
             };
 
+            publish_mpt_rule_for_genesis_build(
+                config.chain.chain_id,
+                Some("default"),
+                config.chain.mpt_state_root_height,
+            )?;
             initialize_genesis_state_with_profile(
                 storage,
                 executor,
@@ -1573,6 +1686,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?,
         genesis::r1006_rehearsal_from_env(),
     )?;
+    genesis::r1007_boot_guard(
+        config.chain.chain_id,
+        config.chain.genesis_profile.as_deref(),
+        running_genesis.as_ref(),
+        &citrate_economics::r1007::readiness()
+            .map_err(|e| anyhow::anyhow!("invalid r1007 genesis: {e}"))?,
+        genesis::r1006_rehearsal_from_env(),
+    )?;
+    // r1007 (S3-6): the chain parameters compiled for this block 0; the node's
+    // [checkpoint] section may only repeat them. Data source: GENESIS_CHAIN_PARAMS.
+    let genesis_params = running_genesis.and_then(|g| {
+        citrate_consensus::genesis_params::chain_params_for_genesis(config.chain.chain_id, &g)
+    });
+    genesis::check_checkpoint_params(genesis_params.as_ref(), &config.checkpoint)?;
+    if let Some(p) = &genesis_params {
+        info!("Genesis chain parameters: {}", p.render());
+    }
+    // fed#535: the slot length and chain-params fingerprint, one greppable line.
+    info!(
+        "{}",
+        slot_config_line(
+            config.mining.target_block_time,
+            genesis_params.as_ref().map(|p| p.render()).as_deref()
+        )
+    );
     let on_demand = producer::check_mine_on_demand(
         std::env::var(producer::MINE_ON_DEMAND_ENV).ok().as_deref(),
         config.chain.genesis_profile.as_deref(),
@@ -1701,6 +1839,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             storage_root_source
         ),
     }
+    // CV-14: the standard, incremental MPT state root (an r1007 genesis rule),
+    // published before state is hydrated and before any root is computed.
+    let (mpt_root_height, mpt_root_source) = citrate_execution::mpt_state_root::init_for_genesis(
+        config.chain.chain_id,
+        running_genesis.as_ref(),
+        config.chain.mpt_state_root_height,
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    match mpt_root_height {
+        Some(h) => info!(
+            "MPT state root ACTIVE from height {} (source: {})",
+            h, mpt_root_source
+        ),
+        None => info!(
+            "MPT state root not scheduled (source: {}); legacy state root",
+            mpt_root_source
+        ),
+    }
 
     info!("Chain ID: {}", config.chain.chain_id);
     info!("Data directory: {:?}", config.storage.data_dir);
@@ -1797,6 +1953,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // encrypted-at-rest (AES-256-GCM per value) with the raw key from the parent
     // process's OS keyring; absent, the default plaintext path is used.
     let storage_encryption = at_rest_encryption_from_env()?;
+    // CV-7c: a cold resync the previous process requested (it was held on a
+    // dead branch it could not switch from) moves the chain database aside
+    // here, before it is opened; the node then syncs from genesis via peers.
+    let recovery_policy = cold_resync::Policy::from(&config.recovery);
+    cold_resync::apply_pending(&config.storage.data_dir, recovery_policy)?;
     let storage = Arc::new(StorageManager::with_config(
         &config.storage.data_dir,
         StorageConfig {
@@ -1880,154 +2041,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         storage.db.clone(),
     ));
 
-    // Load existing state from storage into memory
-    info!("Loading state from storage...");
-    match storage.state.get_all_accounts() {
-        Ok(accounts) => {
-            info!(
-                "Found {} accounts in storage, loading into memory...",
-                accounts.len()
-            );
-            for (address, account) in accounts {
-                debug!(
-                    "Loaded account: 0x{} with balance {}",
-                    hex::encode(address.0),
-                    account.balance
-                );
-                state_db.accounts.load_account(address, account);
-            }
-            info!("State loaded successfully");
-        }
-        Err(e) => {
-            warn!("Failed to load accounts from storage: {}", e);
-        }
-    }
-
-    // The applied tip = the block whose committed state the store holds. Fall back to
-    // the latest block only when no applied-tip pointer exists (pre-S3b stores / fresh
-    // genesis), preserving the prior behavior for those.
-    let (boot_tip_hash, boot_tip_height) = storage
-        .blocks
-        .get_applied_tip()
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| {
-            let h = storage.blocks.get_latest_height().unwrap_or(0);
-            let hash = storage
-                .blocks
-                .get_block_by_height(h)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            (hash, h)
-        });
-
-    // C6 fix: Also load contract storage slots from persistent storage.
-    // From the storage-root hardening height (the next block this node executes)
-    // every persisted record is restored byte for byte; below it the legacy view
-    // (32-byte keys, values cut or padded to 32 bytes) is kept, so a restarted
-    // node rebuilds exactly the state it rebuilt before.
-    let full_hydration = citrate_execution::storage_root_hardening::active_at(
-        citrate_execution::storage_root_hardening::storage_root_hardening_height(),
-        boot_tip_height.saturating_add(1),
-    );
-    match storage.state.get_all_storage() {
-        Ok(records) => {
-            let storage_slots = boot_storage_view(
-                records,
-                citrate_execution::storage_root_hardening::storage_root_hardening_height(),
-                boot_tip_height,
-            );
-            info!(
-                "Found {} storage slots in storage, loading into memory ({} hydration)...",
-                storage_slots.len(),
-                if full_hydration { "full" } else { "legacy" }
-            );
-            for ((address, storage_key), storage_value) in storage_slots {
-                state_db.set_storage(
-                    address,
-                    storage_key.as_bytes().to_vec(),
-                    storage_value.as_bytes().to_vec(),
-                );
-            }
-            // Clear dirty flags since these are loaded from storage, not new writes
-            let _ = state_db.take_dirty_storage();
-            info!("Storage slots loaded successfully");
-        }
-        Err(e) => {
-            // Starting without contract storage would execute and root against
-            // a state this node never committed. Refuse instead.
-            error!("Failed to load storage slots from storage: {}", e);
-            return Err(anyhow::anyhow!(
-                "refusing to start: contract storage could not be hydrated: {e}"
-            ));
-        }
-    }
-
-    // SRP-S3b: verify the hydrated in-memory root reproduces the committed root of the
-    // APPLIED TIP — the block whose post-execution state the durable store reflects — NOT
-    // the latest stored block. A node legitimately stores blocks AHEAD of what it has
-    // applied (execute-on-receive downloads then drains; the producer persists the block
-    // before atomically advancing state+tip). Comparing against the latest BLOCK would
-    // false-positive whenever blocks lead the applied tip; the applied-tip pointer and the
-    // durable state are advanced ATOMICALLY (persist_state_changes_with_tip), so they must
-    // always agree — a mismatch means a genuinely corrupt/divergent reconstruction.
-    {
-        let (tip_hash, tip_height) = (boot_tip_hash, boot_tip_height);
-        // The hydrated state is the post-state of the applied tip: root it under
-        // that height's storage-root rule.
-        state_db.set_root_height(tip_height);
-        let memory_root = state_db.calculate_state_root();
-        if tip_height > 0 && tip_hash != citrate_consensus::types::Hash::default() {
-            let committed_root = storage
-                .state
-                .get_state_root(&tip_hash)
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    storage
-                        .blocks
-                        .get_block(&tip_hash)
-                        .ok()
-                        .flatten()
-                        .map(|b| b.state_root)
-                });
-            match committed_root {
-                Some(root) if root != citrate_consensus::types::Hash::default() => {
-                    if memory_root == root {
-                        info!(
-                            "State root verification PASSED (applied tip height {}, root={})",
-                            tip_height,
-                            hex::encode(&memory_root.as_bytes()[..8])
-                        );
-                    } else {
-                        // SRP-S3: a node whose hydrated root does NOT reproduce the applied
-                        // tip's committed root MUST NOT start — it would seal/verify against
-                        // a divergent root and fork the fleet. HARD-FAIL (safe local stop),
-                        // never warn-and-continue. See ADR-2026-07-21-restart-produce-purity.
-                        error!("SRP-S3 BOOT HALT: state root MISMATCH at applied tip height {}: memory={} committed={} — refusing to start (a node that cannot reconstruct the committed root would fork the fleet)",
-                            tip_height,
-                            hex::encode(memory_root.as_bytes()),
-                            hex::encode(root.as_bytes()));
-                        return Err(anyhow::anyhow!(
-                            "SRP-S3 boot halt: hydrated state root {} != committed root {} at applied tip height {}",
-                            hex::encode(memory_root.as_bytes()),
-                            hex::encode(root.as_bytes()),
-                            tip_height
-                        ));
-                    }
-                }
-                _ => {
-                    debug!(
-                        "No committed state root for applied tip height {} — skipping verification",
-                        tip_height
-                    );
-                }
-            }
-        }
-        // Clear dirty flags from state root calculation
-        state_db.accounts.clear_dirty();
-    }
+    // Load existing state from storage into memory and verify it against the
+    // applied tip's committed root (boot_state.rs; the split-heal harness's
+    // disk-reload restart runs the same function).
+    boot_state::hydrate_state_db(&storage, &state_db)?;
 
     // MCP + inference service
     let mcp = Arc::new(citrate_mcp::MCPService::new(storage.clone()));
@@ -2172,6 +2189,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 exec.get_nonce(&citrate_execution::address_utils::normalize_address(pk))
             })
         })
+        // r1007 (spec 06 D6): the window counts from the sender's run included on
+        // the applied chain but not yet executed, so a steady sender is not
+        // refused while its txs wait one block for acceptance. Same bound (16).
+        .with_included_nonce_reader(crate::mergeset::included_nonce_reader(storage.clone()))
         // PBA-N9 (security#134): reject a transaction on every ingress path when the
         // sender's committed balance cannot cover it together with its already-pooled
         // transactions. Without this the pool admits unfunded floods that evict honest
@@ -2277,13 +2298,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // On the r1006 genesis with its producer set filled, the registry and the activation
     // height are compiled into the genesis profile (genesis::resolve_validator_registry);
     // the env may only repeat them. On any other chain the env decides, as before.
-    let compiled_validator_set =
-        if running_genesis == Some(citrate_consensus::hardening::R1006_GENESIS) {
-            citrate_economics::r1006::validator_set_binding()
-                .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
-        } else {
-            None
-        };
+    let compiled_validator_set = genesis::compiled_validator_set(running_genesis.as_ref())?;
     let validator_registry: Option<([u8; 20], u64)> = genesis::resolve_validator_registry(
         compiled_validator_set,
         std::env::var("CITRATE_VALIDATOR_REGISTRY").ok().as_deref(),
@@ -2351,27 +2366,44 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // PIL-42's genesis DAG seed moved into `BlockAdmission::seed_genesis` (see
     // SYNC-S1 D2 below) so that every chain-store/DAG-store consistency concern
     // lives in one module under one set of rules.
-    let shared_ghostdag = Arc::new(GhostDag::new(
-        GhostDagParams::default(),
-        shared_dag_store.clone(),
-    ));
+    // G11: the pruning-point walk reads headers DAG pruning dropped from the
+    // chain store (a late or side-branch block inside the undo window).
+    let shared_ghostdag = Arc::new(
+        GhostDag::new(GhostDagParams::default(), shared_dag_store.clone())
+            .with_ancestry_headers(Arc::new(dag_prune::ChainStoreHeaders(storage.clone()))),
+    );
 
     // WP-W.1: Create CheckpointManager for BFT finality vote handling
     let checkpoint_manager = {
-        use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+        use citrate_consensus::checkpoint::CheckpointManager;
         // Stage 0 checkpoint finality: build the consensus CheckpointConfig from the
         // node's `[checkpoint]` config instead of `default()`, and bind `chain_id`
         // to the node's chain config (NOT a hardcoded 40204) so a devnet (e.g. 1337)
         // signs/verifies vote messages for its own chain. `quorum_threshold` is
         // carried through for reference, but finalization derives the effective
         // quorum `floor(2n/3)+1` from the actual committee size (see checkpoint.rs).
-        let cp_config = CheckpointConfig {
-            interval: config.checkpoint.interval,
-            committee_size: config.checkpoint.committee_size,
-            quorum_threshold: config.checkpoint.quorum_threshold,
-            chain_id: config.chain.chain_id,
-            vote_depth: config.checkpoint.vote_depth,
+        // r1007 (spec 06 §1.2, §7): the checkpoint interval and the committee
+        // size are compiled consensus constants (the interval is aligned with
+        // the G11 pruning point; a per-node committee size would let nodes
+        // derive different committees); differing `[checkpoint]` values are
+        // ignored with a warning. Votes bind the genesis this node loaded
+        // (r1006 and r1007 share chain id 40204).
+        let genesis_hash = match storage.blocks.get_block_by_height(0) {
+            Ok(Some(g)) => g,
+            other => {
+                warn!(
+                    "checkpoint finality: genesis not readable at start-up ({:?}); votes \
+                     bind the zero genesis and will not verify on the network",
+                    other.err()
+                );
+                citrate_consensus::types::Hash::default()
+            }
         };
+        let cp_config = finality_driver::node_checkpoint_config(
+            &config.checkpoint,
+            config.chain.chain_id,
+            genesis_hash,
+        );
         let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
         Arc::new(CheckpointManager::with_persistence(
             cp_config,
@@ -2381,16 +2413,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     };
 
     // WP-S.3 Stage 1a: the checkpoint-finality producer path (propose / sign /
-    // broadcast / early-vote buffer / relay). Switched by the COMPILED pin for this
-    // chain (`checkpoint_gadget::CHECKPOINT_VOTING_PINS`, OFF for every chain in this
-    // release) — never by env or config. Committee source: the shared epoch-snapshot
+    // broadcast / early-vote buffer / relay). r1007 (ADR CV-8): ON from genesis in
+    // this build (`checkpoint_gadget::CHECKPOINT_VOTING_FROM_GENESIS`, no pin) —
+    // never by env or config. Committee source: the shared epoch-snapshot
     // proposer selector (`validator_selector`, filled by registry_sync from
     // `ValidatorRegistry.activeSet()` at each S(E)); `None` when no registry is
-    // configured, in which case no committee can be derived and nothing is proposed.
-    let finality_gadget = Arc::new(citrate_consensus::checkpoint_gadget::FinalityGadget::new(
+    // configured, in which case only the genesis validator set can form a committee.
+    // Epoch 0: checkpoints no registry snapshot governs (at or below S(1) = 800, or
+    // every height on a chain without a registry) draw their committee from the
+    // genesis validator set compiled with this node's block 0 (spec 06 §7): the
+    // genesis the checkpoint manager read above (on a fresh database the
+    // start-up probe ran before block 0 existed).
+    let checkpoint_genesis = *checkpoint_manager.config().genesis_hash.as_bytes();
+    let finality_gadget = Arc::new(finality_driver::node_finality_gadget(
         checkpoint_manager.clone(),
         validator_selector.clone(),
-    ));
+        Some(&checkpoint_genesis),
+    )?);
     let finality_voting_on = finality_gadget.enabled();
     // Finalized height as VERIFIED by the Stage 1c floor verifier while the
     // producer path runs; only ever advances to a certificate whose (height,
@@ -2404,6 +2443,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // by hash); stays `None` without a canonical applicator (tags then resolve
     // to genesis).
     let mut finality_rpc_handle: Option<citrate_api::FinalizedTagSource> = None;
+    // `citrate_getFinalityStatus` (spec 06 §5.5): the finality driver publishes
+    // the CheckpointManager's finalized and pending checkpoints here each pass;
+    // until it runs, the method reports `published: false`.
+    let finality_status = Arc::new(citrate_api::finality_status::FinalityStatusCell::default());
+    // WP-S.3 Stage 1b (spec §11.10): late-joiner checkpoint certificate sync.
+    // `None` in Legacy mode (voting pin OFF, every chain in this release) and
+    // without a canonical applicator: nothing is requested, served or accepted.
+    let mut certificate_sync: Option<Arc<finality_sync::CertificateSync>> = None;
 
     // EXECUTE-ON-RECEIVE (step 2): the fast-path applier. Active under v2 headers
     // (CITRATE_BLOCK_V2) — the flag that makes a block's state_root reproducible by a
@@ -2427,7 +2474,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 canonical_apply::CanonicalApplicator::new(executor.clone(), storage.clone())
                     .with_fork_choice(shared_ghostdag.clone())
                     // Never rebuild from genesis once the DAG store is pruned.
-                    .with_dag_prune_floor(shared_dag_store.clone());
+                    .with_dag_prune_floor(shared_dag_store.clone())
+                    // A reorg returns the abandoned blocks' still-valid txs to
+                    // the pool (a tx in a block that lost the slot is otherwise
+                    // executed by no one).
+                    .with_mempool(mempool.clone());
             // VALIDATOR-S1 (step 5): attach the registry snapshot-sync so a node
             // that RECEIVES or REORGS to a snapshot block S(E) rebuilds its
             // proposer selector from the registry — not only the producer.
@@ -2486,13 +2537,23 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // RPC tags frozen, CHECKPOINT FINALITY SAFETY STOP alarm + metrics).
             // Same compiled voting pin and chain id as `finality_gadget` (whose
             // manager was built with `config.chain.chain_id`).
-            let floor_mode = finality_floor::FloorMode::for_chain(config.chain.chain_id);
+            let floor_mode = finality_floor::FloorMode::for_genesis(
+                config.chain.chain_id,
+                &checkpoint_manager.config().genesis_hash,
+            );
             let floor_verifier = Arc::new(finality_floor::FloorVerifier::new(
                 floor_mode,
                 checkpoint_manager.clone(),
                 app.clone(),
                 finality_gadget.safety_stop(),
                 finality_observed.clone(),
+                // Every certificate (boot, poll, finalization, peer sync) is
+                // verified against the committee derived HERE (the height's epoch
+                // snapshot, rehydrated above, or the genesis set; its epoch seed).
+                finality_floor::CertificateCommittees::new(
+                    finality_gadget.clone(),
+                    storage.clone(),
+                ),
             ));
             // Enforced only (no-op in Legacy / Observed): installed before the
             // boot check and before the driver / vote handler can finalize.
@@ -2502,6 +2563,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // halts finality before it does anything else.
             let _ = floor_verifier.boot_check().await;
             finality_rpc_handle = Some(floor_verifier.rpc_finalized_handle());
+            // Stage 1b: peer certificates are verified against this node's own
+            // epoch committee and chain, then handed to this floor verifier.
+            // Enforced: installed only with the guard above in place, so a
+            // synced certificate goes through the same finalization path.
+            certificate_sync = finality_sync::CertificateSync::new(
+                finality_gadget.clone(),
+                app.clone(),
+                floor_verifier.clone(),
+            )
+            .map(Arc::new);
             let _ = floor_verifier.spawn();
             Some(app)
         } else {
@@ -2531,6 +2602,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // block 1 against a zero selected-parent and orphans it.
     block_admission.seed_genesis().await;
 
+    // CV-7c: a node held on a dead branch (the applicator's dead-branch
+    // marker) for `[recovery] cold_resync_after_secs` requests a guarded cold
+    // resync and exits for the supervisor to restart it (cold_resync.rs).
+    if let Some(app) = canonical_applicator.clone() {
+        cold_resync::spawn_monitor(
+            app,
+            config.storage.data_dir.clone(),
+            recovery_policy,
+            finality_voting_on,
+        );
+    }
+
     // A database that followed a branch the release's canonical checkpoints
     // exclude stays on it: admission refuses the network's blocks above it.
     // Say so plainly; the fix is to move the chain data aside and resync.
@@ -2552,6 +2635,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // (MS-BOUND, ghostdag::MERGE_SCORE_WINDOW), so pruning no longer breaks them.
     dag_prune::spawn(storage.clone(), shared_dag_store.clone());
     memory_bounds::spawn_report(storage.clone(), shared_dag_store.clone());
+    // r1007 CV-4b: slot statistics for the S1 sortition decision (measure only).
+    slot_stats::spawn(storage.clone(), shared_dag_store.clone());
 
     // D2.4: repair partial admissions already on disk. Any node that ran a
     // pre-D2 binary can be carrying a chain-store hole with the block sitting
@@ -2660,11 +2745,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // applied chain; advertising the stored max makes it look caught up to
         // peers (which then pick it as a sync source and it serves them nothing)
         // and mis-drives fork choice. The applied tip is our true synced head.
-        let (head_hash, head_height) = storage
-            .blocks
-            .get_applied_tip()
-            .ok()
-            .flatten()
+        // CV-7b: a node held on a dead branch advertises its fork point, not
+        // the dead tip (cold_resync::advertised_head).
+        let (head_hash, head_height) = cold_resync::advertised_head(&storage)
             .unwrap_or((citrate_consensus::types::Hash::default(), 0));
         max_seen_height.fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
         let genesis_hash = storage
@@ -2678,12 +2761,55 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // merely shaped like genesis (parentless, arbitrary height) cannot
         // bypass the admission gates.
         shared_dag_store.set_configured_genesis(genesis_hash);
+        // r1007 G9 (#184): bind the slot origin (the genesis timestamp) from
+        // the same block. A DAG store that holds neither genesis nor the
+        // origin key (an in-memory store over a pruned chain) could otherwise
+        // slot-check nothing, and a store whose origin disagrees with this
+        // genesis would mis-slot every block: refuse to start.
+        if genesis_hash != citrate_consensus::types::Hash::default() {
+            match storage.blocks.get_block(&genesis_hash) {
+                Ok(Some(genesis)) => shared_dag_store
+                    .set_slot_origin(&genesis.header)
+                    .map_err(|e| anyhow::anyhow!("G9 slot origin: {e}"))?,
+                Ok(None) => warn!(
+                    "G9: genesis {genesis_hash} is indexed at height 0 but its block is not                      stored; the slot origin comes from the DAG store alone"
+                ),
+                Err(e) => return Err(anyhow::anyhow!("G9: read genesis {genesis_hash}: {e}")),
+            }
+        }
         let network_id: u32 = config.chain.chain_id as u32;
 
         // Incoming message channel (log-only for now)
         let (in_tx, mut in_rx) =
             tokio::sync::mpsc::channel::<(PeerId, citrate_network::NetworkMessage)>(512);
+        // r1007 G9 ingress: gossip holds early blocks and this weak handle
+        // feeds them back into the queue once due (`gossip_hold`). Weak, so
+        // the queue still closes when the peer manager drops its sender.
+        let held_release_tx = in_tx.downgrade();
         peer_manager.set_incoming(in_tx).await;
+        // ADR CV-6 (planset H3): history serving has its own lane and task.
+        // GetBlocks/GetHeaders never enter the consensus queue above and are
+        // answered from storage off this loop, under per-peer and global
+        // budgets (`serve_plane.rs`).
+        let (serve_tx, serve_rx) =
+            tokio::sync::mpsc::channel(citrate_network::inbound::SERVE_LANE_CAPACITY);
+        peer_manager.set_serve_sink(serve_tx).await;
+        let serve_task = serve_plane::spawn(storage.clone(), peer_manager.clone(), serve_rx);
+        // The serving task is the node's only answer to peers' history
+        // requests; like the message loop (#146), it may not die quietly.
+        tokio::spawn(async move {
+            let reason = match serve_task.await {
+                Err(e) if e.is_panic() => format!("PANICKED ({})", e),
+                Err(e) => format!("was cancelled ({})", e),
+                Ok(()) => "exited (serve lane closed)".to_string(),
+            };
+            tracing::error!(
+                "FATAL: the history serving task {} — this node can no longer answer \
+                 peers' GetBlocks/GetHeaders. Exiting so the supervisor restarts it.",
+                reason
+            );
+            std::process::exit(1);
+        });
         let pm_for_rx = peer_manager.clone();
         let storage_for_handler = storage.clone();
         // Peers still sending pre-activation-format blocks at or after the
@@ -2767,6 +2893,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // a few times in case an early fork-choice view was still partial.
                 let ghostdag_rec = shared_ghostdag.clone();
                 let latest_stored = storage.blocks.get_latest_height().unwrap_or(0);
+                let storage_rec = storage.clone();
                 tokio::spawn(async move {
                     let mut aborted = 0u32;
                     for _ in 0..600u32 {
@@ -2780,6 +2907,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // rebuild toward a partially-loaded head.
                         let head_h = ghostdag_rec.get_block_height(&head).await.unwrap_or(0);
                         if head_h < latest_stored {
+                            continue;
+                        }
+                        // RC-10: GhostDAG admits a block, so fork choice can name
+                        // it, a moment before its header is written. Wait for the
+                        // head to be stored before the same-chain and rebuild
+                        // checks, which read it from the block store. A read error
+                        // is not "stored".
+                        if !storage_rec.blocks.has_block(&head).unwrap_or(false) {
                             continue;
                         }
                         let cur = app.applied_tip().await;
@@ -2848,8 +2983,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // more pass, not a back-to-back burst competing with the
                 // producer for the advance lock.
                 let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
+                // Admission wakes this task for every stored block
+                // (`request_drain`); it is the node's only executor of
+                // received blocks, so the P2P message loop never waits on
+                // execution. Wakes during a pass coalesce into one more pass.
+                let wake = app.drain_wake();
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = wake.notified() => {}
+                    }
                     app.drive_drain().await;
                 }
             });
@@ -2862,6 +3005,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             peer_manager.clone(),
         ));
         let gossip_for_rx = gossip.clone();
+        // r1007 G9 ingress ("hold, rather than reject"): early blocks gossip
+        // held go back through the NewBlock arm below once their slot is due.
+        gossip_hold::spawn_release(gossip.clone(), held_release_tx);
         // Sync manager (basic integration)
         // WEDGE #85: judge sync completion against THIS node's applied chain, not
         // the height of the last block handed to us. Without this a node with a
@@ -2917,9 +3063,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let mut interval = timing::cadence_interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
-                    if let Ok(Some((hash, height))) = storage_head.blocks.get_applied_tip() {
+                    if let Some((hash, height)) = cold_resync::advertised_head(&storage_head) {
                         let mut g = advertised_head.write().await;
-                        if g.0 != height {
+                        if *g != (height, hash) {
                             *g = (height, hash);
                         }
                     }
@@ -3034,6 +3180,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // the message handler, which judges the answers.
         let rejoin = Arc::new(parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()));
         let rejoin_for_rx = rejoin.clone();
+        // sync_recovery.rs: hold back re-asking the applied-tip anchor while
+        // admission is ahead of apply (its last answer held nothing new).
+        let tip_reask = Arc::new(parking_lot::Mutex::new(sync_recovery::TipReask::new()));
+        let tip_reask_for_rx = tip_reask.clone();
 
         // Periodic sync tick: request headers/blocks and check timeouts
         let pm_for_sync = pm_for_rx.clone();
@@ -3042,7 +3192,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
         let rejoin_for_loop = rejoin.clone();
+        let tip_reask_for_loop = tip_reask.clone();
         let initial_sync_for_sync = initial_sync_done.clone();
+        let attested_for_sync = attested_network_head.clone();
         tokio::spawn(async move {
             // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
             // ever timed out — also a slow leak) and `pending_retries` are gone
@@ -3073,10 +3225,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let mut best_h: u64 = 0;
                 let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
                 let mut split_candidates: Vec<sync_peer::SplitCandidate> = Vec::new();
+                let mut heard_peers: usize = 0;
                 for p in pm_for_sync.get_all_peers() {
                     let info = p.info.read().await;
                     if info.state != citrate_network::peer::PeerState::Connected {
                         continue;
+                    }
+                    if sync_recovery::peer_head_heard(&info.head_hash) {
+                        heard_peers = heard_peers.saturating_add(1);
                     }
                     if info.head_height > best_h {
                         best_h = info.head_height;
@@ -3129,22 +3285,24 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 if target > 0 {
                     sync_for_loop.set_target(target).await;
                 }
-                // One-time initial-sync condition for the producer gate.
+                // One-time initial-sync condition for the producer gate. Only
+                // peers whose head this node has heard count (R2 early seal).
                 if !initial_sync_for_sync.load(std::sync::atomic::Ordering::Relaxed)
                     && sync_recovery::initial_sync_complete(
                         applied_height,
                         target,
-                        connected_peers.len(),
+                        heard_peers,
                         node_started_at.elapsed(),
                     )
                 {
                     initial_sync_for_sync.store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::info!(
-                        "Initial sync complete (applied={} target={} peers={}); block production \
-                         may start",
+                        "Initial sync complete (applied={} target={} peers={} heard={}); block \
+                         production may start",
                         applied_height,
                         target,
-                        connected_peers.len()
+                        connected_peers.len(),
+                        heard_peers
                     );
                 }
                 // Choose a peer to pull from — see node/src/sync_peer.rs for the
@@ -3175,6 +3333,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         .map(|c| c.head_hash)
                         .filter(|h| storage_for_sync.blocks.has_block(h).unwrap_or(true))
                         .collect();
+                // CV-5: the producer gate cannot reconcile with a branch it hears;
+                // start a fork-point search against a peer whose head we lack.
+                if attested_for_sync.take_resync_request() {
+                    if let Some(t) = sync_rejoin::start_resync(
+                        &mut rejoin_for_loop.lock(),
+                        &split_candidates,
+                        applied_tip_now,
+                        |h| held_heads.contains(h),
+                    ) {
+                        tracing::warn!("SYNCREJOIN {:?}: resync asked by the producer gate", t);
+                    }
+                }
                 let chosen_id = {
                     let sel = sync_peers_for_loop.lock().await;
                     let (source, transition) = sync_rejoin::choose_source(
@@ -3342,7 +3512,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     {
                         send_failed = true;
                     }
-                    if pb < sync_recovery::TICK_PENDING_GATE {
+                    // Admission ahead of apply: the last answer to this same
+                    // applied-tip anchor held nothing new, so asking again
+                    // re-imports the same range (rcBLUE-2 (g)). Skip until the
+                    // tip moves; it is not a silent peer, so nothing is noted.
+                    let held_tip = tip_reask_for_loop.lock().hold(
+                        block_from,
+                        applied_tip.0,
+                        std::time::Instant::now(),
+                    );
+                    if pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
                         // Only a request that was actually SENT is recorded as
                         // asked (Ok(false): anchor already pending, or the
                         // in-flight cap; nothing went on the wire).
@@ -3452,16 +3631,25 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // sole source, and never recovered). Only prune when another peer
                     // can take over; otherwise keep retrying against the one we have.
                     let (total_peers, _, _) = pm_for_sync.get_peer_counts().await;
-                    if pf >= 5 && total_peers > 1 && pm_for_sync.get_peer(&pid).is_some() {
+                    let mapped = pm_for_sync.get_peer(&pid).is_some();
+                    if sync_peer::drop_after_timeouts(
+                        pf,
+                        total_peers,
+                        mapped,
+                        pm_for_sync.last_inbound_age(&pid),
+                    ) {
                         pm_for_sync.remove_peer(&pid).await;
                         sync_peers_for_loop.lock().await.reset(&pid.0);
                         tracing::warn!(
                             "Dropped peer {} after repeated sync timeouts (will re-handshake)",
                             pid.0
                         );
-                    } else if pf >= 5 {
+                    } else if pf >= sync_peer::DROP_AFTER_TIMEOUTS && (total_peers <= 1 || !mapped)
+                    {
                         // Sole peer: reset the counter so we keep trying it rather
-                        // than freezing after 5 timeouts.
+                        // than freezing after 5 timeouts. A peer kept because it is
+                        // still talking keeps its count, so it stays de-preferred
+                        // until it answers.
                         sync_peers_for_loop.lock().await.reset(&pid.0);
                     }
                 }
@@ -3504,6 +3692,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // takes exactly the old submit_vote -> finalize path, or (switch ON) also
         // buffers early votes and returns accepted votes for one re-gossip.
         let finality_gadget_for_net = finality_gadget.clone();
+        // WP-S.3 Stage 1b: serves / accepts checkpoint certificates (`None`:
+        // compiled off, the two sync messages are ignored).
+        let certificate_sync_for_net = certificate_sync.clone();
         // #85: the success half of the sync-peer accounting (invariant I3) —
         // the tick task can only ever observe timeouts, so the peer that
         // actually answers has to be credited from the receive side.
@@ -3602,21 +3793,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         }
                         // Requests are driven by periodic sync loop
                     }
-                    NetworkMessage::GetBlocks { from, count, .. } => {
-                        tracing::info!("Received GetBlocks request from peer {} for {} blocks starting from {:?}",
-                                     pid.0, count, from);
-                        // NET-2 (SECREM-01): `count` is attacker-supplied —
-                        // serve through the clamped, tip-bounded path only.
-                        let blocks = block_serve::serve_blocks(&storage_for_handler, &from, count);
-
-                        tracing::info!("Sending {} blocks to peer {}", blocks.len(), pid.0);
-                        let _ = pm_for_rx
-                            .send_to_peers(
-                                std::slice::from_ref(&pid),
-                                &NetworkMessage::Blocks { blocks },
-                            )
-                            .await;
-                    }
+                    // GetBlocks / GetHeaders: routed to the serving lane by
+                    // `forward_incoming` (ADR CV-6) and answered by
+                    // `serve_plane`, never on this loop.
                     NetworkMessage::GetPeers => {
                         // Serve a small list of peers from discovery
                         let peers = discovery.get_peers_for_exchange().await;
@@ -3629,28 +3808,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                     NetworkMessage::Peers { peers } => {
                         discovery.handle_peer_exchange(peers).await;
-                    }
-                    NetworkMessage::GetHeaders { from, count } => {
-                        tracing::info!(
-                            "Received GetHeaders request from peer {} starting {:?} count {}",
-                            pid.0,
-                            from,
-                            count
-                        );
-                        // NET-1 (SECREM-01 Critical): the previous inline
-                        // loop ran `while headers.len() < count` with no tip
-                        // bound and no break on missing heights — one packet
-                        // with a large `count` spun to u64::MAX storage
-                        // reads. All serving now goes through the clamped,
-                        // tip-bounded, gap-breaking path.
-                        let headers =
-                            block_serve::serve_headers(&storage_for_handler, &from, count);
-                        let _ = pm_for_rx
-                            .send_to_peers(
-                                std::slice::from_ref(&pid),
-                                &NetworkMessage::Headers { headers },
-                            )
-                            .await;
                     }
                     NetworkMessage::Headers { headers } => {
                         let _ = sync_for_rx.handle_headers(&pid, headers).await;
@@ -3726,10 +3883,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // at that height, so bump it.
                         if let Some(p) = pm_for_rx.get_peer(&pid) {
                             let mut info = p.info.write().await;
-                            if block.header.height > info.head_height {
-                                info.head_height = block.header.height;
-                                info.head_hash = block.header.block_hash;
-                            }
+                            info.observe_gossiped_head(
+                                block.header.height,
+                                block.header.block_hash,
+                                block.header.blue_score,
+                            );
                         }
                         // SYNC-S1 / D2: gossip runs its own validation (structure,
                         // signature, peer scoring, relay) and then hands the block to the
@@ -3746,7 +3904,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await
                         {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
-                                Ok(_) => {
+                                // r1007 G9 ingress: an early block is held by
+                                // gossip, not admitted; `gossip_hold` re-delivers
+                                // it here once its slot is inside the drift.
+                                Ok(
+                                    citrate_network::BlockGossip::Held
+                                    | citrate_network::BlockGossip::HoldFull,
+                                ) => {}
+                                Ok(
+                                    citrate_network::BlockGossip::Relayed
+                                    | citrate_network::BlockGossip::AlreadyRelayed,
+                                ) => {
                                     // PBA-L1b-006: gossip validation proves only a
                                     // self-consistent, self-signed header — any key
                                     // can sign height u64::MAX. The height becomes
@@ -3947,6 +4115,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
                         let mut pending = sync_for_rx.drain_validated_blocks().await;
+                        let answer_top = pending.iter().map(|b| b.header.height).max();
+                        // sync_rejoin.rs: the highest validated block served, held or not.
+                        let answer_highest = pending
+                            .iter()
+                            .max_by_key(|b| b.header.height)
+                            .map(|b| (b.header.block_hash, b.header.height));
                         // sync_rejoin.rs: is this the asked peer's answer to the
                         // anchor the sync tick asked for? Judged on the blocks that
                         // passed validation (their hashes recompute).
@@ -4098,13 +4272,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // us. Judging it absolutely is what produced two successive
                         // dead bands; the gap is the yardstick.
                         {
-                            let applied_now = storage_for_handler
+                            let (applied_hash_now, applied_now) = storage_for_handler
                                 .blocks
                                 .get_applied_tip()
                                 .ok()
                                 .flatten()
-                                .map(|(_, h)| h)
-                                .unwrap_or(0);
+                                .unwrap_or((citrate_consensus::types::Hash::default(), 0));
                             let target = max_seen_for_rx.load(std::sync::atomic::Ordering::Relaxed);
                             let gap = target.saturating_sub(applied_now);
                             // #156: did our own applied tip pass the anchor we
@@ -4116,11 +4289,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // An EMPTY answer is never stale: on a sealing node the tip
                             // moves between request and answer, and calling "the peer has
                             // nothing for my anchor" Redundant hid that signal.
+                            // Admission ahead of apply (rcBLUE-2 (g)): every block it
+                            // served above the applied tip is already held. The peer
+                            // answered what was asked; score it Redundant, and hold
+                            // the tick off re-asking that anchor.
+                            let held_ahead = sync_recovery::answer_is_held_ahead(
+                                answer_top,
+                                newly_admitted,
+                                deferred_from_answer,
+                                applied_now,
+                            );
+                            tip_reask_for_rx.lock().note_answer(
+                                applied_hash_now,
+                                held_ahead,
+                                std::time::Instant::now(),
+                            );
                             let stale_anchor = sync_recovery::answer_anchor_was_stale(
                                 sync_for_rx.last_block_anchor_height(),
                                 applied_now,
                                 answer_hashes.len(),
-                            );
+                            ) || held_ahead;
                             // Missing-parent recovery continues by hash, within this
                             // peer's walk budget (sync_recovery.rs).
                             {
@@ -4151,11 +4339,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             // sync_rejoin.rs: steer the next anchor on this answer.
                             let mut search_gave_up = false;
                             if let Some(anchor_height) = answers_rejoin {
-                                let answer = sync_rejoin::classify(
+                                let answer = sync_rejoin::classify_answer(
                                     answer_hashes.is_empty(),
                                     newly_admitted,
                                     fixpoint_highest,
                                     deferred_from_answer,
+                                    answer_highest,
                                 );
                                 let transition =
                                     rejoin_for_rx
@@ -4280,6 +4469,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     NetworkMessage::CheckpointVote {
                         height,
                         block_hash,
+                        binding,
                         voter_pubkey,
                         signature,
                     } => {
@@ -4301,6 +4491,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         let vote = CheckpointVote {
                             height,
                             block_hash,
+                            binding,
                             voter: PublicKey::new(voter_bytes),
                             signature: Signature::new(sig_bytes),
                         };
@@ -4362,6 +4553,41 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .await;
                         }
                     }
+                    // WP-S.3 Stage 1b (spec §11.10): a peer asks for a finalized
+                    // checkpoint certificate. Rate-limited per peer and size-bounded
+                    // inside `serve`; no answer when compiled off or none in range.
+                    NetworkMessage::GetCheckpoint { above, at_or_below } => {
+                        if let Some(cs) = &certificate_sync_for_net {
+                            if let Some(resp) = cs.serve(&pid.0, above, at_or_below).await {
+                                let _ = pm_for_rx
+                                    .send_to_peers(std::slice::from_ref(&pid), &resp)
+                                    .await;
+                            }
+                        }
+                    }
+                    // Stage 1b: only the answer to this node's outstanding request
+                    // is used; it is verified (epoch committee, quorum, signatures,
+                    // (height, hash) on this node's chain) off the message loop.
+                    NetworkMessage::CheckpointCertificate {
+                        height,
+                        block_hash,
+                        binding,
+                        signatures,
+                    } => match &certificate_sync_for_net {
+                        Some(cs) if cs.accept_response(&pid.0).await => {
+                            let cs = cs.clone();
+                            let peer = pid.0.clone();
+                            tokio::spawn(async move {
+                                let _ = cs
+                                    .process(&peer, height, block_hash, binding, signatures)
+                                    .await;
+                            });
+                        }
+                        _ => tracing::debug!(
+                            "Checkpoint certificate from peer {} not requested; ignored",
+                            pid.0
+                        ),
+                    },
                     _ => {
                         tracing::debug!("Unhandled message variant from peer {}", pid.0);
                     }
@@ -4446,6 +4672,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let processed = msgs_processed.load(std::sync::atomic::Ordering::Relaxed);
                 let drops = pm_for_stall.inbound_drops();
                 metrics::record_inbound_drops(&pm_for_stall.inbound_drops_by_kind());
+                // Serving-lane drops: reported, but not a stall signal (the
+                // consensus loop is not behind when history serving is).
+                metrics::record_serve_drops(&pm_for_stall.serve_drops_by_kind());
                 let shed_this_window = drops.saturating_sub(last_drops);
                 let starved = shed_this_window > 0 && processed == last_processed;
                 last_processed = processed;
@@ -4608,7 +4837,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     ghostdag_params: Some(shared_ghostdag.params().clone()),
                 }
             }),
-        );
+        )
+        // ADR CV-8 / spec 06 §5.5: the real checkpoint state, for the explorer.
+        .with_finality_status(finality_status.clone());
 
         // PIL-12: spawn the Ethereum-compatible subscription server next
         // to the RPC server. Until this commit, main.rs constructed
@@ -4655,11 +4886,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             match rpc_server.spawn() {
                 Ok((close_handle, join_handle)) => {
                     info!("RPC server started");
-                    // Keep server alive
-                    tokio::signal::ctrl_c().await.ok();
-                    // Signal server to close and join its OS thread
-                    close_handle.close();
+                    // Keep server alive until SIGINT or SIGTERM (CORE-053).
+                    shutdown::shutdown_signal().await.ok();
+                    // Close the server and join its OS thread, both on a
+                    // blocking thread: `close` drops the server's own tokio
+                    // runtime, which panics inside an async context ("Cannot
+                    // drop a runtime in a context where blocking is not
+                    // allowed"; G4 2026-11-11, every SIGTERM shutdown).
                     tokio::task::spawn_blocking(move || {
+                        close_handle.close();
                         let _ = join_handle.join();
                     })
                     .await
@@ -4731,7 +4966,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     storage.clone(),
                     peer_manager.clone(),
                     proposer_signing_key.clone(),
+                    finality_status.clone(),
+                    finality_floor::FloorMode::for_genesis(
+                        config.chain.chain_id,
+                        &checkpoint_manager.config().genesis_hash,
+                    ),
                 );
+                // Stage 1b: fetch finalized certificates from peers so a node that
+                // joined late or restarted behind gets its floor without waiting
+                // to take part in a live quorum.
+                if let Some(cs) = &certificate_sync {
+                    finality_sync::spawn_requester(cs.clone(), peer_manager.clone());
+                }
             }
             None => warn!(
                 "checkpoint finality: producer path ON but execute-on-receive is disabled — \
@@ -4847,7 +5093,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // execute→persist never races the receive-path applier, and each sealed block
         // advances the applied tip. Present iff execute-on-receive (v2) is enabled.
         if let Some(app) = &canonical_applicator {
-            producer_instance = producer_instance.with_applied_tip_lock(app.advance_lock());
+            // RC-6: and advance the applied tip to fork choice's head under that lock
+            // before each build (the drain task may be one pass behind).
+            producer_instance = producer_instance.with_applicator(app.clone());
             // #126 (producer catch-up gate): refuse to seal while this node is rebuilding
             // its applied state from genesis or has not yet hydrated its DAG after a
             // restart, so a lagging/replaying node never forks the fleet by sealing on a
@@ -4883,16 +5131,118 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         );
     }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    // Wait for shutdown signal: SIGINT or SIGTERM (systemd stop), CORE-053.
+    let signal = shutdown::shutdown_signal().await?;
+    info!("Shutting down ({signal})...");
 
-    // Wait for RPC to shut down
-    if let Some(handle) = rpc_handle {
-        handle.abort();
+    // Wait for the RPC task to close its server (it waits on the same signal),
+    // bounded so a stuck server cannot hold the process; then abort it.
+    if let Some(mut handle) = rpc_handle {
+        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle)
+            .await
+            .is_err()
+        {
+            warn!("RPC server did not close within 10 s of the shutdown signal; aborting it");
+            handle.abort();
+        }
     }
 
     Ok(())
+}
+
+/// The one start-up line the devnet judge greps (fed#535): the slot length
+/// consensus runs with, the configured `[mining] target_block_time`, the
+/// production period that becomes on the slot grid (this producer seals every
+/// `production_period_secs`; a cadence, not a consensus value), and the
+/// chain-params fingerprint (SHA-256 of `GenesisChainParams::render()` for a
+/// genesis that compiles chain params, `none` otherwise). Stable `key=value`
+/// fields after a fixed tag.
+fn slot_config_line(target_block_time: u64, params_render: Option<&str>) -> String {
+    use sha2::Digest;
+    let fp = match params_render {
+        Some(r) => format!("0x{}", hex::encode(sha2::Sha256::digest(r.as_bytes()))),
+        None => "none".to_string(),
+    };
+    format!(
+        "SLOT_CONFIG slot_secs={} target_block_time={} production_period_secs={} chain_params_fp={}",
+        citrate_consensus::slots::SLOT_DURATION_SECS,
+        target_block_time,
+        crate::timing::production_period_secs(target_block_time),
+        fp
+    )
+}
+
+#[cfg(test)]
+mod slot_config_line_tests {
+    use super::slot_config_line;
+
+    /// fed#535: one stable, greppable line; the fingerprint follows the
+    /// parameters; main logs it at start-up.
+    #[test]
+    fn the_slot_config_line_is_stable_and_logged_at_startup() {
+        let r = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS.render();
+        let line = slot_config_line(1, Some(&r));
+        assert!(
+            line.starts_with(
+                "SLOT_CONFIG slot_secs=1 target_block_time=1 production_period_secs=1 \
+                 chain_params_fp=0x"
+            ),
+            "{line}"
+        );
+        assert_eq!(line, slot_config_line(1, Some(&r)), "stable");
+        assert_eq!(line.split_whitespace().count(), 5, "{line}");
+        assert_ne!(
+            line,
+            slot_config_line(1, Some("other")),
+            "moves with the parameters"
+        );
+        assert_eq!(
+            slot_config_line(2, None),
+            "SLOT_CONFIG slot_secs=1 target_block_time=2 production_period_secs=2 chain_params_fp=none"
+        );
+        // The producer seals every ceil(target_block_time / slot) slots on the
+        // slot grid (timing::production_period_secs): the slot is consensus,
+        // target_block_time only this producer's cadence on it.
+        assert!(slot_config_line(3, None).contains(" production_period_secs=3 "));
+        assert!(slot_config_line(0, None).contains(" production_period_secs=1 "));
+        assert!(include_str!("main.rs")
+            .contains("info!(\n        \"{}\",\n        slot_config_line(\n            config.mining.target_block_time,"));
+    }
+}
+
+/// The `clear-disqualified` command's store step: every root mark in the DAG
+/// metadata of `storage` (spec 06 §3.10).
+fn clear_disqualified_marks(storage: &StorageManager) -> anyhow::Result<usize> {
+    let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+    let dag = DagStore::persistent_with_strict_vrf(kv, false)
+        .map_err(|e| anyhow::anyhow!("open the DAG store: {e}"))?;
+    dag.clear_disqualified_marks()
+        .map_err(|e| anyhow::anyhow!("clear the disqualified marks: {e}"))
+}
+
+#[cfg(test)]
+mod clear_disqualified_tests {
+    use super::*;
+
+    /// fed#533 (4): the operator command removes every root mark from a
+    /// node's store, and the CLI parses it.
+    #[test]
+    fn clear_disqualified_removes_the_marks_of_a_node_store() {
+        let dir = tempfile::tempdir().expect("dir");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        {
+            let kv = Arc::new(persistent_dag::RocksDbKvStore::new(storage.db.clone()));
+            let dag = DagStore::persistent_with_strict_vrf(kv, false).expect("dag");
+            dag.mark_disqualified_root(&citrate_consensus::types::Hash::new([7; 32]));
+            dag.mark_disqualified_root(&citrate_consensus::types::Hash::new([8; 32]));
+            assert_eq!(dag.stored_disqualified_roots(), 2);
+        }
+        assert_eq!(clear_disqualified_marks(&storage).expect("clear"), 2);
+        assert_eq!(clear_disqualified_marks(&storage).expect("again"), 0);
+        let cli = Cli::try_parse_from(["citrate", "--data-dir", "/tmp/x", "clear-disqualified"])
+            .expect("parses");
+        assert!(matches!(cli.command, Some(Commands::ClearDisqualified)));
+    }
 }
 
 /// The storage records a node restarted at applied tip `tip_height` loads into

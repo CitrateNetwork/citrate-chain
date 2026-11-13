@@ -368,12 +368,13 @@ async fn test_tip_selector_select_tip_same_score_tie_break_by_hash() {
         .select_tip(&[block1.hash(), block2.hash()])
         .await
         .unwrap();
-    // Ties break by SMALLEST hash — the one canonical order shared with
-    // `cmp_tip_for_parent_selection` (audit H-08) and `GhostDag::select_tip`. The
+    // Ties break on the LARGER ForkChoiceKey (r1007 G8: blue_work, vrf_output,
+    // hash) — the one canonical order shared with `cmp_tip_for_parent_selection`
+    // (audit H-08), `GhostDag::select_tip` and the selected-parent rule G3. The
     // producer's parent selection MUST agree with the drain's reorg fork-choice, or
     // an equal-score sibling tie deadlocks the MP-S1 guard (the 2026-08-06 halt at
-    // height 90,998). The lower hash (0x01) wins regardless of insertion order.
-    assert_eq!(result, block1.hash());
+    // height 90,998). The higher hash (0x02) wins regardless of insertion order.
+    assert_eq!(result, block2.hash());
 }
 
 #[tokio::test]

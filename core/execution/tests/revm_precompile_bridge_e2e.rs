@@ -94,6 +94,7 @@ fn call_via_forwarder(target: [u8; 20], calldata: Vec<u8>) -> ([u8; 32], [u8; 32
         coinbase: [0x42; 20],
         prevrandao: [0u8; 32],
         block_hashes: HashMap::new(),
+        gas_limit: None,
     };
 
     let (output, _gas, _logs) = execute_contract_call_with_context(
@@ -383,6 +384,7 @@ mod porep_v2_through_revm {
             coinbase: [0x42; 20],
             prevrandao: [0u8; 32],
             block_hashes: HashMap::new(),
+            gas_limit: None,
         };
 
         let (output, _gas, _logs) = execute_contract_call_with_context(

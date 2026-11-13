@@ -1,21 +1,26 @@
 // citrate/core/consensus/src/ordering.rs
 
-//! Total Ordering for GhostDAG
+//! GHOSTDAG total order (r1007 spec 06 §3.2, ADR CV-4a).
 //!
-//! This module provides deterministic total ordering of blocks in a DAG structure.
-//! The ordering follows the GhostDAG protocol:
+//! The execution order of the DAG is the concatenation, for each selected-chain
+//! block C in increasing height, of [`consensus_ordered_mergeset`]`(C)`: the
+//! selected parent SP(C) first, then `Mergeset*(C)` (the blocks C merges that
+//! are not in past(SP(C))), blues and reds interleaved, in ASCENDING
+//! fork-choice key `(blue_work, vrf_output, hash)`. This is rusty-kaspa
+//! `GhostdagData::consensus_ordered_mergeset` with Citrate's key. It is a
+//! linear extension of the DAG: the key strictly grows along every parent edge
+//! of a validly-scored DAG (blue_work grows by at least one unit along SP
+//! edges and SP is the heaviest parent).
 //!
-//! 1. Walk the selected-parent chain from genesis to tip
-//! 2. For each block on the chain, yield it first
-//! 3. Then yield its mergeset (blocks reachable only via merge parents)
-//! 4. Mergeset blocks are sorted by (blue_score DESC, hash ASC) for determinism
-//! 5. Each block is yielded exactly once (first occurrence wins)
-//!
-//! This ensures all nodes produce identical orderings for the same DAG state.
+//! The former `TotalOrderIterator` (walk to genesis, mergesets from merge
+//! parents only, DESCENDING score) is replaced. [`TotalOrdering`] keeps its
+//! API for the DAG-wide order and is built on the same rule, computing each
+//! chain block's `Mergeset*` structurally from the DAG.
 
+use crate::acceptance::InclusionColor;
 use crate::dag_store::DagStore;
 use crate::ghostdag::GhostDag;
-use crate::types::Hash;
+use crate::types::{ForkChoiceKey, GhostdagData, Hash};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use thiserror::Error;
@@ -35,10 +40,73 @@ pub enum OrderingError {
     #[error("DAG store error: {0}")]
     DagStoreError(String),
 
-    /// RM-B1 / WP-B4.1 (audit C-03): error from the GhostDAG engine
-    /// while computing the canonical blue score for a block.
+    /// RM-B1 / WP-B4.1 (audit C-03): error from the GhostDAG engine.
     #[error("DAG error: {0}")]
     DagError(String),
+}
+
+/// One block of an accepting block's ordered mergeset, with its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderedMember {
+    pub hash: Hash,
+    pub color: InclusionColor,
+}
+
+/// Spec 06 §3.2: the blocks chain block C accepts, in execution order.
+///
+/// `data` is C's GHOSTDAG record (its `mergeset_blues` start with SP). The
+/// result is SP first, then every other block of `mergeset_blues` and
+/// `mergeset_reds` sorted ascending by its fork-choice key, which `key_of`
+/// supplies from committed header fields. Genesis (no selected parent)
+/// accepts nothing. A block whose key is unavailable fails closed with
+/// `BlockNotFound`: the order is never guessed.
+pub fn consensus_ordered_mergeset<F>(
+    data: &GhostdagData,
+    mut key_of: F,
+) -> Result<Vec<OrderedMember>, OrderingError>
+where
+    F: FnMut(&Hash) -> Option<ForkChoiceKey>,
+{
+    if data.selected_parent == Hash::default() {
+        return Ok(Vec::new());
+    }
+    let mut rest: Vec<(ForkChoiceKey, OrderedMember)> = Vec::with_capacity(
+        data.mergeset_blues
+            .len()
+            .saturating_add(data.mergeset_reds.len()),
+    );
+    for h in data
+        .mergeset_blues
+        .iter()
+        .filter(|h| **h != data.selected_parent)
+    {
+        let key = key_of(h).ok_or(OrderingError::BlockNotFound(*h))?;
+        rest.push((
+            key,
+            OrderedMember {
+                hash: *h,
+                color: InclusionColor::Blue,
+            },
+        ));
+    }
+    for h in &data.mergeset_reds {
+        let key = key_of(h).ok_or(OrderingError::BlockNotFound(*h))?;
+        rest.push((
+            key,
+            OrderedMember {
+                hash: *h,
+                color: InclusionColor::Red,
+            },
+        ));
+    }
+    rest.sort_by_key(|(key, _)| *key);
+    let mut out = Vec::with_capacity(rest.len().saturating_add(1));
+    out.push(OrderedMember {
+        hash: data.selected_parent,
+        color: InclusionColor::SelectedParent,
+    });
+    out.extend(rest.into_iter().map(|(_, m)| m));
+    Ok(out)
 }
 
 /// Result of ordering a range of blocks
@@ -70,249 +138,59 @@ pub struct TransactionRef {
     pub tx_hash: Hash,
 }
 
-/// Block ordering metadata for sorting
-#[derive(Debug, Clone)]
-struct BlockOrderingInfo {
-    hash: Hash,
-    blue_score: u64,
-    #[allow(dead_code)]
-    height: u64,
-    #[allow(dead_code)]
-    is_chain_block: bool,
-}
-
-impl BlockOrderingInfo {
-    /// Compare for ordering: higher blue score first, then lower hash (lexicographic)
-    fn ordering_key(&self) -> (std::cmp::Reverse<u64>, Hash) {
-        (std::cmp::Reverse(self.blue_score), self.hash)
-    }
-}
-
-/// Total order iterator for GhostDAG blocks
-pub struct TotalOrderIterator {
-    /// DAG storage
-    dag_store: Arc<DagStore>,
-
-    /// GhostDAG instance for blue score queries (reserved for future optimizations)
-    #[allow(dead_code)]
-    ghostdag: Arc<GhostDag>,
-
-    /// Blocks already yielded (for deduplication)
-    yielded: HashSet<Hash>,
-
-    /// Queue of blocks to process on selected-parent chain
-    chain_queue: VecDeque<Hash>,
-
-    /// Queue of mergeset blocks pending for current chain block
-    mergeset_queue: VecDeque<Hash>,
-
-    /// Current chain block being processed
-    current_chain_block: Option<Hash>,
-
-    /// Whether we're done iterating
-    finished: bool,
-}
-
-impl TotalOrderIterator {
-    /// Create a new iterator from genesis to the specified tip
-    pub async fn new(
-        dag_store: Arc<DagStore>,
-        ghostdag: Arc<GhostDag>,
-        tip: Hash,
-    ) -> Result<Self, OrderingError> {
-        // Build the selected-parent chain from tip back to genesis
-        let chain = Self::build_selected_parent_chain(&dag_store, tip).await?;
-
-        let mut chain_queue = VecDeque::new();
-        // Add chain blocks oldest first (genesis -> tip)
-        for hash in chain.into_iter().rev() {
-            chain_queue.push_back(hash);
+/// `Mergeset*(chain)` computed structurally: every block reachable from
+/// `chain`'s merge parents that is not in `seen` (which must hold
+/// past(SP(chain)) ∪ {SP(chain)}), sorted ascending by fork-choice key.
+async fn structural_mergeset_star(
+    dag_store: &DagStore,
+    merge_parents: &[Hash],
+    seen: &HashSet<Hash>,
+) -> Result<Vec<Hash>, OrderingError> {
+    let mut found: HashMap<Hash, ForkChoiceKey> = HashMap::new();
+    let mut queue: VecDeque<Hash> = merge_parents.iter().copied().collect();
+    while let Some(h) = queue.pop_front() {
+        if seen.contains(&h) || found.contains_key(&h) || h == Hash::default() {
+            continue;
         }
-
-        Ok(Self {
-            dag_store,
-            ghostdag,
-            yielded: HashSet::new(),
-            chain_queue,
-            mergeset_queue: VecDeque::new(),
-            current_chain_block: None,
-            finished: false,
-        })
-    }
-
-    /// Build selected-parent chain from tip to genesis
-    async fn build_selected_parent_chain(
-        dag_store: &DagStore,
-        tip: Hash,
-    ) -> Result<Vec<Hash>, OrderingError> {
-        let mut chain = Vec::new();
-        let mut current = tip;
-
-        loop {
-            chain.push(current);
-
-            let block = dag_store
-                .get_block(&current)
-                .await
-                .map_err(|_| OrderingError::BlockNotFound(current))?;
-
-            if block.is_genesis() {
-                break;
-            }
-
-            current = block.selected_parent();
-        }
-
-        Ok(chain)
-    }
-
-    /// Get the next block in total order
-    pub async fn next(&mut self) -> Result<Option<Hash>, OrderingError> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        loop {
-            // First, try to yield from mergeset queue
-            if let Some(hash) = self.next_from_mergeset().await? {
-                return Ok(Some(hash));
-            }
-
-            // No more mergeset blocks, move to next chain block
-            if let Some(chain_hash) = self.chain_queue.pop_front() {
-                // Prepare mergeset for this chain block
-                self.prepare_mergeset(&chain_hash).await?;
-
-                // Yield the chain block itself if not already yielded
-                if !self.yielded.contains(&chain_hash) {
-                    self.yielded.insert(chain_hash);
-                    self.current_chain_block = Some(chain_hash);
-                    return Ok(Some(chain_hash));
-                }
-
-                // Chain block already yielded (from earlier mergeset), continue to its mergeset
-                self.current_chain_block = Some(chain_hash);
-                continue;
-            }
-
-            // No more chain blocks, we're done
-            self.finished = true;
-            return Ok(None);
-        }
-    }
-
-    /// Get next block from mergeset queue
-    async fn next_from_mergeset(&mut self) -> Result<Option<Hash>, OrderingError> {
-        while let Some(hash) = self.mergeset_queue.pop_front() {
-            if !self.yielded.contains(&hash) {
-                self.yielded.insert(hash);
-                return Ok(Some(hash));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Prepare the mergeset for a chain block
-    async fn prepare_mergeset(&mut self, chain_block: &Hash) -> Result<(), OrderingError> {
-        let block = self
-            .dag_store
-            .get_block(chain_block)
+        let header = dag_store
+            .get_header(&h)
             .await
-            .map_err(|_| OrderingError::BlockNotFound(*chain_block))?;
-
-        // Collect all blocks reachable via merge parents (the mergeset)
-        let mut mergeset = Vec::new();
-
-        for merge_parent in &block.header.merge_parent_hashes {
-            // Recursively collect blocks from merge parent's ancestry
-            // that aren't already in our yielded set
-            self.collect_mergeset_recursive(*merge_parent, &mut mergeset)
-                .await?;
-        }
-
-        // Sort mergeset by blue score (descending) then hash (ascending).
-        //
-        // RM-B1 / WP-B4.1 (audit C-03): the score MUST be the
-        // *locally recomputed* blue score, NOT the proposer-supplied
-        // `block.header.blue_score`. A malicious proposer can stuff
-        // u64::MAX into the header to bias mergeset ordering toward
-        // their own block, enabling MEV / sandwich attacks without
-        // controlling the chain tip. Locally recomputing via
-        // `ghostdag.calculate_blue_score(&b)` reduces the ordering
-        // to a function of the DAG content alone.
-        let mut ordering_infos: Vec<BlockOrderingInfo> = Vec::new();
-        for hash in &mergeset {
-            if let Ok(b) = self.dag_store.get_block(hash).await {
-                let blue_score = self
-                    .ghostdag
-                    .calculate_blue_score(&b)
-                    .await
-                    .map_err(|e| OrderingError::DagError(e.to_string()))?;
-                ordering_infos.push(BlockOrderingInfo {
-                    hash: *hash,
-                    blue_score,
-                    height: b.header.height,
-                    is_chain_block: false,
-                });
-            }
-        }
-
-        ordering_infos.sort_by_key(|info| info.ordering_key());
-
-        // Add sorted mergeset to queue
-        self.mergeset_queue.clear();
-        for info in ordering_infos {
-            if !self.yielded.contains(&info.hash) {
-                self.mergeset_queue.push_back(info.hash);
-            }
-        }
-
-        Ok(())
+            .map_err(|_| OrderingError::BlockNotFound(h))?;
+        found.insert(h, ForkChoiceKey::of_header(&header));
+        queue.push_back(header.selected_parent_hash);
+        queue.extend(header.merge_parent_hashes.iter().copied());
     }
+    let mut ms: Vec<(ForkChoiceKey, Hash)> = found.into_iter().map(|(h, k)| (k, h)).collect();
+    ms.sort();
+    Ok(ms.into_iter().map(|(_, h)| h).collect())
+}
 
-    /// Recursively collect mergeset blocks
-    async fn collect_mergeset_recursive(
-        &self,
-        hash: Hash,
-        collected: &mut Vec<Hash>,
-    ) -> Result<(), OrderingError> {
-        // Skip if already collected or yielded
-        if self.yielded.contains(&hash) || collected.contains(&hash) {
-            return Ok(());
+/// The selected chain from `tip` down to genesis, tip first.
+async fn selected_chain(dag_store: &DagStore, tip: Hash) -> Result<Vec<Hash>, OrderingError> {
+    let mut chain = Vec::new();
+    let mut current = tip;
+    loop {
+        chain.push(current);
+        let header = dag_store
+            .get_header(&current)
+            .await
+            .map_err(|_| OrderingError::BlockNotFound(current))?;
+        if header.selected_parent_hash == Hash::default() {
+            break;
         }
-
-        collected.push(hash);
-
-        // Get the block and recurse to its parents
-        if let Ok(block) = self.dag_store.get_block(&hash).await {
-            // Only recurse to parents not already yielded
-            if !self.yielded.contains(&block.selected_parent()) && !block.is_genesis() {
-                // Only include selected parent if it's not in our chain
-                // (would have been yielded earlier or will be yielded later)
-                // This is handled by the yielded check above
-            }
-
-            for merge_parent in &block.header.merge_parent_hashes {
-                Box::pin(self.collect_mergeset_recursive(*merge_parent, collected)).await?;
-            }
+        if chain.len() > 50_000_000 {
+            return Err(OrderingError::CycleDetected);
         }
-
-        Ok(())
+        current = header.selected_parent_hash;
     }
-
-    /// Collect all remaining blocks into a vector
-    pub async fn collect(mut self) -> Result<Vec<Hash>, OrderingError> {
-        let mut result = Vec::new();
-        while let Some(hash) = self.next().await? {
-            result.push(hash);
-        }
-        Ok(result)
-    }
+    Ok(chain)
 }
 
 /// Total ordering manager
 pub struct TotalOrdering {
     dag_store: Arc<DagStore>,
+    /// Kept for API compatibility; the order reads committed header keys only.
+    #[allow(dead_code)]
     ghostdag: Arc<GhostDag>,
 
     /// Cache of ordered ranges
@@ -336,11 +214,40 @@ impl TotalOrdering {
             return Ok(cached.clone());
         }
 
-        // Calculate order
-        let iterator =
-            TotalOrderIterator::new(self.dag_store.clone(), self.ghostdag.clone(), tip).await?;
-
-        let order = iterator.collect().await?;
+        // Calculate order: genesis, then for each chain block C_i (i >= 1)
+        // its selected parent C_{i-1} and Mergeset*(C_i) ascending by key,
+        // then the tip itself (which its future chain child accepts first).
+        let mut chain = selected_chain(&self.dag_store, tip).await?;
+        chain.reverse();
+        let mut order: Vec<Hash> = Vec::new();
+        let mut seen: HashSet<Hash> = HashSet::new();
+        if let Some(g) = chain.first() {
+            order.push(*g);
+            seen.insert(*g);
+        }
+        for i in 1..chain.len() {
+            let (Some(sp), Some(c)) = (chain.get(i.saturating_sub(1)), chain.get(i)) else {
+                return Err(OrderingError::InvalidState);
+            };
+            if seen.insert(*sp) {
+                order.push(*sp);
+            }
+            let header = self
+                .dag_store
+                .get_header(c)
+                .await
+                .map_err(|_| OrderingError::BlockNotFound(*c))?;
+            let ms = structural_mergeset_star(&self.dag_store, &header.merge_parent_hashes, &seen)
+                .await?;
+            for h in ms {
+                if seen.insert(h) {
+                    order.push(h);
+                }
+            }
+        }
+        if chain.len() > 1 && seen.insert(tip) {
+            order.push(tip);
+        }
 
         // Cache result
         self.order_cache
@@ -652,5 +559,63 @@ mod tests {
         assert_eq!(tx_order[0].block_hash, genesis.hash());
         assert_eq!(tx_order[1].tx_hash, tx2.hash);
         assert_eq!(tx_order[1].block_hash, block_a.hash());
+    }
+
+    fn key(work: u128, vrf: u8, h: u8) -> ForkChoiceKey {
+        ForkChoiceKey {
+            blue_work: work,
+            vrf_output: Hash::new([vrf; 32]),
+            hash: Hash::new([h; 32]),
+        }
+    }
+
+    /// Spec 06 §3.2: SP first, then blues and reds interleaved ascending by
+    /// (blue_work, vrf_output, hash), whatever order the record lists them in.
+    #[test]
+    fn consensus_order_is_sp_then_ascending_key_interleaving_colors() {
+        let sp = Hash::new([9; 32]);
+        let keys: HashMap<Hash, ForkChoiceKey> = [
+            (Hash::new([1; 32]), key(3, 7, 1)),
+            (Hash::new([2; 32]), key(2, 9, 2)),
+            (Hash::new([3; 32]), key(3, 5, 3)),
+            (Hash::new([4; 32]), key(2, 9, 4)),
+        ]
+        .into_iter()
+        .collect();
+        let mut data = GhostdagData::with_selected_parent(sp, Hash::default());
+        data.mergeset_blues.push(Hash::new([1; 32]));
+        data.mergeset_blues.push(Hash::new([4; 32]));
+        data.mergeset_reds.push(Hash::new([3; 32]));
+        data.mergeset_reds.push(Hash::new([2; 32]));
+        let order = consensus_ordered_mergeset(&data, |h| keys.get(h).copied()).expect("order");
+        let got: Vec<(u8, InclusionColor)> = order
+            .iter()
+            .map(|m| (m.hash.as_bytes()[0], m.color))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (9, InclusionColor::SelectedParent),
+                (2, InclusionColor::Red),
+                (4, InclusionColor::Blue),
+                (3, InclusionColor::Red),
+                (1, InclusionColor::Blue),
+            ]
+        );
+    }
+
+    #[test]
+    fn consensus_order_of_genesis_is_empty_and_missing_key_fails_closed() {
+        assert!(
+            consensus_ordered_mergeset(&GhostdagData::genesis(), |_| None)
+                .expect("genesis")
+                .is_empty()
+        );
+        let mut data = GhostdagData::with_selected_parent(Hash::new([9; 32]), Hash::default());
+        data.mergeset_reds.push(Hash::new([1; 32]));
+        assert!(matches!(
+            consensus_ordered_mergeset(&data, |_| None),
+            Err(OrderingError::BlockNotFound(_))
+        ));
     }
 }

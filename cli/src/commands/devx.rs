@@ -61,6 +61,17 @@ fn contract() -> Result<Value> {
     serde_json::from_str(CONTRACT_JSON).context("parsing vendored federation-contract.json")
 }
 
+/// The genesis hash the vendored federation contract was written for
+/// (`chain.genesisHash`), if it names one.
+pub fn vendored_genesis_hash() -> Option<String> {
+    contract()
+        .ok()?
+        .get("chain")?
+        .get("genesisHash")?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn parse_addr20(v: &Value) -> Result<[u8; 20]> {
     let s = v
         .as_str()
