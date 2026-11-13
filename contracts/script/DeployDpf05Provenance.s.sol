@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import {PartProvenanceRegistry} from "../src/defense_prime/PartProvenanceRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf05Provenance — Foundry deployment script for DPF-05 Provenance
 /// @notice Deploys PartProvenanceRegistry to chain 40204 (Citrate testnet),
@@ -51,7 +52,7 @@ import {PartProvenanceRegistry} from "../src/defense_prime/PartProvenanceRegistr
 ///   2. Append the address to .agentile/launch/DEPLOYED_CONTRACTS_2026_05_10.md
 ///   3. Update the "Deployed Contracts" table in .agentile/CONFIG.md
 ///   4. (Operator step) wire setContradictionLedger if Stage 1 has landed
-contract DeployDpf05Provenance is Script {
+contract DeployDpf05Provenance is EnvSigner {
     struct DeployedAddresses {
         address partProvenanceRegistry;
     }
@@ -60,7 +61,7 @@ contract DeployDpf05Provenance is Script {
     ///         In dry-run this is `msg.sender`; in live broadcast it
     ///         must be the root-tenant multi-sig executor passed via
     ///         env `ROOT_GOVERNANCE`.
-    function _governance() internal view returns (address) {
+    function _governance() internal view virtual returns (address) {
         try vm.envAddress("ROOT_GOVERNANCE") returns (address g) {
             return g;
         } catch {
@@ -70,8 +71,9 @@ contract DeployDpf05Provenance is Script {
 
     function run() external returns (DeployedAddresses memory addrs) {
         address governance = _governance();
+        _requireRootGovernance(governance);
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         // PartProvenanceRegistry — single contract for DPF-05.
         // Records part lineage events; recorders and the optional

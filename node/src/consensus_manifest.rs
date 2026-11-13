@@ -43,6 +43,8 @@ pub struct FingerprintInputs<'a> {
     pub supply_hardening_height: Option<u64>,
     /// Appended to the pre-image only when set (chain#392).
     pub storage_root_hardening_height: Option<u64>,
+    /// Appended to the pre-image only when set (CV-14, the MPT state root).
+    pub mpt_state_root_height: Option<u64>,
     pub value_transfer_activation_height: u64,
     pub create_nonce_fix_activation_height: u64,
     pub merge_depth_activation_height: u64,
@@ -126,6 +128,10 @@ pub fn fingerprint_preimage(i: &FingerprintInputs<'_>) -> String {
         Some(h) => format!("{preimage}storage_root_hardening_height={h}\n"),
         None => preimage,
     };
+    let preimage = match i.mpt_state_root_height {
+        Some(h) => format!("{preimage}mpt_state_root_height={h}\n"),
+        None => preimage,
+    };
     match i.genesis_binding {
         None => preimage,
         Some(b) => format!(
@@ -196,6 +202,10 @@ pub struct ConsensusManifest {
     /// (`citrate_execution::storage_root_hardening`); `None` = not activated.
     /// Part of the fingerprint only when set.
     pub storage_root_hardening_height: Option<u64>,
+    /// Standard incremental MPT state root height
+    /// (`citrate_execution::mpt_state_root`, CV-14); `None` = not activated.
+    /// Part of the fingerprint only when set.
+    pub mpt_state_root_height: Option<u64>,
     /// Execution/consensus rules that switch on by height, as this process
     /// resolved them (compiled default or devnet env override). A node whose
     /// env overrides one of these computes different roots, so they are in the
@@ -333,6 +343,7 @@ impl ConsensusManifest {
             citrate_execution::executor::create_nonce_fix_activation_height();
         let merge_depth_activation_height =
             citrate_consensus::ghostdag::merge_depth_activation_height();
+        let mpt_state_root_height = citrate_execution::mpt_state_root::mpt_state_root_height();
         let fingerprint = fingerprint_of(&FingerprintInputs {
             git_sha,
             feat_halo2_verifier,
@@ -344,6 +355,7 @@ impl ConsensusManifest {
             vrf_canonical_encoding_height,
             supply_hardening_height,
             storage_root_hardening_height,
+            mpt_state_root_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -367,6 +379,7 @@ impl ConsensusManifest {
             vrf_canonical_encoding_height,
             supply_hardening_height,
             storage_root_hardening_height,
+            mpt_state_root_height,
             value_transfer_activation_height,
             create_nonce_fix_activation_height,
             merge_depth_activation_height,
@@ -402,20 +415,31 @@ impl ConsensusManifest {
     }
 
     /// The rule schedule string for a genesis (`-` when it has no compiled activations).
+    ///
+    /// A genesis with compiled chain parameters (r1007) appends `|params:<rendering>`, so
+    /// the binding also covers its slot, retention, undo window and checkpoint values. A
+    /// genesis without them (r1006) renders exactly as before.
     pub fn genesis_rules_of(genesis: &[u8; 32]) -> String {
         match citrate_consensus::hardening::genesis_activations(genesis) {
             None => "-".to_string(),
-            Some(a) => a
-                .entries()
-                .iter()
-                .map(|(n, h)| {
-                    format!(
-                        "{n}:{}",
-                        h.map(|h| h.to_string()).unwrap_or_else(|| "unset".into())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("|"),
+            Some(a) => {
+                let mut r = a
+                    .entries()
+                    .iter()
+                    .map(|(n, h)| {
+                        format!(
+                            "{n}:{}",
+                            h.map(|h| h.to_string()).unwrap_or_else(|| "unset".into())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if let Some(p) = citrate_consensus::genesis_params::genesis_chain_params(genesis) {
+                    r.push_str("|params:");
+                    r.push_str(&p.render());
+                }
+                r
+            }
         }
     }
 
@@ -435,6 +459,7 @@ impl ConsensusManifest {
             vrf_canonical_encoding_height: self.vrf_canonical_encoding_height,
             supply_hardening_height: self.supply_hardening_height,
             storage_root_hardening_height: self.storage_root_hardening_height,
+            mpt_state_root_height: self.mpt_state_root_height,
             value_transfer_activation_height: self.value_transfer_activation_height,
             create_nonce_fix_activation_height: self.create_nonce_fix_activation_height,
             merge_depth_activation_height: self.merge_depth_activation_height,
@@ -501,6 +526,12 @@ impl ConsensusManifest {
             self.storage_root_hardening_height
                 .map(|h| format!("hardened from height {h}"))
                 .unwrap_or_else(|| "not activated".to_string())
+        );
+        println!(
+            "  state root (MPT)   {}",
+            self.mpt_state_root_height
+                .map(|h| format!("standard MPT from height {h}"))
+                .unwrap_or_else(|| "not activated (legacy root)".to_string())
         );
         println!(
             "  value transfer     from height {}",
@@ -656,6 +687,7 @@ mod tests {
             vrf_canonical_encoding_height: None,
             supply_hardening_height: None,
             storage_root_hardening_height: None,
+            mpt_state_root_height: None,
             value_transfer_activation_height: 1,
             create_nonce_fix_activation_height: 2,
             merge_depth_activation_height: 3,
@@ -794,6 +826,13 @@ mod tests {
                 },
             ),
             (
+                "MPT state root height",
+                FingerprintInputs {
+                    mpt_state_root_height: Some(5),
+                    ..base
+                },
+            ),
+            (
                 "value transfer",
                 FingerprintInputs {
                     value_transfer_activation_height: 9,
@@ -857,6 +896,7 @@ mod tests {
                 vrf_canonical_encoding_height: m.vrf_canonical_encoding_height,
                 supply_hardening_height: m.supply_hardening_height,
                 storage_root_hardening_height: m.storage_root_hardening_height,
+                mpt_state_root_height: m.mpt_state_root_height,
                 value_transfer_activation_height: m.value_transfer_activation_height,
                 create_nonce_fix_activation_height: m.create_nonce_fix_activation_height,
                 merge_depth_activation_height: m.merge_depth_activation_height,
@@ -955,6 +995,27 @@ mod tests {
         // A different block 0 under the same compiled rules would bind differently.
         let other = m.clone().bound(&[7u8; 32]);
         assert_ne!(other.fingerprint, r1006.fingerprint);
+    }
+
+    /// r1007 shares chain id 40204 with r1005 and r1006: its manifest is bound to its own
+    /// block 0, and its binding also carries the compiled chain parameters (slot,
+    /// retention and undo window, checkpoint committee), so two binaries that disagree on
+    /// any of them print different fingerprints. r1006's binding is unchanged.
+    #[test]
+    fn r1007_is_bound_with_its_rules_and_chain_params() {
+        use citrate_consensus::genesis_params::R1007_CHAIN_PARAMS;
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+        let m = ConsensusManifest::current();
+        let r1006 = ConsensusManifest::for_node(Some("r1006"), Some(&R1006_GENESIS));
+        let r1007 = ConsensusManifest::for_node(Some("r1007"), Some(&R1007_GENESIS));
+        assert_ne!(r1007.fingerprint, r1006.fingerprint);
+        assert_ne!(r1007.fingerprint, m.fingerprint);
+        let rules = r1007.genesis_rules.clone().expect("bound");
+        assert!(rules.contains("mpt_state_root:0"), "{rules}");
+        assert!(rules.contains(&R1007_CHAIN_PARAMS.render()), "{rules}");
+        let r6 = r1006.genesis_rules.expect("bound");
+        assert!(!r6.contains("params"), "r1006's binding is unchanged: {r6}");
+        assert!(r6.contains("mpt_state_root:unset"), "{r6}");
     }
 
     /// The fingerprint follows the chain a node runs, never what its config calls it:

@@ -129,6 +129,8 @@ pub struct ExecutionContext {
     pub gas_limit: u64,
     pub gas_used: u64,
     pub gas_price: u64,
+    /// The transaction's value (r1007 T2: a deployment carries it).
+    pub value: u128,
     pub origin: Address,
     pub logs: Vec<Log>,
     pub output: Vec<u8>,
@@ -161,6 +163,7 @@ impl ExecutionContext {
             gas_limit: tx.gas_limit,
             gas_used: 0,
             gas_price: tx.gas_price,
+            value: tx.value,
             origin: crate::address_utils::normalize_address(&tx.from),
             logs: Vec::new(),
             output: Vec::new(),
@@ -197,6 +200,9 @@ impl ExecutionContext {
 /// Default chain ID for Citrate network
 pub const DEFAULT_CHAIN_ID: u64 = 40204;
 
+mod mergeset;
+pub use mergeset::{Emission, EmissionFn};
+
 /// Transaction executor
 pub struct Executor {
     state_db: Arc<StateDB>,
@@ -232,6 +238,14 @@ pub struct Executor {
     /// Off by default, so direct callers (genesis init, RPC) persist eagerly as
     /// before. See `docs/consensus/EXECUTE_ON_RECEIVE_state_application.md` §7.
     defer_persist: std::sync::atomic::AtomicBool,
+    /// Orders the external, non-mutating account reads ([`Self::get_balance`],
+    /// [`Self::get_nonce`], [`Self::get_code_hash`],
+    /// [`Self::get_canonical_account`]) against a working-set transition: a
+    /// snapshot restore and the store reconcile that follows it
+    /// ([`Self::state_transition`]). A reader holds it shared; a transition holds
+    /// it exclusively, so a reader never sees the working set half restored or
+    /// the store on the other branch from memory.
+    read_gate: parking_lot::RwLock<()>,
     /// VALIDATOR-S1 §R': the FINALIZED epoch reward policy (share bps + reward
     /// minter + proposer->staker map), materialized by `registry_sync` at each
     /// snapshot boundary S(E) and read — never re-derived from the live tip — by
@@ -256,6 +270,11 @@ pub struct Executor {
     /// (`citrate_consensus::hardening`); tests override it with
     /// [`Executor::set_pba_hardening`].
     pba_hardening_height: std::sync::atomic::AtomicU64,
+    /// S3-7: the RPC call tracer (`crate::trace`). `None` on every executor
+    /// except one built for an RPC trace (`Executor::replay_executor` +
+    /// [`Executor::with_call_tracer`]), so the consensus executor always takes
+    /// the untraced REVM path.
+    call_tracer: Option<crate::trace::CallTraceHandle>,
 }
 
 /// Height at which contract-initiated native value transfers start working.
@@ -572,6 +591,29 @@ impl ReceiptIndexBatch {
         }
     }
 
+    /// r1007 S3-3b: the index entries of one ACCEPTING block: the receipts of
+    /// the transactions its mergeset execution ran (keyed by tx hash, indexed
+    /// under the accepting block, carrying the including block), and those
+    /// transactions' bodies. Skipped occurrences have no receipt.
+    pub fn for_accepting_block(block: &Block, exec: &crate::acceptance::MergesetExecution) -> Self {
+        let receipts = exec
+            .receipts
+            .iter()
+            .map(|r| {
+                let mut r = r.clone();
+                r.block_hash = block.header.block_hash;
+                r.block_number = block.header.height;
+                r
+            })
+            .collect();
+        Self {
+            removals: Vec::new(),
+            receipts,
+            transactions: exec.executed.clone(),
+            reconcile_marker: None,
+        }
+    }
+
     /// Append another batch's entries (removals stay ahead of puts at commit time).
     /// A marker change in `other` replaces this batch's.
     pub fn extend(&mut self, other: ReceiptIndexBatch) {
@@ -761,6 +803,35 @@ pub trait StateStoreTrait: Send + Sync {
     /// `StateStore` overrides the batch methods and writes the index inside them.
     fn put_receipt_index(&self, _index: &ReceiptIndexBatch) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // CV-14: the MPT trie-node store. A CACHE of the state tries: a store that
+    // keeps none (these defaults, in-memory test stores) only makes a restart
+    // rebuild the trie from state; it never changes a root. `StateStore`
+    // (RocksDB) overrides them.
+    // ------------------------------------------------------------------------
+
+    /// A trie node's RLP by its keccak256 hash.
+    fn get_trie_node(&self, _hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Store `nodes` (hash, RLP) and record `root` as the state root of the
+    /// applied block at `height`. Records above `height` (an abandoned longer
+    /// branch) are dropped.
+    fn put_trie_nodes(
+        &self,
+        _height: u64,
+        _root: &Hash,
+        _nodes: &[([u8; 32], Vec<u8>)],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The state root recorded for the applied block at `height`.
+    fn trie_root_at(&self, _height: u64) -> anyhow::Result<Option<Hash>> {
+        Ok(None)
     }
 
     // ------------------------------------------------------------------------
@@ -955,11 +1026,13 @@ impl Executor {
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             defer_persist: std::sync::atomic::AtomicBool::new(false),
+            read_gate: parking_lot::RwLock::new(()),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
             pba_hardening_height: std::sync::atomic::AtomicU64::new(
                 citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
             ),
+            call_tracer: None,
         }
     }
 
@@ -1101,11 +1174,13 @@ impl Executor {
             block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
             commit_coordinator,
             defer_persist: std::sync::atomic::AtomicBool::new(false),
+            read_gate: parking_lot::RwLock::new(()),
             reward_policy: crate::block_rewards::new_shared_reward_policy(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(u64::MAX),
             pba_hardening_height: std::sync::atomic::AtomicU64::new(
                 citrate_consensus::hardening::pba_hardening_height().unwrap_or(u64::MAX),
             ),
+            call_tracer: None,
         }
     }
 
@@ -1158,6 +1233,11 @@ impl Executor {
     /// Return the persisted "latest" account state when storage exists.
     /// Falls back to in-memory state for test-only or non-persistent executors.
     pub fn get_canonical_account(&self, address: &Address) -> crate::types::AccountState {
+        let _shared = if StateTransition::held_here() {
+            None
+        } else {
+            Some(self.read_gate.read())
+        };
         self.get_account_from_store(address)
             .unwrap_or_else(|| self.state_db.accounts.get_account(address))
     }
@@ -1327,6 +1407,11 @@ impl Executor {
                 )?;
             }
 
+            // CV-14: the applied block's trie nodes, after its state.
+            if let Some((_, height)) = applied_tip {
+                self.persist_trie_nodes_at(store.as_ref(), height);
+            }
+
             // Commit state DB (clears dirty tracking)
             self.state_db.commit();
             Ok(count)
@@ -1346,52 +1431,64 @@ impl Executor {
         }
     }
 
-    /// Get account balance
+    /// Get account balance. A read only: see [`Self::peek_account`].
     pub fn get_balance(&self, address: &Address) -> U256 {
-        if self.state_db.accounts.exists(address) {
-            return self.state_db.accounts.get_balance(address);
-        }
-
-        if let Some(account) = self.get_account_from_store(address) {
-            self.state_db
-                .accounts
-                .load_account(*address, account.clone());
-            return account.balance;
-        }
-
-        self.state_db.accounts.get_balance(address)
+        self.peek_account(address).balance
     }
 
-    /// Get account nonce
+    /// Get account nonce. A read only: see [`Self::peek_account`].
     pub fn get_nonce(&self, address: &Address) -> u64 {
-        if self.state_db.accounts.exists(address) {
-            return self.state_db.accounts.get_nonce(address);
-        }
-
-        if let Some(account) = self.get_account_from_store(address) {
-            self.state_db
-                .accounts
-                .load_account(*address, account.clone());
-            return account.nonce;
-        }
-
-        self.state_db.accounts.get_nonce(address)
+        self.peek_account(address).nonce
     }
 
-    /// Get contract code hash
+    /// Get contract code hash. A read only: see [`Self::peek_account`].
     pub fn get_code_hash(&self, address: &Address) -> Hash {
+        self.peek_account(address).code_hash
+    }
+
+    /// The account as the working set holds it, else as the store holds it,
+    /// else empty. NEVER changes the working set.
+    ///
+    /// This is the read every caller outside execution uses (mempool admission,
+    /// block-candidate selection, RPC, tools). A read that loaded the store's
+    /// copy into the working set (the former `get_*`) could, concurrently with a
+    /// reorg, pin the abandoned branch's account in memory: the store still
+    /// holds that branch until the reconcile after the snapshot restore, and the
+    /// restore itself clears and refills the resident map. The reapply then ran
+    /// the winning branch on that account, and its commitments did not
+    /// reproduce. Execution's own reads load through [`Self::resident_account`].
+    fn peek_account(&self, address: &Address) -> crate::types::AccountState {
+        let _shared = if StateTransition::held_here() {
+            None
+        } else {
+            Some(self.read_gate.read())
+        };
         if self.state_db.accounts.exists(address) {
-            return self.state_db.accounts.get_code_hash(address);
+            return self.state_db.accounts.get_account(address);
         }
+        self.get_account_from_store(address)
+            .unwrap_or_else(|| self.state_db.accounts.get_account(address))
+    }
 
-        if let Some(account) = self.get_account_from_store(address) {
-            self.state_db
-                .accounts
-                .load_account(*address, account.clone());
-            return account.code_hash;
+    /// Execution's read: the working-set account, loaded from the store on a
+    /// miss so a following write updates the committed account rather than an
+    /// empty one. Only the apply, produce and settle paths call it, which own
+    /// the working set while they run.
+    pub(crate) fn resident_account(&self, address: &Address) -> crate::types::AccountState {
+        if !self.state_db.accounts.exists(address) {
+            if let Some(account) = self.get_account_from_store(address) {
+                self.state_db.accounts.load_account(*address, account);
+            }
         }
+        self.state_db.accounts.get_account(address)
+    }
 
-        self.state_db.accounts.get_code_hash(address)
+    /// A working-set transition (a snapshot restore, then the store reconcile
+    /// that matches it): external reads wait until it is dropped. Held across
+    /// synchronous code only. Re-entrant on the holding thread, so the restore
+    /// and reconcile it brackets can take it again.
+    pub fn state_transition(&self) -> StateTransition<'_> {
+        StateTransition::enter(&self.read_gate)
     }
 
     /// Get the state root hash from the current state database
@@ -1540,7 +1637,16 @@ impl Executor {
     /// NEVER mutates the shared consensus `state_db`.
     pub fn state_root_readonly(&self) -> Hash {
         let iso = Arc::new(StateDB::new());
-        iso.restore(self.state_db.snapshot());
+        let snapshot = {
+            // Never a half-restored working set (see `read_gate`).
+            let _shared = if StateTransition::held_here() {
+                None
+            } else {
+                Some(self.read_gate.read())
+            };
+            self.state_db.snapshot()
+        };
+        iso.restore(snapshot);
         iso.calculate_state_root()
     }
 
@@ -1556,6 +1662,7 @@ impl Executor {
     /// snapshot (byte-exact, incl. the accumulating state trie). Reverts the
     /// in-memory state to a fork point before re-applying the winning branch.
     pub fn state_restore(&self, snapshot: crate::state::StateSnapshot) {
+        let _transition = self.state_transition();
         self.state_db.restore(snapshot)
     }
 
@@ -1630,6 +1737,7 @@ impl Executor {
         undo: &[BlockUndo],
     ) -> anyhow::Result<()> {
         use std::collections::{HashMap, HashSet};
+        let _transition = self.state_transition();
         let store = match &self.state_store {
             Some(s) => s,
             None => return Ok(()),
@@ -1708,7 +1816,33 @@ impl Executor {
                 undo,
             )?;
         }
+        // CV-14: the winning tip's trie nodes, after its state.
+        if let Some((_, height)) = applied_tip {
+            self.persist_trie_nodes_at(store.as_ref(), height);
+        }
         Ok(())
+    }
+
+    /// CV-14: hand the current state's new trie nodes to `store`, recorded as
+    /// the root of the applied block at `height` (only under the MPT rule).
+    /// The node store is a cache (see `StateStoreTrait::get_trie_node`), so a
+    /// failed write is logged and the block stays committed: a restart then
+    /// rebuilds the trie from state.
+    fn persist_trie_nodes_at(&self, store: &dyn StateStoreTrait, height: u64) {
+        if !crate::mpt_state_root::mpt_state_root_active(height) {
+            return;
+        }
+        let mut write =
+            |root: &Hash, nodes: &[([u8; 32], Vec<u8>)]| store.put_trie_nodes(height, root, nodes);
+        match self.state_db.persist_trie_nodes(&mut write) {
+            Ok((root, n)) => debug!(
+                "trie nodes persisted: height {height}, root {}, {n} new node(s)",
+                hex::encode(&root.as_bytes()[..8])
+            ),
+            Err(e) => {
+                warn!("trie nodes not persisted at height {height} (restart will rebuild): {e}")
+            }
+        }
     }
 
     /// EXECUTE-ON-RECEIVE — the verified, revertible state-application atom.
@@ -1828,6 +1962,7 @@ impl Executor {
             coinbase,
             prevrandao: *block.header.vrf_reveal.output.as_bytes(),
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
 
         // Capture receipts so §R' can levy the priority fee on the EXACT gas each
@@ -2004,6 +2139,27 @@ impl Executor {
         Ok(())
     }
 
+    /// r1007 S3-3b: the structural part of the PBA body rule for a chain
+    /// block being applied: its tx root binds its own list. Its transactions'
+    /// signatures and chain id are checked where they run, when the block is
+    /// accepted (`execute_mergeset`), so each tx is authenticated once.
+    fn verify_block_body_structure(&self, block: &Block) -> Result<(), ExecutionError> {
+        let pba = self.pba_hardening();
+        let height = block.header.height;
+        if !pba.active_at(height) {
+            return Ok(());
+        }
+        let expected =
+            citrate_consensus::tx_auth::tx_root_for_height(pba, height, &block.transactions);
+        if block.tx_root != expected {
+            return Err(ExecutionError::InvalidBlockBody(format!(
+                "tx_root {} does not commit to the block's transactions (expected {expected})",
+                block.tx_root
+            )));
+        }
+        Ok(())
+    }
+
     /// PBA-R2: the block-validity hardening this executor enforces.
     pub fn pba_hardening(&self) -> citrate_consensus::hardening::PbaHardening {
         match self
@@ -2123,7 +2279,7 @@ impl Executor {
                 // producer's and a cold-sync's logs can be diffed at the wedge height.
                 let was_resident = std::env::var("CITRATE_SRP_DEBUG").is_ok()
                     && self.state_db.accounts.exists(addr);
-                let bal = self.get_balance(addr);
+                let bal = self.resident_account(addr).balance;
                 if std::env::var("CITRATE_SRP_DEBUG").is_ok() {
                     tracing::warn!(
                         target: "srp_s4",
@@ -2272,7 +2428,7 @@ impl Executor {
 
         // Transiently fund the minter so REVM's caller-balance precheck (>= value)
         // passes; gas price is 0 so nothing is charged. Recorded for restore.
-        let minter_before = self.get_balance(&minter);
+        let minter_before = self.resident_account(&minter).balance;
         let funded = minter_before.checked_add(amount).ok_or_else(|| {
             ExecutionError::RewardSettlement("transient minter funding overflows".into())
         })?;
@@ -2338,7 +2494,7 @@ impl Executor {
                 // contract-initiated transfer came to be silently discarded.
                 if value_semantics == crate::revm_adapter::ValueSemantics::LegacyDropInternal {
                     self.set_balance(&minter, minter_before);
-                    let reg_bal = self.get_balance(&registry_addr);
+                    let reg_bal = self.resident_account(&registry_addr).balance;
                     let credited = reg_bal.checked_add(amount).ok_or_else(|| {
                         ExecutionError::RewardSettlement("registry credit overflows balance".into())
                     })?;
@@ -2390,6 +2546,8 @@ impl Executor {
 
         // -- Fast path: bounded CAS retries with NO exec_lock held --
         for _attempt in 0..MAX_RETRIES {
+            // S3-7: a traced replay keeps the frames of the committed attempt.
+            self.trace_begin_attempt();
             let mut context = ExecutionContext::new(block, tx);
             let pin = coord.current_version();
             context.journal.lock().pin_at(pin);
@@ -2427,6 +2585,7 @@ impl Executor {
         // we then commit unconditionally (no read-set validation needed).
         // Progress is guaranteed (TLA+ `Progress` temporal property).
         let _guard = coord.acquire_exec_lock().await;
+        self.trace_begin_attempt();
         let mut context = ExecutionContext::new(block, tx);
         context.journal.lock().pin_at(coord.current_version());
         let (receipt, writes) = self
@@ -2436,6 +2595,14 @@ impl Executor {
         self.drain_journal(&context.journal);
         self.persist_account_versions(&writes, new_version);
         Ok(receipt)
+    }
+
+    /// S3-7: start a new attempt on the RPC call tracer, if one is attached
+    /// (never on the consensus executor, whose `call_tracer` is `None`).
+    fn trace_begin_attempt(&self) {
+        if let Some(t) = &self.call_tracer {
+            t.lock().begin_attempt();
+        }
     }
 
     /// Persist per-account + global MVCC versions to RocksDB.
@@ -2654,6 +2821,7 @@ impl Executor {
             eth_tx_type: tx.eth_tx_type,
             effective_gas_price: tx.gas_price,
             revert_reason,
+            acceptance: None,
         };
 
         info!(
@@ -2771,6 +2939,7 @@ impl Executor {
             // in-place simulate, minus the shared-state mutation.
             commit_coordinator: self.commit_coordinator.clone(),
             defer_persist: std::sync::atomic::AtomicBool::new(false),
+            read_gate: parking_lot::RwLock::new(()),
             reward_policy: self.reward_policy.clone(),
             validator_activation_height: std::sync::atomic::AtomicU64::new(
                 self.validator_activation_height
@@ -2780,7 +2949,67 @@ impl Executor {
                 self.pba_hardening_height
                     .load(std::sync::atomic::Ordering::SeqCst),
             ),
+            // S3-7: a traced replay executor's simulation stays traced
+            // (`debug_traceCall`); `None` on every other executor.
+            call_tracer: self.call_tracer.clone(),
         }
+    }
+
+    /// S3-7 (CNV-RPC): a throwaway executor over `state` for an RPC replay
+    /// (historical `eth_call`, `debug_traceTransaction`, `debug_traceCall`).
+    ///
+    /// Isolated from the node by construction:
+    /// - its own `StateDB`, restored from `state` (nothing is shared with the
+    ///   consensus state, not even the code map);
+    /// - its own MVCC `CommitCoordinator`, so committing replayed transactions
+    ///   never bumps the node's versions;
+    /// - `store` in place of the node's state store. The caller passes a
+    ///   store whose writes are discarded (the RPC passes a code-only reader,
+    ///   `citrate_api::historical_state`), or `None`.
+    ///
+    /// Chain id, gas schedule, reward policy, activation heights and the
+    /// inference/artifact adapters are copied from `self`, so a replayed
+    /// transaction runs under the rules the node runs it under.
+    pub fn replay_executor(
+        &self,
+        state: crate::state::StateSnapshot,
+        store: Option<Arc<dyn StateStoreTrait>>,
+    ) -> Executor {
+        let db = StateDB::new();
+        db.restore(state);
+        Executor {
+            state_db: Arc::new(db),
+            state_store: store,
+            gas_schedule: self.gas_schedule.clone(),
+            inference_service: self.inference_service.clone(),
+            artifact_service: self.artifact_service.clone(),
+            ai_storage: self.ai_storage.clone(),
+            model_registry: self.model_registry.clone(),
+            precompile_executor: self.precompile_executor.clone(),
+            chain_id: self.chain_id,
+            block_context: std::sync::RwLock::new(crate::revm_adapter::BlockContext::default()),
+            commit_coordinator: Arc::new(CommitCoordinator::new()),
+            defer_persist: std::sync::atomic::AtomicBool::new(false),
+            read_gate: parking_lot::RwLock::new(()),
+            reward_policy: self.reward_policy.clone(),
+            validator_activation_height: std::sync::atomic::AtomicU64::new(
+                self.validator_activation_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            pba_hardening_height: std::sync::atomic::AtomicU64::new(
+                self.pba_hardening_height
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            call_tracer: None,
+        }
+    }
+
+    /// S3-7: attach an RPC call tracer (`crate::trace`). Every REVM call or
+    /// create this executor runs for a transaction is recorded into `tracer`.
+    /// The inspector only observes; results are those of the untraced path.
+    pub fn with_call_tracer(mut self, tracer: crate::trace::CallTraceHandle) -> Self {
+        self.call_tracer = Some(tracer);
+        self
     }
 
     pub async fn simulate_transaction(
@@ -3364,16 +3593,24 @@ impl Executor {
         context: &mut ExecutionContext,
     ) -> Result<(), ExecutionError> {
         context.use_gas(self.gas_schedule.create)?;
+        // r1007 T2 (spec 06 §3.12): under supply hardening the deployment's
+        // value moves to the created contract. Below the activation (r1006
+        // history) it is checked against the balance and never transferred.
+        let value = if crate::supply_hardening::supply_hardening_active(context.block_number) {
+            U256::from(context.value)
+        } else {
+            U256::zero()
+        };
 
         // Execute deployment bytecode using revm (battle-tested EVM)
         // Revm will calculate the correct CREATE address and create the account
         // WP-Z.2: Pass block context so PREVRANDAO opcode returns real VRF output
         let gas_remaining = context.gas_limit.saturating_sub(context.gas_used);
-        let result = crate::revm_adapter::execute_contract_create_with_context(
+        let result = crate::revm_adapter::execute_contract_create_traced(
             self.state_db.clone(),
             from,
             code,
-            U256::zero(), // No value transfer during deployment
+            value,
             gas_remaining,
             U256::from(context.gas_price),
             self.chain_id,
@@ -3382,10 +3619,12 @@ impl Executor {
             self.get_block_context(),
             Some(context.writes_handle.clone()),
             Some(context.journal.clone()),
-            // Deployments carry no value on this path (see the U256::zero()
-            // above), but constructor code can still CALL out with value, so
-            // the same height gate applies.
+            // Constructor code can CALL out with value, and from supply
+            // hardening the deployment carries its own value, so the same
+            // height gate applies.
             crate::executor::value_semantics_at(context.block_number),
+            // S3-7: `None` except on an RPC trace replay executor.
+            self.call_tracer.as_ref(),
         );
 
         match result {
@@ -3483,7 +3722,7 @@ impl Executor {
         // the account from the persistent store on cache miss. Pairing
         // it with a parallel `state_store.get_code` fallback hydrates
         // the bytecode cache before REVM needs it.
-        let code_hash = self.get_code_hash(&to);
+        let code_hash = self.resident_account(&to).code_hash;
         let cached_code = self.state_db.get_code(&code_hash);
         let code_opt = match cached_code {
             Some(c) => Some(c),
@@ -3515,11 +3754,19 @@ impl Executor {
         // with contract code about what lives at those addresses. Gated on
         // the hardening activation (40204 pins it at genesis on the reroll)
         // so pre-activation history replays unchanged.
+        //
+        // r1007 T1 (spec 06 §3.12): under supply hardening a call to an account
+        // without code runs in REVM like any other call, so its value moves and
+        // it pays EVM gas. Below the activation (r1006 history) nothing runs and
+        // no value moves, unchanged.
         let code_len = match &code_opt {
             Some(code) => Some(code.len()),
             None if crate::activation::pba_hardening_active(context.block_number)
                 && crate::revm_adapter::is_revm_precompile_at(&to, context.block_number) =>
             {
+                Some(0)
+            }
+            None if crate::supply_hardening::supply_hardening_active(context.block_number) => {
                 Some(0)
             }
             None => None,
@@ -3540,7 +3787,7 @@ impl Executor {
             );
             let available_gas = context.gas_limit.saturating_sub(context.gas_used);
             // WP-Z.2: Pass block context so PREVRANDAO opcode returns real VRF output
-            match crate::revm_adapter::execute_contract_call_with_context(
+            match crate::revm_adapter::execute_contract_call_traced(
                 self.state_db.clone(),
                 from,
                 to,
@@ -3558,6 +3805,8 @@ impl Executor {
                 // hydrate account / code / storage on cold cache miss.
                 self.state_store.clone(),
                 value_semantics,
+                // S3-7: `None` except on an RPC trace replay executor.
+                self.call_tracer.as_ref(),
             ) {
                 Ok((output, gas_used, revm_logs)) => {
                     VM_EXECUTIONS_TOTAL.with_label_values(&["ok"]).inc();
@@ -4652,6 +4901,42 @@ impl Executor {
     }
 }
 
+thread_local! {
+    /// How many [`StateTransition`]s this thread holds (re-entrancy).
+    static TRANSITIONS_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The exclusive side of [`Executor::state_transition`]. Not `Send`: it is
+/// held across synchronous code on one thread, never across an `.await`.
+pub struct StateTransition<'a> {
+    _exclusive: Option<parking_lot::RwLockWriteGuard<'a, ()>>,
+}
+
+impl<'a> StateTransition<'a> {
+    fn enter(gate: &'a parking_lot::RwLock<()>) -> Self {
+        let outer = TRANSITIONS_HELD.with(|n| {
+            let held = n.get();
+            n.set(held.saturating_add(1));
+            held == 0
+        });
+        Self {
+            _exclusive: if outer { Some(gate.write()) } else { None },
+        }
+    }
+
+    /// Whether this thread holds a transition (its own reads then skip the
+    /// shared gate instead of waiting on itself).
+    fn held_here() -> bool {
+        TRANSITIONS_HELD.with(|n| n.get() > 0)
+    }
+}
+
+impl Drop for StateTransition<'_> {
+    fn drop(&mut self) {
+        TRANSITIONS_HELD.with(|n| n.set(n.get().saturating_sub(1)));
+    }
+}
+
 #[cfg(test)]
 #[path = "executor_journal_routing_tests.rs"]
 mod journal_routing_tests;
@@ -4840,6 +5125,7 @@ mod tests {
                 coinbase: CB,
                 prevrandao: [0x5A; 32],
                 block_hashes: std::collections::HashMap::new(),
+                gas_limit: None,
             });
             let tx = create_test_tx(alice, Some(bob), 1000, 0);
             let blk = block_with(vec![tx.clone()], Hash::default());
@@ -4962,6 +5248,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: vrf_output,
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
 
         let block = create_test_block();

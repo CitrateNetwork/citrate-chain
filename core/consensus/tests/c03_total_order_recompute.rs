@@ -9,6 +9,10 @@
 // `ghostdag.calculate_blue_score(&block)`. The header value is
 // ignored for ordering purposes.
 //
+// r1007 S3-1 (CV-3): the admission rule is now exact equality with the
+// GHOSTDAG score (`BlueScoreMismatch`), not the old feasibility band
+// (`BlueScoreOutOfRange`); on these merge-free children the two coincide.
+//
 // SECREM-01 (pre-audit 2026-06-09, CONS-2/3) strengthened the model:
 // `GhostDag::add_block` now REJECTS out-of-band header scores at
 // admission (`validate_block_consistency`), so a u64::MAX header lie
@@ -79,7 +83,7 @@ async fn c03_malicious_blue_score_ignored_by_ordering() {
     assert!(
         matches!(
             err,
-            GhostDagError::BlueScoreOutOfRange {
+            GhostDagError::BlueScoreMismatch {
                 claimed: u64::MAX,
                 ..
             }
@@ -116,7 +120,7 @@ async fn c03_recomputed_score_invariant_under_header_lies() {
         assert!(
             matches!(
                 ghostdag.add_block(&liar).await,
-                Err(GhostDagError::BlueScoreOutOfRange { .. })
+                Err(GhostDagError::BlueScoreMismatch { .. })
             ),
             "header score {lie} admitted on a child of genesis (band is {{2}})"
         );

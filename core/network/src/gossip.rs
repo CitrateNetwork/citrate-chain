@@ -8,7 +8,8 @@ use crate::{
 };
 use citrate_consensus::types::{Block, Hash, PublicKey, Transaction};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -86,6 +87,57 @@ impl Default for GossipConfig {
     }
 }
 
+/// What [`GossipProtocol::handle_new_block`] did with a block that is not
+/// invalid. Only [`BlockGossip::Relayed`] and [`BlockGossip::AlreadyRelayed`]
+/// may go on to admission: a held block
+/// is handed back by [`GossipProtocol::take_due_held_blocks`] once its slot
+/// arrives, and goes through `handle_new_block` again then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockGossip {
+    /// Valid now: relayed to peers; admit it.
+    Relayed,
+    /// Already validated and relayed earlier (a duplicate); admission is
+    /// idempotent, so it may be admitted as before.
+    AlreadyRelayed,
+    /// Valid but early (r1007 G9 ingress, spec "hold, rather than reject"):
+    /// its timestamp is past the 15 s drift and within
+    /// [`citrate_consensus::slots::HELD_FUTURE_HORIZON_SECS`]. Held, not
+    /// relayed, not admitted, and the sender is not penalized.
+    Held,
+    /// Valid but early, and the hold is full for this sender or in total.
+    /// Dropped without a penalty; sync fetches it once it is due.
+    HoldFull,
+}
+
+/// At most this many early blocks are held at once (r1007 G9 ingress).
+pub const MAX_HELD_BLOCKS: usize = 64;
+
+/// At most this many held blocks per sending peer, so one peer (or one key
+/// signing junk for future slots) cannot take the whole hold.
+pub const MAX_HELD_BLOCKS_PER_PEER: usize = 8;
+
+/// At most this many serialized bytes held in total.
+pub const MAX_HELD_BYTES: usize = 16 * 1024 * 1024;
+
+/// One early block in the hold.
+#[derive(Debug, Clone)]
+struct HeldBlock {
+    from: PeerId,
+    block: Block,
+    size: usize,
+}
+
+/// Result of the gossip checks on one block.
+enum BlockCheck {
+    Valid,
+    /// Valid except that it is early, within the hold horizon; `size` is its
+    /// serialized length.
+    Early {
+        size: usize,
+    },
+    Invalid,
+}
+
 /// Seen item tracking
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -132,6 +184,16 @@ pub struct GossipProtocol {
     /// PBA-R2 block-validity hardening: selects the `tx_root` rule by height
     /// (PBA-L1b-002). See `citrate_consensus::hardening`.
     pba_hardening: citrate_consensus::hardening::PbaHardening,
+
+    /// r1007 G9 ingress: early but otherwise valid blocks, by hash, until
+    /// their slot is inside the drift. Bounded by [`MAX_HELD_BLOCKS`],
+    /// [`MAX_HELD_BLOCKS_PER_PEER`] and [`MAX_HELD_BYTES`].
+    held: parking_lot::Mutex<BTreeMap<Hash, HeldBlock>>,
+
+    /// Milliseconds added to the wall clock the time checks read. `None` in a
+    /// node; a simulation or test that runs on its own time sets it
+    /// ([`Self::with_clock_offset`], as `SyncManager::with_clock_offset`).
+    clock_offset_ms: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug, Default)]
@@ -157,7 +219,87 @@ impl GossipProtocol {
             learning_data: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(GossipStats::default())),
             pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
+            held: parking_lot::Mutex::new(BTreeMap::new()),
+            clock_offset_ms: None,
         }
+    }
+
+    /// Judge block timestamps against the wall clock plus `offset`
+    /// milliseconds, so a simulated network's time checks follow its own time.
+    pub fn with_clock_offset(mut self, offset: Arc<AtomicU64>) -> Self {
+        self.clock_offset_ms = Some(offset);
+        self
+    }
+
+    /// The wall clock (seconds since the UNIX epoch) the time checks read.
+    fn now_secs(&self) -> u64 {
+        let offset_secs = self
+            .clock_offset_ms
+            .as_ref()
+            .map(|o| o.load(Ordering::Relaxed) / 1_000)
+            .unwrap_or(0);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(offset_secs)
+    }
+
+    /// How many early blocks are held now.
+    pub fn held_block_count(&self) -> usize {
+        self.held.lock().len()
+    }
+
+    /// Remove and return the held blocks whose timestamp is now inside the
+    /// drift, each with the peer it came from, oldest timestamp first. The
+    /// caller feeds each one back through [`Self::handle_new_block`] (in a
+    /// node: the inbound message queue, as a `NewBlock` from that peer), where
+    /// it is validated again and, now timely, relayed and admitted.
+    pub fn take_due_held_blocks(&self) -> Vec<(PeerId, Block)> {
+        let now = self.now_secs();
+        let mut held = self.held.lock();
+        let due: Vec<Hash> = held
+            .iter()
+            .filter(|(_, h)| {
+                citrate_consensus::hardening::within_future_drift(h.block.header.timestamp, now)
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        let mut out: Vec<(PeerId, Block)> = due
+            .iter()
+            .filter_map(|hash| held.remove(hash))
+            .map(|h| (h.from, h.block))
+            .collect();
+        drop(held);
+        out.sort_by_key(|(_, b)| (b.header.timestamp, b.header.block_hash));
+        out
+    }
+
+    /// Put an early block in the hold, within its bounds. A block already
+    /// held stays held once, under the peer that sent it first.
+    pub fn hold_early_block(&self, from: &PeerId, block: Block, size: usize) -> BlockGossip {
+        let hash = block.header.block_hash;
+        let mut held = self.held.lock();
+        if held.contains_key(&hash) {
+            return BlockGossip::Held;
+        }
+        let from_peer = held.values().filter(|h| &h.from == from).count();
+        let bytes: usize = held.values().map(|h| h.size).fold(0, usize::saturating_add);
+        if held.len() >= MAX_HELD_BLOCKS
+            || from_peer >= MAX_HELD_BLOCKS_PER_PEER
+            || bytes.saturating_add(size) > MAX_HELD_BYTES
+        {
+            return BlockGossip::HoldFull;
+        }
+        held.insert(
+            hash,
+            HeldBlock {
+                from: from.clone(),
+                block,
+                size,
+            },
+        );
+        BlockGossip::Held
     }
 
     /// The PBA-R2 hardening activation this instance enforces.
@@ -175,11 +317,16 @@ impl GossipProtocol {
     }
 
     /// Handle new block announcement
+    ///
+    /// Only `Ok(BlockGossip::Relayed | BlockGossip::AlreadyRelayed)` may be
+    /// admitted. An
+    /// early but otherwise valid block (r1007 G9 ingress) is held without a
+    /// penalty and returned by [`Self::take_due_held_blocks`] once due.
     pub async fn handle_new_block(
         &self,
         block: Block,
         from_peer: &PeerId,
-    ) -> Result<(), NetworkError> {
+    ) -> Result<BlockGossip, NetworkError> {
         let hash = block.hash();
 
         // Check if already seen
@@ -189,7 +336,7 @@ impl GossipProtocol {
                     let mut stats = self.stats.write().await;
                     stats.duplicates_filtered = stats.duplicates_filtered.saturating_add(1);
                 }
-                return Ok(());
+                return Ok(BlockGossip::AlreadyRelayed);
             }
         }
 
@@ -209,16 +356,33 @@ impl GossipProtocol {
         }
 
         // Validate block (full integrity checks — WP-G.3)
-        if !self.validate_block(&block).await {
-            warn!("Block validation failed from {}: {}", from_peer, hash);
-            // Penalize peer for sending invalid block
-            self.peer_manager
-                .update_peer_score(from_peer, SCORE_INVALID_BLOCK)
-                .await;
-            return Err(NetworkError::InvalidMessage(format!(
-                "Block {} failed validation",
-                hash
-            )));
+        match self.validate_block(&block).await {
+            BlockCheck::Valid => {}
+            BlockCheck::Early { size } => {
+                // r1007 G9 ingress: early is not invalid. No penalty, no
+                // relay; the seen entry stays unpropagated so the release
+                // (or a re-send) is validated again.
+                let out = self.hold_early_block(from_peer, block, size);
+                debug!(
+                    "[TIMESTAMP_EARLY] block={} from={} -> {:?} (held {})",
+                    hash,
+                    from_peer,
+                    out,
+                    self.held_block_count()
+                );
+                return Ok(out);
+            }
+            BlockCheck::Invalid => {
+                warn!("Block validation failed from {}: {}", from_peer, hash);
+                // Penalize peer for sending invalid block
+                self.peer_manager
+                    .update_peer_score(from_peer, SCORE_INVALID_BLOCK)
+                    .await;
+                return Err(NetworkError::InvalidMessage(format!(
+                    "Block {} failed validation",
+                    hash
+                )));
+            }
         }
 
         // Reward peer for valid block relay
@@ -229,7 +393,7 @@ impl GossipProtocol {
         // Propagate to other peers
         self.propagate_block(block.clone(), from_peer).await?;
 
-        Ok(())
+        Ok(BlockGossip::Relayed)
     }
 
     /// Handle new transaction announcement
@@ -602,14 +766,16 @@ impl GossipProtocol {
     /// Checks performed (in order):
     /// 1. BLOCK_OVERSIZED — serialized size exceeds transport limit
     /// 2. INVALID_HEIGHT — height=0 on non-genesis
-    /// 3. TIMESTAMP_FUTURE — timestamp > now + 15min
+    /// 3. TIMESTAMP_FUTURE — timestamp > now + HELD_FUTURE_HORIZON_SECS is
+    ///    invalid; past MAX_FUTURE_BLOCK_DRIFT_SECS (15 s) but within it, the
+    ///    block is early (r1007 G9 ingress: held, not rejected)
     /// 4. ZERO_BLUE_SCORE — non-genesis with blue_score=0
     /// 5. MISSING_VRF — non-genesis without VRF proof
     /// 6. MISSING_PARENT — non-genesis with zero selected_parent_hash
     /// 7. HASH_MISMATCH — recomputed hash differs from advertised (C-05)
     /// 8. TX_ROOT_MISMATCH — recomputed tx_root differs from header
     /// 9. INVALID_SIGNATURE — ed25519 signature verification failed (WP-G.2)
-    async fn validate_block(&self, block: &Block) -> bool {
+    async fn validate_block(&self, block: &Block) -> BlockCheck {
         // SECREM-A001: genesis is an IDENTITY, not a shape. Compute it once
         // and use it for every exemption below, so a block shaped like
         // genesis at an arbitrary height cannot skip the parent / VRF /
@@ -627,7 +793,7 @@ impl GossipProtocol {
                     "[BLOCK_SERIALIZE_FAIL] block={} err={} — rejecting",
                     block.header.block_hash, e
                 );
-                return false;
+                return BlockCheck::Invalid;
             }
         };
         if size > self.config.max_message_size {
@@ -635,39 +801,42 @@ impl GossipProtocol {
                 "[BLOCK_OVERSIZED] block={} size={}",
                 block.header.block_hash, size
             );
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 2. INVALID_HEIGHT
         if block.header.height == 0 && !is_genesis {
             warn!("[INVALID_HEIGHT] block={}", block.header.block_hash);
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 3. TIMESTAMP_FUTURE
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Shared with the sync ingress (PBA-L1b-003); saturating.
-        if !citrate_consensus::hardening::within_future_drift(block.header.timestamp, now) {
+        let now = self.now_secs();
+        // Shared with the sync ingress (PBA-L1b-003); saturating. r1007 G9:
+        // past the 15 s drift but within the hold horizon the block is early,
+        // not invalid; it is held if every other check passes (below).
+        let early = !citrate_consensus::hardening::within_future_drift(block.header.timestamp, now);
+        if early
+            && block.header.timestamp
+                > now.saturating_add(citrate_consensus::slots::HELD_FUTURE_HORIZON_SECS)
+        {
             warn!(
                 "[TIMESTAMP_FUTURE] block={} ts={} now={}",
                 block.header.block_hash, block.header.timestamp, now
             );
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 4. ZERO_BLUE_SCORE
         if block.header.blue_score == 0 && !is_genesis {
             warn!("[ZERO_BLUE_SCORE] block={}", block.header.block_hash);
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 5. MISSING_VRF
         if !is_genesis && block.header.vrf_reveal.proof.is_empty() {
             warn!("[MISSING_VRF] block={}", block.header.block_hash);
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 5a. INVALID_PROPOSER_PUBKEY — RM-B1 / WP-B3.1 (audit C-02):
@@ -683,13 +852,13 @@ impl GossipProtocol {
                 block.header.block_hash,
                 hex::encode(block.header.proposer_pubkey.as_bytes())
             );
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 6. MISSING_PARENT — non-genesis must reference a selected parent
         if !is_genesis && block.header.selected_parent_hash == Hash::default() {
             warn!("[MISSING_PARENT] block={}", block.header.block_hash);
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 7. HASH_MISMATCH — recompute canonical hash from all fields (C-05)
@@ -699,7 +868,7 @@ impl GossipProtocol {
                 block.header.block_hash,
                 block.compute_hash_for(self.pba_hardening)
             );
-            return false;
+            return BlockCheck::Invalid;
         }
 
         // 8. TX_ROOT_MISMATCH — verify tx_root matches transactions in block
@@ -715,7 +884,7 @@ impl GossipProtocol {
                     "[TX_ROOT_MISMATCH] block={} expected={} computed={}",
                     block.header.block_hash, block.tx_root, computed_tx_root
                 );
-                return false;
+                return BlockCheck::Invalid;
             }
         }
 
@@ -729,19 +898,23 @@ impl GossipProtocol {
                         block.header.block_hash,
                         hex::encode(block.header.proposer_pubkey.as_bytes())
                     );
-                    return false;
+                    return BlockCheck::Invalid;
                 }
                 Err(e) => {
                     warn!(
                         "[INVALID_SIGNATURE] block={} error={}",
                         block.header.block_hash, e
                     );
-                    return false;
+                    return BlockCheck::Invalid;
                 }
             }
         }
 
-        true
+        if early {
+            BlockCheck::Early { size }
+        } else {
+            BlockCheck::Valid
+        }
     }
 
     /// Validate transaction (basic checks)

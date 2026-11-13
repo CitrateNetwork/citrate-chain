@@ -136,6 +136,34 @@ impl RocksDB {
         Ok(db)
     }
 
+    /// Open an existing database READ-ONLY (no encryption at rest), with
+    /// every column family it has. Nothing is created and nothing can be
+    /// written: a write through the handle fails at RocksDB. Works while the
+    /// node that owns the directory is running (RocksDB read-only opens take
+    /// no lock), so tools such as the replay recorder
+    /// (`tools/replay-ref`) can dump a live node's data dir.
+    ///
+    /// An encrypted database is refused (its values need the key).
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if EncryptionMeta::load(path)?.is_some() {
+            return Err(
+                AtRestError::EncryptedDbWithoutEncryption(path.display().to_string()).into(),
+            );
+        }
+        let opts = Options::default();
+        let cfs = DB::list_cf(&opts, path)?;
+        let db = DB::open_cf_for_read_only(&opts, path, cfs, false)?;
+        let db = Self {
+            db: Arc::new(db),
+            cipher: None,
+            write_batch_count: Arc::new(AtomicU64::new(0)),
+            write_batch_sync_count: Arc::new(AtomicU64::new(0)),
+        };
+        db.probe_for_sealed_values(path)?;
+        Ok(db)
+    }
+
     /// Open database with encryption at rest enabled.
     ///
     /// Key/meta lifecycle (see [`AtRestCipher::open_or_init`]): a fresh
@@ -443,6 +471,36 @@ impl RocksDB {
         Ok(())
     }
 
+    /// Visit the keys of `cf` from `from` (inclusive) up to `to` (exclusive;
+    /// `None`: no upper bound) that start with `prefix`, in key order, without
+    /// reading values or collecting them. The scan ends at the first key past
+    /// `to` or without `prefix`. Errors end the scan as in
+    /// [`Self::for_each_prefix_key_cf`].
+    pub fn for_each_key_in_range_cf(
+        &self,
+        cf: &str,
+        from: &[u8],
+        to: Option<&[u8]>,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cf_handle = self.cf_handle(cf)?;
+        let mode = rocksdb::IteratorMode::From(from, rocksdb::Direction::Forward);
+        for item in self.db.iterator_cf(&cf_handle, mode) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if let Some(end) = to {
+                if key.as_ref() >= end {
+                    break;
+                }
+            }
+            visit(&key)?;
+        }
+        Ok(())
+    }
+
     /// Compact a column family
     pub fn compact_cf(&self, cf: &str) -> Result<()> {
         let cf_handle = self.cf_handle(cf)?;
@@ -526,6 +584,35 @@ impl Clone for RocksDB {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The replay recorder's open: reads what a writer left, beside a live
+    /// writer too, and can never write.
+    #[test]
+    fn read_only_open_reads_and_never_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let writer = RocksDB::open(dir.path()).expect("open");
+        writer.put_cf("blocks", b"k", b"v").expect("put");
+        writer.flush().expect("flush");
+        let reader = RocksDB::open_read_only(dir.path()).expect("read-only open");
+        assert_eq!(
+            reader.get_cf("blocks", b"k").expect("get"),
+            Some(b"v".to_vec())
+        );
+        assert!(
+            reader.put_cf("blocks", b"k2", b"v").is_err(),
+            "a write went through"
+        );
+        drop(writer);
+        let reader2 = RocksDB::open_read_only(dir.path()).expect("reopen");
+        assert_eq!(
+            reader2.get_cf("blocks", b"k").expect("get"),
+            Some(b"v".to_vec())
+        );
+        assert!(
+            RocksDB::open_read_only(dir.path().join("missing")).is_err(),
+            "nothing is created"
+        );
+    }
 
     #[test]
     fn memory_budget_overrides_parse_and_clamp() {

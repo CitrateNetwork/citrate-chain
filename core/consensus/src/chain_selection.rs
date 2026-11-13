@@ -141,10 +141,26 @@ impl ChainSelector {
 
         let current_chain = self.current_chain.read().await;
         let current_score = current_chain.blue_score;
+        let current_tip = current_chain.tip;
         drop(current_chain);
 
+        // r1007 G8: the better chain is the one whose tip has the larger
+        // ForkChoiceKey (blue_work, vrf_output, hash) over committed header
+        // values, the order `GhostDag::select_tip` uses. With no current tip
+        // key (an empty chain) the score comparison decides, as before.
+        let new_key = self.ghostdag.fork_choice_key(&block.hash()).await;
+        let current_key = if current_tip == Hash::default() {
+            None
+        } else {
+            self.ghostdag.fork_choice_key(&current_tip).await
+        };
+        let heavier = match (new_key, current_key) {
+            (Some(n), Some(c)) => n > c,
+            _ => new_blue_score > current_score,
+        };
+
         // Check if new block creates a better chain
-        if new_blue_score > current_score {
+        if heavier {
             info!(
                 "New block {} has higher blue score ({} > {}), considering reorg",
                 block.hash(),

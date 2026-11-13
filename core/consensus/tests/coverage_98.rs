@@ -32,15 +32,16 @@ fn make_block(hash_byte: u8, height: u64, blue_score: u64, parent: Hash) -> Bloc
         .build_unhashed()
 }
 
-fn make_block_with_merge(
-    hash_byte: u8,
-    height: u64,
-    blue_score: u64,
-    selected_parent: Hash,
-    merge_parents: Vec<Hash>,
-) -> Block {
-    let mut block = make_block(hash_byte, height, blue_score, selected_parent);
-    block.header.merge_parent_hashes = merge_parents;
+/// r1007 (S3-1): a block naming `parents`, with the header the producer
+/// writes: the heaviest parent as selected parent (G3) and the GHOSTDAG
+/// blue_score / blue_work (G7).
+async fn sealed(ghostdag: &GhostDag, hash_byte: u8, parents: Vec<Hash>) -> Block {
+    let (sp, merges, height, data) = ghostdag
+        .ghostdag_for_parents(&parents)
+        .await
+        .expect("valid parents");
+    let mut block = make_block(hash_byte, height, data.blue_score, sp);
+    block.header.merge_parent_hashes = merges;
     block
 }
 
@@ -117,7 +118,13 @@ fn make_pubkey(id: u8) -> PublicKey {
 /// match the verifier's expectation byte-for-byte.
 fn sign_vote(height: u64, block_hash: &Hash, signing_key: &ed25519_dalek::SigningKey) -> Signature {
     use ed25519_dalek::Signer;
-    let message = citrate_consensus::checkpoint::canonical_vote_message(40204, height, block_hash);
+    let message = citrate_consensus::checkpoint::canonical_vote_message(
+        40204,
+        &citrate_consensus::types::Hash::default(),
+        height,
+        block_hash,
+        &tb(),
+    );
     let sig = signing_key.sign(&message);
     Signature::new(sig.to_bytes())
 }
@@ -126,6 +133,7 @@ fn sign_vote(height: u64, block_hash: &Hash, signing_key: &ed25519_dalek::Signin
 fn make_signed_vote(id: u8, height: u64, block_hash: &Hash) -> CheckpointVote {
     let sk = make_signing_key(id);
     CheckpointVote {
+        binding: tb(),
         height,
         block_hash: *block_hash,
         voter: make_pubkey(id),
@@ -289,20 +297,18 @@ async fn test_extends_current_chain_via_merge_parent() {
     let b2 = make_block(0x52, 2, 3, b1.hash());
     dag_store.store_block(b2.clone()).await.unwrap();
     ghostdag.add_block(&b2).await.unwrap();
-    // Equal score → no reorg; current tip is still A2.
-    let _ = cs.on_new_block(&b2).await;
+    // r1007 G8: at equal work B2 is the heavier key (0x52 > 0x42), so the
+    // selector is NOT told about B2 on its own (it would reorg to it); B2
+    // reaches the selector only inside the probe block's past. The current
+    // tip is still A2.
     assert_eq!(cs.get_chain_state().await.tip, current_tip);
 
-    // The probe block: selected parent is B2 (NOT the current tip), merge
-    // parent IS the current tip, equal scores so the merge is admissible.
-    // Band for one merge parent: [4, 5] — claim 4.
-    let merge_block = make_block_with_merge(
-        0x50,
-        3,
-        4,
-        b2.hash(),         // selected parent is fork tip B2
-        vec![current_tip], // merge parent is current tip A2
-    );
+    // The probe block: selected parent is B2 (NOT the current tip; G3 makes
+    // it the selected parent as the heavier key), merge parent IS the current
+    // tip. The header carries the GHOSTDAG score (G7).
+    let merge_block = sealed(&ghostdag, 0x50, vec![b2.hash(), current_tip]).await;
+    assert_eq!(merge_block.selected_parent(), b2.hash());
+    assert_eq!(merge_block.header.merge_parent_hashes, vec![current_tip]);
     dag_store.store_block(merge_block.clone()).await.unwrap();
     ghostdag.add_block(&merge_block).await.unwrap();
 
@@ -542,8 +548,10 @@ async fn test_on_new_block_equal_score_no_reorg() {
     }
     // Tip is blocks[2], ghostdag score = 3
 
-    // Create a sibling of blocks[2] from blocks[1] — same depth, so same score = 3
-    let sibling = make_block(0xF0, 2, 3, blocks[1].hash());
+    // Create a sibling of blocks[2] from blocks[1] — same depth, so same score = 3.
+    // r1007 G8: equal work breaks on the key, so the sibling must also be the
+    // lighter key (a smaller hash) not to be preferred.
+    let sibling = make_block(0x01, 2, 3, blocks[1].hash());
     dag_store.store_block(sibling.clone()).await.unwrap();
     ghostdag.add_block(&sibling).await.unwrap();
 
@@ -698,8 +706,8 @@ async fn test_select_highest_blue_score_with_tiebreak_hash_ordering() {
     );
 
     let result = ts.select_current_tip().await.unwrap();
-    // Tie-break: sort candidates, pick first. [0x10;32] < [0x20;32] so child1 wins.
-    assert_eq!(result, child1.hash());
+    // r1007 G8 tie-break: the larger ForkChoiceKey. [0x20;32] > [0x10;32] so child2 wins.
+    assert_eq!(result, child2.hash());
 }
 
 // --- select_weighted_random ---
@@ -941,7 +949,13 @@ async fn test_checkpoint_status_finalized() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..4u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -963,7 +977,13 @@ async fn test_checkpoint_status_pending() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         mgr.checkpoint_status(5).await,
@@ -990,7 +1010,13 @@ async fn test_pending_vote_count_with_votes() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..2u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -1008,7 +1034,13 @@ async fn test_pending_vote_count_zero_votes() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(mgr.pending_vote_count(5).await, Some(0));
 }
@@ -1051,10 +1083,18 @@ fn test_committee_selector_single_validator() {
 
 #[test]
 fn test_committee_selector_zero_stake_validators() {
+    // #185: the quorum counts stake, so a zero-stake validator can never
+    // contribute to one and is not selected (it used to be, at weight 1).
     let validators: Vec<(PublicKey, u128)> = (0..5).map(|i| (make_pubkey(i), 0)).collect();
     let seed = Hash::new([7; 32]);
     let committee = CommitteeSelector::select(&validators, 50, &seed, 3);
-    assert_eq!(committee.len(), 3);
+    assert!(committee.is_empty());
+    let mut mixed = validators.clone();
+    mixed.push((make_pubkey(9), 5));
+    assert_eq!(
+        CommitteeSelector::select(&mixed, 50, &seed, 3),
+        vec![make_pubkey(9)]
+    );
 }
 
 #[test]
@@ -1078,7 +1118,9 @@ fn test_checkpoint_has_quorum() {
     let cp = Checkpoint {
         height: 50,
         block_hash: Hash::new([1; 32]),
+        binding: tb(),
         committee: vec![],
+        stakes: vec![],
         votes,
         status: CheckpointStatus::Pending,
     };
@@ -1097,7 +1139,9 @@ fn test_checkpoint_vote_count() {
     let cp = Checkpoint {
         height: 50,
         block_hash: Hash::new([1; 32]),
+        binding: tb(),
         committee: vec![],
+        stakes: vec![],
         votes,
         status: CheckpointStatus::Pending,
     };
@@ -1144,7 +1188,13 @@ async fn test_propose_not_checkpoint_boundary() {
     let blocks = build_checkpoint_chain(&dag, 4).await;
     let mgr = CheckpointManager::new(config, dag);
 
-    let result = mgr.propose(3, blocks[3].hash(), vec![]).await;
+    let result = mgr
+        .propose(
+            3,
+            blocks[3].hash(),
+            citrate_consensus::checkpoint::Committee::equal_stake(0, vec![]),
+        )
+        .await;
     assert!(matches!(
         result,
         Err(CheckpointError::NotCheckpointBoundary)
@@ -1157,7 +1207,13 @@ async fn test_propose_block_not_found() {
     let config = CheckpointConfig::for_testing();
     let mgr = CheckpointManager::new(config, dag);
 
-    let result = mgr.propose(5, Hash::new([0xAA; 32]), vec![]).await;
+    let result = mgr
+        .propose(
+            5,
+            Hash::new([0xAA; 32]),
+            citrate_consensus::checkpoint::Committee::equal_stake(0, vec![]),
+        )
+        .await;
     assert!(matches!(result, Err(CheckpointError::BlockNotFound(_))));
 }
 
@@ -1169,11 +1225,21 @@ async fn test_propose_already_exists() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee.clone())
-        .await
-        .unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee.clone()),
+    )
+    .await
+    .unwrap();
 
-    let result = mgr.propose(5, blocks[5].hash(), committee).await;
+    let result = mgr
+        .propose(
+            5,
+            blocks[5].hash(),
+            citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+        )
+        .await;
     assert!(matches!(result, Err(CheckpointError::AlreadyExists(5))));
 }
 
@@ -1187,7 +1253,13 @@ async fn test_finalize_checkpoint_without_quorum_rejected() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..2u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -1217,10 +1289,17 @@ async fn test_submit_vote_wrong_block_hash() {
     let mgr = CheckpointManager::new(config, dag);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     let wrong_hash = Hash::new([0xDE; 32]);
     let vote = CheckpointVote {
+        binding: tb(),
         height: 5,
         block_hash: wrong_hash,
         voter: make_pubkey(0),
@@ -1243,7 +1322,13 @@ async fn test_latest_finalized_height_and_get_checkpoint() {
     assert_eq!(mgr.latest_finalized_height().await, 0);
 
     let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-    mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+    mgr.propose(
+        5,
+        blocks[5].hash(),
+        citrate_consensus::checkpoint::Committee::equal_stake(0, committee),
+    )
+    .await
+    .unwrap();
 
     for i in 0..4u8 {
         let vote = make_signed_vote(i, 5, &blocks[5].hash());
@@ -1337,4 +1422,15 @@ fn test_chain_state_default_values() {
     };
     assert_eq!(state.tip, Hash::new([0; 32]));
     assert!(state.selected_chain.is_empty());
+}
+
+/// S3-5 (spec 06 §7): the binding a vote for a test block carries: epoch 0,
+/// the default state root test blocks have, the empty accepted root.
+#[allow(dead_code)]
+fn tb() -> citrate_consensus::checkpoint::VoteBinding {
+    citrate_consensus::checkpoint::VoteBinding {
+        epoch: 0,
+        state_root: citrate_consensus::types::Hash::default(),
+        accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+    }
 }

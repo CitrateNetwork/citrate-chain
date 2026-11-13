@@ -652,10 +652,19 @@ impl SyncManager {
         let mut validated = Vec::with_capacity(total);
         let mut rejected = 0usize;
 
+        // The wall clock, plus a simulation's clock offset (none in a node), so
+        // a simulated network that stamps blocks with its own time judges them
+        // against that time (r1007 G9: the drift is 15 s, not 900 s).
+        let offset_secs = self
+            .clock_offset_ms
+            .as_ref()
+            .map(|o| o.load(Ordering::Relaxed) / 1_000)
+            .unwrap_or(0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_secs()
+            .saturating_add(offset_secs);
         for block in blocks {
             // 0. PBA-L1b-003: the same wall-clock future bound gossip applies.
             // This path (which also receives unsolicited `Blocks`) skipped it,
