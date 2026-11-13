@@ -71,6 +71,9 @@ jobs:
           if [ -f scripts/check-canonical-slugs.sh ]; then bash scripts/check-canonical-slugs.sh .; fi
           if [ -f scripts/tests/test_canonical_github_slugs.sh ]; then bash scripts/tests/test_canonical_github_slugs.sh .; fi
 
+      - name: Homebrew formula matches the release tarball
+        run: bash scripts/tests/test_homebrew_formula.sh .
+
   ci:
     name: ci
     needs: secret-scan
