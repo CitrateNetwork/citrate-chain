@@ -15,6 +15,8 @@
 #              the boot check consults every stored certificate)
 #   MUST FAIL  CheckpointFinalitySafety_bootlimit.cfg FinalizedNeverReverted (the boot check
 #              consults only the latest stored certificate)
+#   MUST FAIL  CheckpointFinalitySafety_syncnoguard.cfg FinalizedNeverReverted (Stage 1b
+#              certificate sync installing without the finalization guard)
 #   MUST FAIL  CheckpointFinalitySafety_committees.cfg NoConflictingFinality (open finding:
 #              committees are drawn per candidate block, so siblings can be finalized
 #              by different committees without any equivocation)
@@ -96,6 +98,7 @@ expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_pollonly.cfg FinalizedStaysCanonical
 expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_restart.cfg
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_bootlimit.cfg FinalizedNeverReverted
+expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_syncnoguard.cfg FinalizedNeverReverted
 expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_committees.cfg NoConflictingFinality
 if [ "${TLA_FINALITY_DEEP:-0}" = "1" ]; then
     TIMEOUT="${TLC_DEEP_TIMEOUT:-7200}" expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_deep.cfg

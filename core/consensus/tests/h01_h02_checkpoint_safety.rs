@@ -16,7 +16,10 @@
 // Sister TLA+ spec: `specs/tla/consensus/CheckpointVoteSafety.tla`
 // (added in WP-B2.1 + WP-B2.2).
 
-use citrate_consensus::checkpoint::{canonical_vote_message, CITRATE_VOTE_DOMAIN_SEPARATOR};
+use citrate_consensus::checkpoint::{
+    canonical_vote_message, empty_accepted_root, Committee, VoteBinding,
+    CITRATE_VOTE_DOMAIN_SEPARATOR,
+};
 use citrate_consensus::{
     Block, BlockBuilder, CheckpointConfig, CheckpointManager, CheckpointVote, DagStore, Hash,
     PublicKey, Signature, VrfProof,
@@ -36,6 +39,16 @@ fn hash_for(n: u64) -> Hash {
     h[0..8].copy_from_slice(&n.to_le_bytes());
     h[31] = 0xFF;
     Hash::new(h)
+}
+
+/// The binding a vote for a test block carries (epoch 0, the default state
+/// root of the test blocks, the empty accepted root).
+fn tb() -> VoteBinding {
+    VoteBinding {
+        epoch: 0,
+        state_root: Hash::default(),
+        accepted_root: empty_accepted_root(),
+    }
 }
 
 fn make_block(hash: Hash, parent: Hash, height: u64) -> Block {
@@ -61,9 +74,10 @@ fn signed_vote_for_chain(
     chain_id: u64,
 ) -> CheckpointVote {
     let pubkey_bytes = sk.verifying_key().to_bytes();
-    let message = canonical_vote_message(chain_id, height, &block_hash);
+    let message = canonical_vote_message(chain_id, &Hash::default(), height, &block_hash, &tb());
     let sig = sk.sign(&message);
     CheckpointVote {
+        binding: tb(),
         height,
         block_hash,
         voter: PublicKey::new(pubkey_bytes),
@@ -91,9 +105,13 @@ async fn h01_invalid_vote_flood_does_not_lock_out_honest_voters() {
         .map(|k| PublicKey::new(k.verifying_key().to_bytes()))
         .collect();
 
-    mgr.propose(50, hash_for(50), committee.clone())
-        .await
-        .expect("propose");
+    mgr.propose(
+        50,
+        hash_for(50),
+        Committee::equal_stake(0, committee.clone()),
+    )
+    .await
+    .expect("propose");
 
     // Attacker constructs garbage votes claiming to be each honest
     // member. Pre-fix, each `submit_vote` would mark (height, voter)
@@ -102,6 +120,7 @@ async fn h01_invalid_vote_flood_does_not_lock_out_honest_voters() {
     // the voted set is left untouched.
     for honest_pk in &committee {
         let bad = CheckpointVote {
+            binding: tb(),
             height: 50,
             block_hash: hash_for(50),
             voter: *honest_pk,
@@ -146,7 +165,7 @@ async fn h02_cross_chain_vote_replay_rejected() {
 
     let sk = test_key(7);
     let pk = PublicKey::new(sk.verifying_key().to_bytes());
-    mgr.propose(50, hash_for(50), vec![pk])
+    mgr.propose(50, hash_for(50), Committee::equal_stake(0, vec![pk]))
         .await
         .expect("propose");
 
@@ -172,33 +191,47 @@ async fn h02_cross_chain_vote_replay_rejected() {
 /// silently change the prefix and divorce verifier from signer.
 #[test]
 fn h02_canonical_message_layout_pinned() {
+    // r1007 vote message v2 (spec 06 §7): separator, chain id, genesis hash,
+    // epoch, height, block hash, state root, accepted root, in that order.
+    // (Pinned the v1 69-byte layout before r1007.)
     let chain_id = 0x0102030405060708u64;
     let height = 0xFEDCBA9876543210u64;
     let block_hash = Hash::new([0xAA; 32]);
+    let genesis = Hash::new([0x6E; 32]);
+    let binding = VoteBinding {
+        epoch: 0x1122334455667788,
+        state_root: Hash::new([0x51; 32]),
+        accepted_root: Hash::new([0xAC; 32]),
+    };
 
-    let msg = canonical_vote_message(chain_id, height, &block_hash);
+    let msg = canonical_vote_message(chain_id, &genesis, height, &block_hash, &binding);
 
-    // Layout: separator (21) + chain_id (8) + height (8) + hash (32) = 69
-    assert_eq!(msg.len(), CITRATE_VOTE_DOMAIN_SEPARATOR.len() + 8 + 8 + 32);
-    assert_eq!(msg.len(), 69);
-
-    // Domain separator at the start.
+    // Layout: separator (21) + chain_id (8) + genesis (32) + epoch (8)
+    //   + height (8) + hash (32) + state root (32) + accepted root (32) = 173
     assert_eq!(
-        &msg[..CITRATE_VOTE_DOMAIN_SEPARATOR.len()],
+        msg.len(),
+        CITRATE_VOTE_DOMAIN_SEPARATOR.len() + 8 + 32 + 8 + 8 + 32 + 32 + 32
+    );
+    assert_eq!(msg.len(), 173);
+    assert_eq!(CITRATE_VOTE_DOMAIN_SEPARATOR, b"CITRATE-CHECKPOINT-V2");
+
+    let mut at = 0usize;
+    let mut take = |n: usize| {
+        let s = &msg[at..at + n];
+        at += n;
+        s.to_vec()
+    };
+    assert_eq!(
+        take(CITRATE_VOTE_DOMAIN_SEPARATOR.len()),
         CITRATE_VOTE_DOMAIN_SEPARATOR
     );
-
-    // chain_id immediately after separator, little-endian.
-    let chain_start = CITRATE_VOTE_DOMAIN_SEPARATOR.len();
-    assert_eq!(&msg[chain_start..chain_start + 8], &chain_id.to_le_bytes());
-
-    // height after chain_id, little-endian.
-    let height_start = chain_start + 8;
-    assert_eq!(&msg[height_start..height_start + 8], &height.to_le_bytes());
-
-    // block_hash at the tail.
-    let hash_start = height_start + 8;
-    assert_eq!(&msg[hash_start..], block_hash.as_bytes());
+    assert_eq!(take(8), chain_id.to_le_bytes());
+    assert_eq!(take(32), genesis.as_bytes());
+    assert_eq!(take(8), binding.epoch.to_le_bytes());
+    assert_eq!(take(8), height.to_le_bytes());
+    assert_eq!(take(32), block_hash.as_bytes());
+    assert_eq!(take(32), binding.state_root.as_bytes());
+    assert_eq!(take(32), binding.accepted_root.as_bytes());
 }
 
 /// H-01 (additional): block-hash mismatch in a vote rejected, voter
@@ -216,7 +249,7 @@ async fn h01_block_hash_mismatch_does_not_lock_voter() {
 
     let sk = test_key(11);
     let pk = PublicKey::new(sk.verifying_key().to_bytes());
-    mgr.propose(50, hash_for(50), vec![pk])
+    mgr.propose(50, hash_for(50), Committee::equal_stake(0, vec![pk]))
         .await
         .expect("propose");
 
@@ -270,7 +303,7 @@ async fn h01_h02_legacy_signed_vote_rejected_voter_not_locked() {
 
     let sk = test_key(9);
     let pk = PublicKey::new(sk.verifying_key().to_bytes());
-    mgr.propose(50, hash_for(50), vec![pk])
+    mgr.propose(50, hash_for(50), Committee::equal_stake(0, vec![pk]))
         .await
         .expect("propose");
 
@@ -282,6 +315,7 @@ async fn h01_h02_legacy_signed_vote_rejected_voter_not_locked() {
     legacy_msg.extend_from_slice(hash_for(50).as_bytes());
     let legacy_sig = sk.sign(&legacy_msg);
     let legacy_vote = CheckpointVote {
+        binding: tb(),
         height: 50,
         block_hash: hash_for(50),
         voter: pk,

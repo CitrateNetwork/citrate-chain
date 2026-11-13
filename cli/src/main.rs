@@ -112,15 +112,24 @@ async fn main() -> Result<()> {
     // Load or create config
     let config = config::Config::load(cli.config.as_deref(), cli.rpc.as_deref())?;
 
-    // Execute command
-    match cli.command {
-        Commands::Account(cmd) => account::execute(cmd, &config).await?,
-        Commands::Model(cmd) => model::execute(cmd, &config).await?,
-        Commands::Contract(cmd) => contract::execute(cmd, &config).await?,
-        Commands::Network(cmd) => network::execute(cmd, &config).await?,
-        Commands::Governance(cmd) => governance::execute(cmd, &config).await?,
-        Commands::Advanced(cmd) => advanced::execute(cmd, &config).await?,
-        Commands::Wizard(cmd) => wizard::execute(cmd, &config).await?,
+    if let Err(err) = run(cli.command, &config).await {
+        if let Some(hint) = commands::rpc_hint::connect_failure_hint(&err, &config.rpc_endpoint) {
+            eprintln!("{}", hint.yellow());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+async fn run(command: Commands, config: &config::Config) -> Result<()> {
+    match command {
+        Commands::Account(cmd) => account::execute(cmd, config).await?,
+        Commands::Model(cmd) => model::execute(cmd, config).await?,
+        Commands::Contract(cmd) => contract::execute(cmd, config).await?,
+        Commands::Network(cmd) => network::execute(cmd, config).await?,
+        Commands::Governance(cmd) => governance::execute(cmd, config).await?,
+        Commands::Advanced(cmd) => advanced::execute(cmd, config).await?,
+        Commands::Wizard(cmd) => wizard::execute(cmd, config).await?,
         Commands::Devx(cmd) => devx::execute(cmd)?,
         Commands::Init { force } => {
             config::Config::init(force)?;

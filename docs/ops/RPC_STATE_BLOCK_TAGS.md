@@ -8,6 +8,13 @@ status: active with chain#425 (PR #428). The window is an operator opt-out; whet
 
 # RPC state reads and block tags
 
+> **Update 2026-11-07 (S3-7, branch `r1007/rpc-explorer`):** a number or hash naming a block of
+> the applied chain below the executed head is now served from that block's state for
+> `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` and `eth_call`,
+> rebuilt from the undo records inside the undo window and refused outside it. The rules below
+> still apply to every tag that cannot be rebuilt, and to `eth_estimateGas`. See
+> [`docs/rpc/EXPLORER_METHODS.md`](../rpc/EXPLORER_METHODS.md#historical-state-balance-nonce-code-storage-and-eth_call-at-a-block).
+
 A Citrate node keeps one account state: the post-state of its **executed head** (the applied tip,
 `citrate_executedHead`). It has no state at older heights.
 

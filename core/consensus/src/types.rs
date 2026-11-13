@@ -285,7 +285,20 @@ pub struct Block {
     /// blocks and for nodes that have not yet been configured with the registry address.
     #[serde(default)]
     pub equivocation_vote: Option<Signature>,
+
+    /// r1007 S3-3b (spec 06 §3.9, CV-4a): commitment to the transactions this
+    /// block EXECUTED when it accepted its mergeset on post(SP): SHA3-256 over
+    /// `"CITRATE-ACCEPTED-V1" ‖ u64 count ‖ (tx_hash ‖ including_block_hash ‖
+    /// u8 status)*` in execution order (skipped occurrences excluded), computed
+    /// by `citrate_execution::acceptance::accepted_root`. Part of the block hash
+    /// whenever it is not the zero hash (see `compute_hash_for`); genesis
+    /// accepts nothing and keeps it zero.
+    #[serde(default)]
+    pub accepted_root: Hash,
 }
+
+/// Domain tag appended to the block-hash preimage ahead of `accepted_root`.
+pub const ACCEPTED_ROOT_COMMIT_DOMAIN: &[u8] = b"citrate:accepted-root:v1";
 
 impl Block {
     /// Get the block hash
@@ -367,6 +380,15 @@ impl Block {
         hasher.update(self.tx_root.as_bytes());
         hasher.update(self.receipt_root.as_bytes());
         hasher.update(self.artifact_root.as_bytes());
+        // r1007 S3-3b: the accepted-transactions commitment. Every block that
+        // accepts a mergeset commits a non-zero root (the empty list hashes
+        // to a non-zero value too), so only genesis and pre-r1007 fixtures
+        // keep the legacy preimage. Domain-separated and fixed-length, so the
+        // two preimage shapes cannot collide.
+        if self.accepted_root != Hash::default() {
+            hasher.update(ACCEPTED_ROOT_COMMIT_DOMAIN);
+            hasher.update(self.accepted_root.as_bytes());
+        }
         if hardening.active_at(self.header.height) {
             crate::block_sidecars::commit_into(&mut hasher, self);
         }
@@ -431,14 +453,69 @@ impl Block {
     /// hash, and isolated unit tests) accepts the height-0 parentless shape; the
     /// height-0 requirement alone already rejects the shaped-height attack, and
     /// production wiring always configures the hash before admitting any block.
+    ///
+    /// CV-9: the content binding accepts either encoding a genesis is hashed
+    /// with: the block-hash encoding ([`Self::verify_hash`]) or the canonical
+    /// genesis encoding ([`Self::canonical_genesis_hash`]), which is how every
+    /// network genesis so far was hashed. Requiring only the first made the
+    /// exemption fail for the real genesis, so a strict store refused it when
+    /// it was re-offered at startup ("zero proposer public key"). The canonical
+    /// genesis encoding does not bind the proposer, VRF, coinbase, gas fields or
+    /// signature, so under it those must be inert (zero or empty) as the
+    /// canonical genesis builder leaves them.
     pub fn is_configured_genesis(&self, configured: Option<Hash>) -> bool {
         if self.header.height != 0 || !self.is_genesis() {
             return false;
         }
         match configured {
-            Some(h) => self.header.block_hash == h && self.verify_hash(),
+            Some(h) => {
+                self.header.block_hash == h
+                    && (self.verify_hash()
+                        || (self.canonical_genesis_hash() == h && self.genesis_fields_inert()))
+            }
             None => true,
         }
+    }
+
+    /// The canonical genesis encoding: the hash every network genesis is
+    /// identified by (`citrate_economics::genesis::calculate_canonical_block_hash`
+    /// delegates here). It binds the version, parents, timestamp, height, blue
+    /// score and work, pruning point and the four commitment roots, and nothing
+    /// else.
+    pub fn canonical_genesis_hash(&self) -> Hash {
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(self.header.version.to_le_bytes());
+        hasher.update(self.header.selected_parent_hash.as_bytes());
+        for parent in &self.header.merge_parent_hashes {
+            hasher.update(parent.as_bytes());
+        }
+        hasher.update(self.header.timestamp.to_le_bytes());
+        hasher.update(self.header.height.to_le_bytes());
+        hasher.update(self.header.blue_score.to_le_bytes());
+        hasher.update(self.header.blue_work.to_le_bytes());
+        hasher.update(self.header.pruning_point.as_bytes());
+        hasher.update(self.state_root.as_bytes());
+        hasher.update(self.tx_root.as_bytes());
+        hasher.update(self.receipt_root.as_bytes());
+        hasher.update(self.artifact_root.as_bytes());
+        Hash::new(hasher.finalize().into())
+    }
+
+    /// The fields [`Self::canonical_genesis_hash`] does not bind hold nothing a
+    /// genesis could use: no proposer, VRF, coinbase, gas used or signature.
+    fn genesis_fields_inert(&self) -> bool {
+        self.header
+            .proposer_pubkey
+            .as_bytes()
+            .iter()
+            .all(|b| *b == 0)
+            && self.header.vrf_reveal.proof.is_empty()
+            && self.header.vrf_reveal.output == Hash::default()
+            && self.header.coinbase == [0u8; 20]
+            && self.header.gas_used == 0
+            && self.accepted_root == Hash::default()
+            && self.signature.as_bytes().iter().all(|b| *b == 0)
     }
 }
 
@@ -848,6 +925,7 @@ impl BlockBuilder {
                 gradient_commitment: None,
                 learning_root: Hash::default(),
                 equivocation_vote: None,
+                accepted_root: Hash::default(),
             },
         }
     }
@@ -931,6 +1009,10 @@ impl BlockBuilder {
         self.block.receipt_root = root;
         self
     }
+    pub fn accepted_root(mut self, root: Hash) -> Self {
+        self.block.accepted_root = root;
+        self
+    }
     pub fn artifact_root(mut self, root: Hash) -> Self {
         self.block.artifact_root = root;
         self
@@ -1004,16 +1086,115 @@ impl Default for BlockBuilder {
     }
 }
 
+/// The work one blue block adds (r1007 spec §1.2 `WORK_UNIT`, G7).
+///
+/// Unit work: every blue block weighs the same, so `blue_work` is
+/// `blue_score × WORK_UNIT`. Owner question O1 (stake-weighted work) is
+/// answered with the spec default here: stake weighting would make a header
+/// unverifiable without the epoch stake table, which a pruned or header-only
+/// validator does not have.
+pub const WORK_UNIT: u128 = 1_000_000;
+
 /// Canonical blue-work derivation from a blue score.
 ///
 /// SECREM-01 CONS-2/CONS-3: this is the single source of truth for the
-/// score→work relation. The producer fills `header.blue_work` with it and
-/// admission validation (`GhostDag::validate_block_consistency`) rejects any
-/// header whose claimed `blue_work` deviates from it — a self-reported work
-/// value is never consumed. If the work function ever changes, it changes
-/// here, behind a height-gated activation.
+/// score→work relation. Under r1007 (G7) `ghostdag(B).blue_work` equals this
+/// function of `ghostdag(B).blue_score`, and admission rejects a header whose
+/// `blue_work` differs from the GHOSTDAG value.
 pub fn blue_work_for_score(blue_score: u64) -> u128 {
-    u128::from(blue_score).saturating_mul(1_000_000)
+    u128::from(blue_score).saturating_mul(WORK_UNIT)
+}
+
+/// The fork-choice and selected-parent order (r1007 spec §1.1 `Key`, G3, G8):
+/// `(blue_work, vrf_output, hash)`, compared lexicographically, byte strings
+/// as big-endian unsigned integers. "Heavier" is larger.
+///
+/// The VRF output sits before the hash because a proposer can regrind its
+/// block hash at no cost, but not its VRF output (reviewer question R4).
+/// Field order is the comparison order (derived `Ord`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ForkChoiceKey {
+    pub blue_work: u128,
+    pub vrf_output: Hash,
+    pub hash: Hash,
+}
+
+impl ForkChoiceKey {
+    /// The key of a block, from its committed header fields only.
+    pub fn of_header(header: &BlockHeader) -> Self {
+        Self {
+            blue_work: header.blue_work,
+            vrf_output: header.vrf_reveal.output,
+            hash: header.block_hash,
+        }
+    }
+}
+
+/// The per-block GHOSTDAG record (r1007 spec §1.1 `GhostdagData`; rusty-kaspa
+/// `consensus/src/model/stores/ghostdag.rs`). A pure function of headers.
+///
+/// - `mergeset_blues` is ordered: the selected parent first, then the blue
+///   blocks of `Mergeset*(B)` in the order they were colored (ascending Key).
+/// - `mergeset_reds` is in coloring order too.
+/// - `blues_anticone_sizes` holds, for each blue of the mergeset and each blue
+///   whose anticone this block changed, its blue anticone size from this
+///   block's point of view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GhostdagData {
+    /// `Hash::default()` for genesis.
+    pub selected_parent: Hash,
+    pub blue_score: u64,
+    pub blue_work: u128,
+    pub mergeset_blues: Vec<Hash>,
+    pub mergeset_reds: Vec<Hash>,
+    pub blues_anticone_sizes: std::collections::BTreeMap<Hash, u32>,
+    /// `MDR(B)`: the chain ancestor of SP(B) at `max(0, height(B) - MERGE_DEPTH)`.
+    /// `Hash::default()` for genesis.
+    pub merge_depth_root: Hash,
+}
+
+impl GhostdagData {
+    /// Genesis: blue score 0, blue work 0, empty mergeset (spec G7, Kaspa
+    /// `genesis_ghostdag_data`).
+    pub fn genesis() -> Self {
+        Self {
+            selected_parent: Hash::default(),
+            blue_score: 0,
+            blue_work: 0,
+            mergeset_blues: Vec::new(),
+            mergeset_reds: Vec::new(),
+            blues_anticone_sizes: std::collections::BTreeMap::new(),
+            merge_depth_root: Hash::default(),
+        }
+    }
+
+    /// The record of a block before its `Mergeset*` is colored: SP is blue,
+    /// with an empty blue anticone (Kaspa `new_with_selected_parent`).
+    pub fn with_selected_parent(selected_parent: Hash, merge_depth_root: Hash) -> Self {
+        let mut sizes = std::collections::BTreeMap::new();
+        sizes.insert(selected_parent, 0);
+        Self {
+            selected_parent,
+            blue_score: 0,
+            blue_work: 0,
+            mergeset_blues: vec![selected_parent],
+            mergeset_reds: Vec::new(),
+            blues_anticone_sizes: sizes,
+            merge_depth_root,
+        }
+    }
+
+    /// `Mergeset(B)`: the selected parent, the other blues, then the reds.
+    pub fn unordered_mergeset(&self) -> impl Iterator<Item = &Hash> {
+        self.mergeset_blues.iter().chain(self.mergeset_reds.iter())
+    }
+
+    /// `|Mergeset(B)|`, the selected parent included.
+    pub fn mergeset_size(&self) -> usize {
+        self.mergeset_blues
+            .len()
+            .saturating_add(self.mergeset_reds.len())
+    }
 }
 
 /// Blue set information for a block

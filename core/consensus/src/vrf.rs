@@ -384,17 +384,33 @@ impl VrfProposerSelector {
         previous_vrf: &Hash,
         slot: u64,
     ) -> Result<bool, VrfError> {
+        self.verify_vrf_math_at(pubkey, proof, previous_vrf, slot, slot)
+    }
+
+    /// [`Self::verify_vrf_math_only`] with the block's `height` and the
+    /// `slot` its alpha binds given separately (r1007 G9: the alpha binds the
+    /// time slot, `slots::slot_of(timestamp, genesis_timestamp)`, not the
+    /// height). `height` gates the legacy-proof cutoff and the canonical
+    /// point encoding, which are height-scheduled; `slot` goes into the alpha.
+    pub fn verify_vrf_math_at(
+        &self,
+        pubkey: &PublicKey,
+        proof: &VrfProof,
+        previous_vrf: &Hash,
+        height: u64,
+        slot: u64,
+    ) -> Result<bool, VrfError> {
         if proof.proof.len() == 114 {
             // WP-S.2: ECVRF-P256-SHA256 proof (pk_p256=33 + Gamma=33 + c=16 + s=32)
-            self.verify_ecvrf_proof(pubkey, proof, previous_vrf, slot)
+            self.verify_ecvrf_proof(pubkey, proof, previous_vrf, height, slot)
         } else if proof.proof.len() == 32 {
             // Legacy SHA3 proof — accepted only below the cutoff
             // height. See `legacy_vrf_cutoff_height` doc + audit
             // finding H-06.
-            if slot >= self.legacy_vrf_cutoff_height {
+            if height >= self.legacy_vrf_cutoff_height {
                 tracing::warn!(
-                    "H-06: rejecting legacy 32-byte VRF proof at slot {} (cutoff {})",
-                    slot,
+                    "H-06: rejecting legacy 32-byte VRF proof at height {} (cutoff {})",
+                    height,
                     self.legacy_vrf_cutoff_height
                 );
                 return Ok(false);
@@ -441,8 +457,34 @@ impl VrfProposerSelector {
         signed_payload: &[u8],
         block_signature: &crate::types::Signature,
     ) -> Result<bool, VrfError> {
+        self.verify_vrf_with_block_signature_at(
+            pubkey,
+            proof,
+            previous_vrf,
+            slot,
+            slot,
+            signed_payload,
+            block_signature,
+        )
+    }
+
+    /// [`Self::verify_vrf_with_block_signature`] with the block's `height`
+    /// (activation gates) and the time `slot` its alpha binds (r1007 G9)
+    /// given separately. This is the admission entry point
+    /// (`DagStore::verify_block_vrf_crypto`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_vrf_with_block_signature_at(
+        &self,
+        pubkey: &PublicKey,
+        proof: &VrfProof,
+        previous_vrf: &Hash,
+        height: u64,
+        slot: u64,
+        signed_payload: &[u8],
+        block_signature: &crate::types::Signature,
+    ) -> Result<bool, VrfError> {
         // Step 1: ECVRF math (or legacy below cutoff).
-        if !self.verify_vrf_math_only(pubkey, proof, previous_vrf, slot)? {
+        if !self.verify_vrf_math_at(pubkey, proof, previous_vrf, height, slot)? {
             return Ok(false);
         }
 
@@ -481,12 +523,13 @@ impl VrfProposerSelector {
         pubkey: &PublicKey,
         proof: &VrfProof,
         previous_vrf: &Hash,
+        height: u64,
         slot: u64,
     ) -> Result<bool, VrfError> {
         // From the activation height the proof's curve points must be in
         // canonical compressed form; below it the previous decoder applies,
         // so historical blocks are judged exactly as they were.
-        let decoded = if crate::vrf_encoding::active_at(self.canonical_encoding_height, slot) {
+        let decoded = if crate::vrf_encoding::active_at(self.canonical_encoding_height, height) {
             crate::ecvrf::EcvrfProof::from_bytes_canonical(&proof.proof)
         } else {
             crate::ecvrf::EcvrfProof::from_bytes(&proof.proof)
@@ -780,7 +823,9 @@ mod tests {
             .and_then(|b| b.find("\n    fn "))
             .unwrap_or(body.len());
         let body = body.get(..end).unwrap_or(body);
-        assert!(body.contains("vrf_encoding::active_at(self.canonical_encoding_height, slot)"));
+        // r1007 G9: the decoder is chosen by the block HEIGHT (the activation
+        // schedule is in heights); the alpha's time slot is a separate argument.
+        assert!(body.contains("vrf_encoding::active_at(self.canonical_encoding_height, height)"));
         assert!(body.contains("EcvrfProof::from_bytes_canonical(&proof.proof)"));
         assert_eq!(
             prod.matches("EcvrfProof::from_bytes").count(),

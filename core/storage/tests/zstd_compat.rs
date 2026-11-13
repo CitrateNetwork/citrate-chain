@@ -27,6 +27,12 @@
 //!
 //! Do not regenerate the fixtures from a post-upgrade build: that would turn
 //! the goldens into a self-comparison.
+//!
+//! r1007 (S3-3b) appended `accepted_root` to `Block`, so a block has two
+//! stored encodings (`citrate_storage::chain::block_codec`). The fixtures hold
+//! the v0.1.3 encoding; the payloads below name it explicitly, and the
+//! RocksDB check asserts the defined behaviour for an old-format block: it
+//! decodes, with `accepted_root` zero.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,7 +41,10 @@ use citrate_consensus::types::{
     Block, BlockBuilder, Hash, PublicKey, Signature, Transaction, VrfProof,
 };
 use citrate_execution::types::{AccountState, Address};
-use citrate_storage::db::column_families::{all_column_families, CF_METADATA};
+use citrate_storage::chain::block_codec::{
+    decode_stored_block, encode_block_v013, StoredBlockEncoding,
+};
+use citrate_storage::db::column_families::{all_column_families, CF_BLOCKS, CF_METADATA};
 use citrate_storage::{pruning::PruningConfig, StorageManager};
 use primitive_types::U256;
 
@@ -125,14 +134,14 @@ fn raw_kv(i: u32) -> (Vec<u8>, Vec<u8>) {
     (key, value)
 }
 
-/// 1.5 MiB of real block encodings: spans many 128 KiB zstd blocks
+/// 1.5 MiB of real (v0.1.3) block encodings: spans many 128 KiB zstd blocks
 /// (multi-block frames) while staying small as a fixture.
 fn large_blocks() -> Vec<u8> {
     const LEN: usize = 3 * 512 * 1024;
     let mut out = Vec::with_capacity(LEN + 4096);
     let mut n: u8 = 0;
     while out.len() < LEN {
-        out.extend(bincode::serialize(&rich_block(n)).expect("serialize block"));
+        out.extend(encode_block_v013(&rich_block(n)).expect("v013 block"));
         n = n.wrapping_add(1);
     }
     out.truncate(LEN);
@@ -154,9 +163,10 @@ fn incompressible(len: usize) -> Vec<u8> {
 /// (name, bytes). Every entry has `<name>.encode_all.zst` and `<name>.bulk.zst`
 /// fixtures.
 fn payloads() -> Vec<(&'static str, Vec<u8>)> {
-    let block = bincode::serialize(&rich_block(7)).expect("serialize block");
+    // The v0.1.3 block encoding, the one the fixtures were written with.
+    let block = encode_block_v013(&rich_block(7)).expect("v013 block");
     let blocks: Vec<u8> = (0..BLOCK_COUNT)
-        .flat_map(|n| bincode::serialize(&rich_block(n)).expect("serialize block"))
+        .flat_map(|n| encode_block_v013(&rich_block(n)).expect("v013 block"))
         .collect();
     let accounts: Vec<u8> = (0..ACCOUNT_COUNT)
         .flat_map(|n| bincode::serialize(&account(n).1).expect("serialize account"))
@@ -273,11 +283,21 @@ fn rocksdb_written_by_v013_build_opens_and_reads() {
             .get_block(&want.hash())
             .expect("get_block")
             .unwrap_or_else(|| panic!("block {n} missing"));
+        // Defined behaviour: a v0.1.3 block decodes, with no accepted root.
+        let raw = storage
+            .db
+            .get_cf(CF_BLOCKS, want.hash().as_bytes())
+            .expect("raw block")
+            .expect("stored");
+        let (_, encoding) = decode_stored_block(&raw).expect("decodes");
+        assert_eq!(encoding, StoredBlockEncoding::V013, "block {n}");
+        assert_eq!(got.accepted_root, Hash::default(), "block {n}");
         assert_eq!(
-            bincode::serialize(&got).expect("ser"),
-            bincode::serialize(&want).expect("ser"),
+            encode_block_v013(&got).expect("v013"),
+            encode_block_v013(&want).expect("v013"),
             "block {n} differs"
         );
+        assert_eq!(got.hash(), want.hash(), "block {n}: same block hash");
     }
     for n in 0..ACCOUNT_COUNT {
         let (addr, want) = account(n);
@@ -384,4 +404,41 @@ fn regenerate_zstd_v013_fixtures() {
     for stale in options {
         fs::remove_file(&stale).expect("remove stale OPTIONS");
     }
+}
+
+/// The two encodings are distinct and each decodes to itself; an r1007 block
+/// that accepted a mergeset (non-zero `accepted_root`) has no v0.1.3 encoding,
+/// and bytes that are neither are refused with an error, never guessed.
+#[test]
+fn block_encodings_are_explicit() {
+    let old = rich_block(3);
+    let v013 = encode_block_v013(&old).expect("v013");
+    let r1007 = bincode::serialize(&old).expect("r1007");
+    assert_eq!(
+        r1007.len(),
+        v013.len() + 32,
+        "r1007 appends the 32-byte accepted root"
+    );
+    assert_eq!(
+        decode_stored_block(&v013).expect("v013 decodes").1,
+        StoredBlockEncoding::V013
+    );
+    assert_eq!(
+        decode_stored_block(&r1007).expect("r1007 decodes").1,
+        StoredBlockEncoding::R1007
+    );
+    let mut accepting = old.clone();
+    accepting.accepted_root = Hash::new([0xAC; 32]);
+    let e = encode_block_v013(&accepting)
+        .expect_err("no v013 form")
+        .to_string();
+    assert!(e.contains("accepted_root"), "{e}");
+    let (back, enc) =
+        decode_stored_block(&bincode::serialize(&accepting).expect("ser")).expect("decodes");
+    assert_eq!(enc, StoredBlockEncoding::R1007);
+    assert_eq!(back.accepted_root, accepting.accepted_root);
+    let e = decode_stored_block(&v013[..v013.len() / 2])
+        .expect_err("truncated")
+        .to_string();
+    assert!(e.contains("neither"), "{e}");
 }
