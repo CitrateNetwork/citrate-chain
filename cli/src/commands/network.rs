@@ -268,10 +268,35 @@ async fn get_status(config: &Config) -> Result<()> {
         .unwrap_or(&serde_json::Value::Null)
         .is_boolean();
 
+    // Which chain this endpoint serves: eth_chainId and the hash of block 0.
+    let node_chain_id = rpc_result(&client, config, "eth_chainId", json!([]))
+        .await
+        .and_then(|v| v.as_str().map(str::to_string))
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let node_genesis = rpc_result(
+        &client,
+        config,
+        "eth_getBlockByNumber",
+        json!(["0x0", false]),
+    )
+    .await
+    .and_then(|b| b.get("hash").and_then(|h| h.as_str()).map(str::to_string));
+
     println!("{}", "Network Status:".bold());
     println!("RPC Endpoint: {}", config.rpc_endpoint.cyan());
     println!("Network ID: {}", network_id);
-    println!("Chain ID: {}", config.chain_id);
+    for line in super::rpc_hint::chain_lines(
+        node_chain_id,
+        config.chain_id,
+        node_genesis.as_deref(),
+        super::devx::vendored_genesis_hash().as_deref(),
+    ) {
+        if line.starts_with("WARNING") {
+            println!("{}", line.yellow());
+        } else {
+            println!("{}", line);
+        }
+    }
     println!("Latest Block: {}", block_number);
     println!(
         "Syncing: {}",
@@ -283,6 +308,23 @@ async fn get_status(config: &Config) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// One JSON-RPC call; `None` on a transport error, an error reply or a null result.
+async fn rpc_result(
+    client: &reqwest::Client,
+    config: &Config,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let response = client
+        .post(&config.rpc_endpoint)
+        .json(&json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 }))
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = response.json().await.ok()?;
+    body.get("result").filter(|v| !v.is_null()).cloned()
 }
 
 async fn get_block(config: &Config, block: &str) -> Result<()> {
@@ -443,7 +485,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
         if let Some(value_hex) = tx["value"].as_str() {
             let value = u128::from_str_radix(value_hex.trim_start_matches("0x"), 16).unwrap_or(0);
-            println!("Value: {} wei ({} ETH)", value, value as f64 / 1e18);
+            println!("Value: {} wei ({} SALT)", value, value as f64 / 1e18);
         }
 
         println!(
@@ -578,7 +620,7 @@ async fn get_gas_price(config: &Config) -> Result<()> {
         println!("{}", "Current Gas Price:".bold());
         println!("  {} wei", price);
         println!("  {} gwei", price as f64 / 1e9);
-        println!("  {} ETH", price as f64 / 1e18);
+        println!("  {} SALT", price as f64 / 1e18);
     } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
