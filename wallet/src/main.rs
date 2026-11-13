@@ -87,12 +87,12 @@ enum Commands {
         #[arg(short, long)]
         amount: String,
 
-        /// Gas price in gwei
+        /// Gas price in gwei (default: 1 gwei)
         #[arg(short, long)]
         gas_price: Option<u64>,
 
-        /// Gas limit
-        #[arg(short, long)]
+        /// Gas limit (default: 21000 for a transfer). No short flag: `-g` is --gas-price.
+        #[arg(long)]
         gas_limit: Option<u64>,
     },
 
@@ -428,7 +428,16 @@ async fn send_transaction(
     pb.set_message("Sending transaction...");
     pb.enable_steady_tick(Duration::from_millis(100));
 
-    let tx_hash = wallet.transfer(from, to_address, amount_wei).await?;
+    let tx_hash = wallet
+        .send_transaction(
+            from,
+            to_address,
+            amount_wei,
+            Vec::new(),
+            gwei_to_wei(gas_price)?,
+            gas_limit,
+        )
+        .await?;
 
     pb.finish_and_clear();
 
@@ -642,8 +651,68 @@ fn format_latt(wei: U256) -> String {
 }
 
 /// Convert SALT to wei
+/// `--gas-price` is in gwei; the transaction carries wei.
+fn gwei_to_wei(gwei: Option<u64>) -> Result<Option<u64>> {
+    gwei.map(|g| {
+        g.checked_mul(1_000_000_000)
+            .ok_or_else(|| anyhow::anyhow!("--gas-price {g} gwei is too large"))
+    })
+    .transpose()
+}
+
 fn latt_to_wei(latt: f64) -> U256 {
     let wei_per_latt = 1_000_000_000_000_000_000u128; // 10^18
     let wei = (latt * wei_per_latt as f64) as u128;
     U256::from(wei)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gwei_to_wei, Cli, Commands};
+    use clap::{CommandFactory, Parser};
+
+    /// clap reports a short-flag clash only through its debug assertions. A release
+    /// build silently routes the value to whichever argument wins (see #448 for the
+    /// same check on citrate-cli).
+    #[test]
+    fn wallet_command_tree_has_no_flag_clashes() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn send_reads_gas_price_and_gas_limit_into_their_own_fields() {
+        let cli = Cli::try_parse_from([
+            "citrate-wallet",
+            "send",
+            "--from",
+            "0",
+            "--to",
+            "0xbc6a39c7d861a8f3d791f8a025051e7eac7043bb",
+            "--amount",
+            "0.001",
+            "--gas-price",
+            "2",
+            "--gas-limit",
+            "30000",
+        ]);
+        match cli.map(|c| c.command) {
+            Ok(Commands::Send {
+                gas_price,
+                gas_limit,
+                ..
+            }) => {
+                assert_eq!(gas_price, Some(2));
+                assert_eq!(gas_limit, Some(30000));
+            }
+            Ok(_) => panic!("parsed into another subcommand"),
+            Err(e) => panic!("send did not parse: {e}"),
+        }
+    }
+
+    #[test]
+    fn gas_price_flag_is_gwei_and_reaches_the_transaction_as_wei() {
+        assert_eq!(gwei_to_wei(None).ok(), Some(None));
+        assert_eq!(gwei_to_wei(Some(2)).ok(), Some(Some(2_000_000_000)));
+        assert!(gwei_to_wei(Some(u64::MAX)).is_err());
+    }
 }
