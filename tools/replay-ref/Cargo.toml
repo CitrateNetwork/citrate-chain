@@ -1,0 +1,41 @@
+[package]
+name = "citrate-replay-ref"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Differential replay harness (r1007 S3-3c, spec 06 section 8.3): records a node's DAG, selected chain and committed state roots from a RocksDB data dir (read-only), and replays the selected chain from genesis through a reference path that shares only the trusted execution base with the node (never node::canonical_apply), reporting the first block whose state root differs."
+
+[lib]
+name = "citrate_replay_ref"
+path = "src/lib.rs"
+
+[[bin]]
+name = "replay-diff"
+path = "src/bin/replay_diff.rs"
+
+[[bin]]
+name = "replay-record"
+path = "src/bin/replay_record.rs"
+
+[dependencies]
+# The trusted base (spec 06 section 8.3): block and tx types, the executor
+# (revm, settlement, the from-scratch state root), the reward schedule and the
+# on-disk layout. No dependency on the node crate.
+citrate-consensus = { path = "../../core/consensus" }
+citrate-execution = { path = "../../core/execution" }
+citrate-economics = { path = "../../core/economics" }
+citrate-storage = { path = "../../core/storage" }
+# `--mode mergeset`: the independent reference (spec 06 §8.3).
+citrate-mergeset-ref = { path = "../mergeset-ref" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+primitive-types = "0.12"
+hex = "0.4"
+flate2 = "1.1"
+
+[dev-dependencies]
+tempfile = "3"

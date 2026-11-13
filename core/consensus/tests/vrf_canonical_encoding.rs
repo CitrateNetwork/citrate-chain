@@ -276,6 +276,8 @@ fn signed_child(parent: &Block, secret: &[u8; 32], vrf: VrfProof) -> Block {
     let key = SigningKey::from_bytes(secret);
     let mut b = BlockBuilder::new()
         .height(1)
+        // r1007 G9: the VRF alpha binds the time slot; slot == height here.
+        .timestamp(citrate_consensus::slots::SLOT_DURATION_SECS)
         .parent(parent.hash())
         .proposer(proposer_of(secret))
         .vrf_reveal(vrf)

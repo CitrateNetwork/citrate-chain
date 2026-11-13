@@ -703,6 +703,64 @@ pub fn load_executed_block(storage: &StorageManager, hash: &Hash) -> Result<Bloc
         })
 }
 
+/// r1007 S3-3b (spec 06 §5.1-§5.2): the transactions block `block` EXECUTED,
+/// with their receipts, in execution order: the accepting view EVM tools see.
+///
+/// A block that commits an `accepted_root` executed its mergeset: its list is
+/// the receipts indexed under it (`t‖block‖tx` markers written with them),
+/// ordered by each receipt's acceptance position, with bodies from
+/// `CF_TRANSACTIONS`. A pre-r1007 block (no `accepted_root`) executed its own
+/// list: the receipts naming it, in body order. Data sources:
+/// `StorageManager::transactions` (receipts, the block index, bodies).
+pub fn executed_transactions(
+    storage: &StorageManager,
+    block: &Block,
+) -> Result<
+    Vec<(
+        citrate_consensus::types::Transaction,
+        citrate_execution::types::TransactionReceipt,
+    )>,
+    String,
+> {
+    let hash = block.header.block_hash;
+    if block.accepted_root == Hash::default() {
+        let mut out = Vec::new();
+        for tx in &block.transactions {
+            if let Ok(Some(r)) = storage.transactions.get_receipt(&tx.hash) {
+                if r.block_hash == hash {
+                    out.push((tx.clone(), r));
+                }
+            }
+        }
+        return Ok(out);
+    }
+    let mut rows = Vec::new();
+    for tx_hash in storage
+        .transactions
+        .get_block_transactions(&hash)
+        .map_err(|e| format!("block index of {hash}: {e}"))?
+    {
+        let receipt = match storage.transactions.get_receipt(&tx_hash) {
+            Ok(Some(r)) if r.block_hash == hash => r,
+            Ok(_) => continue,
+            Err(e) => return Err(format!("receipt of {tx_hash}: {e}")),
+        };
+        let tx = storage
+            .transactions
+            .get_transaction(&tx_hash)
+            .map_err(|e| format!("transaction {tx_hash}: {e}"))?
+            .ok_or_else(|| format!("executed transaction {tx_hash} has no stored body"))?;
+        let pos = receipt
+            .acceptance
+            .as_ref()
+            .map(|a| a.transaction_index)
+            .unwrap_or(u64::MAX);
+        rows.push((pos, tx, receipt));
+    }
+    rows.sort_by_key(|(pos, tx, _)| (*pos, tx.hash));
+    Ok(rows.into_iter().map(|(_, tx, r)| (tx, r)).collect())
+}
+
 /// JSON-RPC method that reports [`executed_head`].
 pub const EXECUTED_HEAD_METHOD: &str = "citrate_executedHead";
 

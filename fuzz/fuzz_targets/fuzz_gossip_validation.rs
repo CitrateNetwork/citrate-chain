@@ -229,9 +229,12 @@ fuzz_target!(|data: &[u8]| {
     let from_peer = PeerId::new("fuzz-peer".to_string());
 
     let now_before = now_secs();
-    let accepted = runtime()
-        .block_on(gossip.handle_new_block(block.clone(), &from_peer))
-        .is_ok();
+    // r1007 G9 ingress: a held (early) block is not accepted; it is handed
+    // back once due and judged again then.
+    let accepted = matches!(
+        runtime().block_on(gossip.handle_new_block(block.clone(), &from_peer)),
+        Ok(citrate_network::BlockGossip::Relayed | citrate_network::BlockGossip::AlreadyRelayed)
+    );
     let now_after = now_secs();
 
     if accepted {

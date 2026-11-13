@@ -32,6 +32,54 @@ pub struct NodeConfig {
     /// Checkpoint configuration (WP-W.2)
     #[serde(default)]
     pub checkpoint: CheckpointNodeConfig,
+
+    /// Automatic recovery from a dead branch (ADR-2026-11-03 CV-7c).
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+}
+
+/// `[recovery]`: the guarded automatic cold resync (node/src/cold_resync.rs).
+///
+/// A node whose applied tip is held on a dead branch (the dead-branch marker,
+/// CV-7b) for `cold_resync_after_secs` moves its chain database aside (never
+/// deleted; the node identity keys stay) and resyncs from genesis via peers,
+/// at most once per `cold_resync_min_interval_hours`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// Allow the automatic cold resync. `false` leaves a wedged node wedged
+    /// (it still stops serving and sealing on the dead branch and reports
+    /// `syncState: wedged`) for an operator to resync by hand.
+    #[serde(default = "default_cold_resync")]
+    pub cold_resync: bool,
+    /// Minimum time between two automatic cold resyncs of this data dir.
+    #[serde(default = "default_cold_resync_min_interval_hours")]
+    pub cold_resync_min_interval_hours: u64,
+    /// How long the node must have been wedged before it resyncs.
+    #[serde(default = "default_cold_resync_after_secs")]
+    pub cold_resync_after_secs: u64,
+}
+
+fn default_cold_resync() -> bool {
+    true
+}
+
+fn default_cold_resync_min_interval_hours() -> u64 {
+    6
+}
+
+fn default_cold_resync_after_secs() -> u64 {
+    900
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            cold_resync: default_cold_resync(),
+            cold_resync_min_interval_hours: default_cold_resync_min_interval_hours(),
+            cold_resync_after_secs: default_cold_resync_after_secs(),
+        }
+    }
 }
 
 /// VRF configuration for proposer election verification.
@@ -70,7 +118,10 @@ pub struct CheckpointNodeConfig {
     #[serde(default = "default_checkpoint_interval")]
     pub interval: u64,
 
-    /// Committee size.
+    /// Committee size. Accepted for file compatibility and IGNORED: the node
+    /// runs the consensus constant `CHECKPOINT_COMMITTEE_SIZE` (a differing
+    /// value is logged at start-up), since nodes that disagree on it derive
+    /// different committees (`finality_driver::node_checkpoint_config`).
     #[serde(default = "default_committee_size")]
     pub committee_size: usize,
 
@@ -94,7 +145,7 @@ fn default_checkpoint_interval() -> u64 {
 }
 
 fn default_committee_size() -> usize {
-    100
+    citrate_consensus::checkpoint::CHECKPOINT_COMMITTEE_SIZE
 }
 
 fn default_quorum_threshold() -> usize {
@@ -286,6 +337,18 @@ pub struct ChainConfig {
     #[serde(default)]
     pub storage_root_hardening_height: Option<u64>,
 
+    /// Standard, incremental MPT state root activation height
+    /// (`citrate_execution::mpt_state_root`, ADR-2026-11-03 CV-14): for the
+    /// post-state of a block at or after this height the state root is the
+    /// standard Ethereum secure-trie root. It changes every root value, so it
+    /// is a genesis rule (r1007).
+    ///
+    /// A CONSENSUS PARAMETER. Absent (the default, and every shipped profile)
+    /// = not activated. On a release genesis only its compiled entry sets it
+    /// (r1005, r1006: never). A new genesis sets `0` (active from block 1).
+    #[serde(default)]
+    pub mpt_state_root_height: Option<u64>,
+
     /// A local development chain. The activation height compiled into the
     /// release for this chain id (`citrate_consensus::hardening::
     /// PINNED_ACTIVATIONS`) is not applied, so dev profiles keep choosing
@@ -431,6 +494,7 @@ impl Default for NodeConfig {
                 vrf_canonical_encoding_height: None,
                 supply_hardening_height: None,
                 storage_root_hardening_height: None,
+                mpt_state_root_height: None,
                 dev_profile: false,
             },
             network: NetworkConfig {
@@ -473,6 +537,7 @@ impl Default for NodeConfig {
             validator: ValidatorConfig::default(),
             vrf: VrfConfig::default(),
             checkpoint: CheckpointNodeConfig::default(),
+            recovery: RecoveryConfig::default(),
         }
     }
 }
@@ -483,6 +548,18 @@ impl NodeConfig {
     pub fn validate(&self) -> Result<(), String> {
         // Validate validator configuration (fail-closed in production)
         self.validator.validate()?;
+        // Spec 06 G11 (fed#465): the pruning-point walk reads pruned DAG
+        // headers from the chain store, so a pruning chain store must keep at
+        // least PRUNING_DEPTH chain-block headers below the applied tip.
+        let depth = citrate_consensus::ghostdag::PRUNING_DEPTH;
+        if self.storage.pruning && self.storage.keep_blocks < depth {
+            return Err(format!(
+                "[storage] keep_blocks = {} with pruning on is below PRUNING_DEPTH ({depth}): \
+                 the G11 pruning-point walk reads chain-store headers that deep, so this node \
+                 could refuse valid blocks. Set keep_blocks >= {depth} or pruning = false",
+                self.storage.keep_blocks
+            ));
+        }
         Ok(())
     }
 
@@ -549,6 +626,28 @@ mod tests {
         let c: CheckpointNodeConfig =
             toml::from_str("interval = 2\nvote_depth = 5").expect("vote_depth override");
         assert_eq!(c.vote_depth, 5);
+    }
+
+    /// fed#465 (06 G11 storage dependency): the pruning-point walk falls back
+    /// to chain-store headers, so a node that prunes its chain store must keep
+    /// at least PRUNING_DEPTH (10,000) headers. Below that it can refuse valid
+    /// blocks, so the node refuses the configuration at start-up.
+    #[test]
+    fn chain_store_pruning_below_pruning_depth_is_refused() {
+        let depth = citrate_consensus::ghostdag::PRUNING_DEPTH;
+        let mut c = NodeConfig::default();
+        c.storage.pruning = true;
+        c.storage.keep_blocks = depth - 1;
+        let e = c.validate().expect_err("keep_blocks below PRUNING_DEPTH");
+        assert!(e.contains("keep_blocks") && e.contains("10000"), "{e}");
+        c.storage.keep_blocks = depth;
+        c.validate().expect("keep_blocks = PRUNING_DEPTH is enough");
+        c.storage.keep_blocks = 100_000;
+        c.validate().expect("the default");
+        // Not pruning: the chain store keeps everything, whatever keep_blocks says.
+        c.storage.pruning = false;
+        c.storage.keep_blocks = 1_000;
+        c.validate().expect("pruning off");
     }
 
     #[test]
@@ -1054,6 +1153,10 @@ mod tests {
         let main = include_str!("main.rs");
         let start = main.find("async fn start_node(").expect("start_node");
         let body = &main[start..];
+        assert!(
+            include_str!("boot_state.rs").contains("storage.state.get_all_storage()"),
+            "hydrate_state_db reads the stored slots"
+        );
         let init = body
             .find("citrate_execution::storage_root_hardening::init_for_genesis(")
             .expect("start_node must publish the storage root hardening height");
@@ -1061,7 +1164,9 @@ mod tests {
             "GhostDag::new(",
             "Executor::with_storage_and_chain_id(",
             "ConsensusManifest::for_node(",
-            "storage.state.get_all_storage()",
+            // Hydration moved into boot_state::hydrate_state_db (S1-5);
+            // start_node's call to it is the hydration point.
+            "boot_state::hydrate_state_db(",
         ] {
             let at = body
                 .find(marker)
@@ -1122,6 +1227,111 @@ mod tests {
         let with = base.replacen("[chain]", "[chain]\nstorage_root_hardening_height = 0", 1);
         let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
         assert_eq!(cfg.chain.storage_root_hardening_height, Some(0));
+    }
+
+    /// CV-14: the MPT state root height is published in start_node before any
+    /// state is hydrated or rooted, from one publication path, and no shipped
+    /// profile schedules it (it is an r1007 genesis rule: the r1007 genesis
+    /// entry, or `mpt_state_root_height = 0` on a new devnet, sets it).
+    #[test]
+    fn mpt_state_root_is_published_first_and_unset_in_every_shipped_profile() {
+        let main = include_str!("main.rs");
+        let start = main.find("async fn start_node(").expect("start_node");
+        let body = &main[start..];
+        let init = body
+            .find("citrate_execution::mpt_state_root::init_for_genesis(")
+            .expect("start_node must publish the MPT state root height");
+        for marker in [
+            "GhostDag::new(",
+            "Executor::with_storage_and_chain_id(",
+            "ConsensusManifest::for_node(",
+            "boot_state::hydrate_state_db(",
+        ] {
+            let at = body
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} in start_node"));
+            assert!(init < at, "MPT state root height published before {marker}");
+        }
+        assert!(
+            !main.contains("set_mpt_state_root_height("),
+            "one publication path"
+        );
+        assert_eq!(NodeConfig::default().chain.mpt_state_root_height, None);
+        assert_eq!(NodeConfig::devnet().chain.mpt_state_root_height, None);
+        for (name, text) in [
+            (
+                "node/config/devnet.toml",
+                include_str!("../config/devnet.toml"),
+            ),
+            (
+                "node/config/mainnet.toml",
+                include_str!("../config/mainnet.toml"),
+            ),
+            (
+                "node/config/testnet.toml",
+                include_str!("../config/testnet.toml"),
+            ),
+            (
+                "node/config/testnet-beta.toml",
+                include_str!("../config/testnet-beta.toml"),
+            ),
+            (
+                "node/config/team-testnet.toml",
+                include_str!("../config/team-testnet.toml"),
+            ),
+            (
+                "devnet-config.toml",
+                include_str!("../../devnet-config.toml"),
+            ),
+            (
+                "testnet-config.toml",
+                include_str!("../../testnet-config.toml"),
+            ),
+        ] {
+            assert!(
+                !text.contains("mpt_state_root_height"),
+                "{name} must not schedule the MPT state root"
+            );
+        }
+        let base = include_str!("../config/devnet.toml");
+        let with = base.replacen("[chain]", "[chain]\nmpt_state_root_height = 0", 1);
+        let cfg: NodeConfig = toml::from_str(&with).expect("key parses");
+        assert_eq!(cfg.chain.mpt_state_root_height, Some(0));
+    }
+
+    /// r1007 genesis rule (CV-14, lead decision 2026-11-09): activation 0 roots
+    /// block 0 itself under the MPT rule, so the rule must be published before
+    /// a genesis is BUILT, not only before start_node hydrates. Every function
+    /// in main.rs that builds a genesis publishes it first (through
+    /// `publish_mpt_rule_for_genesis_build`, which resolves it for the genesis
+    /// the build is meant to produce).
+    #[test]
+    fn every_genesis_build_publishes_the_mpt_rule_first() {
+        let main = include_str!("main.rs");
+        let mut builds = 0;
+        for needle in [
+            "initialize_genesis_state(",
+            "initialize_genesis_state_with_profile(",
+        ] {
+            for (at, _) in main.match_indices(needle) {
+                // Skip the `use` line and the helper's own definition.
+                let line_start = main[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line = &main[line_start..at];
+                if line.trim_start().starts_with("use ") || line.contains("fn ") {
+                    continue;
+                }
+                let fn_start = main[..at].rfind("fn ").expect("inside a function");
+                let before = &main[fn_start..at];
+                assert!(
+                    before.contains("publish_mpt_rule_for_genesis_build(")
+                        || before.contains("citrate_execution::mpt_state_root::init_for_genesis("),
+                    "the genesis build at byte {at} of main.rs does not publish the MPT \
+                         state root rule first"
+                );
+                builds += 1;
+            }
+        }
+        assert!(builds >= 4, "found {builds} genesis builds in main.rs");
     }
 
     /// The canonical VRF encoding height is published in start_node before

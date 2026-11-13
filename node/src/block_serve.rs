@@ -102,6 +102,15 @@ fn resolve_start_inclusive(storage: &StorageManager, from: &Hash) -> Option<u64>
     }
 }
 
+/// CV-7b (H6): the dead-branch marker, when this node's applied tip is held on
+/// a branch it cannot switch from. Unreadable reads as "no marker": serving
+/// stays as it was.
+fn dead_branch(storage: &StorageManager) -> Option<citrate_storage::chain::wedge::WedgeRecord> {
+    citrate_storage::chain::wedge::read(&storage.db)
+        .ok()
+        .flatten()
+}
+
 /// Walk heights `[start, tip]`, mapping each stored block through `map`,
 /// stopping at the item clamp, the first index gap, or the byte budget.
 fn collect_bounded<T: serde::Serialize>(
@@ -115,6 +124,12 @@ fn collect_bounded<T: serde::Serialize>(
     };
     let Ok(tip) = storage.blocks.get_latest_height() else {
         return Vec::new();
+    };
+    // CV-7b: above the fork point of a dead branch the height index is that
+    // branch; it is not served as this node's chain.
+    let tip = match dead_branch(storage) {
+        Some(w) => tip.min(w.fork_height),
+        None => tip,
     };
     let mut out: Vec<T> = Vec::new();
     let mut budget = MAX_RESPONSE_BYTES;
@@ -225,6 +240,9 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
             .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
     });
 
+    // CV-7b: the dead branch's blocks above its fork point are left out (a
+    // height whose only member was one is an empty group, not a gap).
+    let wedge = dead_branch(storage);
     let mut out: Vec<Block> = Vec::new();
     let mut budget = MAX_RESPONSE_BYTES;
     let mut expected = start;
@@ -247,6 +265,18 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
                 break;
             }
             i = i.saturating_add(1);
+            if let Some(w) = &wedge {
+                if row_h > w.fork_height && row_h <= w.dead_tip_height {
+                    let canonical = storage
+                        .blocks
+                        .get_canonical_block_by_height(row_h)
+                        .ok()
+                        .flatten();
+                    if w.is_dead_block(row_h, &hash, canonical) {
+                        continue;
+                    }
+                }
+            }
             // The anchor's own block IS included. It is tempting to strip it —
             // "they anchored on it, so they have it" — but that assumption is
             // false for the SYNC-S3 recovery request, which anchors at a MISSING

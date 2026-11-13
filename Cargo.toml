@@ -31,6 +31,10 @@ members = [
     "crates/citrate-commd",
     # HUP-S9.2: independent replay of a federated LoRA round (docs/fl/FL_ROUND_V1.md).
     "tools/fl-replay",
+    # r1007 S3-3c: differential replay harness (recorder, reference executor, replay-diff).
+    "tools/replay-ref",
+    # r1007 S3-3b/S3-3c: the independent mergeset-acceptance reference.
+    "tools/mergeset-ref",
     # HUP-S6.10: the Citrate-aware dry-run fork (read-only; not a default member).
     "crates/citrate-fork",
 ]

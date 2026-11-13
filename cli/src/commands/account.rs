@@ -254,7 +254,7 @@ async fn get_balance(config: &Config, address: &str) -> Result<()> {
 
         println!("Address: {}", format!("0x{}", address).cyan());
         println!("Balance: {} wei", balance);
-        println!("         {} ETH", balance as f64 / 1e18);
+        println!("         {} SALT", balance as f64 / 1e18);
     } else if let Some(error) = result
         .get("error")
         .unwrap_or(&serde_json::Value::Null)

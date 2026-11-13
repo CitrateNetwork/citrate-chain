@@ -48,15 +48,19 @@ pub fn legacy_hydration_view(records: Vec<StorageRecord>) -> Vec<StorageRecord> 
 }
 
 /// Undo records are kept for this many applied heights: the node's reorg
-/// window (`canonical_apply::MAX_REORG_DEPTH`, which asserts it is equal). With
-/// the records of heights `t-99..=t` a node at tip `t` can rebuild the state of
-/// every height `t-100..=t` after a restart.
-pub const REORG_UNDO_DEPTH: u64 = 100;
-
-/// Largest undo record kept, encoded. A bigger one is skipped (the block is
-/// left without a record): it would only shorten the window a restart can
-/// rebuild, and it keeps one oversized block from bloating every commit.
-pub const MAX_UNDO_RECORD_BYTES: usize = 8 * 1024 * 1024;
+/// window (`canonical_apply::MAX_REORG_DEPTH`, which asserts it is equal),
+/// which is the DAG prune retention (ADR-2026-11-03 CV-7a, spec 06 §4.2:
+/// undo window = PRUNING_DEPTH = 10,000). With the records of heights
+/// `t-9_999..=t` a node at tip `t` can rebuild the state of every height
+/// `t-10_000..=t`, so any fork the DAG store still holds can be switched
+/// across in place.
+///
+/// Disk cost (S1-6, `undo_record_size_per_block_shape_s1_6`): about 131
+/// bytes per touched account and 101 per touched slot, so 4.8 MiB for
+/// 10,000 reward-only blocks and 255 MiB for 10,000 blocks of 100 transfers.
+/// Records are never dropped for their size (a missing record inside the
+/// window is a permanent wedge, root cause H6).
+pub const REORG_UNDO_DEPTH: u64 = 10_000;
 
 /// `CF_METADATA` key prefix of the undo records (big-endian height follows).
 /// Metadata, not a column family of its own, so a binary without it still
@@ -89,6 +93,44 @@ fn merge_model_job_undo(mut held: ModelJobUndo, more: &ModelJobUndo) -> ModelJob
     held.jobs
         .extend(more.jobs.iter().filter(|(k, _)| !jobs.contains(k)).cloned());
     held
+}
+
+/// CV-14 trie-node store, in `CF_STATE` (no new column family, so an older
+/// binary still opens the database): `mpt_node:` + keccak256(RLP) -> RLP.
+const TRIE_NODE_PREFIX: &[u8] = b"mpt_node:";
+/// `mpt_root:` + big-endian height -> the state root of the applied block there.
+const TRIE_ROOT_PREFIX: &[u8] = b"mpt_root:";
+/// The highest height with a root record (so a rewrite at a lower height knows
+/// which records an abandoned longer branch left).
+const TRIE_ROOT_TIP_KEY: &[u8] = b"mpt_root_tip";
+
+/// Trie nodes unreachable from every root in the undo window are swept every
+/// this many heights (mark-and-sweep; see [`StateStore::prune_trie_nodes`]).
+pub const TRIE_PRUNE_INTERVAL: u64 = 1_000;
+
+fn trie_node_key(hash: &[u8; 32]) -> Vec<u8> {
+    let mut k = TRIE_NODE_PREFIX.to_vec();
+    k.extend_from_slice(hash);
+    k
+}
+
+fn trie_root_key(height: u64) -> Vec<u8> {
+    let mut k = TRIE_ROOT_PREFIX.to_vec();
+    k.extend_from_slice(&height.to_be_bytes());
+    k
+}
+
+/// What a trie-node prune kept and removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TriePruneStats {
+    /// Root records inside the window (the mark roots).
+    pub roots: usize,
+    /// Root records removed (below the window).
+    pub roots_removed: usize,
+    /// Nodes reachable from a root in the window (kept).
+    pub nodes_kept: usize,
+    /// Nodes removed (reachable from none).
+    pub nodes_removed: usize,
 }
 
 /// Whether height `h` is inside the kept window at tip height `tip`.
@@ -340,6 +382,69 @@ impl StateStoreTrait for StateStore {
     /// C1-R: the receipt index on its own, as one fsync'd batch. The commit paths
     /// stage it inside their state batch instead; this override keeps the
     /// standalone trait method honest for any caller of the default fallback.
+    fn get_trie_node(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        self.db.get_cf(CF_STATE, &trie_node_key(hash))
+    }
+
+    /// One batch: the nodes, the root record for `height`, and the removal of
+    /// the records an abandoned longer branch left above it. Every
+    /// [`TRIE_PRUNE_INTERVAL`] heights, a prune over the undo window
+    /// ([`REORG_UNDO_DEPTH`], = retention) follows.
+    fn put_trie_nodes(
+        &self,
+        height: u64,
+        root: &Hash,
+        nodes: &[([u8; 32], Vec<u8>)],
+    ) -> Result<()> {
+        let mut batch = self.db.batch();
+        for (hash, rlp) in nodes {
+            self.db
+                .batch_put_cf(&mut batch, CF_STATE, &trie_node_key(hash), rlp)?;
+        }
+        let prev_tip = self
+            .db
+            .get_cf(CF_STATE, TRIE_ROOT_TIP_KEY)?
+            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+            .map(u64::from_be_bytes);
+        if let Some(prev) = prev_tip.filter(|p| *p > height) {
+            // An abandoned branch reached `prev`: its records above `height`
+            // no longer name canonical roots.
+            let span = prev.saturating_sub(height).min(REORG_UNDO_DEPTH);
+            for h in (prev.saturating_sub(span).saturating_add(1)..=prev).filter(|h| *h > height) {
+                self.db
+                    .batch_delete_cf(&mut batch, CF_STATE, &trie_root_key(h))?;
+            }
+        }
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_STATE,
+            &trie_root_key(height),
+            root.as_bytes(),
+        )?;
+        self.db.batch_put_cf(
+            &mut batch,
+            CF_STATE,
+            TRIE_ROOT_TIP_KEY,
+            &height.to_be_bytes(),
+        )?;
+        self.db.write_batch(batch)?;
+        if height > 0 && height.is_multiple_of(TRIE_PRUNE_INTERVAL) {
+            let stats = self.prune_trie_nodes(height, REORG_UNDO_DEPTH)?;
+            info!(
+                "trie nodes pruned at height {height}: {} root(s) in the window, {} node(s) kept, {} removed",
+                stats.roots, stats.nodes_kept, stats.nodes_removed
+            );
+        }
+        Ok(())
+    }
+
+    fn trie_root_at(&self, height: u64) -> Result<Option<Hash>> {
+        Ok(self
+            .db
+            .get_cf(CF_STATE, &trie_root_key(height))?
+            .and_then(|b| Hash::try_from_bytes(&b)))
+    }
+
     fn put_receipt_index(&self, index: &ReceiptIndexBatch) -> Result<()> {
         if index.is_empty() {
             return Ok(());
@@ -413,6 +518,103 @@ impl StateStoreTrait for StateStore {
 }
 
 impl StateStore {
+    /// Mark-and-sweep the trie-node store: keep every node reachable from the
+    /// root recorded at a height in (`tip` - `window`, `tip`] (account tries,
+    /// and the storage tries their leaves name), delete every other node and
+    /// the root records below the window. Production runs it with
+    /// `window` = [`REORG_UNDO_DEPTH`] (CV-7a: undo window = retention).
+    ///
+    /// A node the next state needs is never removed: the current trie is
+    /// reachable from the tip's own record. A missing node anywhere only costs
+    /// a restart its trie reuse (it rebuilds from state).
+    pub fn prune_trie_nodes(&self, tip: u64, window: u64) -> Result<TriePruneStats> {
+        use citrate_execution::state::mpt;
+        use std::collections::HashSet;
+        let floor = tip.saturating_sub(window);
+        let mut stats = TriePruneStats::default();
+        let mut roots: Vec<[u8; 32]> = Vec::new();
+        let mut stale_records: Vec<Vec<u8>> = Vec::new();
+        self.db
+            .for_each_prefix_key_cf(CF_STATE, TRIE_ROOT_PREFIX, |key| {
+                let h = key
+                    .strip_prefix(TRIE_ROOT_PREFIX)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map(u64::from_be_bytes);
+                match h {
+                    Some(h) if h > floor && h <= tip => {}
+                    _ => stale_records.push(key.to_vec()),
+                }
+                Ok(())
+            })?;
+        for h in floor.saturating_add(1)..=tip {
+            if let Some(r) = self.trie_root_at(h)? {
+                roots.push(*r.as_bytes());
+            }
+        }
+        stats.roots = roots.len();
+        // Mark. Account-trie leaves name a storage root to descend into.
+        let mut marked: HashSet<[u8; 32]> = HashSet::new();
+        let mut stack: Vec<([u8; 32], bool)> = roots.iter().map(|r| (*r, true)).collect();
+        while let Some((hash, account_trie)) = stack.pop() {
+            if hash == mpt::EMPTY_ROOT || !marked.insert(hash) {
+                continue;
+            }
+            let Some(rlp) = self.get_trie_node(&hash)? else {
+                continue;
+            };
+            let Ok((children, leaf_values)) = mpt::node_refs_and_leaf_values(&rlp) else {
+                continue;
+            };
+            stack.extend(children.into_iter().map(|c| (c, account_trie)));
+            if account_trie {
+                for v in leaf_values {
+                    if let Some(sr) =
+                        citrate_execution::state::mpt_state::account_leaf_storage_root(&v)
+                    {
+                        stack.push((sr, false));
+                    }
+                }
+            }
+        }
+        // Sweep.
+        let mut batch = self.db.batch();
+        self.db
+            .for_each_prefix_key_cf(CF_STATE, TRIE_NODE_PREFIX, |key| {
+                let keep = key
+                    .strip_prefix(TRIE_NODE_PREFIX)
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .is_some_and(|h| marked.contains(&h));
+                if keep {
+                    stats.nodes_kept = stats.nodes_kept.saturating_add(1);
+                } else {
+                    stats.nodes_removed = stats.nodes_removed.saturating_add(1);
+                    self.db.batch_delete_cf(&mut batch, CF_STATE, key)?;
+                }
+                Ok(())
+            })?;
+        for key in &stale_records {
+            self.db.batch_delete_cf(&mut batch, CF_STATE, key)?;
+        }
+        stats.roots_removed = stale_records.len();
+        self.db.write_batch(batch)?;
+        Ok(stats)
+    }
+
+    /// Trie nodes stored, and their total RLP bytes (storage overhead).
+    pub fn trie_node_usage(&self) -> Result<(usize, u64)> {
+        let mut n: usize = 0;
+        let mut bytes: u64 = 0;
+        for (_, v) in self
+            .db
+            .prefix_iter_cf(CF_STATE, TRIE_NODE_PREFIX)?
+            .take_while(|(k, _)| k.starts_with(TRIE_NODE_PREFIX))
+        {
+            n = n.saturating_add(1);
+            bytes = bytes.saturating_add(v.len() as u64);
+        }
+        Ok((n, bytes))
+    }
+
     /// Stage the applied-tip pointer and the canonical height index for it into
     /// `batch` (same key + layout as `BlockStore::put_applied_tip`). The returned
     /// guard must be held until `batch` is committed: staging reads the index it
@@ -474,8 +676,7 @@ impl StateStore {
     /// shortens the window a restart can rebuild, so nothing here can fail the
     /// commit. Any error (a read, an encode, a staging write, the window scan)
     /// is logged and leaves the block without a record (a delete of its height
-    /// is staged last); a record over [`MAX_UNDO_RECORD_BYTES`] is skipped the
-    /// same way.
+    /// is staged last). A record is never skipped for its size.
     fn stage_block_undo(
         &self,
         batch: &mut rocksdb::WriteBatch,
@@ -507,22 +708,29 @@ impl StateStore {
         }
     }
 
-    /// Stage `record`, or, over [`MAX_UNDO_RECORD_BYTES`] encoded, skip it
-    /// (a warning, and a delete of its height so no stale record stays).
+    /// Stage `record`, whatever its size: one RocksDB value. At the r1007
+    /// acceptance gas cap a record is bounded at about 2 MB (spec 06 §4.2);
+    /// a value of that size needs no chunking.
+    ///
+    /// The record is written in canonical order (accounts by address, slots
+    /// by address then key, models and jobs by id), so its bytes are a function of the block and its
+    /// pre-state only, whichever path built it: the linear commit or a reorg
+    /// re-apply (spec 06 §8.1 I7). Each address and slot appears once in a
+    /// record, so the order carries no meaning.
     fn stage_undo_record(&self, batch: &mut rocksdb::WriteBatch, record: &BlockUndo) -> Result<()> {
         let key = reorg_undo_key(record.height);
-        let bytes = bincode::serialize(record)?;
-        if bytes.len() > MAX_UNDO_RECORD_BYTES {
-            warn!(
-                "reorg window: undo record of block {} @ {} is {} bytes (cap {}); not kept, a \
-                 restart can revert no further than this height",
-                record.hash,
-                record.height,
-                bytes.len(),
-                MAX_UNDO_RECORD_BYTES
-            );
-            return self.db.batch_delete_cf(batch, CF_METADATA, &key);
+        let mut canonical = record.clone();
+        canonical.accounts.sort_by_key(|a| a.0 .0);
+        canonical
+            .storage
+            .sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| a.1.cmp(&b.1)));
+        if let Some(mj) = canonical.models_jobs.as_mut() {
+            mj.models
+                .sort_by(|a, b| a.0 .0.as_bytes().cmp(b.0 .0.as_bytes()));
+            mj.jobs
+                .sort_by(|a, b| a.0 .0.as_bytes().cmp(b.0 .0.as_bytes()));
         }
+        let bytes = bincode::serialize(&canonical)?;
         self.db.batch_put_cf(batch, CF_METADATA, &key, &bytes)
     }
 
@@ -613,7 +821,6 @@ impl StateStore {
     /// Stage a reorg's undo records (the winning branch's, computed by the
     /// node from its in-memory states) and drop every other record outside the
     /// window at the new tip `tip`, including the abandoned branch's above it.
-    /// A record over [`MAX_UNDO_RECORD_BYTES`] is skipped.
     ///
     /// Fail-soft, as [`Self::stage_block_undo`]: an error is logged and the
     /// branch's heights are left without records; the reorg commit goes on.
@@ -635,16 +842,47 @@ impl StateStore {
     }
 
     /// Delete, in `batch`, every kept record outside the window at `tip`.
+    ///
+    /// Reads only the keys outside the window: those at or below
+    /// `tip - REORG_UNDO_DEPTH` and those above `tip` (keys sort by
+    /// big-endian height). On a linear commit that is the one record that just
+    /// left the window, so the cost per block does not grow with the window.
     fn stage_undo_window(&self, batch: &mut rocksdb::WriteBatch, tip: u64) -> Result<()> {
         #[cfg(test)]
         if test_undo_faults::fail_staging() {
             anyhow::bail!("injected undo staging failure");
         }
-        for height in self.reorg_undo_heights()? {
-            if !in_undo_window(height, tip) {
-                self.db
-                    .batch_delete_cf(batch, CF_METADATA, &reorg_undo_key(height))?;
+        let floor = tip.saturating_sub(REORG_UNDO_DEPTH);
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        let mut collect = |key: &[u8]| {
+            if let Some(h) = reorg_undo_height(key) {
+                if !in_undo_window(h, tip) {
+                    doomed.push(key.to_vec());
+                }
             }
+            Ok(())
+        };
+        // Heights 0..=floor (all of them when the tip is inside the first window).
+        let below_end = floor.checked_add(1).map(reorg_undo_key);
+        self.db.for_each_key_in_range_cf(
+            CF_METADATA,
+            &reorg_undo_key(0),
+            below_end.as_deref(),
+            REORG_UNDO_PREFIX,
+            &mut collect,
+        )?;
+        // Heights above the tip.
+        if let Some(above) = tip.checked_add(1) {
+            self.db.for_each_key_in_range_cf(
+                CF_METADATA,
+                &reorg_undo_key(above),
+                None,
+                REORG_UNDO_PREFIX,
+                &mut collect,
+            )?;
+        }
+        for key in doomed {
+            self.db.batch_delete_cf(batch, CF_METADATA, &key)?;
         }
         Ok(())
     }
@@ -1032,11 +1270,13 @@ mod tests {
         assert_eq!(rec.hash, block_hash(2));
         assert_eq!(rec.parent, Some((block_hash(1), 1)));
         assert_eq!(rec.accounts, vec![(a, Some(acct(10))), (b, None)]);
+        // Canonical order (address, then key): the record is a function of
+        // the block and its pre-state, not of the write order (I7).
         assert_eq!(
             rec.storage,
             vec![
-                (a, b"k".to_vec(), Some(b"v1".to_vec())),
-                (a, b"j".to_vec(), None)
+                (a, b"j".to_vec(), None),
+                (a, b"k".to_vec(), Some(b"v1".to_vec()))
             ]
         );
         // A second write at the same tip extends the record with new keys only:
@@ -1152,7 +1392,15 @@ mod tests {
         let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
         let a = Address([1; 20]);
         let none = ReceiptIndexBatch::default();
-        for h in 1..=150u64 {
+        let d = REORG_UNDO_DEPTH;
+        let top = d + 50;
+        let other = |h: u64| {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&h.to_be_bytes());
+            b[31] = 0xC2;
+            Hash::new(b)
+        };
+        for h in 1..=top {
             store
                 .write_state_batch_with_applied_tip(
                     &[(a, acct(h))],
@@ -1165,21 +1413,31 @@ mod tests {
         }
         assert_eq!(
             store.reorg_undo_heights().expect("heights"),
-            (51..=150).collect::<Vec<u64>>()
+            (51..=top).collect::<Vec<u64>>()
         );
-        // Revert to a fork point at 140: no records passed, nothing changes.
+        // Revert to a fork point at top - 10: no records passed, nothing changes.
+        let fork = top - 10;
         store
-            .write_reorg_batch_sync(&[], &[], &[], &[], Some((block_hash(140), 140)), &none, &[])
+            .write_reorg_batch_sync(
+                &[],
+                &[],
+                &[],
+                &[],
+                Some((block_hash(fork), fork)),
+                &none,
+                &[],
+            )
             .expect("commit");
         assert_eq!(
             store.reorg_undo_heights().expect("heights"),
-            (51..=150).collect::<Vec<u64>>()
+            (51..=top).collect::<Vec<u64>>()
         );
-        // The winning branch 141..=145 commits with its records.
-        let winner: Vec<BlockUndo> = (141..=145u64)
+        // The winning branch fork+1..=fork+5 commits with its records.
+        let win_tip = fork + 5;
+        let winner: Vec<BlockUndo> = (fork + 1..=win_tip)
             .map(|h| BlockUndo {
                 height: h,
-                hash: Hash::new([h as u8; 32]),
+                hash: other(h),
                 parent: None,
                 accounts: vec![(a, Some(acct(h - 1)))],
                 storage: vec![],
@@ -1192,23 +1450,26 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                Some((Hash::new([145; 32]), 145)),
+                Some((other(win_tip), win_tip)),
                 &none,
                 &winner,
             )
             .expect("commit");
         assert_eq!(
             store.reorg_undo_heights().expect("heights"),
-            (46..=145).filter(|h| *h >= 51).collect::<Vec<u64>>(),
-            "abandoned 146..=150 dropped; nothing below the window"
+            (51..=win_tip).collect::<Vec<u64>>(),
+            "abandoned heights above {win_tip} dropped; nothing below the window"
         );
         assert_eq!(
-            store.get_reorg_undo(143).expect("read").map(|r| r.hash),
-            Some(Hash::new([143; 32]))
+            store
+                .get_reorg_undo(fork + 3)
+                .expect("read")
+                .map(|r| r.hash),
+            Some(other(fork + 3))
         );
         assert_eq!(
-            store.get_reorg_undo(140).expect("read").map(|r| r.hash),
-            Some(block_hash(140)),
+            store.get_reorg_undo(fork).expect("read").map(|r| r.hash),
+            Some(block_hash(fork)),
             "the shared chain's records stay"
         );
     }
@@ -1321,15 +1582,17 @@ mod tests {
         }
     }
 
-    /// An undo record larger than the cap is not kept (a warning, no record
-    /// at that height); the commit itself goes through. Linear and reorg alike.
+    /// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2): an undo record is never
+    /// dropped for its size. A missing record inside the window is a
+    /// permanent wedge (H6), so a block whose pre-images encode to more than
+    /// 8 MiB keeps its record, linear and reorg alike.
     #[test]
-    fn an_oversized_undo_record_is_skipped() {
+    fn an_undo_record_over_8_mib_is_kept() {
         let temp_dir = TempDir::new().expect("tempdir");
         let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
         let a = Address([1; 20]);
         let none = ReceiptIndexBatch::default();
-        let big = vec![0xAB; MAX_UNDO_RECORD_BYTES + 1];
+        let big = vec![0xAB; 8 * 1024 * 1024 + 1];
         store
             .write_state_batch_with_applied_tip(
                 &[(a, acct(1))],
@@ -1339,7 +1602,6 @@ mod tests {
                 None,
             )
             .expect("block 1");
-        // Block 2 overwrites the big slot: its pre-image is over the cap.
         store
             .write_state_batch_with_applied_tip(
                 &[(a, acct(2))],
@@ -1349,49 +1611,34 @@ mod tests {
                 None,
             )
             .expect("block 2 commits");
-        assert_eq!(store.durable_tip().expect("tip"), Some((block_hash(2), 2)));
-        assert!(
-            store.get_reorg_undo(2).expect("read").is_none(),
-            "an oversized record is not kept"
-        );
-        assert!(store.get_reorg_undo(1).expect("read").is_some());
-        // A reorg's winning record over the cap is skipped; the others are kept.
-        let records = [
-            BlockUndo {
-                height: 3,
-                hash: block_hash(3),
-                parent: Some((block_hash(2), 2)),
-                accounts: vec![(a, Some(acct(2)))],
-                storage: vec![(a, b"big".to_vec(), Some(big.clone()))],
-                models_jobs: Some(Default::default()),
-            },
-            BlockUndo {
-                height: 4,
-                hash: block_hash(4),
-                parent: Some((block_hash(3), 3)),
-                accounts: vec![(a, Some(acct(3)))],
-                storage: vec![],
-                models_jobs: Some(Default::default()),
-            },
-        ];
+        let rec = store
+            .get_reorg_undo(2)
+            .expect("read")
+            .expect("a record over 8 MiB is kept");
+        assert_eq!(rec.storage, vec![(a, b"big".to_vec(), Some(big.clone()))]);
+        let records = [BlockUndo {
+            height: 3,
+            hash: block_hash(3),
+            parent: Some((block_hash(2), 2)),
+            accounts: vec![(a, Some(acct(2)))],
+            storage: vec![(a, b"big".to_vec(), Some(big.clone()))],
+            models_jobs: Some(Default::default()),
+        }];
         store
             .write_reorg_batch_sync(
-                &[(a, acct(4))],
+                &[(a, acct(3))],
                 &[],
                 &[],
                 &[],
-                Some((block_hash(4), 4)),
+                Some((block_hash(3), 3)),
                 &none,
                 &records,
             )
             .expect("reorg commits");
-        assert!(
-            store.get_reorg_undo(3).expect("read").is_none(),
-            "an oversized winning record is not kept"
-        );
         assert_eq!(
-            store.get_reorg_undo(4).expect("read").map(|r| r.hash),
-            Some(block_hash(4))
+            store.get_reorg_undo(3).expect("read").map(|r| r.storage),
+            Some(vec![(a, b"big".to_vec(), Some(big))]),
+            "a winning record over 8 MiB is kept"
         );
     }
 
@@ -1413,5 +1660,133 @@ mod tests {
         // Delete value
         store.delete_storage(&address, b"key1").unwrap();
         assert!(store.get_storage(&address, b"key1").unwrap().is_none());
+    }
+
+    /// S1-6 (ADR-2026-11-03 CV-7a, RT-4): the storage cost of keeping one undo
+    /// record per applied height for the whole DAG retention window (10,000)
+    /// instead of `REORG_UNDO_DEPTH` (100). Measures the encoded record of
+    /// three block shapes on a store where every touched account and slot
+    /// already exists (so every pre-image is a full value, the worst case for
+    /// a steady-state chain):
+    ///
+    /// - reward-only: the coinbase, the treasury and the reward minter;
+    /// - 100 native transfers: 100 senders + 100 recipients + those three;
+    /// - 50 token transfers: 50 senders (nonce) + those three, and two 32-byte
+    ///   balance slots per transfer on one contract.
+    ///
+    /// Prints `S1-6 undo record` lines (run with `--nocapture`). Asserts that
+    /// the record grows linearly with what the block touches, so the
+    /// projection (bytes per record x 10,000) holds.
+    #[test]
+    fn undo_record_size_per_block_shape_s1_6() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let store = StateStore::new(Arc::new(RocksDB::open(temp_dir.path()).expect("open")));
+        let none = ReceiptIndexBatch::default();
+        let addr = |tag: u8, i: u32| {
+            let mut a = [tag; 20];
+            a[16..].copy_from_slice(&i.to_be_bytes());
+            Address(a)
+        };
+        let full = |nonce: u64| AccountState {
+            nonce,
+            balance: U256::from(10u128.pow(24)),
+            storage_root: Hash::new([0x5A; 32]),
+            code_hash: Hash::new([0xC0; 32]),
+            model_permissions: vec![],
+        };
+        let fixed = [addr(0xC0, 0), addr(0x11, 0), addr(0x1D, 0)];
+        let token = addr(0x7E, 0);
+        let word = |i: u32, tag: u8| {
+            let mut w = vec![tag; 32];
+            w[28..].copy_from_slice(&i.to_be_bytes());
+            w
+        };
+        // Height 1 writes every account and slot the blocks below touch, so
+        // each later pre-image is a full stored value.
+        let mut accounts: Vec<(Address, AccountState)> =
+            fixed.iter().map(|a| (*a, full(1))).collect();
+        for i in 0..100 {
+            accounts.push((addr(0xA0, i), full(1)));
+            accounts.push((addr(0xB0, i), full(1)));
+        }
+        accounts.push((token, full(1)));
+        let slots: Vec<StateStorageChange> = (0..100)
+            .map(|i| slot(token, &word(i, 0x01), Some(&word(i, 0x02))))
+            .collect();
+        store
+            .write_state_batch_with_applied_tip(
+                &accounts,
+                &slots,
+                Some((block_hash(1), 1)),
+                &none,
+                Some(&ModelJobUndo::default()),
+            )
+            .expect("seed");
+        let measure = |height: u64,
+                       accounts: Vec<(Address, AccountState)>,
+                       storage: Vec<StateStorageChange>|
+         -> (usize, usize, usize) {
+            let (na, ns) = (accounts.len(), storage.len());
+            store
+                .write_state_batch_with_applied_tip(
+                    &accounts,
+                    &storage,
+                    Some((block_hash(height), height)),
+                    &none,
+                    Some(&ModelJobUndo::default()),
+                )
+                .expect("commit");
+            let rec = store
+                .get_reorg_undo(height)
+                .expect("read")
+                .expect("record kept");
+            assert_eq!(rec.accounts.len(), na);
+            assert_eq!(rec.storage.len(), ns);
+            let bytes = bincode::serialize(&rec).expect("encode").len();
+            (bytes, na, ns)
+        };
+        let reward_only = measure(2, fixed.iter().map(|a| (*a, full(2))).collect(), Vec::new());
+        let mut transfers: Vec<(Address, AccountState)> =
+            fixed.iter().map(|a| (*a, full(3))).collect();
+        for i in 0..100 {
+            transfers.push((addr(0xA0, i), full(3)));
+            transfers.push((addr(0xB0, i), full(3)));
+        }
+        let native = measure(3, transfers, Vec::new());
+        let mut senders: Vec<(Address, AccountState)> =
+            fixed.iter().map(|a| (*a, full(4))).collect();
+        for i in 0..50 {
+            senders.push((addr(0xA0, i), full(4)));
+        }
+        let token_slots: Vec<StateStorageChange> = (0..100)
+            .map(|i| slot(token, &word(i, 0x01), Some(&word(i, 0x03))))
+            .collect();
+        let tokens = measure(4, senders, token_slots);
+        for (name, (bytes, na, ns)) in [
+            ("reward-only", reward_only),
+            ("100 native transfers", native),
+            ("50 token transfers", tokens),
+        ] {
+            println!(
+                "S1-6 undo record {name}: {bytes} bytes ({na} account(s), {ns} slot(s)); \
+                 x100 = {} KiB, x10000 = {:.1} MiB",
+                bytes * 100 / 1024,
+                (bytes * 10_000) as f64 / (1024.0 * 1024.0)
+            );
+        }
+        // Linear in what the block touches: a per-account and per-slot cost,
+        // plus a small fixed header.
+        let per_account = (native.0 - reward_only.0) / (native.1 - reward_only.1);
+        assert!(
+            (60..=200).contains(&per_account),
+            "per-account pre-image: {per_account} bytes"
+        );
+        assert!(
+            reward_only.0 < 1_024,
+            "reward-only record: {} bytes",
+            reward_only.0
+        );
+        // Far below the 8 MiB cap the records once had (removed by S3-4).
+        assert!(native.0 < 8 * 1024 * 1024 && tokens.0 < 8 * 1024 * 1024);
     }
 }
