@@ -1438,4 +1438,60 @@ mod tests {
             dl.len()
         );
     }
+
+    /// r1007 (2026-11-14): a node stuck at applied height 1552 re-downloaded
+    /// the SAME 64 headers (1553-1616) on every 2 s tick — 2,540 times in five
+    /// hours. `downloaded_headers` is only drained when a batch reaches the
+    /// target, so it filled to the 64 MiB cap with duplicates and then logged
+    /// "SYNC_CAP: ... evicting 64 oldest headers" on every batch. RED on main:
+    /// the buffer holds every repeat. GREEN: a repeated batch is held once.
+    #[tokio::test]
+    async fn a_repeated_header_batch_is_held_once() {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+
+        let applied = Arc::new(AtomicU64::new(1_552));
+        let sync = SyncManager::new(SyncConfig::default()).with_local_height(applied.clone());
+        sync.set_target(96_291).await;
+        let template = BlockBuilder::new()
+            .parent(Hash::new([7u8; 32]))
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+            .header;
+        let batch = |from: u64| -> Vec<BlockHeader> {
+            (from..from + 64)
+                .map(|height| {
+                    let mut h = template.clone();
+                    h.height = height;
+                    let mut bytes = [9u8; 32];
+                    bytes[..8].copy_from_slice(&height.to_be_bytes());
+                    h.block_hash = Hash::new(bytes);
+                    h
+                })
+                .collect()
+        };
+
+        for _ in 0..3_000 {
+            sync.handle_headers(&crate::PeerId("p".into()), batch(1_553))
+                .await
+                .expect("monotonic batch");
+        }
+        assert_eq!(
+            sync.downloaded_headers.read().await.len(),
+            64,
+            "3,000 copies of the same 64 headers must be held once"
+        );
+
+        // Once the node applies past part of the window, those headers are no
+        // longer needed: they are dropped, and the next batch only adds new ones.
+        applied.store(1_600, Ordering::Relaxed);
+        sync.handle_headers(&crate::PeerId("p".into()), batch(1_601))
+            .await
+            .expect("monotonic batch");
+        let dl = sync.downloaded_headers.read().await;
+        assert!(
+            dl.iter().all(|h| h.height > 1_600),
+            "headers at or below the applied height are dropped"
+        );
+        assert_eq!(dl.len(), 64, "heights 1601..=1664, each once");
+    }
 }
