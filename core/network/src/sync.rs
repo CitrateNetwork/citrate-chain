@@ -7,7 +7,7 @@ use crate::{
 };
 use citrate_consensus::crypto;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -544,9 +544,23 @@ impl SyncManager {
         // streaming solicited-looking header batches. Cap the retained heap by
         // an estimated byte budget and drop the OLDEST headers first (FIFO):
         // the un-consumed tail is always re-derivable from a fresh request.
+        //
+        // r1007 (2026-11-14): while block download is driven from the applied
+        // tip, the 2 s tick re-requests the same window, and nothing drains this
+        // buffer until a batch reaches the target. A node stuck at 1552 held the
+        // same 64 headers thousands of times and evicted on every batch. Keep
+        // each (hash, height) once, and nothing the node has already applied.
         {
             let mut dl = self.downloaded_headers.write().await;
-            dl.extend(headers);
+            let applied = self.applied_height();
+            if let Some(a) = applied {
+                dl.retain(|h| h.height > a);
+            }
+            let mut held: HashSet<(Hash, u64)> =
+                dl.iter().map(|h| (h.block_hash, h.height)).collect();
+            dl.extend(headers.into_iter().filter(|h| {
+                applied.is_none_or(|a| h.height > a) && held.insert((h.block_hash, h.height))
+            }));
             let mut total: usize = dl.iter().map(estimated_header_bytes).sum();
             if total > MAX_DOWNLOADED_HEADERS_BYTES {
                 let mut drop_count = 0usize;
