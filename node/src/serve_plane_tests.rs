@@ -203,3 +203,244 @@ async fn serve_does_not_block_admission() {
     consensus_loop.abort();
     serving.abort();
 }
+
+// ---------------------------------------------------------------------------
+// r1007 cold-sync wedge at height 1552 (2026-11-14).
+//
+// Every fresh node stalled at applied height 1552 while the network ran on past
+// 96,000. Seven producers sealed at both 1552 and 1553; each height-1553 block
+// carries one transaction, and the height-1553 group serializes to 74,543
+// bytes. `serve_blocks` always emits the first height-group above the anchor
+// (the SYNC-S2 forward-progress guarantee), so boot1/2/3 each built a 14-block
+// reply (the 1552 group plus the 1553 group), and Noise refused to encrypt it:
+//
+//   block-serve: height-1553 group is 74543 bytes, over the 61440-byte soft budget
+//   Sending 14 blocks to peer noise_26cee14b...
+//   encrypt failed: Transport error: noise encrypt: input error
+//   Removed peer: noise_26cee14b...
+//
+// The fixture below is that shape, served over a real Noise connection.
+// ---------------------------------------------------------------------------
+
+/// Producers sealing at each height on r1007 around 1552/1553.
+const SIBLINGS: u8 = 7;
+/// One height-1553 block: 74,543 / 7 bytes, rounded up.
+const FAT_BLOCK_BYTES: u64 = 10_650;
+
+/// A block padded with one transaction to serialize to `target_bytes`.
+fn fat_block(id: u8, height: u64, selected: Hash, merges: Vec<Hash>, target_bytes: u64) -> Block {
+    use citrate_consensus::types::{Signature, Transaction};
+    let mk = |data: Vec<u8>| {
+        let tx = Transaction {
+            hash: Hash::new([id; 32]),
+            nonce: 0,
+            from: PublicKey::new([2; 32]),
+            to: None,
+            value: 0,
+            gas_limit: 3_000_000,
+            gas_price: 1_000_000_000,
+            data,
+            signature: Signature::new([1; 64]),
+            tx_type: None,
+            chain_id: Some(40204),
+            ..Default::default()
+        };
+        BlockBuilder::new()
+            .hash(hash_at(id, height))
+            .parent(selected)
+            .merge_parents(merges.clone())
+            .height(height)
+            .timestamp(1_000_000 + height)
+            .blue_score(height)
+            .blue_work(u128::from(height))
+            .proposer(PublicKey::new([1; 32]))
+            .transactions(vec![tx])
+            .build_unhashed()
+    };
+    let base = bincode::serialized_size(&mk(Vec::new())).expect("size");
+    mk(vec![0xAB; target_bytes.saturating_sub(base) as usize])
+}
+
+/// Genesis, seven empty siblings at height 1 (r1007's 1552) and seven
+/// one-transaction siblings at height 2 (r1007's 1553). Returns the storage
+/// and the requester's anchor: the canonical height-1 block.
+fn wedge_1553_store() -> (TempDir, Arc<StorageManager>, Hash) {
+    let dir = TempDir::new().expect("tempdir");
+    let storage =
+        Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+    let genesis = block(1, 0, Hash::default());
+    storage.blocks.put_block(&genesis).expect("put genesis");
+    let mut h1 = Vec::new();
+    for id in 0..SIBLINGS {
+        let b = block(0x10 + id, 1, genesis.hash());
+        storage.blocks.put_block(&b).expect("put h1");
+        h1.push(b.hash());
+    }
+    let anchor = storage
+        .blocks
+        .get_block_by_height(1)
+        .expect("read")
+        .expect("height 1 indexed");
+    let merges: Vec<Hash> = h1.iter().copied().filter(|h| *h != anchor).collect();
+    for id in 0..SIBLINGS {
+        let b = fat_block(0x20 + id, 2, anchor, merges.clone(), FAT_BLOCK_BYTES);
+        storage.blocks.put_block(&b).expect("put h2");
+    }
+    (dir, storage, anchor)
+}
+
+struct WireNode {
+    pm: Arc<PeerManager>,
+    transport: citrate_network::NetworkTransport,
+    id: PeerId,
+    incoming: mpsc::Receiver<(PeerId, NetworkMessage)>,
+}
+
+async fn wire_node() -> WireNode {
+    let keypair = citrate_network::NoiseKeypair::generate().expect("noise keypair");
+    let id = keypair.derive_peer_id();
+    let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+    let (tx, incoming) = mpsc::channel(1024);
+    pm.set_incoming(tx).await;
+    let params = citrate_network::transport::HandshakeParams {
+        network_id: 40204,
+        genesis_hash: Hash::new([0x42; 32]),
+        head: Arc::new(tokio::sync::RwLock::new((0, Hash::new([0x42; 32])))),
+    };
+    let transport =
+        citrate_network::NetworkTransport::new(pm.clone(), id.clone(), params).with_noise(keypair);
+    WireNode {
+        pm,
+        transport,
+        id,
+        incoming,
+    }
+}
+
+async fn wire_connect(server: &WireNode, client: &WireNode) {
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr");
+    server.transport.start_listener(addr).await.expect("listen");
+    client.transport.connect_to(addr).await.expect("dial");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.pm.get_peer(&client.id).is_none() || client.pm.get_peer(&server.id).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "Noise handshake did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// RED on main: the reply is one 14-block message over the Noise cap, so the
+/// requester receives nothing and the server drops it. GREEN: the reply goes
+/// out as several messages, every block arrives, and the connection stays up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_height_group_over_the_noise_cap_is_delivered_whole() {
+    let (_dir, storage, anchor) = wedge_1553_store();
+    let server = wire_node().await;
+    let mut client = wire_node().await;
+    let (serve_tx, serve_rx) = mpsc::channel(citrate_network::inbound::SERVE_LANE_CAPACITY);
+    server.pm.set_serve_sink(serve_tx).await;
+    let serving = crate::serve_plane::spawn(storage.clone(), server.pm.clone(), serve_rx);
+    wire_connect(&server, &client).await;
+
+    let expected = block_serve::serve_blocks(&storage, &anchor, 32);
+    assert_eq!(
+        expected.len(),
+        usize::from(SIBLINGS) * 2,
+        "the anchor's height-group plus the whole fat group above it"
+    );
+    let reply_bytes = bincode::serialized_size(&NetworkMessage::Blocks {
+        blocks: expected.clone(),
+    })
+    .expect("size");
+    assert!(
+        reply_bytes > citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN as u64,
+        "fixture must reproduce an over-cap reply (got {reply_bytes} bytes)"
+    );
+
+    client
+        .pm
+        .get_peer(&server.id)
+        .expect("server connected")
+        .send(NetworkMessage::GetBlocks {
+            from: anchor,
+            count: 32,
+            step: 1,
+        })
+        .await
+        .expect("send GetBlocks");
+
+    let mut got: Vec<Hash> = Vec::new();
+    let mut frames = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while got.len() < expected.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(Some((from, msg))) = tokio::time::timeout(left, client.incoming.recv()).await else {
+            panic!(
+                "received {} of {} blocks in {frames} message(s): the over-cap reply was lost",
+                got.len(),
+                expected.len()
+            );
+        };
+        if let NetworkMessage::Blocks { blocks } = msg {
+            assert_eq!(from, server.id);
+            frames += 1;
+            got.extend(blocks.iter().map(|b| b.header.block_hash));
+        }
+    }
+    let want: Vec<Hash> = expected.iter().map(|b| b.header.block_hash).collect();
+    assert_eq!(got, want, "every block, once, in serve order");
+    assert!(frames > 1, "the reply must have been split");
+    assert!(
+        server.pm.get_peer(&client.id).is_some(),
+        "the server must keep the requester connected"
+    );
+    serving.abort();
+}
+
+/// Every message `answer_frames` puts on the wire for the height-1553 shape
+/// fits one Noise message, and together they are exactly `serve_blocks`.
+#[test]
+fn answer_frames_fit_the_noise_cap() {
+    let (_dir, storage, anchor) = wedge_1553_store();
+    let request = NetworkMessage::GetBlocks {
+        from: anchor,
+        count: 32,
+        step: 1,
+    };
+    let frames = crate::serve_plane::answer_frames(&storage, &request);
+    assert!(frames.len() > 1, "the over-cap reply is split");
+    let cap = citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN;
+    let mut served = Vec::new();
+    for f in &frames {
+        let wire = bincode::serialize(f).expect("encode");
+        assert!(
+            wire.len() <= cap,
+            "a {}-byte message is over {cap}",
+            wire.len()
+        );
+        let NetworkMessage::Blocks { blocks } = f else {
+            panic!("a GetBlocks answer must be Blocks");
+        };
+        served.extend(blocks.iter().map(|b| b.header.block_hash));
+    }
+    let want: Vec<Hash> = block_serve::serve_blocks(&storage, &anchor, 32)
+        .iter()
+        .map(|b| b.header.block_hash)
+        .collect();
+    assert_eq!(served, want);
+
+    // Headers answers are unchanged: one message.
+    let headers = crate::serve_plane::answer_frames(
+        &storage,
+        &NetworkMessage::GetHeaders {
+            from: anchor,
+            count: 64,
+        },
+    );
+    assert_eq!(headers.len(), 1);
+}

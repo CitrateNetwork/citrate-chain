@@ -127,6 +127,31 @@ const MAX_FRAME_LEN: usize = 1024 * 1024; // 1MB
 /// that times out describe the same dead peer instead of disagreeing.
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Can `msg` (serialized to `len` bytes) go out as one Noise message?
+///
+/// r1007 cold-sync wedge (2026-11-14): Noise refuses a plaintext over
+/// [`noise::MAX_NOISE_PLAINTEXT_LEN`] with `Error::Input`, before it touches
+/// the session nonce. The writers used to treat that like a dead socket and
+/// `break`, which dropped the peer and every message queued behind the
+/// oversized one: boot1/2/3 tore down a syncing node's connection every ~30 s
+/// answering its height-1553 `GetBlocks`. The session is still good, so the
+/// writer now drops only the message that cannot be sent, says so, and keeps
+/// going. Other encrypt errors (nonce exhausted, no key) still close.
+fn fits_one_noise_message(msg: &NetworkMessage, len: usize, addr: SocketAddr) -> bool {
+    if len <= noise::MAX_NOISE_PLAINTEXT_LEN {
+        return true;
+    }
+    warn!(
+        "dropping a {} message to {}: {} bytes is over the {}-byte Noise message cap \
+         (connection kept; the sender must split it)",
+        msg.kind(),
+        addr,
+        len,
+        noise::MAX_NOISE_PLAINTEXT_LEN
+    );
+    false
+}
+
 impl NetworkTransport {
     pub fn new(peer_manager: Arc<PeerManager>, local_id: PeerId, params: HandshakeParams) -> Self {
         Self {
@@ -469,6 +494,9 @@ async fn handle_inbound(
             match bincode::serialize(&msg) {
                 Ok(ser) => {
                     let payload = if let Some(ref ns) = noise_w {
+                        if !fits_one_noise_message(&msg, ser.len(), addr) {
+                            continue;
+                        }
                         match ns.encrypt(&ser) {
                             Ok(ct) => ct,
                             Err(e) => {
@@ -796,6 +824,9 @@ async fn handle_outbound(
                 match bincode::serialize(&msg) {
                     Ok(ser) => {
                         let payload = if let Some(ref ns) = noise_w {
+                            if !fits_one_noise_message(&msg, ser.len(), addr) {
+                                continue;
+                            }
                             match ns.encrypt(&ser) {
                                 Ok(ct) => ct,
                                 Err(e) => {

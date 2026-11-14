@@ -81,6 +81,20 @@ pub fn answer(storage: &StorageManager, request: &NetworkMessage) -> Option<Netw
     }
 }
 
+/// [`answer`], as the messages that go on the wire: a `Blocks` reply is split
+/// by [`block_serve::chunk_for_noise`] so no message exceeds the Noise
+/// per-message cap (the r1007 height-1553 wedge); anything else is one message.
+pub fn answer_frames(storage: &StorageManager, request: &NetworkMessage) -> Vec<NetworkMessage> {
+    match answer(storage, request) {
+        Some(NetworkMessage::Blocks { blocks }) => block_serve::chunk_for_noise(blocks)
+            .into_iter()
+            .map(|blocks| NetworkMessage::Blocks { blocks })
+            .collect(),
+        Some(other) => vec![other],
+        None => Vec::new(),
+    }
+}
+
 /// The serving queue with this plane's budgets.
 pub fn queue() -> ServeQueue<NetworkMessage> {
     ServeQueue::new(SERVE_PENDING_PER_PEER, SERVE_PENDING_GLOBAL)
@@ -117,21 +131,43 @@ async fn run(
             let to = pid.clone();
             let handle = jobs.spawn(async move {
                 let kind = request.kind();
-                let built = tokio::task::spawn_blocking(move || answer(&storage, &request)).await;
+                let built =
+                    tokio::task::spawn_blocking(move || answer_frames(&storage, &request)).await;
                 match built {
-                    Ok(Some(reply)) => {
-                        match &reply {
-                            NetworkMessage::Blocks { blocks } => {
-                                info!("Sending {} blocks to peer {}", blocks.len(), to.0)
+                    Ok(frames) => {
+                        let blocks: usize = frames
+                            .iter()
+                            .map(|f| match f {
+                                NetworkMessage::Blocks { blocks } => blocks.len(),
+                                _ => 0,
+                            })
+                            .sum();
+                        match frames.first() {
+                            Some(NetworkMessage::Blocks { .. }) if frames.len() > 1 => info!(
+                                "Sending {} blocks to peer {} in {} messages",
+                                blocks,
+                                to.0,
+                                frames.len()
+                            ),
+                            Some(NetworkMessage::Blocks { .. }) => {
+                                info!("Sending {} blocks to peer {}", blocks, to.0)
                             }
-                            NetworkMessage::Headers { headers } => {
+                            Some(NetworkMessage::Headers { headers }) => {
                                 debug!("Sending {} headers to peer {}", headers.len(), to.0)
                             }
                             _ => {}
                         }
-                        let _ = pm.send_to_peers(std::slice::from_ref(&to), &reply).await;
+                        // In order, one after another, on the peer's one queue.
+                        for frame in &frames {
+                            if pm
+                                .send_to_peers(std::slice::from_ref(&to), frame)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
-                    Ok(None) => {}
                     Err(e) => warn!("serve plane: {} from {} not answered: {}", kind, to.0, e),
                 }
             });
