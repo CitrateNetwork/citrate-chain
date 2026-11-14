@@ -401,3 +401,46 @@ async fn a_height_group_over_the_noise_cap_is_delivered_whole() {
     );
     serving.abort();
 }
+
+/// Every message `answer_frames` puts on the wire for the height-1553 shape
+/// fits one Noise message, and together they are exactly `serve_blocks`.
+#[test]
+fn answer_frames_fit_the_noise_cap() {
+    let (_dir, storage, anchor) = wedge_1553_store();
+    let request = NetworkMessage::GetBlocks {
+        from: anchor,
+        count: 32,
+        step: 1,
+    };
+    let frames = crate::serve_plane::answer_frames(&storage, &request);
+    assert!(frames.len() > 1, "the over-cap reply is split");
+    let cap = citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN;
+    let mut served = Vec::new();
+    for f in &frames {
+        let wire = bincode::serialize(f).expect("encode");
+        assert!(
+            wire.len() <= cap,
+            "a {}-byte message is over {cap}",
+            wire.len()
+        );
+        let NetworkMessage::Blocks { blocks } = f else {
+            panic!("a GetBlocks answer must be Blocks");
+        };
+        served.extend(blocks.iter().map(|b| b.header.block_hash));
+    }
+    let want: Vec<Hash> = block_serve::serve_blocks(&storage, &anchor, 32)
+        .iter()
+        .map(|b| b.header.block_hash)
+        .collect();
+    assert_eq!(served, want);
+
+    // Headers answers are unchanged: one message.
+    let headers = crate::serve_plane::answer_frames(
+        &storage,
+        &NetworkMessage::GetHeaders {
+            from: anchor,
+            count: 64,
+        },
+    );
+    assert_eq!(headers.len(), 1);
+}
