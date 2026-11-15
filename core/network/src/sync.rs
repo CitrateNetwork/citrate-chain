@@ -124,6 +124,11 @@ pub struct SyncManager {
     /// requests with. `None` in a node; a simulation that runs many seconds of
     /// sync in a few milliseconds advances it (see [`Self::with_clock_offset`]).
     clock_offset_ms: Option<Arc<AtomicU64>>,
+
+    /// A fully simulated clock (`origin + ms`), for a network simulation that
+    /// also models link latency (see [`Self::with_virtual_clock`]). Takes
+    /// precedence over `clock_offset_ms`.
+    virtual_clock: Option<(Instant, Arc<AtomicU64>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +197,16 @@ impl SyncManager {
             local_height: None,
             pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
             clock_offset_ms: None,
+            virtual_clock: None,
         }
+    }
+
+    /// Run on a fully simulated clock: `origin + ms` milliseconds. For a
+    /// network simulation that models link latency and bandwidth, where the
+    /// real time a test takes is not the time the simulated node sees.
+    pub fn with_virtual_clock(mut self, origin: Instant, ms: Arc<AtomicU64>) -> Self {
+        self.virtual_clock = Some((origin, ms));
+        self
     }
 
     /// Age requests on the monotonic clock plus `offset` milliseconds, so a
@@ -203,6 +217,10 @@ impl SyncManager {
     }
 
     fn now(&self) -> Instant {
+        if let Some((origin, ms)) = &self.virtual_clock {
+            let at = Duration::from_millis(ms.load(Ordering::Relaxed));
+            return origin.checked_add(at).unwrap_or(*origin);
+        }
         let offset = self
             .clock_offset_ms
             .as_ref()

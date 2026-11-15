@@ -68,6 +68,11 @@ pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 /// Noise-layer fragmentation (a wire change, scheduled for the point release).
 pub const MAX_RESPONSE_BYTES: u64 = 60 * 1024;
 
+/// What a server built before #477 caps a `Blocks` reply at. The
+/// mixed-version sync tests serve with it to stand in for an unpatched peer.
+#[cfg(test)]
+pub const LEGACY_BLOCKS_RESPONSE_BYTES: u64 = 60 * 1024;
+
 /// Split a `Blocks` reply into consecutive batches, each of which serializes as
 /// a `NetworkMessage::Blocks` within one Noise message
 /// ([`citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN`]).
@@ -280,6 +285,18 @@ pub fn serve_headers(storage: &StorageManager, from: &Hash, count: u32) -> Vec<B
 /// The anchor's own block is deliberately INCLUDED in the response — see the
 /// comment at the group-gathering loop. SYNC-S3's recovery request depends on it.
 pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Block> {
+    serve_blocks_within(storage, from, count, MAX_RESPONSE_BYTES)
+}
+
+/// [`serve_blocks`] under a soft byte budget of `max_bytes`. Production serves
+/// with [`MAX_RESPONSE_BYTES`]; the mixed-version sync tests serve with
+/// `LEGACY_BLOCKS_RESPONSE_BYTES` to stand in for a server built before #477.
+pub fn serve_blocks_within(
+    storage: &StorageManager,
+    from: &Hash,
+    count: u32,
+    max_bytes: u64,
+) -> Vec<Block> {
     let max_items = count.min(MAX_BLOCKS_PER_REQUEST);
     // INCLUSIVE of the anchor's height so a merge parent that is a sibling of the
     // anchor is delivered (see resolve_start_inclusive — the deep-sync wedge fix).
@@ -309,7 +326,7 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
     // height whose only member was one is an empty group, not a gap).
     let wedge = dead_branch(storage);
     let mut out: Vec<Block> = Vec::new();
-    let mut budget = MAX_RESPONSE_BYTES;
+    let mut budget = max_bytes;
     let mut expected = start;
     let mut i = 0usize;
     // Has any height-group ABOVE the anchor been emitted yet? The forward-
@@ -380,14 +397,14 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
             {
                 break;
             }
-            if group_bytes > MAX_RESPONSE_BYTES {
+            if group_bytes > max_bytes {
                 // Emitted anyway: forward progress beats a permanent wedge. The
                 // serving plane splits the reply (`chunk_for_noise`), so it is
                 // delivered across several Noise messages.
                 debug!(
                     "block-serve: height-{} group is {} bytes, over the {}-byte soft budget; \
                      serving it anyway to guarantee sync progress (the reply is split)",
-                    h, group_bytes, MAX_RESPONSE_BYTES
+                    h, group_bytes, max_bytes
                 );
             }
             budget = budget.saturating_sub(group_bytes);
@@ -963,6 +980,140 @@ mod tests {
         // The first message must carry something above the anchor height, or the
         // requester scores it as a useless answer.
         assert!(batches[0].iter().any(|b| b.header.height == 2));
+    }
+
+    /// A store shaped like r1007: `siblings` blocks per height above genesis,
+    /// each height's blocks selecting the previous height's first sibling and
+    /// merging the rest; every `fat_every`-th height's first sibling carries a
+    /// ~10 KB transaction (the r1007 height-1553 shape).
+    fn r1007_shaped_store(top: u64, siblings: u64, fat_every: u64) -> (TempDir, StorageManager) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = StorageManager::new(dir.path(), PruningConfig::default()).expect("storage");
+        let id = |h: u64, i: u64| {
+            let mut bytes = [0x5Au8; 32];
+            bytes[..8].copy_from_slice(&h.to_be_bytes());
+            bytes[8..16].copy_from_slice(&i.to_be_bytes());
+            Hash::new(bytes)
+        };
+        let genesis = BlockBuilder::new()
+            .hash(id(0, 0))
+            .parent(Hash::default())
+            .height(0)
+            .timestamp(1_000_000)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed();
+        storage.blocks.put_block(&genesis).expect("put genesis");
+        let mut prev: Vec<Hash> = vec![genesis.hash()];
+        for h in 1..=top {
+            let mut row = Vec::new();
+            for i in 0..siblings {
+                let data = if i == 0 && h % fat_every == 0 {
+                    vec![0xAB; 10_400]
+                } else {
+                    Vec::new()
+                };
+                let tx = citrate_consensus::types::Transaction {
+                    hash: id(h, 1000 + i),
+                    to: Some(PublicKey::new([3; 32])),
+                    gas_limit: 21_000,
+                    data,
+                    chain_id: Some(40204),
+                    ..Default::default()
+                };
+                let b = BlockBuilder::new()
+                    .hash(id(h, i))
+                    .parent(prev[0])
+                    .merge_parents(prev[1..].to_vec())
+                    .height(h)
+                    .timestamp(1_000_000 + h)
+                    .blue_score(h * siblings)
+                    .blue_work(u128::from(h * siblings))
+                    .proposer(PublicKey::new([1; 32]))
+                    .transactions(vec![tx])
+                    .build_unhashed();
+                storage.blocks.put_block(&b).expect("put");
+                row.push(b.hash());
+            }
+            prev = row;
+        }
+        (dir, storage)
+    }
+
+    /// #477: a full 512-block request on a seven-producer DAG with ~10 KB
+    /// blocks is answered whole within the 1 MiB budget, and still goes on the
+    /// wire as Noise-sized messages. A server built before #477 (60 KiB) carries
+    /// a handful of heights for the same request, which is the round-trip cost
+    /// the issue measured (3 new heights per answer).
+    #[test]
+    fn a_full_request_on_an_r1007_shaped_dag_fits_the_split_budget() {
+        let (_dir, storage) = r1007_shaped_store(200, 7, 5);
+        let anchor = storage
+            .blocks
+            .get_block_by_height(10)
+            .expect("read")
+            .expect("anchor");
+        let reply = serve_blocks(&storage, &anchor, MAX_BLOCKS_PER_REQUEST);
+        let heights: std::collections::BTreeSet<u64> =
+            reply.iter().map(|b| b.header.height).collect();
+        assert_eq!(reply.len(), 511, "73 complete seven-block groups");
+        assert_eq!(heights.first(), Some(&10), "inclusive of the anchor group");
+        assert_eq!(heights.len(), 73);
+        let total: u64 = reply
+            .iter()
+            .map(|b| bincode::serialized_size(b).expect("size"))
+            .sum();
+        assert!(total <= MAX_RESPONSE_BYTES, "{total} bytes");
+        let legacy = serve_blocks_within(
+            &storage,
+            &anchor,
+            MAX_BLOCKS_PER_REQUEST,
+            LEGACY_BLOCKS_RESPONSE_BYTES,
+        );
+        let legacy_heights: std::collections::BTreeSet<u64> =
+            legacy.iter().map(|b| b.header.height).collect();
+        assert!(
+            legacy_heights.len() <= 8,
+            "a pre-#477 server carries only a few heights: {}",
+            legacy_heights.len()
+        );
+        // On the wire: every message fits one Noise message, in order.
+        let cap = citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN as u64;
+        let frames = chunk_for_noise(reply.clone());
+        assert!(frames.len() > 1);
+        for f in &frames {
+            assert!(blocks_message_bytes(f) <= cap);
+        }
+        let flat: Vec<Hash> = frames.iter().flatten().map(|b| b.hash()).collect();
+        let want: Vec<Hash> = reply.iter().map(|b| b.hash()).collect();
+        assert_eq!(flat, want);
+    }
+
+    /// A requester built before #477 asks for 32 and still gets at most 32
+    /// (whole groups), whatever the server's byte budget: mixed-version safe.
+    #[test]
+    fn a_pre_477_requester_still_gets_at_most_its_count() {
+        let (_dir, storage) = r1007_shaped_store(200, 7, 5);
+        let anchor = storage
+            .blocks
+            .get_block_by_height(10)
+            .expect("read")
+            .expect("anchor");
+        let reply = serve_blocks(&storage, &anchor, 32);
+        assert_eq!(reply.len(), 28, "four whole seven-block groups");
+    }
+
+    /// `Headers` is not split, so its budget stays the Noise one however many
+    /// headers are asked for.
+    #[test]
+    fn a_headers_reply_stays_one_noise_message() {
+        let (_dir, storage) = r1007_shaped_store(400, 7, 5);
+        let headers = serve_headers(&storage, &Hash::new(ZERO_ANCHOR), MAX_HEADERS_PER_REQUEST);
+        assert!(headers.len() > 64, "more than the old 64-header window");
+        let bytes = bincode::serialized_size(&citrate_network::NetworkMessage::Headers {
+            headers: headers.clone(),
+        })
+        .expect("size");
+        assert!(bytes <= citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN as u64);
     }
 
     /// A reply already under the cap is sent unchanged, as one message.
