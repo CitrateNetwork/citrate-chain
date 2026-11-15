@@ -3207,6 +3207,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // Split healing: rate limits on pulls from same-height peers whose
             // tip we do not hold (sync_peer.rs, sync_rejoin.rs).
             let mut split_gate = sync_peer::SplitPullGate::new();
+            // #477: the SYNCPIPE progress line, at most once per window.
+            let mut pipe_log_at = std::time::Instant::now();
+            let mut pipe_log_delivered: u64 = 0;
             // #310: Skip — a slow sync round must not be followed by a burst
             // of back-to-back block requests to peers.
             let mut interval = timing::cadence_interval(std::time::Duration::from_secs(2));
@@ -3406,6 +3409,73 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                     last_logged_choice = chosen_id.clone();
                 }
+                // #477: pipelined, peer-parallel block download. While the
+                // target is more than `engage_gap` heights above the applied
+                // tip (and no fork-point search runs) the pipeline keeps up to
+                // 8 windows in flight across every peer that may be asked,
+                // each anchored on that peer's own headers, and issues the next
+                // one as each answer arrives (`pipeline_on_answer` in the
+                // receive loop); this tick is its backstop and timeout clock.
+                // The single applied-tip request below then stands down.
+                let pipeline_peers: Vec<(
+                    citrate_network::sync_pipeline::PipelinePeer,
+                    Arc<citrate_network::peer::Peer>,
+                )> = connected_peers
+                    .iter()
+                    .map(|(c, p)| {
+                        (
+                            citrate_network::sync_pipeline::PipelinePeer {
+                                id: citrate_network::PeerId::new(c.id.clone()),
+                                head_height: c.head_height,
+                                admissible: sync_peer::pipeline_peer_admissible(c, applied_height),
+                            },
+                            p.clone(),
+                        )
+                    })
+                    .collect();
+                let following_tip = rejoin_for_loop.lock().is_following_tip();
+                let pipeline_round = sync_for_loop
+                    .pipeline_tick(applied_tip_now, pipeline_peers, following_tip)
+                    .await;
+                let pipelined = sync_for_loop.pipeline_active();
+                if pipe_log_at.elapsed() >= std::time::Duration::from_secs(10) {
+                    let st = sync_for_loop.pipeline_stats();
+                    if pipelined || st.windows_in_flight > 0 {
+                        let secs = pipe_log_at.elapsed().as_secs().max(1);
+                        let fresh = st.delivered_blocks.saturating_sub(pipe_log_delivered);
+                        let peers_line: Vec<String> = sync_for_loop
+                            .pipeline_peer_figures()
+                            .iter()
+                            .map(|f| {
+                                format!(
+                                    "{}:{}w/{}bps/{}ms{}",
+                                    f.id.0.get(..14).unwrap_or(&f.id.0),
+                                    f.in_flight,
+                                    f.blocks_per_sec,
+                                    f.timeout_ms,
+                                    if f.excluded { "/excluded" } else { "" }
+                                )
+                            })
+                            .collect();
+                        tracing::info!(
+                            "SYNCPIPE applied={} target={} frontier={} in_flight={} held={} ({} KiB) \
+                             blocks/s={} timeouts={} reassigned={} contradictions={} peers=[{}]",
+                            applied_height,
+                            target,
+                            st.frontier,
+                            st.windows_in_flight,
+                            st.buffered_blocks,
+                            st.buffered_bytes / 1024,
+                            fresh.checked_div(secs).unwrap_or(0),
+                            st.timeouts,
+                            st.reassigned,
+                            st.contradictions,
+                            peers_line.join(" ")
+                        );
+                    }
+                    pipe_log_delivered = st.delivered_blocks;
+                    pipe_log_at = std::time::Instant::now();
+                }
                 let request_peer: Option<Arc<citrate_network::peer::Peer>> =
                     if let Some(id) = chosen_id {
                         connected_peers
@@ -3466,8 +3536,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // sync_rejoin.rs: the BLOCK anchor is the applied tip unless
                     // answers to it show this node is on a branch the network
                     // does not extend; then it walks down to the fork point and
-                    // follows the heavier branch up. Headers stay on the tip.
-                    let start_from = applied_tip.0;
+                    // follows the heavier branch up. Headers are the pipeline's
+                    // (#477).
                     // "Behind" for the tracker: the clamped sync target this
                     // tick pulls toward (advertised heads included), not only
                     // gossip evidence.
@@ -3478,8 +3548,12 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         rejoin_for_loop.lock().anchor(applied_tip, |h| {
                             sync_rejoin::anchor_at_height(&storage_for_sync, h)
                         });
-                    // Request next headers and blocks from our last known point only if not saturated
-                    let (ph, pb) = sync_for_loop.pending_counts().await;
+                    // Request next blocks from our last known point only if not
+                    // saturated. #477: headers are asked by the pipeline, and
+                    // only while a peer's header window is short of its
+                    // lookahead (the tick used to re-ask the same 64 headers
+                    // every 2 s, one wasted round trip per tick).
+                    let (_ph, pb) = sync_for_loop.pending_counts().await;
                     // #151: a request that FAILS TO SEND must count against this peer.
                     //
                     // Both calls below were `let _ = ...`. A failed send records no
@@ -3504,14 +3578,6 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // the penalty box acts on. That feeds the EXISTING escalation rather
                     // than adding a second policy that could disagree with it.
                     let mut send_failed = false;
-                    if ph < 8
-                        && sync_for_loop
-                            .request_headers(&peer, start_from)
-                            .await
-                            .is_err()
-                    {
-                        send_failed = true;
-                    }
                     // Admission ahead of apply: the last answer to this same
                     // applied-tip anchor held nothing new, so asking again
                     // re-imports the same range (rcBLUE-2 (g)). Skip until the
@@ -3521,7 +3587,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         applied_tip.0,
                         std::time::Instant::now(),
                     );
-                    if pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
+                    if !pipelined && pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
                         // Only a request that was actually SENT is recorded as
                         // asked (Ok(false): anchor already pending, or the
                         // in-flight cap; nothing went on the wire).
@@ -3608,7 +3674,19 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // the good one, plus an `attempt_counts` map that was never pruned.
                 //
                 // Timeouts still do their real job below: they penalize the peer.
-                for (_h, pid) in sync_for_loop.check_timeouts().await {
+                // #477: the pipeline's adaptive timeouts are charged the same way.
+                let mut timed_out: Vec<citrate_network::PeerId> = sync_for_loop
+                    .check_timeouts()
+                    .await
+                    .into_iter()
+                    .map(|(_, pid)| pid)
+                    .collect();
+                for pid in pipeline_round.timed_out {
+                    if !timed_out.contains(&pid) {
+                        timed_out.push(pid);
+                    }
+                }
+                for pid in timed_out {
                     // Penalize the peer that timed out. This DE-PREFERS it as a
                     // sync source; it can never veto the last peer able to serve
                     // us (sync_peer.rs invariant I2).
@@ -3811,6 +3889,20 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     }
                     NetworkMessage::Headers { headers } => {
                         let _ = sync_for_rx.handle_headers(&pid, headers).await;
+                        // #477: new anchors open the next windows now.
+                        let applied_tip = storage_for_handler
+                            .blocks
+                            .get_applied_tip()
+                            .ok()
+                            .flatten()
+                            .unwrap_or((citrate_consensus::types::Hash::default(), 0));
+                        let round = sync_for_rx.pipeline_on_answer(applied_tip).await;
+                        if !round.timed_out.is_empty() {
+                            let mut sel = sync_peers_for_rx.lock().await;
+                            for p in &round.timed_out {
+                                sel.record_timeout(&p.0);
+                            }
+                        }
                     }
                     NetworkMessage::GetTransactions { hashes } => {
                         let mut txs = Vec::new();
@@ -4109,8 +4201,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // for "was it empty"); matching uses the validated set.
                         let answer_hashes: Vec<citrate_consensus::types::Hash> =
                             blocks.iter().map(|b| b.header.block_hash).collect();
-                        // WP-H.4: handle_blocks now validates each block
-                        let _ = sync_for_rx.handle_blocks(&pid, blocks).await;
+                        // WP-H.4: handle_blocks now validates each block.
+                        // #477: an answer to a pipeline window is held in the
+                        // pipeline until the windows below it have arrived;
+                        // the drain below then holds blocks contiguous above
+                        // the applied tip, from any window, in height order.
+                        let handled = sync_for_rx.handle_blocks(&pid, blocks).await;
+                        let receipt = handled.unwrap_or_default();
                         // WP-H.5: Drain validated blocks and persist to chain store.
                         // Without this, synced blocks live only in SyncManager memory
                         // and are never integrated into the DAG.
@@ -4127,11 +4224,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         let verified_hashes: std::collections::HashSet<
                             citrate_consensus::types::Hash,
                         > = pending.iter().map(|b| b.header.block_hash).collect();
-                        let answers_rejoin = rejoin_for_rx.lock().take_answer(
-                            &pid.0,
-                            &answer_hashes,
-                            &verified_hashes,
-                        );
+                        // A pipeline answer is not the tick's applied-tip answer.
+                        let answers_rejoin = if receipt.pipelined {
+                            None
+                        } else {
+                            rejoin_for_rx.lock().take_answer(
+                                &pid.0,
+                                &answer_hashes,
+                                &verified_hashes,
+                            )
+                        };
                         // #85 (deep bulk-sync wedge): admit in topological
                         // (height-ascending) order — every parent (selected OR
                         // merge) has strictly lower height than its child, and the
@@ -4299,16 +4401,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 deferred_from_answer,
                                 applied_now,
                             );
-                            tip_reask_for_rx.lock().note_answer(
-                                applied_hash_now,
-                                held_ahead,
-                                std::time::Instant::now(),
-                            );
-                            let stale_anchor = sync_recovery::answer_anchor_was_stale(
-                                sync_for_rx.last_block_anchor_height(),
-                                applied_now,
-                                answer_hashes.len(),
-                            ) || held_ahead;
+                            if !receipt.pipelined {
+                                tip_reask_for_rx.lock().note_answer(
+                                    applied_hash_now,
+                                    held_ahead,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            // A pipeline answer is judged on what it carried
+                            // that was new to the pipeline (its blocks may be
+                            // held, not admitted, until the window below
+                            // arrives); one that only repeated blocks already
+                            // received is not the peer's fault.
+                            let stale_anchor = if receipt.pipelined {
+                                receipt.new_blocks == 0 && receipt.received > 0
+                            } else {
+                                sync_recovery::answer_anchor_was_stale(
+                                    sync_for_rx.last_block_anchor_height(),
+                                    applied_now,
+                                    answer_hashes.len(),
+                                ) || held_ahead
+                            };
                             // Missing-parent recovery continues by hash, within this
                             // peer's walk budget (sync_recovery.rs).
                             {
@@ -4373,12 +4486,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 }
                             }
                             let mut sel = sync_peers_for_rx.lock().await;
+                            let (served_new, batch) = if receipt.pipelined {
+                                (receipt.new_blocks, receipt.received.max(1))
+                            } else {
+                                (newly_admitted, 32) // SyncConfig::block_batch_size
+                            };
                             let quality = sel.record_serve(
                                 &pid.0,
-                                newly_admitted,
+                                served_new,
                                 highest_admitted,
                                 gap,
-                                32, // SyncConfig::block_batch_size
+                                batch,
                                 stale_anchor,
                             );
                             // A search that gave up on this peer's answers: ask a
@@ -4417,6 +4535,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                     gap,
                                     sel.score(&pid.0)
                                 );
+                            }
+                        }
+                        // #477: issue on answer. The next window goes out now,
+                        // not on the next 2 s tick.
+                        let applied_tip = storage_for_handler
+                            .blocks
+                            .get_applied_tip()
+                            .ok()
+                            .flatten()
+                            .unwrap_or((citrate_consensus::types::Hash::default(), 0));
+                        let round = sync_for_rx.pipeline_on_answer(applied_tip).await;
+                        if !round.timed_out.is_empty() {
+                            let mut sel = sync_peers_for_rx.lock().await;
+                            for p in &round.timed_out {
+                                sel.record_timeout(&p.0);
                             }
                         }
                     }

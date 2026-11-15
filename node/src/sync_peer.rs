@@ -590,6 +590,18 @@ impl SyncPeerSelector {
     }
 }
 
+/// #477: may the pipelined downloader ask this peer for windows at all?
+///
+/// THE HOOK for the sync-peer eligibility rule being fixed in a private
+/// advisory (never choose a sync peer far behind us). Throughput needs only
+/// what is here: a peer that does not claim a head above our applied tip has
+/// nothing the pipeline could ask it for. The pipeline also never assigns a
+/// window starting above a peer's advertised head, and drops a peer whose
+/// header chain the delivered blocks contradict (`sync_pipeline`).
+pub fn pipeline_peer_admissible(candidate: &SyncCandidate, applied_height: u64) -> bool {
+    candidate.head_height > applied_height
+}
+
 /// SPLIT HEALING: how far BELOW our applied height a peer's advertised head
 /// may sit and still be treated as a sibling branch worth pulling. A peer above
 /// us is a forward source ([`SyncPeerSelector::select`], I1) and is never a

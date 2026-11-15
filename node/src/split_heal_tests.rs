@@ -940,6 +940,11 @@ impl Fleet {
         match msg {
             NetworkMessage::Headers { headers } => {
                 let _ = node.sync.handle_headers(&pid, headers).await;
+                let applied = node.applied();
+                let round = node.sync.pipeline_on_answer(applied).await;
+                for p in &round.timed_out {
+                    node.sel.record_timeout(&p.0);
+                }
             }
             NetworkMessage::NewBlock { block } => {
                 // Gossip validation relays a block once to every other peer
@@ -1361,7 +1366,11 @@ impl Node {
     /// main.rs `NetworkMessage::Blocks` arm.
     async fn on_blocks(&mut self, peer: &Arc<Peer>, pid: &PeerId, blocks: Vec<Block>) {
         let answer_hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash).collect();
-        let _ = self.sync.handle_blocks(pid, blocks).await;
+        let receipt = self
+            .sync
+            .handle_blocks(pid, blocks)
+            .await
+            .unwrap_or_default();
         let mut pending = self.sync.drain_validated_blocks().await;
         let answer_top = pending.iter().map(|b| b.header.height).max();
         let answer_highest = pending
@@ -1369,10 +1378,13 @@ impl Node {
             .max_by_key(|b| b.header.height)
             .map(|b| (b.header.block_hash, b.header.height));
         let verified: HashSet<Hash> = pending.iter().map(|b| b.header.block_hash).collect();
-        let answers_rejoin = self
-            .rejoin
-            .lock()
-            .take_answer(&pid.0, &answer_hashes, &verified);
+        let answers_rejoin = if receipt.pipelined {
+            None
+        } else {
+            self.rejoin
+                .lock()
+                .take_answer(&pid.0, &answer_hashes, &verified)
+        };
         let reprocessed = !pending.is_empty();
         if reprocessed {
             pending.append(&mut self.orphans);
@@ -1427,13 +1439,19 @@ impl Node {
             deferred_from_answer,
             applied_now,
         );
-        self.tip_reask
-            .note_answer(applied_hash_now, held_ahead, self.clock);
-        let stale_anchor = sync_recovery::answer_anchor_was_stale(
-            self.sync.last_block_anchor_height(),
-            applied_now,
-            answer_hashes.len(),
-        ) || held_ahead;
+        if !receipt.pipelined {
+            self.tip_reask
+                .note_answer(applied_hash_now, held_ahead, self.clock);
+        }
+        let stale_anchor = if receipt.pipelined {
+            receipt.new_blocks == 0 && receipt.received > 0
+        } else {
+            sync_recovery::answer_anchor_was_stale(
+                self.sync.last_block_anchor_height(),
+                applied_now,
+                answer_hashes.len(),
+            ) || held_ahead
+        };
         {
             let now = self.clock;
             let step = self.walk.next(
@@ -1462,16 +1480,26 @@ impl Node {
             let t = self.rejoin.lock().on_answer(answer, gap > 0, anchor_height);
             gave_up = matches!(t, Some(sync_rejoin::Transition::GaveUp { .. }));
         }
+        let (served_new, batch) = if receipt.pipelined {
+            (receipt.new_blocks, receipt.received.max(1))
+        } else {
+            (newly_admitted, 32)
+        };
         self.sel.record_serve(
             &pid.0,
-            newly_admitted,
+            served_new,
             highest.map(|(_, h)| h).unwrap_or(0),
             gap,
-            32,
+            batch,
             stale_anchor,
         );
         if gave_up {
             self.sel.record_give_up(&pid.0);
+        }
+        // #477: issue on answer.
+        let round = self.sync.pipeline_on_answer(self.applied()).await;
+        for p in &round.timed_out {
+            self.sel.record_timeout(&p.0);
         }
     }
 
@@ -1533,6 +1561,28 @@ impl Node {
             self.clock,
         );
         let chosen = source.peer().map(str::to_string);
+        // #477: the pipelined download, as main.rs runs it.
+        let pipeline_peers: Vec<(citrate_network::sync_pipeline::PipelinePeer, Arc<Peer>)> =
+            connected
+                .iter()
+                .zip(candidates.iter())
+                .map(|(p, c)| {
+                    (
+                        citrate_network::sync_pipeline::PipelinePeer {
+                            id: PeerId::new(c.id.clone()),
+                            head_height: c.head_height,
+                            admissible: sync_peer::pipeline_peer_admissible(c, applied_height),
+                        },
+                        p.clone(),
+                    )
+                })
+                .collect();
+        let following_tip = self.rejoin.lock().is_following_tip();
+        let pipeline_round = self
+            .sync
+            .pipeline_tick(applied_tip, pipeline_peers, following_tip)
+            .await;
+        let pipelined = self.sync.pipeline_active();
         let request_peer = if let Some(id) = chosen {
             connected
                 .iter()
@@ -1551,12 +1601,9 @@ impl Node {
             let (from, height) = self.rejoin.lock().anchor(applied_tip, |h| {
                 sync_rejoin::anchor_at_height(&self.storage, h)
             });
-            let (ph, pb) = self.sync.pending_counts().await;
-            if ph < 8 {
-                let _ = self.sync.request_headers(&peer, applied_tip.0).await;
-            }
+            let (_ph, pb) = self.sync.pending_counts().await;
             let held_tip = self.tip_reask.hold(from, applied_tip.0, self.clock);
-            if pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
+            if !pipelined && pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
                 let sent = self.sync.request_blocks(&peer, from, height).await;
                 if matches!(sent, Ok(false)) {
                     let pid = peer.info.read().await.id.clone();
@@ -1574,6 +1621,9 @@ impl Node {
             }
         }
         for (_h, pid) in self.sync.check_timeouts().await {
+            self.sel.record_timeout(&pid.0);
+        }
+        for pid in &pipeline_round.timed_out {
             self.sel.record_timeout(&pid.0);
         }
     }
@@ -2246,9 +2296,17 @@ mod tests {
         }
     }
 
-    /// The cold node's sync manager for the always-on run, whose DAG is small.
+    /// The cold node's sync manager for the always-on run, whose DAG is small
+    /// (~50 heights): the pipeline at a scale that DAG exercises (it engages
+    /// 8 heights behind, 8-height windows). The production tunables are
+    /// measured by `cold_sync_throughput_on_an_r1007_shaped_dag`.
     fn cold_tune_small(sync: SyncManager) -> SyncManager {
-        sync
+        sync.with_pipeline_config(citrate_network::sync_pipeline::PipelineConfig {
+            engage_gap: 8,
+            window_heights: 8,
+            lookahead_heights: 64,
+            ..citrate_network::sync_pipeline::PipelineConfig::default()
+        })
     }
 
     fn print_cold_lines(out: &str) {
@@ -3021,6 +3079,15 @@ mod tests {
             ".note_sync_target(target, applied_tip.1)",
             "rejoin_for_loop.lock().anchor(",
             ".note_asked(&pid.0, (block_from, block_height))",
+            // #477 pipelined download.
+            "sync_peer::pipeline_peer_admissible(c, applied_height)",
+            "rejoin_for_loop.lock().is_following_tip()",
+            ".pipeline_tick(applied_tip_now, pipeline_peers, following_tip)",
+            "sync_for_loop.pipeline_active()",
+            "!pipelined && pb < sync_recovery::TICK_PENDING_GATE && !held_tip",
+            "sync_for_rx.pipeline_on_answer(applied_tip)",
+            "let answers_rejoin = if receipt.pipelined {",
+            "receipt.new_blocks == 0 && receipt.received > 0",
         ] {
             assert!(
                 main.contains(needle),
