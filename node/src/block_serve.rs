@@ -40,24 +40,42 @@ pub const MAX_HEADERS_PER_REQUEST: u32 = 2048;
 /// Protocol maximum blocks returned per `GetBlocks` request.
 pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 
-/// Soft cap on the serialized response payload.
+/// Byte budget of a reply that goes on the wire as ONE message: `Headers`
+/// (and finality certificates, `finality_sync`).
 ///
 /// This MUST stay under the Noise per-message limit, NOT the 1 MiB length-frame
 /// cap. The transport encrypts every message with a single Noise
 /// `write_message`, which hard-fails above `MAX_NOISE_MSG_LEN` (65535 bytes) —
-/// so an over-64 KiB response is silently dropped by `encrypt`, the requester
+/// so an over-64 KiB message is silently dropped by `encrypt`, the requester
 /// never receives it, and a cold node wedges forever re-requesting the same
-/// anchor. (This is exactly why empty pre-deploy blocks synced but a batch of
-/// real ~13 KiB contract-deploy blocks did not.) 60 KiB leaves headroom for the
-/// `NetworkMessage::Blocks` enum/vec wrapper (~12 B) and Noise's 16-byte auth
-/// tag: 60 KiB payload + wrapper + tag < 65519 usable plaintext bytes.
+/// anchor. 60 KiB leaves headroom for the enum/vec wrapper and Noise's 16-byte
+/// auth tag: 60 KiB payload + wrapper + tag < 65519 usable plaintext bytes.
+pub const MAX_UNSPLIT_RESPONSE_BYTES: u64 = 60 * 1024;
+
+/// What a server built before #477 caps a `Blocks` reply at (the soft budget
+/// used to be [`MAX_UNSPLIT_RESPONSE_BYTES`]). The mixed-version sync tests
+/// serve with it to stand in for an unpatched peer.
+#[cfg(test)]
+pub const LEGACY_BLOCKS_RESPONSE_BYTES: u64 = MAX_UNSPLIT_RESPONSE_BYTES;
+
+/// Soft cap on the serialized payload of a `Blocks` reply.
+///
+/// #477 (cold sync at ~0.1 heights/s on r1007): with a 60 KiB budget a reply
+/// on a seven-producer DAG carried four height-groups, one of them the
+/// requester's own anchor group, so a round trip gained three heights. Since
+/// #476 the serving plane splits every `Blocks` reply with [`chunk_for_noise`]
+/// into messages that each fit one Noise message, so the reply no longer has to
+/// fit one: the budget is now 1 MiB, the transport's frame cap, and a request
+/// for [`MAX_BLOCKS_PER_REQUEST`] blocks is bounded by it (about 17 Noise
+/// messages at most). No wire change: a peer that asks for 32 still gets at
+/// most 32, and a server built before this keeps its 60 KiB budget
+/// ([`LEGACY_BLOCKS_RESPONSE_BYTES`]), so a mixed fleet only differs in how
+/// much each reply carries.
 ///
 /// NOTE: this is a SOFT budget. `serve_blocks` deliberately exceeds it for the
 /// first height-group above the anchor (the SYNC-S2 forward-progress guarantee)
 /// — a response that carries nothing new wedges the requester permanently,
-/// which is strictly worse than an oversized one. An over-budget reply is not
-/// sent as one message: the serving plane splits every `Blocks` reply with
-/// [`chunk_for_noise`] so each message fits one Noise message.
+/// which is strictly worse than an oversized one.
 ///
 /// The "no block on 40204 exceeds this" assumption that used to live here was
 /// WRONG and is what wedged every cold sync: block `79e46ed2` at height 245
@@ -66,12 +84,7 @@ pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 /// 74,543 bytes, which wedged every fresh node at 1552 until replies were split.
 /// A SINGLE block over the Noise cap still cannot be sent; that needs
 /// Noise-layer fragmentation (a wire change, scheduled for the point release).
-pub const MAX_RESPONSE_BYTES: u64 = 60 * 1024;
-
-/// What a server built before #477 caps a `Blocks` reply at. The
-/// mixed-version sync tests serve with it to stand in for an unpatched peer.
-#[cfg(test)]
-pub const LEGACY_BLOCKS_RESPONSE_BYTES: u64 = 60 * 1024;
+pub const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
 /// Split a `Blocks` reply into consecutive batches, each of which serializes as
 /// a `NetworkMessage::Blocks` within one Noise message
@@ -202,7 +215,8 @@ fn collect_bounded<T: serde::Serialize>(
         None => tip,
     };
     let mut out: Vec<T> = Vec::new();
-    let mut budget = MAX_RESPONSE_BYTES;
+    // One message on the wire (`Headers` is not split): the Noise budget.
+    let mut budget = MAX_UNSPLIT_RESPONSE_BYTES;
     let mut h = start;
     while h <= tip && (out.len() as u32) < max_items {
         // A missing height or unreadable block is a gap: nothing
@@ -290,7 +304,7 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
 
 /// [`serve_blocks`] under a soft byte budget of `max_bytes`. Production serves
 /// with [`MAX_RESPONSE_BYTES`]; the mixed-version sync tests serve with
-/// `LEGACY_BLOCKS_RESPONSE_BYTES` to stand in for a server built before #477.
+/// [`LEGACY_BLOCKS_RESPONSE_BYTES`] to stand in for a server built before #477.
 pub fn serve_blocks_within(
     storage: &StorageManager,
     from: &Hash,
@@ -517,9 +531,9 @@ mod tests {
 
     /// NET-2: `count` is clamped to the protocol maximum even when the chain has
     /// more blocks than the clamp — AND the response never exceeds the byte budget.
-    /// The count clamp is an UPPER bound: since MAX_RESPONSE_BYTES was lowered to
-    /// 60 KiB (under the Noise per-message cap), the byte budget may bind before the
-    /// count clamp, so assert `<=` the protocol max + non-empty forward progress.
+    /// The count clamp is an UPPER bound: the byte budget (60 KiB for headers,
+    /// 1 MiB for blocks) may bind before the count clamp, so assert `<=` the
+    /// protocol max + non-empty forward progress.
     #[test]
     fn net2_count_clamped_to_protocol_max() {
         let n = MAX_HEADERS_PER_REQUEST as u64 + 7;
@@ -940,7 +954,7 @@ mod tests {
             .iter()
             .map(|h| bincode::serialized_size(h).expect("sizeable"))
             .sum();
-        assert!(total <= MAX_RESPONSE_BYTES);
+        assert!(total <= MAX_UNSPLIT_RESPONSE_BYTES);
     }
 
     fn blocks_message_bytes(blocks: &[Block]) -> u64 {
