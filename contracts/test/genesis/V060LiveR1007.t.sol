@@ -213,6 +213,60 @@ contract V060LiveR1007Test is Test {
         s.verify(i, d);
     }
 
+    /// The reviewed subset (owner 2026-11-15): the eight reviewed contracts land at exactly the
+    /// addresses the full set predicts, WorkMarket and FLRoundVerifier get no code, and the full
+    /// ten-contract live mode still completes the set later, reusing the eight.
+    function test_live_subset_deploys_the_reviewed_eight_at_the_full_set_addresses() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        DeployV060Genesis.Deployed memory p = s.predict(i);
+        DeployV060Genesis.Deployed memory ps = s.predictSubset(i);
+        DeployV060Genesis.Deployed memory d = s.deployLiveSubset(liveDeployer, i, _rot());
+        assertEq(abi.encode(d), abi.encode(ps));
+        assertEq(d.providerRegistry, p.providerRegistry);
+        assertEq(d.guardianCancellerV2, p.guardianCancellerV2);
+        assertEq(d.taskVerifier, p.taskVerifier);
+        assertEq(d.datasetRegistry, p.datasetRegistry);
+        assertEq(d.guardianRecoveryModuleV2, p.guardianRecoveryModuleV2);
+        assertEq(d.usageReceipts, p.usageReceipts);
+        assertEq(d.orgBudgets, p.orgBudgets);
+        assertEq(d.workAttestations, p.workAttestations);
+        assertEq(d.workMarket, address(0));
+        assertEq(d.flRoundVerifier, address(0));
+        assertEq(p.workMarket.code.length, 0, "WorkMarket is not deployed by the subset");
+        assertEq(p.flRoundVerifier.code.length, 0, "FLRoundVerifier is not deployed by the subset");
+        s.verifyLiveSubset(i, d);
+        // The full live verify must not pass on the subset alone.
+        vm.expectRevert(bytes("a 0.6.0 genesis contract has no code"));
+        s.verifyLive(i, p);
+
+        // Later, the full set: the eight are reused (CREATE2 "already live"), the two are added.
+        DeployV060Genesis.Deployed memory full = s.deployLive(liveDeployer, i, _rot());
+        assertEq(abi.encode(full), abi.encode(p));
+        s.verifyLive(i, full);
+    }
+
+    function test_live_subset_refuses_once_the_full_set_has_started() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        s.deployLive(liveDeployer, i, _rot());
+        _expectRevert(bytes("FLRoundVerifier already has code: this is not the subset step"));
+        s.deployLiveSubset(liveDeployer, i, _rot());
+    }
+
+    function test_live_subset_keeps_every_live_mode_refusal() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        i.keys.v060Deployers = new address[](1);
+        i.keys.v060Deployers[0] = makeAddr("another-deployer");
+        _expectRevert(bytes("deployer is not in GENESIS_KEY_INVENTORY with role V060_DEPLOYER"));
+        s.deployLiveSubset(liveDeployer, i, _rot());
+        i = _inputs();
+        i.keys.governanceOwners = _addrs(0xE001, 4);
+        _expectRevert(bytes("GOVERNANCE owner is not in GENESIS_KEY_INVENTORY with role GOV_OWNERS"));
+        s.deployLiveSubset(liveDeployer, i, _rot());
+    }
+
     function test_live_mode_refuses_a_deployer_not_inventoried_as_v060_deployer() public {
         DeployV060Genesis s = _builder();
         DeployV060Genesis.Inputs memory i = _inputs();
