@@ -2,9 +2,12 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
+import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 
-/// @notice Minimal interfaces — avoids recompiling the full contracts.
-///         Function selectors match the live deployed bytecode.
+/// @notice Minimal interfaces: the setters this sweep calls and the governance getter each target has.
+interface IDpfGoverned {
+    function governance() external view returns (address);
+}
 interface IClassificationRegistry {
     function addOracleSigner(address signer) external;
 }
@@ -28,124 +31,129 @@ interface IDefensePrimeFLScopeIndex {
     function setRecorder(address recorder, bool authorized) external;
 }
 
-/// @title WireDpfOperators — Operator wiring sweep for the DPF contract suite
-/// @notice Authorizes a recorder/resolver/oracle address on every contract
-///         deployed in DPF-08 stages 1-4 that needs an admin-side activation
-///         to be usable. Also wires PartProvenanceRegistry to the Stage-1
-///         ContradictionLedger so step-anomalies can be reported.
+/// @title WireDpfOperators: the DPF operator wiring (REDEPLOY D3) as one GOVERNANCE timelock batch
+/// @notice Authorizes the DPF operator as recorder, resolver or oracle signer on the DPF-08 stage 1-4
+///         contracts, and points PartProvenanceRegistry at the ContradictionLedger. Eight calls:
+///           ClassificationRegistry.addOracleSigner(op)
+///           AgentDecisionRegistryV2.setRecorder(op, true)
+///           ContradictionLedger.setResolver(op, true)
+///           PartProvenanceRegistry.setRecorder(op, true)
+///           PartProvenanceRegistry.setContradictionLedger(ContradictionLedger)
+///           SupplierRegistry.setRecorder(op, true)
+///           MoqRegistry.setRecorder(op, true)
+///           DefensePrimeFLScopeIndex.setRecorder(op, true)
 ///
-/// @dev Address constants are pinned to the 2026-05-10 testnet broadcasts
-///      documented in `.agentile/launch/DEPLOYED_CONTRACTS_2026_05_10.md`.
-///      Re-deploying the suite requires re-pinning these constants OR
-///      reading from an env-driven address registry (future work).
+///         Addresses come from the address books, never from constants: a reroll moves them, and
+///         the constants this script used to pin were the 2026-05/07 deploys, dead after the
+///         rerolls. BLOCK0_BOOK is the r1007 block-0 book (contracts/addresses/r1007/40204.json,
+///         AgentDecisionRegistryV2); POSTGENESIS_BOOK is the r1007 post-genesis book
+///         (contracts/addresses/r1007/40204.postgenesis.json, the other six). Each target must
+///         have code and report `governance()` = GOVERNANCE_TIMELOCK.
 ///
-///      The "recorder" address can be overridden via env `OPERATOR_RECORDER`.
-///      If unset, falls back to `msg.sender` (= deployer for the testnet
-///      bootstrap path). This is the intentional default for a
-///      single-operator demo chain; production deployments authorize a
-///      dedicated recorder key separate from the deployer.
+///         On r1007 every target is administered by the GovernanceTimelock (48 h, 3 of 5), so the
+///         sweep is a timelock batch, not a direct send. `proposal()` (read-only, no key) prints
+///         the GovernanceMultisig `propose` payloads for `scheduleBatch` and, after the delay,
+///         `executeBatch`, plus the operation id. Nothing here broadcasts.
 ///
-///      OUT OF SCOPE (deferred to a separate runbook):
-///        - TenantHierarchy.initRoot(...) — needs root multi-sig config
-///          (admins set + threshold + hkdf_salt + classification_max).
-///          HUMAN-IN-LOOP per the deployment plan's RISK #6.
-///        - RoleEscalation.setRoleAdmin(<multi-sig>, true) — needs the
-///          finalized root multi-sig address.
-///        - Governance transfer (deployer EOA → multi-sig) — same.
-///
-/// Usage:
-///   # Dry-run:
-///   forge script script/WireDpfOperators.s.sol \
-///       --rpc-url https://rpc.citrate.ai
-///
-///   # Live broadcast (Saul only; uses deployer key from .env.testnet):
-///   forge script script/WireDpfOperators.s.sol \
-///       --rpc-url https://rpc.citrate.ai \
-///       --private-key $DEPLOYER_PRIVATE_KEY \
-///       --broadcast --slow
+///         Inputs (env): BLOCK0_BOOK, POSTGENESIS_BOOK, GOVERNANCE_TIMELOCK, DPF_OPERATOR (required:
+///         no fallback to msg.sender, which would authorize whoever ran the script).
+///         Optional DPF_SALT_LABEL (default "r1007.d3.dpf-operators.v1"), hashed into the salt.
 contract WireDpfOperators is Script {
-    // ── Live addresses (chain 40204, deployed 2026-05-10) ───────────
-
-    // Stage 1 — DPF-02 RBAC
-    // Repointed 2026-07-03 to the fresh DPF-DEMO deploy on 40204 (harvest_dpf_addresses.sh).
-    address constant TENANT_HIERARCHY            = 0x9101f6f1AB0A9FFF84e61B8D9E426E22723bc765;
-    address constant CLASSIFICATION_REGISTRY     = 0xd4b1680684106888b7c55d19fB236b41c192340e;
-    address constant ROLE_ESCALATION             = 0xC9B8c0bd4BDf70502095276dEE2b3f4d5da1488e;
-    // G5: OLD-chain envelope (dead after a reroll). Prefer the env override; on
-    // 40204 the resolved address must have code. NOTE: the other constants in this
-    // post-deploy ops script are ALSO stale after the reroll and must be repointed
-    // from the regenerated book before this sweep is run on the new chain.
-    address constant MULTISIG_ENVELOPE_LEGACY_DEFAULT = 0x01f6293FEB59C5950A484F35CE4317B40d8F76be;
-    function _multisigEnvelope() internal view returns (address e) {
-        try vm.envAddress("MULTISIG_ENVELOPE") returns (address a) { e = a; } catch { e = MULTISIG_ENVELOPE_LEGACY_DEFAULT; }
-        require(block.chainid != 40204 || e.code.length != 0, "MULTISIG_ENVELOPE must be a deployed envelope on 40204");
+    struct Targets {
+        address classificationRegistry;
+        address agentDecisionRegistryV2;
+        address contradictionLedger;
+        address partProvenanceRegistry;
+        address supplierRegistry;
+        address moqRegistry;
+        address defensePrimeFLScopeIndex;
     }
-    address constant AGENT_DECISION_REGISTRY_V2  = 0xb524C66176f11613c3A43b0B7DB796cce607C013;
-    address constant CONTRADICTION_LEDGER        = 0x8997e9838Fe5BB451d9D518FaEF5e4Bac49e341D;
 
-    // Stages 2-4 — DefensePrime-side
-    address constant PART_PROVENANCE_REGISTRY    = 0xb0c35160C8d49fB589dd7FED1b8737F885d9e60a;
-    address constant SUPPLIER_REGISTRY           = 0xB2bD1c4084341f04b34e8EAb01D3cAF776816306;
-    address constant MOQ_REGISTRY                = 0xc6955562E15E822F0177618052c1Abe15BE1789C;
-    address constant DEFENSE_PRIME_FL_SCOPE_INDEX       = 0x5c24659E68285497E43F18C429151E902abf528A;
+    function _book(string memory path, string memory name) internal view returns (address a) {
+        string memory json = vm.readFile(path);
+        string memory key = string.concat(".contracts.", name);
+        require(vm.keyExistsJson(json, key), string.concat(name, " is not in ", path));
+        a = vm.parseJsonAddress(json, key);
+    }
 
-    function _recorder() internal view returns (address) {
-        try vm.envAddress("OPERATOR_RECORDER") returns (address r) {
-            return r;
-        } catch {
-            return msg.sender;
+    function targetsFromBooks(string memory block0, string memory postGenesis) public view returns (Targets memory t) {
+        t.agentDecisionRegistryV2 = _book(block0, "AgentDecisionRegistryV2");
+        t.classificationRegistry = _book(postGenesis, "ClassificationRegistry");
+        t.contradictionLedger = _book(postGenesis, "ContradictionLedger");
+        t.partProvenanceRegistry = _book(postGenesis, "PartProvenanceRegistry");
+        t.supplierRegistry = _book(postGenesis, "SupplierRegistry");
+        t.moqRegistry = _book(postGenesis, "MoqRegistry");
+        t.defensePrimeFLScopeIndex = _book(postGenesis, "DefensePrimeFLScopeIndex");
+    }
+
+    /// The batch: eight calls, every target checked for code and for the GOVERNANCE timelock as
+    /// its governance before any calldata is returned.
+    function batch(Targets memory t, address governanceTimelock, address operator)
+        public
+        view
+        returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
+    {
+        require(operator != address(0), "DPF_OPERATOR must be set");
+        require(operator != governanceTimelock, "DPF_OPERATOR is the GOVERNANCE timelock");
+        targets = new address[](8);
+        values = new uint256[](8);
+        payloads = new bytes[](8);
+        (targets[0], payloads[0]) =
+            (t.classificationRegistry, abi.encodeCall(IClassificationRegistry.addOracleSigner, (operator)));
+        (targets[1], payloads[1]) =
+            (t.agentDecisionRegistryV2, abi.encodeCall(IAgentDecisionRegistryV2.setRecorder, (operator, true)));
+        (targets[2], payloads[2]) =
+            (t.contradictionLedger, abi.encodeCall(IContradictionLedger.setResolver, (operator, true)));
+        (targets[3], payloads[3]) =
+            (t.partProvenanceRegistry, abi.encodeCall(IPartProvenanceRegistry.setRecorder, (operator, true)));
+        (targets[4], payloads[4]) = (
+            t.partProvenanceRegistry,
+            abi.encodeCall(IPartProvenanceRegistry.setContradictionLedger, (t.contradictionLedger))
+        );
+        (targets[5], payloads[5]) = (t.supplierRegistry, abi.encodeCall(ISupplierRegistry.setRecorder, (operator, true)));
+        (targets[6], payloads[6]) = (t.moqRegistry, abi.encodeCall(IMoqRegistry.setRecorder, (operator, true)));
+        (targets[7], payloads[7]) =
+            (t.defensePrimeFLScopeIndex, abi.encodeCall(IDefensePrimeFLScopeIndex.setRecorder, (operator, true)));
+        for (uint256 n = 0; n < 8; n++) {
+            require(targets[n].code.length != 0, "a DPF target has no code on this chain");
+            require(
+                IDpfGoverned(targets[n]).governance() == governanceTimelock,
+                "a DPF target is not governed by GOVERNANCE_TIMELOCK"
+            );
         }
     }
 
-    function run() external {
-        address recorder = _recorder();
-        console2.log("=== DPF operator wiring sweep ===");
-        console2.log("Recorder/resolver/oracle target:", recorder);
+    function buildProposal(Targets memory t, address governanceTimelock, address operator, bytes32 salt)
+        public
+        view
+        returns (bytes memory scheduleData, bytes memory executeData, bytes32 opId)
+    {
+        (address[] memory targets, uint256[] memory values, bytes[] memory payloads) =
+            batch(t, governanceTimelock, operator);
+        TimelockController g = TimelockController(payable(governanceTimelock));
+        scheduleData = abi.encodeCall(g.scheduleBatch, (targets, values, payloads, bytes32(0), salt, g.getMinDelay()));
+        executeData = abi.encodeCall(g.executeBatch, (targets, values, payloads, bytes32(0), salt));
+        opId = g.hashOperationBatch(targets, values, payloads, bytes32(0), salt);
+    }
 
-        vm.startBroadcast();
+    function proposal() external view {
+        Targets memory t = targetsFromBooks(vm.envString("BLOCK0_BOOK"), vm.envString("POSTGENESIS_BOOK"));
+        address gt = vm.envAddress("GOVERNANCE_TIMELOCK");
+        address op = vm.envAddress("DPF_OPERATOR");
+        bytes32 salt = keccak256(bytes(vm.envOr("DPF_SALT_LABEL", string("r1007.d3.dpf-operators.v1"))));
+        (bytes memory s, bytes memory e, bytes32 id) = buildProposal(t, gt, op, salt);
+        console2.log("DPF operator:", op);
+        console2.log("timelock operation id:");
+        console2.logBytes32(id);
+        console2.log("step A, GovernanceMultisig.propose(<this>):");
+        console2.logBytes(abi.encodeWithSignature("propose(bytes)", s));
+        console2.log("step B, after the delay, GovernanceMultisig.propose(<this>):");
+        console2.logBytes(abi.encodeWithSignature("propose(bytes)", e));
+    }
 
-        // 1. ClassificationRegistry: enable recorder as HR oracle signer
-        //    (gate for setClearance). msg.sender (deployer) must be governance.
-        IClassificationRegistry(CLASSIFICATION_REGISTRY).addOracleSigner(recorder);
-        console2.log("  [1/8] ClassificationRegistry.addOracleSigner: OK");
-
-        // 2. AgentDecisionRegistryV2: enable recorder
-        //    (gate for record()).
-        IAgentDecisionRegistryV2(AGENT_DECISION_REGISTRY_V2).setRecorder(recorder, true);
-        console2.log("  [2/8] AgentDecisionRegistryV2.setRecorder: OK");
-
-        // 3. ContradictionLedger: enable resolver
-        //    (gate for resolveOpenContradiction).
-        IContradictionLedger(CONTRADICTION_LEDGER).setResolver(recorder, true);
-        console2.log("  [3/8] ContradictionLedger.setResolver: OK");
-
-        // 4. PartProvenanceRegistry: enable recorder
-        //    (gate for recordStep).
-        IPartProvenanceRegistry(PART_PROVENANCE_REGISTRY).setRecorder(recorder, true);
-        console2.log("  [4/8] PartProvenanceRegistry.setRecorder: OK");
-
-        // 5. PartProvenanceRegistry → ContradictionLedger
-        //    (verifyChain looks up open contradictions on the ledger).
-        IPartProvenanceRegistry(PART_PROVENANCE_REGISTRY).setContradictionLedger(CONTRADICTION_LEDGER);
-        console2.log("  [5/8] PartProvenanceRegistry.setContradictionLedger: OK");
-
-        // 6. SupplierRegistry: enable recorder
-        ISupplierRegistry(SUPPLIER_REGISTRY).setRecorder(recorder, true);
-        console2.log("  [6/8] SupplierRegistry.setRecorder: OK");
-
-        // 7. MoqRegistry: enable recorder
-        IMoqRegistry(MOQ_REGISTRY).setRecorder(recorder, true);
-        console2.log("  [7/8] MoqRegistry.setRecorder: OK");
-
-        // 8. DefensePrimeFLScopeIndex: enable recorder
-        //    (gate for tag()).
-        IDefensePrimeFLScopeIndex(DEFENSE_PRIME_FL_SCOPE_INDEX).setRecorder(recorder, true);
-        console2.log("  [8/8] DefensePrimeFLScopeIndex.setRecorder: OK");
-
-        vm.stopBroadcast();
-
-        console2.log("=== Wiring sweep complete ===");
-        console2.log("Recorder/resolver/oracle now authorized on 8 contracts.");
-        console2.log("Deferred to operator runbook: TenantHierarchy.initRoot, RoleEscalation admin transfer, governance hand-off to multi-sig.");
+    /// The old direct-send sweep is gone: on 40204 the targets' governance is the timelock, so a
+    /// direct send from any EOA reverts. Use `--sig "proposal()"`.
+    function run() external pure {
+        revert("WireDpfOperators: the D3 wiring is a GOVERNANCE timelock batch; run with --sig \"proposal()\"");
     }
 }
