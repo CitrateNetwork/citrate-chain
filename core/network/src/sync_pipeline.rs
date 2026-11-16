@@ -3230,6 +3230,96 @@ mod tests {
         );
     }
 
+    /// Our tip on a lighter branch, `forks` of `peers` serving the heavier
+    /// one (the rest silent), driven until the pipeline steps aside or
+    /// `rounds` pass. Returns whether it stepped aside, and the time.
+    fn split_rounds(
+        pl: &mut BlockPipeline,
+        peers: &[PipelinePeer],
+        forks: &[&str],
+        t0: Instant,
+        rounds: usize,
+    ) -> (bool, Instant) {
+        let mut now = t0;
+        for _ in 0..rounds {
+            now += Duration::from_millis(50);
+            let reqs = pl.plan(now, peers, true);
+            feed_headers(pl, &reqs, 400, now);
+            for (p, lo, hi) in pl.fifo_windows() {
+                if forks.contains(&p.0.as_str()) {
+                    let answer = groups(lo - 1, hi);
+                    let _ = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+                }
+            }
+            let _ = pl.poll(now);
+            if !pl.active() {
+                return (true, now);
+            }
+        }
+        (false, now)
+    }
+
+    fn split_pipeline(t0: Instant) -> BlockPipeline {
+        let config = PipelineConfig {
+            engage_gap: 0,
+            ..PipelineConfig::default()
+        };
+        let mut pl = BlockPipeline::new(config, t0);
+        pl.observe_applied((hash(10, 50), 10), t0);
+        pl.set_target(400);
+        pl
+    }
+
+    /// One peer of three serving a branch that forks at our tip cannot make
+    /// the pipeline stand aside.
+    #[test]
+    fn a_minority_cannot_make_the_pipeline_stand_aside() {
+        let t0 = Instant::now();
+        let mut pl = split_pipeline(t0);
+        let peers = [peer("f", 400), peer("x", 400), peer("y", 400)];
+        // Well inside the silent peers' timeouts.
+        let (stepped, _) = split_rounds(&mut pl, &peers, &["f"], t0, 150);
+        assert!(!stepped, "{:?}", pl.stats());
+        assert_eq!(pl.stats().stood_down, 0);
+    }
+
+    /// After standing aside the pipeline resumes: when the applied tip moves
+    /// (the node healed), and after `stand_down` if it did not.
+    #[test]
+    fn the_pipeline_resumes_after_standing_aside() {
+        let t0 = Instant::now();
+        let peers = [peer("h", 400)];
+        // The tip moves.
+        let mut pl = split_pipeline(t0);
+        let (stepped, now) = split_rounds(&mut pl, &peers, &["h"], t0, 2_000);
+        assert!(stepped);
+        pl.observe_applied((hash(11, 0), 11), now);
+        assert!(pl.active(), "resumes when the tip moves");
+        assert!(!blocks_of(&pl.plan(now, &peers, true)).is_empty());
+        // The tip does not move: back after `stand_down`.
+        let mut pl = split_pipeline(t0);
+        let (stepped, now) = split_rounds(&mut pl, &peers, &["h"], t0, 2_000);
+        assert!(stepped);
+        let later = now + Duration::from_secs(61);
+        let _ = pl.plan(later, &peers, true);
+        assert!(pl.active(), "resumes after stand_down");
+    }
+
+    /// A peer that disconnects takes its fork vote with it.
+    #[test]
+    fn a_disconnected_peers_fork_vote_is_dropped() {
+        let t0 = Instant::now();
+        let mut pl = split_pipeline(t0);
+        let peers = [peer("f", 400), peer("g", 400), peer("x", 400)];
+        let (stepped, now) = split_rounds(&mut pl, &peers, &["f"], t0, 150);
+        assert!(!stepped);
+        assert_eq!(pl.fork_votes.len(), 1, "f voted");
+        // f leaves: its vote goes with it.
+        let rest = [peer("g", 400), peer("x", 400)];
+        let _ = pl.plan(now + Duration::from_millis(50), &rest, true);
+        assert!(pl.fork_votes.is_empty(), "{:?}", pl.fork_votes);
+    }
+
     /// A peer that turns inadmissible loses the windows it held.
     #[test]
     fn a_peer_that_turns_inadmissible_loses_its_windows() {
