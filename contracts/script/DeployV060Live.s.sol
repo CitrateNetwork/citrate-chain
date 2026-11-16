@@ -54,6 +54,24 @@ contract DeployV060Live is DeployV060Genesis {
     }
 
 
+    /// @notice The reviewed subset (owner 2026-11-15; `deployLiveSubset`), from the environment:
+    ///         `--sig "runSubset()"`. Same inputs as `run`, except that the WorkMarket bond inputs
+    ///         are not read (no subset contract depends on them). Writes V060_SUBSET_OUT.
+    function runSubset() external returns (Deployed memory d) {
+        V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
+        address deployer = deployerAddress();
+        Inputs memory i = _inputsFromBook(vm.readFile(vm.envString("V060_INPUT_BOOK")), 0, 0, k);
+        require(bytes(vm.envString("V060_SUBSET_OUT")).length != 0, "V060_SUBSET_OUT must name an output path");
+        Rotation memory rot = Rotation({
+            fromGov: vm.envAddress("R1006_GOV_OWNERS", ","),
+            fromGrd: vm.envAddress("R1006_GRD_OWNERS", ","),
+            toGov: vm.envAddress("GOV_OWNERS", ","),
+            toGrd: vm.envAddress("GRD_OWNERS", ",")
+        });
+        d = deployLiveSubset(deployer, i, rot);
+        _writeBook("V060_SUBSET_OUT", subsetBookJson(deployer, d, i));
+    }
+
     /// @notice The canceller-swap proposal for the inputs in the environment (read-only): the
     ///         GovernanceMultisig `propose` payloads, printed only once v2 has code (fed #561).
     function swapProposalFromBook() external {

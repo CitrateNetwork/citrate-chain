@@ -747,6 +747,164 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         require(i.guardianCanceller == _v1Address(i), "the input book's canceller seat is not v1");
     }
 
+    // ------------------------------------------------------------------ live subset (reviewed set)
+
+    /// @notice The live-mode subset (owner 2026-11-15): the 0.6.0 contracts that passed their own
+    ///         pre-deploy review, deployed before WorkMarket and FLRoundVerifier, which wait for the
+    ///         payouts fixes and a re-review. The subset is fixed here, not chosen by an input:
+    ///         ProviderRegistry, GuardianCancellerV2, TaskVerifier, DatasetRegistry,
+    ///         GuardianRecoveryModuleV2, UsageReceipts, OrgBudgets and WorkAttestations. None of
+    ///         their init codes depends on WorkMarket or on the bonds, so each lands at the same
+    ///         CREATE2 address the full set predicts (`predictSubset` = `predict` on these eight).
+    ///         WorkMarket and FLRoundVerifier are never deployed here, and the step refuses to run
+    ///         if FLRoundVerifier already has code (a partial full-set run is not this step).
+    ///         The full ten-contract `deployLive` is unchanged for later.
+    function predictSubset(Inputs memory i) public pure returns (Deployed memory d) {
+        address gt = i.governanceTimelock;
+        address rt = i.guardianTimelock;
+        d.providerRegistry =
+            _create2Address(V060GovernanceSpec.PROVIDER_REGISTRY, V060GovernanceSpec.providerRegistryInit(gt, rt));
+        d.guardianCancellerV2 = _create2Address(
+            V060GovernanceSpec.GUARDIAN_CANCELLER_V2, V060GovernanceSpec.guardianCancellerV2Init(gt, rt, d.providerRegistry)
+        );
+        d.taskVerifier = _create2Address(V060GenesisSpec.TASK_VERIFIER, V060GenesisSpec.taskVerifierInit());
+        d.datasetRegistry =
+            _create2Address(V060GenesisSpec.DATASET_REGISTRY, V060GenesisSpec.datasetRegistryInit(gt));
+        d.guardianRecoveryModuleV2 = _create2Address(
+            V060GenesisSpec.GUARDIAN_RECOVERY_V2, V060GenesisSpec.guardianRecoveryV2Init(i.guardianRecoveryModule)
+        );
+        d.usageReceipts = _create2Address(V060GenesisSpec.USAGE_RECEIPTS, V060GenesisSpec.usageReceiptsInit());
+        d.orgBudgets =
+            _create2Address(V060GenesisSpec.ORG_BUDGETS, V060GenesisSpec.orgBudgetsInit(gt, i.organizationSbt));
+        d.workAttestations =
+            _create2Address(V060GenesisSpec.WORK_ATTESTATIONS, V060GenesisSpec.workAttestationsInit(i.agentSbt));
+    }
+
+    /// @notice Deploy the reviewed subset in live mode, with every live-mode check of `deployLive`
+    ///         before anything is sent. WorkMarket and FLRoundVerifier stay zero in the result.
+    function deployLiveSubset(address deployer, Inputs memory i, Rotation memory rot) public returns (Deployed memory d) {
+        require(deployer != address(0), "deployer must be set");
+        require(
+            _envSignerKey() != 0,
+            "live mode signs only from an env-held key: set PRIVATE_KEY (op run) and EXPECTED_SENDER"
+        );
+        V060GovernanceSpec.requireKeyParams(i.keys);
+        V060GovernanceSpec.requirePureLiveDeployer(deployer, i.keys);
+        Deployed memory p = predictSubset(i);
+        address flrv = _create2Address(
+            V060GenesisSpec.FL_ROUND_VERIFIER, V060GenesisSpec.flRoundVerifierInit(i.federatedRoundLedger)
+        );
+        require(flrv.code.length == 0, "FLRoundVerifier already has code: this is not the subset step");
+        _resolveChainProfile(true);
+        _checkKeys(deployer, i);
+        _checkLiveInputs(i, p, rot);
+
+        console.log("=== 0.6.0 contracts, live mode, reviewed subset (post-genesis) ===");
+        console.log("Deployer:", deployer);
+        _startBroadcastEnv(deployer);
+        d.providerRegistry = _deployProviderRegistry(i);
+        d.guardianCancellerV2 = _deployCancellerV2(i, d.providerRegistry);
+        d.taskVerifier = _deployTaskVerifier();
+        d.datasetRegistry = _deployDatasetRegistry(i);
+        d.guardianRecoveryModuleV2 = _deployGuardianRecoveryV2(i);
+        d.usageReceipts = _deployUsageReceipts();
+        d.orgBudgets = _deployOrgBudgets(i);
+        d.workAttestations = _deployWorkAttestations(i);
+        vm.stopBroadcast();
+
+        require(keccak256(abi.encode(d)) == keccak256(abi.encode(p)), "a subset contract is not at its predicted address");
+        verifyLiveSubset(i, d);
+        console.log("ProviderRegistry         :", d.providerRegistry);
+        console.log("GuardianCancellerV2      :", d.guardianCancellerV2);
+        console.log("TaskVerifier             :", d.taskVerifier);
+        console.log("DatasetRegistry          :", d.datasetRegistry);
+        console.log("GuardianRecoveryModuleV2 :", d.guardianRecoveryModuleV2);
+        console.log("UsageReceipts            :", d.usageReceipts);
+        console.log("OrgBudgets               :", d.orgBudgets);
+        console.log("WorkAttestations         :", d.workAttestations);
+    }
+
+    /// @notice The subset re-read on chain, before the canceller swap: as `verifyLive` for the
+    ///         eight contracts, and FLRoundVerifier still without code.
+    function verifyLiveSubset(Inputs memory i, Deployed memory d) public view {
+        _verifySubsetContracts(i, d);
+        address flrv = _create2Address(
+            V060GenesisSpec.FL_ROUND_VERIFIER, V060GenesisSpec.flRoundVerifierInit(i.federatedRoundLedger)
+        );
+        require(flrv.code.length == 0, "FLRoundVerifier has code: use the full verify");
+        TimelockController g = TimelockController(payable(i.governanceTimelock));
+        bytes32 cancellerRole = g.CANCELLER_ROLE();
+        require(
+            g.hasRole(cancellerRole, _v1Address(i)),
+            "GuardianCanceller v1 no longer holds CANCELLER: use the post-swap check"
+        );
+        require(!g.hasRole(cancellerRole, d.guardianCancellerV2), "GuardianCancellerV2 holds CANCELLER before the swap");
+        require(i.guardianCanceller == _v1Address(i), "the input book's canceller seat is not v1");
+    }
+
+    /// @notice The subset book: the eight contracts and the parameters they were built with.
+    function subsetBookJson(address deployer, Deployed memory d, Inputs memory i) public view returns (string memory) {
+        string[] memory names = new string[](8);
+        address[] memory addrs = new address[](8);
+        (names[0], addrs[0]) = ("ProviderRegistry", d.providerRegistry);
+        (names[1], addrs[1]) = ("GuardianCancellerV2", d.guardianCancellerV2);
+        (names[2], addrs[2]) = ("TaskVerifier", d.taskVerifier);
+        (names[3], addrs[3]) = ("DatasetRegistry", d.datasetRegistry);
+        (names[4], addrs[4]) = ("GuardianRecoveryModuleV2", d.guardianRecoveryModuleV2);
+        (names[5], addrs[5]) = ("UsageReceipts", d.usageReceipts);
+        (names[6], addrs[6]) = ("OrgBudgets", d.orgBudgets);
+        (names[7], addrs[7]) = ("WorkAttestations", d.workAttestations);
+        string memory params = string.concat(
+            '"v060Subset":{"taskReviewWindow":',
+            vm.toString(uint256(V060GenesisSpec.TASK_REVIEW_WINDOW)),
+            ',"usageMaxBackfillDays":',
+            vm.toString(uint256(V060GenesisSpec.USAGE_MAX_BACKFILL_DAYS)),
+            ',"guardian":"',
+            vm.toString(i.guardianTimelock),
+            '","pending":["FLRoundVerifier","WorkMarket"]}'
+        );
+        return _bookJson(deployer, names, addrs, params);
+    }
+
+    function _verifySubsetContracts(Inputs memory i, Deployed memory d) internal view {
+        address[8] memory s = [
+            d.providerRegistry,
+            d.guardianCancellerV2,
+            d.taskVerifier,
+            d.datasetRegistry,
+            d.guardianRecoveryModuleV2,
+            d.usageReceipts,
+            d.orgBudgets,
+            d.workAttestations
+        ];
+        for (uint256 n = 0; n < 8; n++) {
+            require(s[n].code.length != 0, "a 0.6.0 subset contract has no code");
+        }
+        address gt = i.governanceTimelock;
+        address rt = i.guardianTimelock;
+        require(TaskVerifier(d.taskVerifier).reviewWindow() == V060GenesisSpec.TASK_REVIEW_WINDOW, "TaskVerifier: window");
+        require(DatasetRegistry(d.datasetRegistry).governance() == gt, "DatasetRegistry: governance");
+        require(
+            address(GuardianRecoveryModuleV2(d.guardianRecoveryModuleV2).v1()) == i.guardianRecoveryModule,
+            "GuardianRecoveryModuleV2: v1"
+        );
+        require(
+            UsageReceipts(d.usageReceipts).maxBackfillDays() == V060GenesisSpec.USAGE_MAX_BACKFILL_DAYS,
+            "UsageReceipts: backfill"
+        );
+        require(OrgBudgets(d.orgBudgets).governance() == gt, "OrgBudgets: governance");
+        require(address(OrgBudgets(d.orgBudgets).orgs()) == i.organizationSbt, "OrgBudgets: orgs");
+        require(address(WorkAttestations(d.workAttestations).agents()) == i.agentSbt, "WorkAttestations: agents");
+        ProviderRegistry reg = ProviderRegistry(d.providerRegistry);
+        require(reg.governance() == gt && reg.guardian() == rt, "ProviderRegistry: governance or guardian");
+        require(reg.vetoWindow() == V060GovernanceSpec.PROVIDER_VETO_WINDOW, "ProviderRegistry: veto window");
+        GuardianCancellerV2 c = GuardianCancellerV2(d.guardianCancellerV2);
+        require(
+            c.governanceTimelock() == gt && c.guardian() == rt && c.providerRegistry() == d.providerRegistry,
+            "GuardianCancellerV2: wiring"
+        );
+    }
+
     function _v1Address(Inputs memory i) internal pure returns (address) {
         return _create2Address(
             "Genesis.GuardianCanceller",
