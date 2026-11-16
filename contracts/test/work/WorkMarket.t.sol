@@ -124,7 +124,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         uint256 id = _openFl();
         bytes32[] memory none;
         vm.prank(w1);
-        market.join(id, PRICE, none);
+        market.join{value: JBOND}(id, PRICE, none);
         assertTrue(market.joined(id, w1));
         assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.Running));
         assertEq(market.getOffer(id).workers, 1);
@@ -153,15 +153,15 @@ contract WorkMarketTest is WorkMarketTestBase {
 
     function test_join_requires_exact_join_bond() public {
         WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.FL_ROUND);
-        p.joinBond = 0.1 ether;
+        p.joinBond = 1.5 ether;
         uint256 id = _open(p, BUDGET);
         bytes32[] memory none;
         vm.prank(w1);
         vm.expectRevert(WorkMarket.WrongBond.selector);
-        market.join{value: 0.09 ether}(id, 0, none);
+        market.join{value: 1.49 ether}(id, 0, none);
         vm.prank(w1);
-        market.join{value: 0.1 ether}(id, 0, none);
-        assertEq(market.owedOn(id), BUDGET + 0.1 ether);
+        market.join{value: 1.5 ether}(id, 0, none);
+        assertEq(market.owedOn(id), BUDGET + 1.5 ether);
     }
 
     function test_join_allowlist_enforced() public {
@@ -176,7 +176,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         bytes32[] memory proof1 = new bytes32[](1);
         proof1[0] = l2;
         vm.prank(w1);
-        market.join(id, 0, proof1);
+        market.join{value: JBOND}(id, 0, proof1);
 
         vm.prank(w3);
         vm.expectRevert(WorkMarket.NotAllowlisted.selector);
@@ -292,7 +292,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         vm.warp(block.timestamp + WINDOW);
         vm.prank(stranger); // anyone may settle
         _settle(id, leaves, 1, e[1], 2);
-        assertEq(market.balanceOf(w2), 3 * PRICE);
+        assertEq(market.balanceOf(w2), 3 * PRICE + JBOND); // pay plus the released join bond
         assertTrue(market.settled(id, w2));
         WorkMarket.Offer memory o = market.getOffer(id);
         assertEq(o.paid, 3 * PRICE);
@@ -366,12 +366,12 @@ contract WorkMarketTest is WorkMarketTestBase {
         vm.expectRevert(WorkMarket.ExceedsPayout.selector);
         _settle(id, leaves, 1, e[1], 3);
         _settle(id, leaves, 0, e[0], 0);
-        assertEq(market.balanceOf(w1), 3 * PRICE);
+        assertEq(market.balanceOf(w1), 3 * PRICE + JBOND);
     }
 
     function test_settle_releases_join_bond() public {
         WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.FL_ROUND);
-        p.joinBond = 0.5 ether;
+        p.joinBond = 1.5 ether;
         uint256 id = _open(p, BUDGET);
         _join(id, w1);
         _accept(id);
@@ -381,7 +381,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         _postTree(id, leaves, 2);
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, w1, 2, 0, 0, new bytes32[](0));
-        assertEq(market.balanceOf(w1), 2 * PRICE + 0.5 ether);
+        assertEq(market.balanceOf(w1), 2 * PRICE + 1.5 ether);
         assertTrue(market.joinBondReleased(id, w1));
     }
 
@@ -416,7 +416,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         _settle(id, leaves, 0, e[0], 0);
         _settle(id, leaves, 1, e[1], 2);
         _settle(id, leaves, 2, e[2], 5);
-        assertEq(market.balanceOf(w1) + market.balanceOf(w2) + market.balanceOf(w3), 6 * PRICE);
+        assertEq(market.balanceOf(w1) + market.balanceOf(w2) + market.balanceOf(w3), 6 * PRICE + 3 * JBOND);
         vm.prank(coordinator);
         market.claimBond(id);
         assertEq(market.owedOn(id), 0);
@@ -466,7 +466,7 @@ contract WorkMarketTest is WorkMarketTestBase {
 
     function test_join_bond_released_to_unpaid_worker_after_offer_ends() public {
         WorkMarket.OpenParams memory p = _params(IWorkMarket.Kind.FL_ROUND);
-        p.joinBond = 0.5 ether;
+        p.joinBond = 1.5 ether;
         uint256 id = _open(p, BUDGET);
         _join(id, w1);
         vm.prank(w1);
@@ -475,7 +475,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         vm.warp(uint256(market.getOffer(id).deadline) + WINDOW);
         vm.prank(w1);
         market.claimBond(id);
-        assertEq(market.balanceOf(w1), 0.5 ether);
+        assertEq(market.balanceOf(w1), 1.5 ether);
     }
 
     // ── withdraw ───────────────────────────────────────────────────
@@ -488,7 +488,7 @@ contract WorkMarketTest is WorkMarketTestBase {
         uint256 before = w1.balance;
         vm.prank(w1);
         market.withdraw();
-        assertEq(w1.balance, before + 2 * PRICE);
+        assertEq(w1.balance, before + 2 * PRICE + JBOND);
         assertEq(market.balanceOf(w1), 0);
         vm.prank(w1);
         vm.expectRevert(WorkMarket.NothingToClaim.selector);
@@ -498,7 +498,7 @@ contract WorkMarketTest is WorkMarketTestBase {
     function test_withdraw_reentry_gets_nothing_extra() public {
         ReenteringWorker rw = new ReenteringWorker(market);
         uint256 id = _openFl();
-        rw.joinOffer(id, 0);
+        rw.joinOffer{value: JBOND}(id, 0);
         _accept(id);
         Entry[] memory e = new Entry[](1);
         e[0] = Entry(address(rw), 3);
@@ -508,8 +508,8 @@ contract WorkMarketTest is WorkMarketTestBase {
         market.settle(id, address(rw), 3, 0, 0, new bytes32[](0));
         uint256 marketBefore = address(market).balance;
         rw.pull();
-        assertEq(address(rw).balance, 3 * PRICE);
-        assertEq(address(market).balance, marketBefore - 3 * PRICE);
+        assertEq(address(rw).balance, 3 * PRICE + JBOND);
+        assertEq(address(market).balance, marketBefore - 3 * PRICE - JBOND);
         assertEq(rw.reentries(), 1);
     }
 
@@ -572,9 +572,9 @@ contract WorkMarketTest is WorkMarketTestBase {
     function test_constructor_rejects_zero_verifier_and_zero_governance() public {
         address[] memory vs = new address[](1);
         vm.expectRevert(WorkMarket.BadParty.selector);
-        new WorkMarket(governance, guardian, SINK, 1 ether, MINBOND, vs);
+        new WorkMarket(governance, guardian, SINK, 1 ether, MINBOND, JBOND, vs);
         vm.expectRevert(Governable.Governable_ZeroAddress.selector);
-        new WorkMarket(address(0), guardian, SINK, 1 ether, MINBOND, new address[](0));
+        new WorkMarket(address(0), guardian, SINK, 1 ether, MINBOND, JBOND, new address[](0));
     }
 
     /// PBA-L2-002: a salted deploy runs the constructor from the CREATE2 factory, so no admin seat
@@ -582,9 +582,9 @@ contract WorkMarketTest is WorkMarketTestBase {
     function test_constructor_guardian_goes_through_initial_admin_check() public {
         address factory = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
         vm.expectRevert(InitialAdmin.InitialAdmin_Create2Factory.selector);
-        new WorkMarket(governance, factory, SINK, 1 ether, MINBOND, new address[](0));
+        new WorkMarket(governance, factory, SINK, 1 ether, MINBOND, JBOND, new address[](0));
         vm.expectRevert(InitialAdmin.InitialAdmin_Zero.selector);
-        new WorkMarket(governance, address(0), SINK, 1 ether, MINBOND, new address[](0));
+        new WorkMarket(governance, address(0), SINK, 1 ether, MINBOND, JBOND, new address[](0));
     }
 
     function test_setGuardian_refuses_factory_but_may_clear() public {
@@ -611,9 +611,9 @@ contract WorkMarketTest is WorkMarketTestBase {
         vm.prank(w1);
         if (price < minPrice) {
             vm.expectRevert(abi.encodeWithSelector(WorkMarket.PriceBelowFloor.selector, price, minPrice));
-            market.join(id, minPrice, none);
+            market.join{value: JBOND}(id, minPrice, none);
         } else {
-            market.join(id, minPrice, none);
+            market.join{value: JBOND}(id, minPrice, none);
             assertTrue(market.joined(id, w1));
         }
     }
@@ -642,9 +642,9 @@ contract WorkMarketTest is WorkMarketTestBase {
         vm.prank(poster);
         market.refund(id);
         _settle(id, leaves, 1, e[1], u1);
-        assertEq(market.balanceOf(w1), uint256(u1) * price);
-        assertEq(market.balanceOf(w2), uint256(u2) * price);
-        assertEq(market.balanceOf(w1) + market.balanceOf(w2) + market.balanceOf(poster), budget);
+        assertEq(market.balanceOf(w1), uint256(u1) * price + JBOND);
+        assertEq(market.balanceOf(w2), uint256(u2) * price + JBOND);
+        assertEq(market.balanceOf(w1) + market.balanceOf(w2) + market.balanceOf(poster), budget + 2 * JBOND);
         assertEq(market.owedOn(id), CBOND);
     }
 

@@ -41,12 +41,14 @@ import {GuardianRecoveryModuleV2, IGuardianRecoveryModuleV1} from "../../src/aa/
 ///         timelocks) are ceremony inputs, and the scripts refuse to run without the list of
 ///         retired r1006 keys (`PENDING_RETIRED_KEYS`) or with any of those accounts on it.
 ///
-///         Coordinator bonds (`minCoordinatorBond_`, `defaultCoordinatorBond_`): decided by the
-///         owner on 2026-11-11 as REHEARSAL values, 100 SALT and 1,000 SALT, to revisit with
-///         tokenomics before the 0.6.0 ceremony genesis. They are ceremony inputs, recorded in
+///         WorkMarket bonds (`defaultCoordinatorBond_`, `minCoordinatorBond_`, `minJoinBond_`):
+///         the owner decided the coordinator floor (100 SALT) and the default (1,000 SALT) on
+///         2026-11-11 as REHEARSAL values, to revisit with tokenomics, and the join floor (10 SALT)
+///         on 2026-11-14. The two floors are genesis values only: GOVERNANCE (the 48 h timelock)
+///         sets them afterwards, within 1 to 100,000 SALT. They are ceremony inputs, recorded in
 ///         scripts/genesis/phase_inputs.json (`decided`, enforced at P0) and
 ///         scripts/genesis/v060/inputs.v060.env, never a default here: DeployV060Genesis refuses
-///         to build without both (`PENDING_COORDINATOR_BONDS`). They are in WorkMarket's init
+///         to build without all three (`PENDING_COORDINATOR_BONDS`). They are in WorkMarket's init
 ///         code, so its address moves if they are revisited: the 0.6.0 address book is
 ///         PROVISIONAL (WorkMarket's address) until the bonds are final.
 library V060GenesisSpec {
@@ -62,9 +64,12 @@ library V060GenesisSpec {
 
     uint64 internal constant TASK_REVIEW_WINDOW = 72 hours;
     uint32 internal constant USAGE_MAX_BACKFILL_DAYS = 90;
+    /// WorkMarket's own bounds for the bond floors (MIN_BOND_FLOOR, MAX_BOND_FLOOR).
+    uint128 internal constant MIN_BOND_FLOOR = 1 ether;
+    uint128 internal constant MAX_BOND_FLOOR = 100_000 ether;
 
     string internal constant PENDING_COORDINATOR_BONDS =
-        "REQUIRED INPUT: the WorkMarket coordinator bonds; set WORKMARKET_MIN_COORDINATOR_BOND and WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei, min > 0, default >= min; owner 2026-11-11 rehearsal values 100 / 1,000 SALT, scripts/genesis/v060/inputs.v060.env)";
+        "REQUIRED INPUT: the WorkMarket bonds; set WORKMARKET_MIN_COORDINATOR_BOND, WORKMARKET_DEFAULT_COORDINATOR_BOND and WORKMARKET_MIN_JOIN_BOND (SALT wei; floors 1 to 100,000 SALT, default between the coordinator floor and 100,000 SALT; owner values 100 / 1,000 / 10 SALT, scripts/genesis/v060/inputs.v060.env)";
 
     function flRoundVerifierInit(address federatedRoundLedger) internal pure returns (bytes memory) {
         return abi.encodePacked(
@@ -91,6 +96,7 @@ library V060GenesisSpec {
         address guardianTimelock,
         uint128 defaultCoordinatorBond,
         uint128 minCoordinatorBond,
+        uint128 minJoinBond,
         address flRoundVerifier,
         address taskVerifier
     ) internal pure returns (bytes memory) {
@@ -102,6 +108,7 @@ library V060GenesisSpec {
                 governanceTimelock, // slashSink = the GOVERNANCE timelock (the treasury)
                 defaultCoordinatorBond,
                 minCoordinatorBond,
+                minJoinBond,
                 initialVerifiers(flRoundVerifier, taskVerifier)
             )
         );

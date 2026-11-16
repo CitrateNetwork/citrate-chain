@@ -27,6 +27,7 @@ contract WorkMarketVerifiersTest is Test {
     uint128 internal bondNow;
     uint32 internal constant WINDOW = 24 hours;
     uint128 internal constant PRICE = 1 ether;
+    uint128 internal constant JBOND = 1 ether;
     bytes32 internal constant RESULT = keccak256("result");
 
     function setUp() public {
@@ -37,7 +38,7 @@ contract WorkMarketVerifiersTest is Test {
         address[] memory vs = new address[](2);
         vs[0] = address(flV);
         vs[1] = address(taskV);
-        market = new WorkMarket(governance, makeAddr("guardian"), makeAddr("slashSink"), 1 ether, 0.1 ether, vs);
+        market = new WorkMarket(governance, makeAddr("guardian"), makeAddr("slashSink"), 1 ether, 1 ether, JBOND, vs);
         vm.deal(poster, 100 ether);
         vm.deal(worker, 10 ether);
         vm.deal(flCoord, 10 ether);
@@ -61,7 +62,7 @@ contract WorkMarketVerifiersTest is Test {
             deadline: uint64(block.timestamp + 10 days),
             disputeWindow: WINDOW,
             maxWorkers: 8,
-            joinBond: 0,
+            joinBond: JBOND,
             coordinator: coord,
             coordinatorBond: 0,
             disputeAdmin: address(0)
@@ -73,7 +74,7 @@ contract WorkMarketVerifiersTest is Test {
         id = market.open{value: 2 ether}(_params(IWorkMarket.Kind.TASK, address(taskV), keccak256("task"), worker));
         bytes32[] memory none;
         vm.prank(worker);
-        market.join(id, PRICE, none);
+        market.join{value: JBOND}(id, PRICE, none);
     }
 
     function _leaf(uint256 id, address w, uint64 units) internal view returns (bytes32) {
@@ -122,7 +123,7 @@ contract WorkMarketVerifiersTest is Test {
         assertEq(market.getOffer(id).digest, RESULT);
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, worker, 1, 0, 0, new bytes32[](0));
-        assertEq(market.balanceOf(worker), PRICE);
+        assertEq(market.balanceOf(worker), PRICE + JBOND); // pay plus the released join bond
     }
 
     function test_task_auto_release_after_review_window() public {
@@ -201,7 +202,7 @@ contract WorkMarketVerifiersTest is Test {
         id = market.open{value: 2 ether}(p);
         bytes32[] memory none;
         vm.prank(worker);
-        market.join(id, PRICE, none);
+        market.join{value: JBOND}(id, PRICE, none);
         vm.prank(worker);
         taskV.submit(market, id, RESULT);
         if (requesterAccepts) {
@@ -243,7 +244,7 @@ contract WorkMarketVerifiersTest is Test {
         assertEq(market.getOffer(id).digest, v2);
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, worker, 1, 0, 0, new bytes32[](0));
-        assertEq(market.balanceOf(worker), PRICE + bondNow);
+        assertEq(market.balanceOf(worker), PRICE + bondNow + JBOND);
     }
 
     function test_task_upheld_dispute_rejects_auto_accepted_result() public {
@@ -272,10 +273,109 @@ contract WorkMarketVerifiersTest is Test {
             thresholdNeg: -32768,
             confidenceRule: 1,
             weightRule: 1,
-            challengeWindow: 20
+            challengeWindow: 1800 // FLRoundVerifier.MIN_CHALLENGE_WINDOW
         });
         vm.prank(flCoord);
         clusterId = frl.registerCluster(keccak256("c"), r);
+    }
+
+    /// A cluster registered by `coord` with the given FRL challenge window (blocks).
+    function _clusterBy(address coord, uint64 window, bytes32 salt) internal returns (bytes32 clusterId) {
+        FederatedRoundLedger.ClusterRules memory r = FederatedRoundLedger.ClusterRules({
+            minParticipants: 3,
+            chunkDim: 4,
+            valueScaleLog2: 8,
+            thresholdPos: 32768,
+            thresholdNeg: -32768,
+            confidenceRule: 1,
+            weightRule: 1,
+            challengeWindow: window
+        });
+        vm.prank(coord);
+        clusterId = frl.registerCluster(salt, r);
+    }
+
+    function _commitBy(address coord, bytes32 clusterId) internal returns (bytes32 roundId) {
+        FederatedRoundLedger.RoundCommit memory c = FederatedRoundLedger.RoundCommit({
+            clusterId: clusterId,
+            ordinal: 0,
+            configHash: keccak256("cfg"),
+            participantsRoot: keccak256("parts"),
+            participants: 3,
+            nValues: 4,
+            inputRoot: keccak256("in"),
+            outputRoot: keccak256("out"),
+            chunks: 1,
+            adapterHash: keccak256("adapter")
+        });
+        vm.prank(coord);
+        roundId = frl.commitRound(c);
+    }
+
+    /// An FL offer bound to an accepted round of `clusterCoord`'s cluster, coordinated by `offerCoord`.
+    function _acceptedFlOffer(address clusterCoord, address offerCoord, uint64 window)
+        internal
+        returns (uint256 id, bytes32 leaf)
+    {
+        bytes32 clusterId = _clusterBy(clusterCoord, window, keccak256(abi.encode("c", window)));
+        bytes32 bind = flV.bindRefOf(clusterId, 0);
+        vm.prank(poster);
+        id = market.open{value: 5 ether}(_params(IWorkMarket.Kind.FL_ROUND, address(flV), bind, offerCoord));
+        bytes32[] memory none;
+        vm.prank(worker);
+        market.join{value: JBOND}(id, PRICE, none);
+        bytes32 roundId = _commitBy(clusterCoord, clusterId);
+        vm.roll(block.number + uint256(window) + 1);
+        frl.finalize(roundId);
+        assertTrue(frl.isAccepted(roundId));
+        leaf = _leaf(id, worker, 3);
+        bondNow = market.getOffer(id).coordinatorBond;
+    }
+
+    /// The FRL cluster coordinator decides when its round is accepted; an offer's payout may rest
+    /// on that only when the offer names the same coordinator.
+    function test_fl_payout_needs_the_offer_coordinator_to_be_the_cluster_coordinator() public {
+        vm.deal(stranger, 10 ether);
+        (uint256 id, bytes32 leaf) = _acceptedFlOffer(flCoord, stranger, 1800);
+        vm.prank(stranger);
+        vm.expectRevert(WorkMarket.NotAccepted.selector);
+        market.postPayout{value: bondNow}(id, leaf, 3, 0);
+    }
+
+    function test_fl_payout_needs_a_cluster_challenge_window_at_the_floor() public {
+        (uint256 id, bytes32 leaf) = _acceptedFlOffer(flCoord, flCoord, 1799);
+        vm.prank(flCoord);
+        vm.expectRevert(WorkMarket.NotAccepted.selector);
+        market.postPayout{value: bondNow}(id, leaf, 3, 0);
+    }
+
+    function test_fl_floor_is_about_an_hour_of_blocks() public view {
+        assertEq(flV.MIN_CHALLENGE_WINDOW(), 1800);
+    }
+
+    /// The verifier answers only for offers that name it, are FL rounds and bind this round, and
+    /// only to a caller that is a contract (the market asking).
+    function test_fl_accepted_only_for_its_own_bound_fl_offer() public {
+        (uint256 id,) = _acceptedFlOffer(flCoord, flCoord, 1800);
+        bytes32 bind = market.getOffer(id).bindRef;
+        (bool ok,) = flV.acceptedFor(market, id, bind);
+        assertTrue(ok);
+        (ok,) = flV.acceptedFor(market, id, keccak256("another round"));
+        assertFalse(ok, "bindRef must match the offer");
+        (ok,) = flV.acceptedFor(IWorkMarket(stranger), id, bind);
+        assertFalse(ok, "no code: not a market");
+        vm.prank(poster);
+        uint256 task =
+            market.open{value: 2 ether}(_params(IWorkMarket.Kind.TASK, address(taskV), bind, worker));
+        (ok,) = flV.acceptedFor(market, task, bind);
+        assertFalse(ok, "an offer that names another verifier");
+    }
+
+    function test_fl_payout_accepts_the_cluster_coordinator_at_the_floor() public {
+        (uint256 id, bytes32 leaf) = _acceptedFlOffer(flCoord, flCoord, 1800);
+        vm.prank(flCoord);
+        market.postPayout{value: bondNow}(id, leaf, 3, 0);
+        assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.PayoutPosted));
     }
 
     function _commit(bytes32 clusterId) internal returns (bytes32 roundId) {
@@ -308,11 +408,11 @@ contract WorkMarketVerifiersTest is Test {
     function test_fl_unknown_or_committed_round_not_accepted() public {
         bytes32 clusterId = _cluster();
         bytes32 bind = flV.bindRefOf(clusterId, 0);
-        (bool ok, bytes32 d) = flV.accepted(1, bind);
+        (bool ok, bytes32 d) = flV.acceptedFor(market, 1, bind);
         assertFalse(ok);
         assertEq(d, bytes32(0));
         _commit(clusterId);
-        (ok,) = flV.accepted(1, bind);
+        (ok,) = flV.acceptedFor(market, 1, bind);
         assertFalse(ok);
     }
 
@@ -323,7 +423,7 @@ contract WorkMarketVerifiersTest is Test {
         uint256 id = market.open{value: 5 ether}(_params(IWorkMarket.Kind.FL_ROUND, address(flV), bind, flCoord));
         bytes32[] memory none;
         vm.prank(worker);
-        market.join(id, PRICE, none);
+        market.join{value: JBOND}(id, PRICE, none);
 
         bytes32 roundId = _commit(clusterId);
         assertEq(roundId, bind);
@@ -333,9 +433,9 @@ contract WorkMarketVerifiersTest is Test {
         vm.expectRevert(WorkMarket.NotAccepted.selector);
         market.postPayout{value: bondNow}(id, leaf, 3, 0);
 
-        vm.roll(block.number + 21);
+        vm.roll(block.number + 1801);
         frl.finalize(roundId);
-        (bool ok, bytes32 d) = flV.accepted(id, bind);
+        (bool ok, bytes32 d) = flV.acceptedFor(market, id, bind);
         assertTrue(ok);
         assertEq(d, frl.recordDigest(roundId));
 
@@ -346,6 +446,6 @@ contract WorkMarketVerifiersTest is Test {
         assertEq(market.getOffer(id).digest, frl.recordDigest(roundId));
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, worker, 3, 0, 0, new bytes32[](0));
-        assertEq(market.balanceOf(worker), 3 * PRICE);
+        assertEq(market.balanceOf(worker), 3 * PRICE + JBOND);
     }
 }
