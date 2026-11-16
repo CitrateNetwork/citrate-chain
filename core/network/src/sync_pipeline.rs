@@ -2421,6 +2421,184 @@ mod tests {
         assert!(o.is_pipeline());
     }
 
+    /// A DAG where sibling `i` at each height selects sibling `i` below it
+    /// (so a missing sibling leaves its child's selected parent missing).
+    fn strand(h: u64, i: u64) -> Block {
+        let parent = if h == 1 { hash(0, 0) } else { hash(h - 1, i) };
+        block_on(h, i, parent)
+    }
+
+    fn strands(from: u64, to: u64, skip: &[(u64, u64)]) -> Vec<Block> {
+        (from..=to)
+            .flat_map(|h| (0..7).map(move |i| (h, i)))
+            .filter(|k| !skip.contains(k))
+            .map(|(h, i)| if h == 0 { block(0, i) } else { strand(h, i) })
+            .collect()
+    }
+
+    /// Drive `pl` with honest peers answering every in-flight window from
+    /// `serve` (lo, hi) -> blocks, the node applying a height once a block of
+    /// it is released. Returns every released hash.
+    fn drive_until(
+        pl: &mut BlockPipeline,
+        peers: &[PipelinePeer],
+        target: u64,
+        rounds: usize,
+        mut serve: impl FnMut(&PeerId, u64, u64) -> Vec<Block>,
+        mut applies: impl FnMut(&Block) -> bool,
+    ) -> (HashSet<Hash>, u64) {
+        let mut now = Instant::now();
+        let mut released: HashSet<Hash> = HashSet::new();
+        let mut by_height: BTreeMap<u64, Hash> = BTreeMap::new();
+        let mut applied = 0u64;
+        for _ in 0..rounds {
+            now += Duration::from_millis(50);
+            let reqs = pl.plan(now, peers, true);
+            feed_headers(pl, &reqs, target, now);
+            for (p, lo, hi) in pl.in_flight_windows() {
+                let answer = serve(&p, lo, hi);
+                let o = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+                for b in o.release {
+                    if applies(&b) {
+                        by_height.entry(b.header.height).or_insert(b.header.block_hash);
+                    }
+                    released.insert(b.header.block_hash);
+                }
+            }
+            let _ = pl.poll(now);
+            while by_height.contains_key(&(applied + 1)) {
+                applied += 1;
+            }
+            pl.observe_applied((hash(applied, 0), applied), now);
+            if applied >= target {
+                break;
+            }
+        }
+        (released, applied)
+    }
+
+    fn engaged(target: u64) -> BlockPipeline {
+        let now = Instant::now();
+        let config = PipelineConfig {
+            engage_gap: 0,
+            ..PipelineConfig::default()
+        };
+        let mut pl = BlockPipeline::new(config, now);
+        pl.observe_applied((hash(0, 0), 0), now);
+        pl.set_target(target);
+        pl
+    }
+
+    /// A peer answers its windows with blocks of its own that chain onto
+    /// ours (so they look connected) but never apply. Nothing marks those
+    /// heights as done for good: the node, stuck, re-plans and gets them
+    /// from someone else.
+    #[test]
+    fn blocks_that_never_apply_are_asked_for_again_elsewhere() {
+        let target = 300;
+        let mut pl = engaged(target);
+        let peers = [peer("f", target), peer("h", target)];
+        let (_, applied) = drive_until(
+            &mut pl,
+            &peers,
+            target,
+            40_000,
+            |p, lo, hi| {
+                if p.0 == "f" {
+                    let mut v = groups(lo - 1, lo - 1);
+                    v.extend((lo..=hi).map(|h| {
+                        let parent = if h == lo { hash(lo - 1, 0) } else { hash(h - 1, 50) };
+                        block_on(h, 50, parent)
+                    }));
+                    v
+                } else {
+                    groups(lo - 1, hi)
+                }
+            },
+            |b| b.header.block_hash.as_bytes()[8..16] < 50u64.to_be_bytes()[..],
+        );
+        assert_eq!(applied, target, "{:?}", pl.stats());
+    }
+
+    /// An answer cut in the middle of a height-group (a full outbound queue
+    /// drops the rest), and an answer that leaves one sibling out: the
+    /// missing blocks are asked for again, and every block is released.
+    #[test]
+    fn a_cut_group_and_an_omitted_sibling_are_asked_for_again() {
+        let target = 200;
+        for skip in [
+            // The rest of the group at 64, the top of the first window.
+            vec![(64, 4), (64, 5), (64, 6)],
+            // One sibling in the middle of a window.
+            vec![(100, 6)],
+        ] {
+            let mut pl = engaged(target);
+            let peers = [peer("a", target), peer("b", target)];
+            let mut served_once: HashSet<(u64, u64)> = HashSet::new();
+            let (released, applied) = drive_until(
+                &mut pl,
+                &peers,
+                target,
+                20_000,
+                |_, lo, hi| {
+                    // The first answer covering a cut height is short of it;
+                    // later answers are whole.
+                    let cut: Vec<(u64, u64)> = skip
+                        .iter()
+                        .copied()
+                        .filter(|(h, _)| lo <= *h + 1 && *h <= hi && !served_once.contains(&(*h, 0)))
+                        .collect();
+                    for (h, _) in &cut {
+                        served_once.insert((*h, 0));
+                    }
+                    strands(lo - 1, hi, &cut)
+                },
+                |_| true,
+            );
+            assert_eq!(applied, target, "{skip:?}: {:?}", pl.stats());
+            for (h, i) in &skip {
+                assert!(
+                    released.contains(&hash(*h, *i)),
+                    "{skip:?}: block ({h}, {i}) never released: {:?}",
+                    pl.stats()
+                );
+            }
+        }
+    }
+
+    /// Everything delivered was released but the applied tip does not move:
+    /// the stall valve re-plans even with nothing held.
+    #[test]
+    fn the_stall_valve_fires_with_an_empty_buffer() {
+        let t0 = Instant::now();
+        let mut pl = pipeline(t0);
+        let peers = [peer("a", 10_000)];
+        let reqs = pl.plan(t0, &peers, true);
+        let (p, _, lo, hi) = blocks_of(&reqs)[0].clone();
+        let answer = groups(lo - 1, hi);
+        let o = pl.on_blocks(&p, raw_of(&answer), answer.clone(), t0);
+        assert!(!o.release.is_empty());
+        assert_eq!(pl.stats().buffered_blocks, 0);
+        let _ = pl.poll(t0 + Duration::from_secs(31));
+        assert_eq!(pl.stats().stall_flushes, 1);
+        let again = blocks_of(&pl.plan(t0 + Duration::from_secs(31), &peers, true));
+        assert!(again.iter().any(|(_, a, l, _)| *a == 0 && *l == 1), "{again:?}");
+    }
+
+    /// A peer that turns inadmissible loses the windows it held.
+    #[test]
+    fn a_peer_that_turns_inadmissible_loses_its_windows() {
+        let now = Instant::now();
+        let mut pl = pipeline(now);
+        let _ = pl.plan(now, &[peer("a", 10_000)], true);
+        assert_eq!(pl.in_flight_windows().len(), 1);
+        let mut a = peer("a", 10_000);
+        a.admissible = false;
+        let _ = pl.plan(now, &[a, peer("b", 10_000)], true);
+        let w = pl.in_flight_windows();
+        assert!(w.iter().all(|(p, _, _)| p.0 != "a"), "{w:?}");
+    }
+
     /// Many rounds of random answer orders and losses: no two in-flight
     /// windows ever overlap, and every height up to the target is delivered.
     #[test]
