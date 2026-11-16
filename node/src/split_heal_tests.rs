@@ -1584,7 +1584,11 @@ impl Node {
                         citrate_network::sync_pipeline::PipelinePeer {
                             id: PeerId::new(c.id.clone()),
                             head_height: c.head_height,
-                            admissible: sync_peer::pipeline_peer_admissible(c, applied_height),
+                            admissible: sync_peer::pipeline_peer_admissible(
+                                &self.sel,
+                                c,
+                                applied_height,
+                            ),
                         },
                         p.clone(),
                     )
@@ -3121,7 +3125,7 @@ mod tests {
             "rejoin_for_loop.lock().anchor(",
             ".note_asked(&pid.0, (block_from, block_height))",
             // #477 pipelined download.
-            "sync_peer::pipeline_peer_admissible(c, applied_height)",
+            "sync_peer::pipeline_peer_admissible(",
             "rejoin_for_loop.lock().is_following_tip()",
             ".pipeline_tick(applied_tip_now, pipeline_peers, following_tip)",
             "sync_for_loop.pipeline_active()",

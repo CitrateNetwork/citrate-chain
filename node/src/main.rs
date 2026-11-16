@@ -3467,19 +3467,27 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let pipeline_peers: Vec<(
                     citrate_network::sync_pipeline::PipelinePeer,
                     Arc<citrate_network::peer::Peer>,
-                )> = connected_peers
-                    .iter()
-                    .map(|(c, p)| {
-                        (
-                            citrate_network::sync_pipeline::PipelinePeer {
-                                id: citrate_network::PeerId::new(c.id.clone()),
-                                head_height: c.head_height,
-                                admissible: sync_peer::pipeline_peer_admissible(c, applied_height),
-                            },
-                            p.clone(),
-                        )
-                    })
-                    .collect();
+                )> = {
+                    // The selector's self-reports decide "far behind".
+                    let sel = sync_peers_for_loop.lock().await;
+                    connected_peers
+                        .iter()
+                        .map(|(c, p)| {
+                            (
+                                citrate_network::sync_pipeline::PipelinePeer {
+                                    id: citrate_network::PeerId::new(c.id.clone()),
+                                    head_height: c.head_height,
+                                    admissible: sync_peer::pipeline_peer_admissible(
+                                        &sel,
+                                        c,
+                                        applied_height,
+                                    ),
+                                },
+                                p.clone(),
+                            )
+                        })
+                        .collect()
+                };
                 let following_tip = rejoin_for_loop.lock().is_following_tip();
                 let pipeline_round = sync_for_loop
                     .pipeline_tick(applied_tip_now, pipeline_peers, following_tip)
