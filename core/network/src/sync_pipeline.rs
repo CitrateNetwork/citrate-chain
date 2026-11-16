@@ -1114,11 +1114,13 @@ impl BlockPipeline {
         // The deliverer's own consistency: blocks in its window that did not
         // chain from its anchor, or its own headers missing from what it
         // delivered, are charged to it.
-        let own_mismatch = self.peers.get(peer).is_some_and(|slot| {
-            slot.headers
-                .range(lo..=e.last_height.min(hi))
-                .any(|(_, x)| !e.link.chain.contains(x))
-        });
+        let top = e.last_height.min(hi);
+        let own_mismatch = top >= lo
+            && self.peers.get(peer).is_some_and(|slot| {
+                slot.headers
+                    .range(lo..=top)
+                    .any(|(_, x)| !e.link.chain.contains(x))
+            });
         if e.link.unlinked > 0 || own_mismatch {
             self.strike(peer, now);
         }
