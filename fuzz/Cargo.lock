@@ -1199,6 +1199,7 @@ dependencies = [
  "ethereum-types",
  "flate2",
  "hex",
+ "libc",
  "lru 0.17.0",
  "num_cpus",
  "parking_lot 0.12.5",

@@ -164,6 +164,38 @@ impl RocksDB {
         Ok(db)
     }
 
+    /// Open an existing database READ-ONLY with every column family it has,
+    /// encrypted at rest when `encryption` is given (the key is verified
+    /// against the stored commitment; a wrong key is an error), plaintext
+    /// otherwise ([`Self::open_read_only`]). Nothing is created or written.
+    /// lets a cold resync read the signed-vote record out of a
+    /// moved encrypted chain database.
+    pub fn open_read_only_with(
+        path: impl AsRef<Path>,
+        encryption: Option<&EncryptionAtRestConfig>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let Some(config) = encryption else {
+            return Self::open_read_only(path);
+        };
+        if EncryptionMeta::load(path)?.is_none() {
+            anyhow::bail!(
+                "{} is not an encrypted database (no encryption.meta)",
+                path.display()
+            );
+        }
+        let cipher = AtRestCipher::open_or_init(path, config)?;
+        let opts = Options::default();
+        let cfs = DB::list_cf(&opts, path)?;
+        let db = DB::open_cf_for_read_only(&opts, path, cfs, false)?;
+        Ok(Self {
+            db: Arc::new(db),
+            cipher: Some(Arc::new(cipher)),
+            write_batch_count: Arc::new(AtomicU64::new(0)),
+            write_batch_sync_count: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
     /// Open database with encryption at rest enabled.
     ///
     /// Key/meta lifecycle (see [`AtRestCipher::open_or_init`]): a fresh
@@ -449,6 +481,27 @@ impl RocksDB {
             .filter_map(move |item| Self::map_iter_item(&cipher, &cf_name, item)))
     }
 
+    /// Every entry of `cf` whose key starts with `prefix`, in key order, values
+    /// decrypted. Unlike [`Self::prefix_iter_cf`], a read error or a value that
+    /// does not decrypt is an `Err`, never a silently missing entry: for data
+    /// whose absence is unsafe (the signed-vote record).
+    pub fn prefix_entries_strict_cf(&self, cf: &str, prefix: &[u8]) -> Result<Vec<KvItem>> {
+        let cf_handle = self.cf_handle(cf)?;
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator_cf(&cf_handle, prefix) {
+            let (key, stored) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let value = match &self.cipher {
+                None => stored,
+                Some(c) => c.open_value(cf, &key, &stored)?.into_boxed_slice(),
+            };
+            out.push((key, value));
+        }
+        Ok(out)
+    }
+
     /// Visit the keys of `cf` that start with `prefix`, in key order, without
     /// collecting them. Unlike [`Self::prefix_iter_cf`], a storage error ends
     /// the scan with `Err` instead of being skipped, so a caller never mistakes
@@ -584,6 +637,31 @@ impl Clone for RocksDB {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// a signed-vote value that does not decrypt must
+    /// fail the export, never vanish from it (a missing vote is a vote this
+    /// validator may sign again with a different hash).
+    #[test]
+    fn signed_vote_export_fails_on_an_undecryptable_value() {
+        let dir = TempDir::new().expect("tempdir");
+        let db =
+            RocksDB::open_encrypted(dir.path(), &EncryptionAtRestConfig::with_raw_key([7u8; 32]))
+                .expect("open");
+        let good = citrate_consensus::checkpoint_gadget::signed_vote_key(40204, 50);
+        let bad = citrate_consensus::checkpoint_gadget::signed_vote_key(40204, 100);
+        db.put_cf("dag_metadata", &good, &[1u8; 32]).expect("seal");
+        // A sealed-looking value whose tag cannot verify.
+        let cf = db.cf_handle("dag_metadata").expect("cf");
+        let mut garbage = db.db.get_cf(cf, &good).expect("raw read").expect("present");
+        if let Some(last) = garbage.last_mut() {
+            *last ^= 0xFF;
+        }
+        db.db.put_cf(cf, &bad, &garbage).expect("raw write");
+        assert!(
+            crate::signed_votes::export(&db).is_err(),
+            "an undecryptable vote must fail the export"
+        );
+    }
 
     /// The replay recorder's open: reads what a writer left, beside a live
     /// writer too, and can never write.

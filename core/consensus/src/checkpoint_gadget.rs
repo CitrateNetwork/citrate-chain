@@ -252,14 +252,16 @@ pub struct SignedVoteMeta {
 }
 
 impl SignedVoteMeta {
-    fn encode(&self) -> Vec<u8> {
+    /// The stored form: `floor || highest`, u64 big-endian.
+    pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16);
         out.extend_from_slice(&self.floor.to_be_bytes());
         out.extend_from_slice(&self.highest.to_be_bytes());
         out
     }
 
-    fn decode(bytes: &[u8]) -> Option<Self> {
+    /// Parse the stored form; `None` unless exactly 16 bytes.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
         let raw: [u8; 16] = bytes.try_into().ok()?;
         let (f, h) = raw.split_at(8);
         Some(Self {
@@ -300,6 +302,11 @@ pub enum SignRefusal {
 pub struct SafetyStop {
     gate: Mutex<()>,
     engaged: AtomicBool,
+    /// Held until the process exits : set by
+    /// [`SafetyStop::latch_until_exit`], never cleared, and independent of
+    /// `engaged`, so the floor verifier's recovery ([`SafetyStop::clear`])
+    /// cannot lift it.
+    exit_latched: AtomicBool,
 }
 
 /// Proof that the safety stop was NOT engaged when the signing gate was taken.
@@ -314,7 +321,7 @@ impl SigningPermit<'_> {
     /// (the flag only changes under the gate); kept as an explicit check at each
     /// step so the invariant is local to the signing code, not only structural.
     fn halted(&self) -> bool {
-        self.stop.engaged.load(Ordering::SeqCst)
+        self.stop.stopped()
     }
 }
 
@@ -327,22 +334,36 @@ impl SafetyStop {
     }
 
     /// Clear the stop (the verifier does this only when a mismatch resolved).
+    /// Does not lift the exit latch.
     pub async fn clear(&self) {
         let _gate = self.gate.lock().await;
         self.engaged.store(false, Ordering::SeqCst);
     }
 
+    /// Stop signing for the rest of this process (a cold resync
+    /// exports the signed-vote record and exits; nothing may be signed after
+    /// the export). Waits for an in-flight signing decision like
+    /// [`Self::engage`]; unlike it, [`Self::clear`] does not lift it.
+    pub async fn latch_until_exit(&self) {
+        let _gate = self.gate.lock().await;
+        self.exit_latched.store(true, Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.engaged.load(Ordering::SeqCst) || self.exit_latched.load(Ordering::SeqCst)
+    }
+
     /// Unlocked read of the flag: a hint for fast paths and reporting. A signing
     /// decision must use [`Self::signing_permit`] instead.
     pub fn is_engaged(&self) -> bool {
-        self.engaged.load(Ordering::SeqCst)
+        self.stopped()
     }
 
-    /// Take the signing gate. `None` if the stop is engaged. The returned permit
-    /// must be held across authorization, signing and queueing.
+    /// Take the signing gate. `None` if the stop is engaged or latched. The
+    /// returned permit must be held across authorization, signing and queueing.
     async fn signing_permit(&self) -> Option<SigningPermit<'_>> {
         let gate = self.gate.lock().await;
-        if self.engaged.load(Ordering::SeqCst) {
+        if self.stopped() {
             return None;
         }
         Some(SigningPermit {
@@ -3142,6 +3163,19 @@ mod tests {
 
     /// Stage 1c: a halted gadget proposes nothing, signs nothing, writes nothing
     /// and broadcasts nothing; clearing the halt resumes normal operation.
+    /// the exit latch survives the verifier's `clear`.
+    #[tokio::test]
+    async fn the_exit_latch_is_not_lifted_by_clear() {
+        let stop = SafetyStop::default();
+        assert!(stop.signing_permit().await.is_some());
+        stop.latch_until_exit().await;
+        assert!(stop.signing_permit().await.is_none());
+        stop.engage().await;
+        stop.clear().await;
+        assert!(stop.is_engaged(), "clear lifted the exit latch");
+        assert!(stop.signing_permit().await.is_none());
+    }
+
     #[tokio::test]
     async fn halted_gadget_does_nothing_until_cleared() {
         let ks = keys(4);

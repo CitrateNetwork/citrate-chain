@@ -70,6 +70,15 @@ pub struct PeerInfo {
     /// raises the head ([`PeerInfo::observe_gossiped_head`]). Like the head
     /// itself it is advertised, not proven held.
     pub head_blue_score: Option<u64>,
+    /// The head this peer reported for ITSELF in its Hello/HelloAck (its
+    /// applied tip, or a dead branch's fork point). Never raised by relayed
+    /// gossip, unlike `head_height`, so it can show that a peer is far behind
+    /// whatever its advertised head says . 0 until the handshake.
+    pub reported_head_height: u64,
+    /// When `reported_head_height` was last reported: the handshake, then
+    /// each sync request this peer sends us (the serving plane refreshes it
+    /// from the request's anchor).
+    pub reported_at: Instant,
     pub connected_at: Instant,
     pub last_seen: Instant,
     pub messages_sent: u64,
@@ -97,6 +106,8 @@ impl PeerInfo {
             head_height: 0,
             head_hash: Hash::default(),
             head_blue_score: None,
+            reported_head_height: 0,
+            reported_at: now,
             connected_at: now,
             last_seen: now,
             messages_sent: 0,

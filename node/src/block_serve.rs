@@ -167,6 +167,14 @@ fn resolve_start_inclusive(storage: &StorageManager, from: &Hash) -> Option<u64>
     }
 }
 
+/// The height of a request's anchor, when this node holds it (the zero hash is
+/// genesis). A peer anchors its sync requests on its own applied tip (or a
+/// window it is filling), so this is that peer's current self-report
+/// (`serve_plane`).
+pub fn anchor_height(storage: &StorageManager, from: &Hash) -> Option<u64> {
+    resolve_start_inclusive(storage, from)
+}
+
 /// CV-7b (H6): the dead-branch marker, when this node's applied tip is held on
 /// a branch it cannot switch from. Unreadable reads as "no marker": serving
 /// stays as it was.
