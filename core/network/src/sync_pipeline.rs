@@ -274,6 +274,9 @@ pub struct PipelineStats {
     pub held_cap_drops: u64,
     /// Heights asked for again because an answer left a block of them out.
     pub refills: u64,
+    /// Held blocks evicted to make room for others (from a holder over its
+    /// share).
+    pub held_evictions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,8 +327,6 @@ struct Link {
     accepted: usize,
     /// Blocks in the window's range that did not chain from the anchor.
     unlinked: usize,
-    /// It brought blocks while the reorder buffer was at its caps.
-    over_cap: bool,
     /// Blocks taken in whose selected parent this answer left out.
     gaps: usize,
 }
@@ -390,6 +391,9 @@ struct PeerSlot {
     excluded_until: Option<Instant>,
     /// Times it has been excluded: each exclusion lasts twice the last.
     exclusions: u32,
+    /// Blocks of its released to admission (connected to our chain) since it
+    /// was last charged.
+    connected_since_strike: u64,
     header_backoff_until: Option<Instant>,
 }
 
@@ -408,6 +412,7 @@ impl PeerSlot {
             strikes: 0,
             excluded_until: None,
             exclusions: 0,
+            connected_since_strike: 0,
             header_backoff_until: None,
         }
     }
@@ -479,6 +484,9 @@ pub struct BlockPipeline {
     buffer: BTreeMap<u64, Vec<Held>>,
     buffered_bytes: usize,
     buffered_count: usize,
+    /// Peers over their share of the buffer whose answer already ended: they
+    /// are charged on the next poll.
+    over_share: HashSet<PeerId>,
     /// Heights asked for again (once each) because a block above references
     /// a block of them that was never delivered.
     refilled: HashSet<u64>,
@@ -513,6 +521,7 @@ impl BlockPipeline {
             buffered_count: 0,
             refilled: HashSet::new(),
             released_by: BTreeMap::new(),
+            over_share: HashSet::new(),
             max_siblings: 0,
             last_progress: now,
             stats: PipelineStats::default(),
@@ -1189,7 +1198,7 @@ impl BlockPipeline {
                     .range(lo..=top)
                     .any(|(_, x)| !e.link.chain.contains(x))
             });
-        if e.link.unlinked > 0 || own_mismatch || e.link.over_cap {
+        if e.link.unlinked > 0 || own_mismatch {
             self.strike(peer, now);
         }
         // The window: done, or its remainder goes back to the pool.
@@ -1385,6 +1394,9 @@ impl BlockPipeline {
                 if !by.contains(&x.peer) {
                     by.push(x.peer.clone());
                 }
+                if let Some(slot) = self.peers.get_mut(&x.peer) {
+                    slot.connected_since_strike = slot.connected_since_strike.saturating_add(1);
+                }
                 out.push(x.block);
             }
             if !stay.is_empty() {
@@ -1559,25 +1571,145 @@ impl BlockPipeline {
             }
             self.stats.unconnected = self.stats.unconnected.saturating_add(1);
             if let Some(start) = self.first_missing(win_lo.max(next), win_hi) {
-                let covered = self
-                    .windows
-                    .iter()
-                    .any(|(lo, w)| *lo <= start && start <= w.hi);
-                if !covered {
-                    self.windows.insert(
-                        start,
-                        Window {
-                            hi: win_hi,
-                            owner: None,
-                            failed: vec![peer.clone()],
-                            attempts: 1,
-                            retry_at: None,
-                            refill: false,
-                        },
-                    );
-                }
+                self.plan_gap(start, win_hi, &peer);
             }
         }
+    }
+
+    /// Put `start..=hi` (what a dropped delivery uncovered) back in the pool,
+    /// trimmed so it overlaps no window already planned, with `failed_by`
+    /// tried last.
+    fn plan_gap(&mut self, start: u64, hi: u64, failed_by: &PeerId) {
+        let covered = self
+            .windows
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, w)| start <= w.hi);
+        if covered {
+            return;
+        }
+        let next_lo = self
+            .windows
+            .range(start.saturating_add(1)..)
+            .next()
+            .map(|(lo, _)| *lo);
+        let hi = match next_lo {
+            Some(n) => hi.min(n.saturating_sub(1)),
+            None => hi,
+        }
+        .max(start);
+        self.windows.insert(
+            start,
+            Window {
+                hi,
+                owner: None,
+                failed: vec![failed_by.clone()],
+                attempts: 1,
+                retry_at: None,
+                refill: false,
+            },
+        );
+    }
+
+    /// Nothing `peer` delivered has connected to our chain since it was last
+    /// charged. A peer whose holdings are over its share only because they
+    /// wait behind another peer's windows has delivered connected blocks.
+    fn delivered_nothing_connected(&self, peer: &PeerId) -> bool {
+        self.peers
+            .get(peer)
+            .is_some_and(|s| s.connected_since_strike == 0)
+    }
+
+    fn over_caps(&self, bytes: usize) -> bool {
+        self.buffered_count >= self.config.max_held_blocks
+            || self.buffered_bytes.saturating_add(bytes) > self.config.max_held_bytes
+    }
+
+    /// Unverified blocks and bytes each peer holds in the buffer.
+    fn holdings(&self) -> HashMap<PeerId, (usize, usize)> {
+        let mut out: HashMap<PeerId, (usize, usize)> = HashMap::new();
+        for x in self.buffer.values().flatten().filter(|x| !x.verified) {
+            let e = out.entry(x.peer.clone()).or_insert((0, 0));
+            e.0 = e.0.saturating_add(1);
+            e.1 = e.1.saturating_add(x.bytes);
+        }
+        out
+    }
+
+    /// One peer's fair share of the buffer: its caps split over the peers
+    /// that may be asked.
+    fn share(&self) -> (usize, usize) {
+        let n = self.peers.values().filter(|s| s.admissible).count().max(1);
+        (
+            self.config.max_held_blocks.checked_div(n).unwrap_or(0),
+            self.config.max_held_bytes.checked_div(n).unwrap_or(0),
+        )
+    }
+
+    /// Room for one more block of `bytes` at height `h` from `peer`. While
+    /// the buffer is at its caps, the unverified block farthest above the
+    /// frontier of the heaviest holder over its share is evicted (its window
+    /// goes back to the pool with that peer tried last), provided it lies
+    /// above `h` or belongs to another peer. If no room can be made, the
+    /// block is refused. A peer is charged only when it is over its share and
+    /// nothing it delivered has connected since its last charge: a full
+    /// buffer is charged to whoever filled it, never to a peer whose blocks
+    /// are only waiting.
+    fn make_room(&mut self, peer: &PeerId, h: u64, bytes: usize) -> bool {
+        let (share_blocks, share_bytes) = self.share();
+        while self.over_caps(bytes) {
+            let holdings = self.holdings();
+            let heavy = holdings
+                .iter()
+                .filter(|(_, (n, b))| *n > share_blocks || *b > share_bytes)
+                .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then_with(|| b.0 .0.cmp(&a.0 .0)))
+                .map(|(p, _)| p.clone());
+            let victim = heavy.and_then(|hp| {
+                self.buffer
+                    .iter()
+                    .rev()
+                    .flat_map(|(vh, v)| v.iter().enumerate().map(move |(i, x)| (*vh, i, x)))
+                    .find(|(_, _, x)| !x.verified && x.peer == hp)
+                    .map(|(vh, i, x)| (vh, i, x.peer.clone(), x.win_lo, x.win_hi))
+            });
+            let Some((vh, i, vp, win_lo, win_hi)) = victim else {
+                break;
+            };
+            if vp == *peer && vh <= h {
+                break;
+            }
+            if let Some(v) = self.buffer.get_mut(&vh) {
+                if i < v.len() {
+                    let gone = v.remove(i);
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(gone.bytes);
+                    self.buffered_count = self.buffered_count.saturating_sub(1);
+                }
+                if v.is_empty() {
+                    self.buffer.remove(&vh);
+                }
+            }
+            self.stats.held_evictions = self.stats.held_evictions.saturating_add(1);
+            // What the eviction uncovered is asked for again, elsewhere first.
+            if let Some(start) = self.first_missing(vh, win_hi.max(vh)) {
+                self.plan_gap(start, win_hi.max(start), &vp);
+            }
+            let _ = win_lo;
+            // A holder over its share that has delivered nothing connected
+            // since it was last charged is charged (once).
+            if self.delivered_nothing_connected(&vp) {
+                self.over_share.insert(vp.clone());
+            }
+        }
+        if !self.over_caps(bytes) {
+            return true;
+        }
+        let (n, b) = self.holdings().get(peer).copied().unwrap_or((0, 0));
+        if (n >= share_blocks || b.saturating_add(bytes) > share_bytes)
+            && self.delivered_nothing_connected(peer)
+        {
+            self.over_share.insert(peer.clone());
+        }
+        false
     }
 
     /// One strike against `peer`; at `max_strikes` it is excluded for a while
@@ -1585,6 +1717,7 @@ impl BlockPipeline {
     fn strike(&mut self, peer: &PeerId, now: Instant) {
         let exclude = match self.peers.get_mut(peer) {
             Some(slot) => {
+                slot.connected_since_strike = 0;
                 slot.strikes = slot.strikes.saturating_add(1);
                 if slot.strikes >= self.config.max_strikes {
                     slot.strikes = 0;
@@ -1714,13 +1847,8 @@ impl BlockPipeline {
                 continue;
             }
             let bytes = block_bytes(&b);
-            if self.buffered_count >= self.config.max_held_blocks
-                || self.buffered_bytes.saturating_add(bytes) > self.config.max_held_bytes
-            {
+            if !self.make_room(peer, bh, bytes) {
                 self.stats.held_cap_drops = self.stats.held_cap_drops.saturating_add(1);
-                if let Some(e) = self.peers.get_mut(peer).and_then(|s| s.fifo.front_mut()) {
-                    e.link.over_cap = true;
-                }
                 continue;
             }
             self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
@@ -1883,6 +2011,9 @@ impl BlockPipeline {
         self.verify_held();
         self.settle();
         out.flushed.extend(self.take_releasable());
+        for p in std::mem::take(&mut self.over_share) {
+            self.strike(&p, now);
+        }
         let ids: Vec<PeerId> = self.peers.keys().cloned().collect();
         for id in ids {
             while let Some(slot) = self.peers.get(&id) {
@@ -2862,12 +2993,12 @@ mod tests {
             engage_gap: 0,
             window_heights: 8,
             lookahead_heights: 256,
-            max_held_blocks: 150,
+            max_held_blocks: 600,
             ..PipelineConfig::default()
         };
         let mut pl = BlockPipeline::new(config, t0);
         pl.observe_applied((hash(0, 0), 0), t0);
-        let target = 200;
+        let target = 400;
         pl.set_target(target);
         let peers = [peer("b", target), peer("z", target)];
         let mut now = t0;
@@ -2919,6 +3050,12 @@ mod tests {
             }
         }
         assert_eq!(applied, target, "{:?}", pl.stats());
+        assert!(
+            pl.stats().held_evictions > 0,
+            "the buffer filled: {:?}",
+            pl.stats()
+        );
+        assert_eq!(pl.stats().overlapping_requests, 0);
     }
 
     /// A peer that turns inadmissible loses the windows it held.
