@@ -3,6 +3,7 @@
 // Synchronization manager for block and header downloads
 use crate::{
     peer::{Peer, PeerId},
+    sync_pipeline::{BlockPipeline, PipelineConfig, PipelinePeer, PipelineRequest},
     NetworkError, NetworkMessage,
 };
 use citrate_consensus::crypto;
@@ -124,6 +125,47 @@ pub struct SyncManager {
     /// requests with. `None` in a node; a simulation that runs many seconds of
     /// sync in a few milliseconds advances it (see [`Self::with_clock_offset`]).
     clock_offset_ms: Option<Arc<AtomicU64>>,
+
+    /// A fully simulated clock (`origin + ms`), for a network simulation that
+    /// also models link latency (see [`Self::with_virtual_clock`]). Takes
+    /// precedence over `clock_offset_ms`.
+    virtual_clock: Option<(Instant, Arc<AtomicU64>)>,
+
+    /// #477: the pipelined downloader. Every `GetBlocks` / `GetHeaders` this
+    /// manager sends is recorded in it (answers are attributed by order), and
+    /// every answer passes through it. Leaf lock: never held across an await,
+    /// and no other lock is taken while it is held.
+    pipeline: parking_lot::Mutex<BlockPipeline>,
+
+    /// The peers and the fork-point verdict of the last sync tick, so an
+    /// answer can issue the next window without waiting for the next tick.
+    pipeline_peers: parking_lot::Mutex<(Vec<PipelinePeerHandle>, bool)>,
+}
+
+/// A connected peer as the pipeline sees it, and the handle to send to it.
+pub type PipelinePeerHandle = (PipelinePeer, Arc<Peer>);
+
+/// What a `Blocks` message turned out to be (#477).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlocksReceipt {
+    /// It answered a pipeline window: its blocks went through the pipeline's
+    /// reorder buffer, and only what is contiguous above the applied tip is in
+    /// [`SyncManager::drain_validated_blocks`].
+    pub pipelined: bool,
+    /// Blocks of the message the pipeline had not seen (pipelined only).
+    pub new_blocks: usize,
+    /// Blocks in the message as received.
+    pub received: usize,
+}
+
+/// What one pipeline round did.
+#[derive(Debug, Default)]
+pub struct PipelineDrive {
+    /// Requests put on the wire.
+    pub sent: usize,
+    /// Peers whose oldest request went unanswered for their adaptive timeout:
+    /// the caller charges them as it does a sync timeout.
+    pub timed_out: Vec<PeerId>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +234,31 @@ impl SyncManager {
             local_height: None,
             pba_hardening: citrate_consensus::hardening::PbaHardening::from_process(),
             clock_offset_ms: None,
+            virtual_clock: None,
+            pipeline: parking_lot::Mutex::new(BlockPipeline::new(
+                PipelineConfig::default(),
+                Instant::now(),
+            )),
+            pipeline_peers: parking_lot::Mutex::new((Vec::new(), true)),
         }
+    }
+
+    /// Replace the pipeline's tunables (tests and simulations).
+    pub fn with_pipeline_config(self, config: PipelineConfig) -> Self {
+        let now = self.now();
+        *self.pipeline.lock() = BlockPipeline::new(config, now);
+        self
+    }
+
+    /// Run on a fully simulated clock: `origin + ms` milliseconds. For a
+    /// network simulation that models link latency and bandwidth, where the
+    /// real time a test takes is not the time the simulated node sees.
+    pub fn with_virtual_clock(mut self, origin: Instant, ms: Arc<AtomicU64>) -> Self {
+        self.virtual_clock = Some((origin, ms));
+        let now = self.now();
+        let config = self.pipeline.lock().config().clone();
+        *self.pipeline.lock() = BlockPipeline::new(config, now);
+        self
     }
 
     /// Age requests on the monotonic clock plus `offset` milliseconds, so a
@@ -203,6 +269,10 @@ impl SyncManager {
     }
 
     fn now(&self) -> Instant {
+        if let Some((origin, ms)) = &self.virtual_clock {
+            let at = Duration::from_millis(ms.load(Ordering::Relaxed));
+            return origin.checked_add(at).unwrap_or(*origin);
+        }
         let offset = self
             .clock_offset_ms
             .as_ref()
@@ -347,8 +417,14 @@ impl SyncManager {
         }
     }
 
-    /// Process header download request
-    pub async fn request_headers(&self, peer: &Peer, from: Hash) -> Result<(), NetworkError> {
+    /// Process header download request. `from_height` is the height of `from`
+    /// (the pipeline attributes the answer by it).
+    pub async fn request_headers(
+        &self,
+        peer: &Peer,
+        from: Hash,
+        from_height: u64,
+    ) -> Result<(), NetworkError> {
         let peer_id = peer.info.read().await.id.clone();
 
         // Check if already pending
@@ -369,12 +445,16 @@ impl SyncManager {
         .await?;
 
         // Track request
+        let now = self.now();
+        self.pipeline
+            .lock()
+            .note_headers_request(&peer_id, from, from_height, now);
         self.pending_headers.write().await.insert(
             from,
             BlockRequest {
                 hash: from,
                 peer_id,
-                requested_at: self.now(),
+                requested_at: now,
                 retries: 0,
             },
         );
@@ -434,13 +514,18 @@ impl SyncManager {
         })
         .await?;
 
-        // Track request
+        // Track request. The pipeline keeps every request to this peer in
+        // order, its own and these, to tell whose answer a message is.
+        let now = self.now();
+        self.pipeline
+            .lock()
+            .note_other_blocks_request(&peer_id, from_height, now);
         self.pending_blocks.write().await.insert(
             from,
             BlockRequest {
                 hash: from,
                 peer_id,
-                requested_at: self.now(),
+                requested_at: now,
                 retries: 0,
             },
         );
@@ -506,6 +591,22 @@ impl SyncManager {
             .write()
             .await
             .retain(|_, req| req.peer_id != *from_peer);
+        // #477: the pipeline reads each peer's header chain from its answers.
+        // A batch that is not strictly ascending is no chain at all: it still
+        // answers the request (empty).
+        {
+            let ascending = headers.windows(2).all(|w| match w {
+                [a, b] => b.height > a.height,
+                _ => true,
+            });
+            let chain: Vec<(u64, Hash)> = if ascending {
+                headers.iter().map(|h| (h.height, h.block_hash)).collect()
+            } else {
+                Vec::new()
+            };
+            let now = self.now();
+            self.pipeline.lock().on_headers(from_peer, &chain, now);
+        }
         if headers.is_empty() {
             return Ok(());
         }
@@ -632,11 +733,17 @@ impl SyncManager {
     /// 3. tx_root consistency (recomputed from transactions)
     ///
     /// Only validated blocks are stored and count toward progress.
+    ///
+    /// #477: validated blocks then pass through the pipeline. An answer to a
+    /// pipeline window is held there until the windows below it arrive; what
+    /// [`Self::drain_validated_blocks`] then returns is contiguous above the
+    /// applied tip, in height order. Any other message's validated blocks are
+    /// returned unchanged.
     pub async fn handle_blocks(
         &self,
         from_peer: &PeerId,
         blocks: Vec<Block>,
-    ) -> Result<(), NetworkError> {
+    ) -> Result<BlocksReceipt, NetworkError> {
         // Retire the RESPONDING peer's pending block requests up front — a
         // response answers our in-flight request to that peer regardless of
         // contents (empty batch, or a batch whose first block's selected-parent
@@ -651,15 +758,32 @@ impl SyncManager {
             .write()
             .await
             .retain(|_, req| req.peer_id != *from_peer);
+        let raw = match (blocks.first(), blocks.last()) {
+            (Some(f), Some(l)) => Some((
+                (f.header.height, f.header.block_hash),
+                (l.header.height, l.header.block_hash),
+            )),
+            _ => None,
+        };
+        let received = blocks.len();
         if blocks.is_empty() {
-            return Ok(());
+            let now = self.now();
+            let outcome = self
+                .pipeline
+                .lock()
+                .on_blocks(from_peer, None, Vec::new(), now);
+            return Ok(BlocksReceipt {
+                pipelined: outcome.is_pipeline(),
+                new_blocks: 0,
+                received,
+            });
         }
 
         let total = blocks.len();
         // Safety: non-empty guaranteed by early return above
         let first_height = match blocks.first() {
             Some(b) => b.header.height,
-            None => return Ok(()),
+            None => return Ok(BlocksReceipt::default()),
         };
         // (Pending retirement already done unconditionally at the top of this
         // function — see the comment there.)
@@ -751,15 +875,27 @@ impl SyncManager {
             warn!("Sync validation: {}/{} blocks rejected", rejected, total);
         }
 
+        let accepted = validated.len();
+        let now = self.now();
+        let outcome = self
+            .pipeline
+            .lock()
+            .on_blocks(from_peer, raw, validated, now);
+        let receipt = BlocksReceipt {
+            pipelined: outcome.is_pipeline(),
+            new_blocks: outcome.new_blocks,
+            received,
+        };
+        let validated = outcome.release;
+
         if validated.is_empty() {
-            return Ok(());
+            return Ok(receipt);
         }
 
-        let last_height = match validated.last() {
-            Some(b) => b.header.height,
-            None => return Ok(()),
+        let last_height = match validated.iter().map(|b| b.header.height).max() {
+            Some(h) => h,
+            None => return Ok(receipt),
         };
-        let accepted = validated.len();
 
         // Store only validated blocks
         self.downloaded_blocks.write().await.extend(validated);
@@ -821,7 +957,108 @@ impl SyncManager {
             );
         }
 
-        Ok(())
+        Ok(receipt)
+    }
+
+    /// #477: one pipeline round from the sync tick. `applied` is the node's
+    /// applied tip; `peers` every connected peer with the head it advertises
+    /// and whether it may be asked at all; `following_tip` is false while a
+    /// fork-point search runs (the pipeline then plans nothing). The peers
+    /// are kept for [`Self::pipeline_on_answer`].
+    pub async fn pipeline_tick(
+        &self,
+        applied: (Hash, u64),
+        peers: Vec<PipelinePeerHandle>,
+        following_tip: bool,
+    ) -> PipelineDrive {
+        *self.pipeline_peers.lock() = (peers, following_tip);
+        self.pipeline_drive(applied).await
+    }
+
+    /// #477: issue on answer. Called after a `Blocks` or `Headers` message is
+    /// handled, so the next window goes out without waiting for the tick.
+    pub async fn pipeline_on_answer(&self, applied: (Hash, u64)) -> PipelineDrive {
+        self.pipeline_drive(applied).await
+    }
+
+    async fn pipeline_drive(&self, applied: (Hash, u64)) -> PipelineDrive {
+        let target = *self.target_height.read().await;
+        let (peers, following_tip) = {
+            let guard = self.pipeline_peers.lock();
+            (guard.0.clone(), guard.1)
+        };
+        let views: Vec<PipelinePeer> = peers.iter().map(|(v, _)| v.clone()).collect();
+        let now = self.now();
+        let (requests, polled) = {
+            let mut pl = self.pipeline.lock();
+            pl.set_target(target);
+            pl.observe_applied(applied, now);
+            let polled = pl.poll(now);
+            let requests = pl.plan(now, &views, following_tip);
+            (requests, polled)
+        };
+        if !polled.flushed.is_empty() {
+            warn!(
+                "SYNCPIPE stall: applied tip held at {} with {} blocks waiting; handing them to \
+                 admission and re-planning from the tip",
+                applied.1,
+                polled.flushed.len()
+            );
+            self.downloaded_blocks.write().await.extend(polled.flushed);
+        }
+        let mut out = PipelineDrive {
+            sent: 0,
+            timed_out: polled.timed_out,
+        };
+        for request in requests {
+            let Some(peer) = peers
+                .iter()
+                .find(|(v, _)| v.id == *request.peer())
+                .map(|(_, p)| p.clone())
+            else {
+                let now = self.now();
+                self.pipeline.lock().send_failed(request.peer(), now);
+                continue;
+            };
+            let message = match &request {
+                PipelineRequest::Blocks { anchor, count, .. } => NetworkMessage::GetBlocks {
+                    from: *anchor,
+                    count: *count,
+                    step: 1,
+                },
+                PipelineRequest::Headers { from, count, .. } => NetworkMessage::GetHeaders {
+                    from: *from,
+                    count: *count,
+                },
+            };
+            if peer.send(message).await.is_ok() {
+                out.sent = out.sent.saturating_add(1);
+            } else {
+                let now = self.now();
+                self.pipeline.lock().send_failed(request.peer(), now);
+                if !out.timed_out.contains(request.peer()) {
+                    out.timed_out.push(request.peer().clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the pipeline is doing the downloading this round (the legacy
+    /// tick request stands down while it is).
+    pub fn pipeline_active(&self) -> bool {
+        self.pipeline.lock().active()
+    }
+
+    /// The pipeline's counters (logs, tests).
+    pub fn pipeline_stats(&self) -> crate::sync_pipeline::PipelineStats {
+        self.pipeline.lock().stats()
+    }
+
+    /// Per-peer figures (logs, status).
+    pub fn pipeline_peer_figures(&self) -> Vec<crate::sync_pipeline::PeerFigures> {
+        let now = self.now();
+        self.pipeline.lock().peer_figures(now)
     }
 
     /// Start block download phase
@@ -1172,6 +1409,150 @@ mod tests {
         block.header.block_hash = block.compute_hash();
         block.signature = crypto::sign_block(&block.header.block_hash, &key);
         block
+    }
+
+    /// A signed block at `height` on `parent`.
+    fn signed_block_on(height: u64, parent: Hash) -> Block {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+        let key = crypto::generate_keypair();
+        let pubkey = PublicKey::new(key.verifying_key().to_bytes());
+        let mut block = BlockBuilder::new()
+            .parent(parent)
+            .height(height)
+            .proposer(pubkey)
+            .build_unhashed();
+        block.tx_root = citrate_consensus::tx_auth::tx_root_legacy(&[]);
+        block.header.block_hash = block.compute_hash();
+        block.signature = crypto::sign_block(&block.header.block_hash, &key);
+        block
+    }
+
+    fn sent(rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>) -> Vec<NetworkMessage> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    /// #477, through the manager the node runs: the first round asks headers
+    /// and the window above the applied tip; the headers' answer opens more
+    /// windows at once (issue on answer), each anchored one height below
+    /// itself on the peer's own header; an answer to a higher window is held,
+    /// a window the server skipped is asked again, and once it arrives
+    /// everything goes to admission in height order.
+    #[tokio::test]
+    async fn pipeline_rounds_hold_out_of_order_answers_and_re_ask_a_shed_window() {
+        use crate::sync_pipeline::PipelinePeer;
+        let applied = Arc::new(AtomicU64::new(0));
+        let sync = SyncManager::new(SyncConfig::default()).with_local_height(applied.clone());
+        sync.set_target(2_000).await;
+        let (peer, mut rx) = test_peer("a");
+        let peer = Arc::new(peer);
+        let pid = PeerId::new("a".to_string());
+        let view = PipelinePeer {
+            id: pid.clone(),
+            head_height: 2_000,
+            admissible: true,
+        };
+        let genesis = Hash::new([1; 32]);
+        let mut chain: Vec<Block> = Vec::new();
+        let mut parent = genesis;
+        for h in 1..=300 {
+            let b = signed_block_on(h, parent);
+            parent = b.header.block_hash;
+            chain.push(b);
+        }
+
+        let round = sync
+            .pipeline_tick((genesis, 0), vec![(view, peer.clone())], true)
+            .await;
+        assert_eq!(round.sent, 2);
+        assert!(sync.pipeline_active());
+        let first = sent(&mut rx);
+        assert!(matches!(first[0], NetworkMessage::GetHeaders { from, .. } if from == genesis));
+        assert!(matches!(
+            first[1],
+            NetworkMessage::GetBlocks { from, count: 512, step: 1 } if from == genesis
+        ));
+
+        sync.handle_headers(&pid, chain.iter().map(|b| b.header.clone()).collect())
+            .await
+            .expect("headers");
+        let round = sync.pipeline_on_answer((genesis, 0)).await;
+        // Three windows (the per-peer cap of 4, with the first one still
+        // outstanding) and the next headers: 300 headers are short of the
+        // lookahead.
+        assert_eq!(round.sent, 4, "windows up to the per-peer cap, at once");
+        let anchors: Vec<Hash> = sent(&mut rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                NetworkMessage::GetBlocks { from, .. } => Some(from),
+                _ => None,
+            })
+            .collect();
+        let at = |h: usize| chain[h - 1].header.block_hash;
+        assert_eq!(anchors, vec![at(64), at(128), at(192)]);
+
+        // The answer to the window anchored at 64 comes first: held.
+        let receipt = sync
+            .handle_blocks(&pid, chain[63..128].to_vec())
+            .await
+            .expect("blocks");
+        assert!(receipt.pipelined);
+        // Heights 64..=128: its anchor group (64) is new here too.
+        assert_eq!(receipt.new_blocks, 65);
+        assert!(sync.drain_validated_blocks().await.is_empty(), "held");
+        // The first window's request was skipped by the server: asked again.
+        let _ = sync.pipeline_on_answer((genesis, 0)).await;
+        assert!(sent(&mut rx)
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetBlocks { from, .. } if *from == genesis)));
+        let receipt = sync
+            .handle_blocks(&pid, chain[0..64].to_vec())
+            .await
+            .expect("blocks");
+        assert!(receipt.pipelined);
+        let released: Vec<u64> = sync
+            .drain_validated_blocks()
+            .await
+            .iter()
+            .map(|b| b.header.height)
+            .collect();
+        assert_eq!(released, (1..=128).collect::<Vec<u64>>());
+        assert_eq!(sync.pipeline_stats().overlapping_requests, 0);
+    }
+
+    /// #477: a peer that is not admissible (the eligibility hook) is never
+    /// asked, and the pipeline stays out while a fork-point search runs.
+    #[tokio::test]
+    async fn pipeline_asks_no_inadmissible_peer_and_nothing_off_the_tip() {
+        use crate::sync_pipeline::PipelinePeer;
+        let sync =
+            SyncManager::new(SyncConfig::default()).with_local_height(Arc::new(AtomicU64::new(0)));
+        sync.set_target(2_000).await;
+        let (peer, mut rx) = test_peer("a");
+        let peer = Arc::new(peer);
+        let view = PipelinePeer {
+            id: PeerId::new("a".to_string()),
+            head_height: 2_000,
+            admissible: false,
+        };
+        let genesis = Hash::new([1; 32]);
+        let round = sync
+            .pipeline_tick((genesis, 0), vec![(view.clone(), peer.clone())], true)
+            .await;
+        assert_eq!(round.sent, 0);
+        let ok = PipelinePeer {
+            admissible: true,
+            ..view
+        };
+        let round = sync
+            .pipeline_tick((genesis, 0), vec![(ok, peer.clone())], false)
+            .await;
+        assert_eq!(round.sent, 0);
+        assert!(!sync.pipeline_active());
+        assert!(sent(&mut rx).is_empty());
     }
 
     /// RED TEST — #146. The live cold-sync stall reproduced on this box: a

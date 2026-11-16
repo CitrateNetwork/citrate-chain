@@ -4,6 +4,20 @@ All notable changes in this PR are documented here. This follows a Keep‑a‑Ch
 
 ## Unreleased
 
+### Changed (sync, node)
+- **Pipelined, peer-parallel block download for catch-up sync (#477).** A node more than 64
+  heights behind keeps up to 8 `GetBlocks` windows in flight across every connected peer it may
+  ask (at most 4 to one), anchored on that peer's own headers, and sends the next one when an
+  answer arrives instead of on the 2 s tick. Windows ask for up to 512 blocks; a peer's
+  timeout is `clamp(4 x p95 latency, 3 s, 30 s)`, and a window it fails goes to another peer.
+  Out-of-order answers wait in a bounded reorder buffer, so admission still sees blocks in
+  height order. Near the tip the existing tick driver is unchanged. No wire change.
+- **`Blocks` replies carry up to 1 MiB** (was 60 KiB), split into Noise-sized messages as since
+  #476. `Headers` and finality-certificate replies keep the 60 KiB single-message budget. A
+  requester that asks for 32 blocks still gets at most 32.
+- The sync tick no longer re-requests the same 64 headers every 2 s; headers are asked only
+  while a peer's header window is shorter than the pipeline's lookahead.
+
 ### Changed (breaking, CLI)
 - `citrate contract verify` submits to CitrateScan's Etherscan-compatible API
   (`--explorer-url`, default `https://explorer.citrate.ai/api`) instead of the node's

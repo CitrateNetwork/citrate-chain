@@ -117,7 +117,7 @@ pub const MAX_SERVE_RATE_ENTRIES: usize = 1024;
 pub const MAX_CERTIFICATE_SIGNATURES: usize = 512;
 /// Encoded size budget of a certificate response: block serving's 60 KiB
 /// budget, under the 64 KiB Noise per-message limit (`block_serve`).
-pub const MAX_CERTIFICATE_RESPONSE_BYTES: u64 = crate::block_serve::MAX_RESPONSE_BYTES;
+pub const MAX_CERTIFICATE_RESPONSE_BYTES: u64 = crate::block_serve::MAX_UNSPLIT_RESPONSE_BYTES;
 
 /// What handling one certificate response concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]

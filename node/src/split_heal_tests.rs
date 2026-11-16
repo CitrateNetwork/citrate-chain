@@ -177,6 +177,8 @@ struct Node {
     app: Arc<CanonicalApplicator>,
     adm: Arc<BlockAdmission>,
     producer: BlockProducer,
+    /// The producer's pool (the cold-sync runs feed it ~10 KB transactions).
+    mempool: Arc<Mempool>,
     sync: SyncManager,
     rejoin: parking_lot::Mutex<sync_rejoin::RejoinTracker>,
     tip_reask: sync_recovery::TipReask,
@@ -243,6 +245,11 @@ pub(crate) struct Fleet {
     prune_retain: Option<u64>,
     /// See [`Scenario::restart_mode`].
     restart_mode: RestartMode,
+    /// Nodes that serve `GetBlocks` as a server built before #477 does (a
+    /// 60 KiB reply budget; replies split as since #476).
+    legacy_serve: HashSet<usize>,
+    /// Accounts the genesis state funds.
+    alloc: Vec<(citrate_execution::types::Address, U256)>,
     genesis: Block,
     /// Simulated time, in slots, from `epoch`.
     epoch: std::time::Instant,
@@ -283,6 +290,18 @@ fn genesis_block_at(root: Hash, timestamp: u64) -> Block {
         .build_unhashed();
     g.header.block_hash = g.compute_hash();
     g
+}
+
+/// The genesis state: `alloc` funded, nothing else.
+fn genesis_state(
+    alloc: &[(citrate_execution::types::Address, U256)],
+) -> citrate_execution::state::StateSnapshot {
+    let db = Arc::new(StateDB::new());
+    for (addr, balance) in alloc {
+        db.accounts.create_account_if_not_exists(*addr);
+        db.accounts.set_balance(*addr, *balance);
+    }
+    Executor::new(db).state_snapshot()
 }
 
 fn policy(n: usize) -> citrate_execution::block_rewards::EpochRewardPolicy {
@@ -335,8 +354,10 @@ impl Node {
         clock: std::time::Instant,
         clock_ms: Arc<AtomicU64>,
         refuse_window: Option<std::time::Duration>,
+        alloc: &[(citrate_execution::types::Address, U256)],
     ) -> Self {
         let state_db = Arc::new(StateDB::new());
+        let fresh = matches!(boot, Boot::Fresh);
         match &boot {
             Boot::Fresh => {
                 storage.blocks.put_block(genesis).expect("genesis");
@@ -366,6 +387,8 @@ impl Node {
         ));
         if let Boot::Snapshot(state) = boot {
             executor.state_restore(*state);
+        } else if fresh && !alloc.is_empty() {
+            executor.state_restore(genesis_state(alloc));
         }
         executor.set_validator_activation_height(ACT);
         *executor.reward_policy_handle().write() = Some(policy(n));
@@ -399,10 +422,7 @@ impl Node {
                 .with_fork_choice(ghostdag.clone())
                 .with_dag_prune_floor(dag.clone()),
         );
-        app.set_genesis(
-            Executor::new(Arc::new(StateDB::new())).state_snapshot(),
-            genesis.header.block_hash,
-        );
+        app.set_genesis(genesis_state(alloc), genesis.header.block_hash);
         let adm = Arc::new(BlockAdmission::new(
             storage.clone(),
             dag.clone(),
@@ -439,7 +459,7 @@ impl Node {
         let producer = BlockProducer::with_shared_dag(
             storage.clone(),
             executor.clone(),
-            mempool,
+            mempool.clone(),
             None,
             embedded(coinbase(i)),
             key(i),
@@ -488,6 +508,7 @@ impl Node {
             app,
             adm,
             producer,
+            mempool,
             sync,
             rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
             tip_reask: sync_recovery::TipReask::new(),
@@ -539,7 +560,20 @@ impl Fleet {
         n: usize,
         refuse_window: Option<std::time::Duration>,
     ) -> Self {
-        let empty_root = Executor::new(Arc::new(StateDB::new())).calculate_state_root();
+        Self::with_genesis(n, refuse_window, Vec::new()).await
+    }
+
+    /// A fleet whose genesis state funds `alloc` (the cold-sync runs' senders).
+    pub(crate) async fn with_genesis(
+        n: usize,
+        refuse_window: Option<std::time::Duration>,
+        alloc: Vec<(citrate_execution::types::Address, U256)>,
+    ) -> Self {
+        let empty_root = {
+            let e = Executor::new(Arc::new(StateDB::new()));
+            e.state_restore(genesis_state(&alloc));
+            e.calculate_state_root()
+        };
         let genesis = match refuse_window {
             Some(_) => genesis_block_at(
                 empty_root,
@@ -567,6 +601,7 @@ impl Fleet {
                     epoch,
                     clock_ms.clone(),
                     refuse_window,
+                    &alloc,
                 )
                 .await,
             );
@@ -603,6 +638,8 @@ impl Fleet {
             refuse_window,
             prune_retain: None,
             restart_mode: RestartMode::Snapshot,
+            legacy_serve: HashSet::new(),
+            alloc,
             genesis,
             epoch,
             clock_ms,
@@ -791,6 +828,7 @@ impl Fleet {
             self.now(),
             self.clock_ms.clone(),
             self.refuse_window,
+            &self.alloc,
         )
         .await;
         self.nodes.insert(i, node);
@@ -877,10 +915,17 @@ impl Fleet {
                             return;
                         }
                         let peer = self.peer(at, from);
+                        let legacy = self.legacy_serve.contains(&at);
                         let node = &mut self.nodes[at];
                         while let Some((asker, request)) = node.serve_q.take_next() {
-                            if let Some(reply) = crate::serve_plane::answer(&node.storage, &request)
-                            {
+                            // The messages that go on the wire (a `Blocks`
+                            // reply split under the Noise cap, #476).
+                            let frames = if legacy {
+                                legacy_answer_frames(&node.storage, &request)
+                            } else {
+                                crate::serve_plane::answer_frames(&node.storage, &request)
+                            };
+                            for reply in frames {
                                 let _ = peer.send(reply).await;
                             }
                             node.serve_q.done(&asker);
@@ -899,6 +944,11 @@ impl Fleet {
         match msg {
             NetworkMessage::Headers { headers } => {
                 let _ = node.sync.handle_headers(&pid, headers).await;
+                let applied = node.applied();
+                let round = node.sync.pipeline_on_answer(applied).await;
+                for p in &round.timed_out {
+                    node.sel.record_timeout(&p.0);
+                }
             }
             NetworkMessage::NewBlock { block } => {
                 // Gossip validation relays a block once to every other peer
@@ -1320,7 +1370,11 @@ impl Node {
     /// main.rs `NetworkMessage::Blocks` arm.
     async fn on_blocks(&mut self, peer: &Arc<Peer>, pid: &PeerId, blocks: Vec<Block>) {
         let answer_hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash).collect();
-        let _ = self.sync.handle_blocks(pid, blocks).await;
+        let receipt = self
+            .sync
+            .handle_blocks(pid, blocks)
+            .await
+            .unwrap_or_default();
         let mut pending = self.sync.drain_validated_blocks().await;
         let answer_top = pending.iter().map(|b| b.header.height).max();
         let answer_highest = pending
@@ -1328,10 +1382,13 @@ impl Node {
             .max_by_key(|b| b.header.height)
             .map(|b| (b.header.block_hash, b.header.height));
         let verified: HashSet<Hash> = pending.iter().map(|b| b.header.block_hash).collect();
-        let answers_rejoin = self
-            .rejoin
-            .lock()
-            .take_answer(&pid.0, &answer_hashes, &verified);
+        let answers_rejoin = if receipt.pipelined {
+            None
+        } else {
+            self.rejoin
+                .lock()
+                .take_answer(&pid.0, &answer_hashes, &verified)
+        };
         let reprocessed = !pending.is_empty();
         if reprocessed {
             pending.append(&mut self.orphans);
@@ -1386,13 +1443,19 @@ impl Node {
             deferred_from_answer,
             applied_now,
         );
-        self.tip_reask
-            .note_answer(applied_hash_now, held_ahead, self.clock);
-        let stale_anchor = sync_recovery::answer_anchor_was_stale(
-            self.sync.last_block_anchor_height(),
-            applied_now,
-            answer_hashes.len(),
-        ) || held_ahead;
+        if !receipt.pipelined {
+            self.tip_reask
+                .note_answer(applied_hash_now, held_ahead, self.clock);
+        }
+        let stale_anchor = if receipt.pipelined {
+            receipt.new_blocks == 0 && receipt.received > 0
+        } else {
+            sync_recovery::answer_anchor_was_stale(
+                self.sync.last_block_anchor_height(),
+                applied_now,
+                answer_hashes.len(),
+            ) || held_ahead
+        };
         {
             let now = self.clock;
             let step = self.walk.next(
@@ -1421,16 +1484,26 @@ impl Node {
             let t = self.rejoin.lock().on_answer(answer, gap > 0, anchor_height);
             gave_up = matches!(t, Some(sync_rejoin::Transition::GaveUp { .. }));
         }
+        let (served_new, batch) = if receipt.pipelined {
+            (receipt.new_blocks, receipt.received.max(1))
+        } else {
+            (newly_admitted, 32)
+        };
         self.sel.record_serve(
             &pid.0,
-            newly_admitted,
+            served_new,
             highest.map(|(_, h)| h).unwrap_or(0),
             gap,
-            32,
+            batch,
             stale_anchor,
         );
         if gave_up {
             self.sel.record_give_up(&pid.0);
+        }
+        // #477: issue on answer.
+        let round = self.sync.pipeline_on_answer(self.applied()).await;
+        for p in &round.timed_out {
+            self.sel.record_timeout(&p.0);
         }
     }
 
@@ -1501,6 +1574,28 @@ impl Node {
             self.clock,
         );
         let chosen = source.peer().map(str::to_string);
+        // #477: the pipelined download, as main.rs runs it.
+        let pipeline_peers: Vec<(citrate_network::sync_pipeline::PipelinePeer, Arc<Peer>)> =
+            connected
+                .iter()
+                .zip(candidates.iter())
+                .map(|(p, c)| {
+                    (
+                        citrate_network::sync_pipeline::PipelinePeer {
+                            id: PeerId::new(c.id.clone()),
+                            head_height: c.head_height,
+                            admissible: sync_peer::pipeline_peer_admissible(c, applied_height),
+                        },
+                        p.clone(),
+                    )
+                })
+                .collect();
+        let following_tip = self.rejoin.lock().is_following_tip();
+        let pipeline_round = self
+            .sync
+            .pipeline_tick(applied_tip, pipeline_peers, following_tip)
+            .await;
+        let pipelined = self.sync.pipeline_active();
         let request_peer = if let Some(id) = chosen {
             connected
                 .iter()
@@ -1519,12 +1614,9 @@ impl Node {
             let (from, height) = self.rejoin.lock().anchor(applied_tip, |h| {
                 sync_rejoin::anchor_at_height(&self.storage, h)
             });
-            let (ph, pb) = self.sync.pending_counts().await;
-            if ph < 8 {
-                let _ = self.sync.request_headers(&peer, applied_tip.0).await;
-            }
+            let (_ph, pb) = self.sync.pending_counts().await;
             let held_tip = self.tip_reask.hold(from, applied_tip.0, self.clock);
-            if pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
+            if !pipelined && pb < sync_recovery::TICK_PENDING_GATE && !held_tip {
                 let sent = self.sync.request_blocks(&peer, from, height).await;
                 if matches!(sent, Ok(false)) {
                     let pid = peer.info.read().await.id.clone();
@@ -1542,6 +1634,9 @@ impl Node {
             }
         }
         for (_h, pid) in self.sync.check_timeouts().await {
+            self.sel.record_timeout(&pid.0);
+        }
+        for pid in &pipeline_round.timed_out {
             self.sel.record_timeout(&pid.0);
         }
     }
@@ -1775,9 +1870,16 @@ fn run_in_child(test: &str) {
 
 /// [`run_in_child`], returning the child's stdout and stderr.
 fn child_output(test: &str) -> String {
+    child_output_with(test, &[])
+}
+
+/// [`child_output`] with extra test-harness arguments (`--include-ignored`
+/// for a measurement run).
+fn child_output_with(test: &str, extra: &[&str]) -> String {
     let exe = std::env::current_exe().expect("exe");
     let out = std::process::Command::new(exe)
         .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .args(extra)
         .env(CHILD_ENV, "1")
         .output()
         .expect("spawn child");
@@ -1801,9 +1903,524 @@ fn in_child() -> bool {
     true
 }
 
+/// What a server built before #477 sends for `request`: `Blocks` replies
+/// under the old 60 KiB budget, split as since #476.
+fn legacy_answer_frames(storage: &StorageManager, request: &NetworkMessage) -> Vec<NetworkMessage> {
+    match request {
+        NetworkMessage::GetBlocks { from, count, .. } => {
+            crate::block_serve::chunk_for_noise(crate::block_serve::serve_blocks_within(
+                storage,
+                from,
+                *count,
+                crate::block_serve::LEGACY_BLOCKS_RESPONSE_BYTES,
+            ))
+            .into_iter()
+            .map(|blocks| NetworkMessage::Blocks { blocks })
+            .collect()
+        }
+        other => crate::serve_plane::answer_frames(storage, other),
+    }
+}
+
+/// #477: a cold node syncing a static DAG from a few servers, over a modelled
+/// network.
+///
+/// Seven producers seal for `slots` slots (seven siblings per height, every
+/// `fat_every`-th slot one of them carrying a ~10 KB transaction, the r1007
+/// height-1553 shape), then stop. A fresh node, wired like every node here
+/// (`Node::start`: storage-backed executor, applicator with fork choice,
+/// admission, sync manager), connects to `servers` only and syncs through the
+/// code the node runs: its sync tick every 2 s, the `Blocks` / `Headers`
+/// handlers, and the servers' serving plane (`serve_plane::answer_frames`, or
+/// a pre-#477 server's 60 KiB replies for `legacy`).
+///
+/// Time is simulated: a message from a server reaches the cold node one
+/// `latency_ms` later, after every earlier message to it has, at
+/// `downlink_mbit`. With `count_cpu`, the cold node's own processing time
+/// (validation, admission, apply, measured on this host) and a server's answer
+/// time are added to the clock, so the blocks/s reported are what the sync
+/// logic, this host's CPU and that link allow together; without it (debug
+/// builds) they are what the sync logic and the link allow.
+#[derive(Clone, Debug)]
+pub(crate) struct ColdSync {
+    pub slots: u64,
+    pub fat_every: Option<u64>,
+    pub servers: Vec<usize>,
+    pub latency_ms: u64,
+    pub downlink_mbit: u64,
+    pub count_cpu: bool,
+    pub max_virtual_secs: u64,
+}
+
+/// What one cold sync did.
+#[derive(Debug, Clone)]
+pub(crate) struct ColdSyncReport {
+    pub legacy: Vec<usize>,
+    pub count_cpu: bool,
+    pub tip: u64,
+    pub dag_blocks: usize,
+    pub dag_bytes: u64,
+    pub max_siblings: usize,
+    pub fat_blocks: usize,
+    /// Simulated ms at which the cold node's applied tip reached `tip`.
+    pub reached_ms: Option<u64>,
+    pub applied: u64,
+    pub virtual_ms: u64,
+    pub wall: std::time::Duration,
+    pub messages_to_cold: usize,
+    pub bytes_to_cold: u64,
+    pub requests_from_cold: usize,
+}
+
+impl ColdSyncReport {
+    /// DAG blocks per simulated second until the tip was reached (or until
+    /// the run stopped, counting what was applied).
+    pub(crate) fn blocks_per_sec(&self) -> u64 {
+        let ms = self.reached_ms.unwrap_or(self.virtual_ms).max(1);
+        let blocks = if self.reached_ms.is_some() {
+            self.dag_blocks as u64
+        } else {
+            (self.dag_blocks as u64)
+                .saturating_mul(self.applied)
+                .checked_div(self.tip.max(1))
+                .unwrap_or(0)
+        };
+        blocks.saturating_mul(1000) / ms
+    }
+
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "cold sync legacy={:?} cpu={}: tip={} dag_blocks={} dag_MiB={:.1} max_siblings={} \
+             fat_blocks={} reached={} applied={} virtual={:.1}s blocks/s={} heights/s={:.1} \
+             wall={:.1}s msgs_in={} MiB_in={:.1} requests_out={}",
+            self.legacy,
+            self.count_cpu,
+            self.tip,
+            self.dag_blocks,
+            self.dag_bytes as f64 / (1024.0 * 1024.0),
+            self.max_siblings,
+            self.fat_blocks,
+            self.reached_ms.is_some(),
+            self.applied,
+            self.reached_ms.unwrap_or(self.virtual_ms) as f64 / 1000.0,
+            self.blocks_per_sec(),
+            self.applied as f64 * 1000.0 / self.reached_ms.unwrap_or(self.virtual_ms).max(1) as f64,
+            self.wall.as_secs_f64(),
+            self.messages_to_cold,
+            self.bytes_to_cold as f64 / (1024.0 * 1024.0),
+            self.requests_from_cold
+        )
+    }
+}
+
+/// The key of the `seq`-th ~10 KB transaction's sender.
+fn fat_sender(seq: u64) -> Ed25519SigningKey {
+    let mut seed = [0x3Cu8; 32];
+    seed[..8].copy_from_slice(&seq.to_be_bytes());
+    Ed25519SigningKey::from_bytes(&seed)
+}
+
+/// A signed ~10 KB transaction from its own funded sender (nonce 0), so it is
+/// valid in any block.
+fn fat_tx(seq: u64) -> citrate_consensus::types::Transaction {
+    let sk = fat_sender(seq);
+    let data = vec![0xAB; 10_400];
+    let mut tx = citrate_consensus::types::Transaction {
+        nonce: 0,
+        to: Some(PublicKey::new([0xB0; 32])),
+        value: 0,
+        gas_limit: 21_000 + 16 * data.len() as u64 + 10_000,
+        gas_price: 1_000_000_000,
+        data,
+        chain_id: Some(CHAIN_ID),
+        ..Default::default()
+    };
+    citrate_consensus::crypto::sign_transaction_v2(&mut tx, &sk).expect("sign");
+    tx.hash = citrate_consensus::tx_auth::native_tx_id(&tx);
+    tx
+}
+
+impl Fleet {
+    /// A fleet of `producers` producers plus one cold node (the last index),
+    /// down, after `slots` slots: the DAG [`ColdSync`] syncs.
+    pub(crate) async fn cold_sync_dag(producers: usize, spec: &ColdSync) -> Self {
+        let senders = spec
+            .fat_every
+            .map(|e| spec.slots / e.max(1) + 1)
+            .unwrap_or(0);
+        let alloc = (0..senders)
+            .map(|i| {
+                let pk = PublicKey::new(fat_sender(i).verifying_key().to_bytes());
+                (
+                    citrate_execution::address_utils::normalize_address(&pk),
+                    U256::from(10u128.pow(21)),
+                )
+            })
+            .collect();
+        let mut fleet = Self::with_genesis(producers + 1, None, alloc).await;
+        let cold = producers;
+        fleet.down.insert(cold);
+        let mut rng = Rng(0x4770_4770_4770_4770);
+        let mut fat = 0u64;
+        for slot in 0..spec.slots {
+            if let Some(every) = spec.fat_every {
+                if slot > ACT && slot % every == 0 {
+                    let p = (fat as usize) % producers;
+                    fleet.nodes[p]
+                        .mempool
+                        .add_transaction(fat_tx(fat), citrate_sequencer::mempool::TxClass::Standard)
+                        .await
+                        .expect("fixture: the pool takes the ~10 KB transaction");
+                    fat += 1;
+                }
+            }
+            let order = rng.order(producers);
+            fleet.slot(&order).await;
+        }
+        fleet.pump().await;
+        fleet.quiet = (0..producers).collect();
+        fleet
+    }
+
+    /// Node `i` restarts as a fresh process on an empty data dir.
+    async fn replace_with_fresh(&mut self, i: usize) {
+        let n = self.nodes.len();
+        let dir = TempDir::new().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let node = Node::start(
+            i,
+            n,
+            &self.genesis,
+            storage,
+            dir,
+            Boot::Fresh,
+            self.slot_no,
+            self.now(),
+            self.clock_ms.clone(),
+            self.refuse_window,
+            &self.alloc,
+        )
+        .await;
+        self.nodes[i] = node;
+        self.attach_peers(i).await;
+    }
+
+    /// Sync a fresh cold node (the last index) from `spec.servers`, of which
+    /// `legacy` serve as pre-#477 servers. `tune` sets up the cold node's sync
+    /// manager (its clock is the simulation's).
+    pub(crate) async fn cold_sync(
+        &mut self,
+        spec: &ColdSync,
+        legacy: &[usize],
+        tune: impl FnOnce(SyncManager) -> SyncManager,
+    ) -> ColdSyncReport {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let cold = self.nodes.len() - 1;
+        self.replace_with_fresh(cold).await;
+        self.down.remove(&cold);
+        let servers = spec.servers.clone();
+        self.set_links(|i, j| {
+            (i == cold && servers.contains(&j)) || (j == cold && servers.contains(&i))
+        });
+        self.legacy_serve = legacy.iter().copied().collect();
+        let _ = self.outbox();
+        self.handshake().await;
+
+        let tip = self.nodes[servers[0]].applied().1;
+        for &s in &servers {
+            assert_eq!(
+                self.nodes[s].applied().1,
+                tip,
+                "fixture: every server holds the whole DAG"
+            );
+        }
+        let rows = self.nodes[servers[0]]
+            .storage
+            .blocks
+            .hashes_in_height_range(1, tip)
+            .expect("height range");
+        let mut per_height: HashMap<u64, usize> = HashMap::new();
+        let mut fat_blocks = 0usize;
+        let mut dag_bytes = 0u64;
+        for (h, hash) in &rows {
+            *per_height.entry(*h).or_default() += 1;
+            let b = self.nodes[servers[0]]
+                .storage
+                .blocks
+                .get_block(hash)
+                .expect("read")
+                .expect("stored");
+            let size = bincode::serialized_size(&b).expect("size");
+            dag_bytes += size;
+            if size > 10_000 {
+                fat_blocks += 1;
+            }
+        }
+        let max_siblings = per_height.values().copied().max().unwrap_or(0);
+
+        // The cold node's clock is the simulation's.
+        let origin = self.now();
+        let vclock = Arc::new(AtomicU64::new(0));
+        {
+            let node = &mut self.nodes[cold];
+            let sync = SyncManager::new(SyncConfig::default())
+                .with_local_height(node.app.applied_height_handle())
+                .with_virtual_clock(origin, vclock.clone());
+            node.sync = tune(sync);
+            node.walk =
+                sync_recovery::ParentWalks::new(origin, SyncConfig::default().request_timeout);
+        }
+
+        let latency_us = spec.latency_ms * 1000;
+        // Bytes per microsecond x 1e6 (Mbit/s -> bytes/s).
+        let bytes_per_sec = spec.downlink_mbit.max(1) * 1_000_000 / 8;
+        let mut heap: BinaryHeap<Reverse<(u64, u64)>> = BinaryHeap::new();
+        let mut in_flight: HashMap<u64, (usize, usize, NetworkMessage)> = HashMap::new();
+        let mut seq = 0u64;
+        let mut downlink_free = 0u64;
+        let mut server_free: HashMap<usize, u64> = HashMap::new();
+        let mut report = ColdSyncReport {
+            legacy: legacy.to_vec(),
+            count_cpu: spec.count_cpu,
+            tip,
+            dag_blocks: rows.len(),
+            dag_bytes,
+            max_siblings,
+            fat_blocks,
+            reached_ms: None,
+            applied: 0,
+            virtual_ms: 0,
+            wall: std::time::Duration::ZERO,
+            messages_to_cold: 0,
+            bytes_to_cold: 0,
+            requests_from_cold: 0,
+        };
+        let mut schedule = |out: Vec<(usize, usize, NetworkMessage)>,
+                            send_us: u64,
+                            heap: &mut BinaryHeap<Reverse<(u64, u64)>>,
+                            in_flight: &mut HashMap<u64, (usize, usize, NetworkMessage)>,
+                            report: &mut ColdSyncReport| {
+            for (from, to, msg) in out {
+                let mut at = send_us + latency_us;
+                if to == cold {
+                    let size = bincode::serialized_size(&msg).expect("size");
+                    let start = at.max(downlink_free);
+                    at = start + (size * 1_000_000).div_ceil(bytes_per_sec);
+                    downlink_free = at;
+                    report.messages_to_cold += 1;
+                    report.bytes_to_cold += size;
+                } else if from == cold {
+                    report.requests_from_cold += 1;
+                }
+                seq += 1;
+                heap.push(Reverse((at, seq)));
+                in_flight.insert(seq, (from, to, msg));
+            }
+        };
+        let max_us = spec.max_virtual_secs * 1_000_000;
+        let mut v = 0u64;
+        let mut next_tick = 0u64;
+        let wall = std::time::Instant::now();
+        loop {
+            let applied = self.nodes[cold].applied().1;
+            if applied >= tip {
+                report.reached_ms = Some(v / 1000);
+                break;
+            }
+            if v > max_us {
+                break;
+            }
+            let set_clock = |fleet: &mut Self, us: u64| {
+                vclock.store(us / 1000, Ordering::Relaxed);
+                fleet.nodes[cold].clock = origin + std::time::Duration::from_micros(us);
+            };
+            let next_event = heap.peek().map(|Reverse((t, _))| *t);
+            if next_event.is_none_or(|t| t >= next_tick) {
+                v = v.max(next_tick);
+                set_clock(self, v);
+                let peers: Vec<Arc<Peer>> = servers.iter().map(|&s| self.peer(cold, s)).collect();
+                let t = std::time::Instant::now();
+                self.nodes[cold]
+                    .tick(&peers, std::time::Duration::from_secs(3600))
+                    .await;
+                self.nodes[cold].app.drive_drain().await;
+                if spec.count_cpu {
+                    v += t.elapsed().as_micros() as u64;
+                }
+                next_tick += 2_000_000;
+                let out = self.outbox();
+                schedule(out, v, &mut heap, &mut in_flight, &mut report);
+                continue;
+            }
+            let Some(Reverse((t, id))) = heap.pop() else {
+                continue;
+            };
+            let (from, to, msg) = in_flight.remove(&id).expect("scheduled message");
+            let send = if to == cold {
+                v = v.max(t);
+                set_clock(self, v);
+                let w = std::time::Instant::now();
+                self.receive(to, from, msg).await;
+                if spec.count_cpu {
+                    v += w.elapsed().as_micros() as u64;
+                }
+                v
+            } else {
+                let free = server_free.entry(to).or_default();
+                let start = t.max(*free);
+                let w = std::time::Instant::now();
+                self.receive(to, from, msg).await;
+                let spent = if spec.count_cpu {
+                    w.elapsed().as_micros() as u64
+                } else {
+                    0
+                };
+                let end = start + spent;
+                *free = end;
+                end
+            };
+            let out = self.outbox();
+            schedule(out, send, &mut heap, &mut in_flight, &mut report);
+        }
+        report.applied = self.nodes[cold].applied().1;
+        report.virtual_ms = v / 1000;
+        report.wall = wall.elapsed();
+        report
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #477: the shape of the cold-sync runs. 40 ms one way and 50 Mbit/s down
+    /// stand for a home connection to the fleet.
+    fn cold_spec(slots: u64, count_cpu: bool) -> ColdSync {
+        ColdSync {
+            slots,
+            fat_every: Some(5),
+            servers: vec![0, 1, 2],
+            latency_ms: 40,
+            downlink_mbit: 50,
+            count_cpu,
+            max_virtual_secs: 6 * 3600,
+        }
+    }
+
+    /// The cold node's sync manager for the always-on run, whose DAG is small
+    /// (~50 heights): the pipeline at a scale that DAG exercises (it engages
+    /// 8 heights behind, 8-height windows). The production tunables are
+    /// measured by `cold_sync_throughput_on_an_r1007_shaped_dag`.
+    fn cold_tune_small(sync: SyncManager) -> SyncManager {
+        sync.with_pipeline_config(citrate_network::sync_pipeline::PipelineConfig {
+            engage_gap: 8,
+            window_heights: 8,
+            lookahead_heights: 64,
+            ..citrate_network::sync_pipeline::PipelineConfig::default()
+        })
+    }
+
+    fn print_cold_lines(out: &str) {
+        for l in out.lines().filter(|l| l.starts_with("cold sync")) {
+            eprintln!("{l}");
+        }
+    }
+
+    /// #477 (r1007 cold sync gaining ~0.1 heights/s). A fresh node syncs a
+    /// seven-producer DAG (seven siblings per height, ~10 KB blocks among
+    /// them) from three servers, through the code a node runs, on a modelled
+    /// 40 ms / 50 Mbit link; once from three current servers and once from a
+    /// mixed fleet where two of the three are pre-#477 (60 KiB replies). Both
+    /// reach the tip, at a rate the 2 s, one-request-per-tick driver cannot:
+    /// it gains three heights (21 blocks) per tick, ~10 blocks/s.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cold_node_syncs_a_seven_producer_dag_from_three_servers() {
+        if !in_child() {
+            let out = child_output(
+                "split_heal_tests::tests::a_cold_node_syncs_a_seven_producer_dag_from_three_servers",
+            );
+            print_cold_lines(&out);
+            return;
+        }
+        let spec = cold_spec(ACT + 40, false);
+        let mut fleet = Fleet::cold_sync_dag(7, &spec).await;
+        for legacy in [vec![], vec![1, 2]] {
+            let r = fleet.cold_sync(&spec, &legacy, cold_tune_small).await;
+            println!("{}", r.line());
+            assert!(
+                r.max_siblings >= 6,
+                "fixture: a seven-producer DAG ({})",
+                r.line()
+            );
+            assert!(r.fat_blocks > 0, "fixture: ~10 KB blocks ({})", r.line());
+            assert!(
+                r.reached_ms.is_some(),
+                "the cold node reaches the tip: {}",
+                r.line()
+            );
+            assert!(
+                r.blocks_per_sec() >= 100,
+                "cold sync throughput {} blocks/s is the 2 s tick's: {}",
+                r.blocks_per_sec(),
+                r.line()
+            );
+        }
+    }
+
+    /// #477 measurement (release; numbers in the PR). `CITRATE_COLD_SYNC_SLOTS`
+    /// sets the DAG's length (default 1,500 slots: ~10,500 blocks). Runs three
+    /// servers all current, one current and two pre-#477, and all three
+    /// pre-#477, with the cold node's processing time counted (this host's CPU
+    /// and the link together), then the first two again on the link alone.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "measurement (#477): run in release"]
+    async fn cold_sync_throughput_on_an_r1007_shaped_dag() {
+        if !in_child() {
+            let out = child_output_with(
+                "split_heal_tests::tests::cold_sync_throughput_on_an_r1007_shaped_dag",
+                &["--include-ignored"],
+            );
+            print_cold_lines(&out);
+            return;
+        }
+        let slots = std::env::var("CITRATE_COLD_SYNC_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_500);
+        let spec = cold_spec(slots, true);
+        let t = std::time::Instant::now();
+        let mut fleet = Fleet::cold_sync_dag(7, &spec).await;
+        println!(
+            "cold sync fixture: {slots} slots in {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
+        let mut reports = Vec::new();
+        for (legacy, cpu) in [
+            (vec![], true),
+            (vec![1, 2], true),
+            (vec![0, 1, 2], true),
+            (vec![], false),
+            (vec![1, 2], false),
+        ] {
+            let run = ColdSync {
+                count_cpu: cpu,
+                ..spec.clone()
+            };
+            let r = fleet.cold_sync(&run, &legacy, |s| s).await;
+            println!("{}", r.line());
+            reports.push(r);
+        }
+        for r in &reports {
+            assert!(r.reached_ms.is_some(), "{}", r.line());
+        }
+        assert!(
+            reports[0].blocks_per_sec() >= 150,
+            "#477 target: {}",
+            reports[0].line()
+        );
+    }
 
     fn base(producers: usize) -> Scenario {
         Scenario {
@@ -2503,6 +3120,15 @@ mod tests {
             ".note_sync_target(target, applied_tip.1)",
             "rejoin_for_loop.lock().anchor(",
             ".note_asked(&pid.0, (block_from, block_height))",
+            // #477 pipelined download.
+            "sync_peer::pipeline_peer_admissible(c, applied_height)",
+            "rejoin_for_loop.lock().is_following_tip()",
+            ".pipeline_tick(applied_tip_now, pipeline_peers, following_tip)",
+            "sync_for_loop.pipeline_active()",
+            "!pipelined && pb < sync_recovery::TICK_PENDING_GATE && !held_tip",
+            "sync_for_rx.pipeline_on_answer(applied_tip)",
+            "let answers_rejoin = if receipt.pipelined {",
+            "receipt.new_blocks == 0 && receipt.received > 0",
         ] {
             assert!(
                 main.contains(needle),

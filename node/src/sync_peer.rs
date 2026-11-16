@@ -649,6 +649,21 @@ impl SyncPeerSelector {
 /// whose handshake is a little stale is never caught by it.
 pub const FAR_BEHIND_BAND: u64 = ANCESTRY_RECOVERY_WINDOW;
 
+/// #477: may the pipelined downloader ask this peer for windows at all?
+///
+/// The one place the pipeline's peer-eligibility rule lives. A peer that does
+/// not claim a head above our applied tip has nothing the pipeline could ask
+/// it for. The pipeline also never assigns a window starting above a peer's
+/// advertised head, and drops a peer whose header chain the delivered blocks
+/// contradict (`sync_pipeline`).
+///
+/// `head_height` is the peer's advertised head, which relayed gossip can
+/// inflate (I4), so it is a necessary condition only; any further eligibility
+/// check for pipeline peers belongs in this function.
+pub fn pipeline_peer_admissible(candidate: &SyncCandidate, applied_height: u64) -> bool {
+    candidate.head_height > applied_height
+}
+
 /// SPLIT HEALING: how far BELOW our applied height a peer's advertised head
 /// may sit and still be treated as a sibling branch worth pulling. A peer above
 /// us is a forward source ([`SyncPeerSelector::select`], I1) and is never a

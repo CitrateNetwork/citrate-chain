@@ -382,6 +382,13 @@ impl RejoinTracker {
         now.saturating_duration_since(since)
     }
 
+    /// #477: whether blocks are anchored on the applied tip (no fork-point
+    /// search or follow is running). The pipelined downloader only runs then:
+    /// a node on a side branch first finds its fork point.
+    pub fn is_following_tip(&self) -> bool {
+        matches!(self.mode, Mode::Tip { .. })
+    }
+
     /// The peer the running search is pinned to; `None` in `Tip` mode.
     pub fn search_peer(&self) -> Option<&str> {
         match self.mode {

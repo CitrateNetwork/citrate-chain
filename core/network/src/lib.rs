@@ -81,6 +81,7 @@ pub mod peer;
 pub mod protocol;
 pub mod relay;
 pub mod sync;
+pub mod sync_pipeline;
 pub mod transaction_gossip;
 pub mod transport;
 pub mod types;
