@@ -778,6 +778,8 @@ impl BlockPipeline {
     pub fn peer_gone(&mut self, peer: &PeerId, now: Instant) {
         self.drop_outstanding(peer, false, now);
         self.peers.remove(peer);
+        // A departed peer's evidence of a fork no longer counts.
+        self.fork_votes.remove(peer);
     }
 
     /// A send to `peer` failed: as if it timed out at once.
@@ -881,8 +883,10 @@ impl BlockPipeline {
             slot.head_height = p.head_height;
             slot.admissible = p.admissible;
             if turned {
-                // No longer to be asked: what it holds goes back to the pool.
+                // No longer to be asked: what it holds goes back to the pool,
+                // and its fork vote no longer counts.
                 self.drop_outstanding(&p.id, false, now);
+                self.fork_votes.remove(&p.id);
             }
         }
         let mut out = Vec::new();
