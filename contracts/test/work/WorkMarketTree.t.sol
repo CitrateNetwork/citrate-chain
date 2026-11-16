@@ -143,7 +143,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         vm.expectRevert(WorkMarket.WindowClosed.selector);
         market.dispute(id, ev);
         _settle(id, leaves, 0, _entries3()[0], 0);
-        assertEq(market.balanceOf(w1), 2 * PRICE);
+        assertEq(market.balanceOf(w1), 2 * PRICE + JBOND);
     }
 
     // ── A2: index outside the tree ─────────────────────────────────
@@ -155,7 +155,7 @@ contract WorkMarketTreeTest is WorkMarketTestBase {
         vm.expectRevert(WorkMarket.BadProof.selector);
         market.settle(id, w3, 2, 0, 5, path);
         _settle(id, leaves, 0, Entry(w1, 2), 0); // the honest worker is paid
-        assertEq(market.balanceOf(w1), 2 * PRICE);
+        assertEq(market.balanceOf(w1), 2 * PRICE + JBOND);
     }
 
     function test_A2_out_of_range_slot_is_challengeable() public {

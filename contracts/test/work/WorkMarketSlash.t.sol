@@ -222,13 +222,12 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         market.releaseIndexChallengeBond(id, 0);
         assertEq(market.balanceOf(w3), CHBOND, "the finder gets its bond back");
         assertEq(market.balanceOf(coordinator), 0, "a withdrawn root earns its coordinator nothing");
-        assertEq(market.owedOn(id), BUDGET);
+        assertEq(market.owedOn(id), BUDGET + 2 * JBOND);
     }
 
     function test_dismissed_worker_challenge_bond_follows_the_root() public {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
-        rs[0] = _receipt(id, w2, bytes32(uint256(1)));
+        WorkMarket.Receipt memory rs = _receipt(id, w2, bytes32(uint256(1)));
         vm.prank(w2);
         market.challengeInclusion{value: CHBOND}(id, rs);
         market.answerChallenge(id, _opening(leaves, 1, _entries3()[1], 2));
@@ -279,34 +278,29 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
         bytes32[] memory l2 = new bytes32[](2);
         l2[0] = keccak256("still no preimage");
         _postTree(id, l2, 1);
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
-        rs[0] = _receipt(id, w2, bytes32(uint256(1)));
+        WorkMarket.Receipt memory rs = _receipt(id, w2, bytes32(uint256(1)));
         vm.prank(w1);
         market.challengeInclusion{value: CHBOND}(id, rs);
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         market.resolveChallenge(id, w2);
         vm.expectRevert(WorkMarket.NothingToClaim.selector);
         market.releaseChallengeBond(id, w2);
-        assertEq(market.owedOn(id), BUDGET);
+        assertEq(market.owedOn(id), BUDGET + 2 * JBOND);
     }
 
-    /// A same-root re-challenge with more receipts than the answered leaf pays proves the root
+    /// A same-root re-challenge with a receipt ordinal above what the answered leaf pays proves the root
     /// faulty, so the earlier, dismissed challenger is refunded at once.
     function test_same_root_rechallenge_refunds_the_dismissed_challenger() public {
         (uint256 id, bytes32[] memory leaves) = _postedFl3(); // w2's leaf pays 3
-        WorkMarket.Receipt[] memory one = new WorkMarket.Receipt[](1);
-        one[0] = _receipt(id, w2, bytes32(uint256(1)));
+        WorkMarket.Receipt memory one = _receipt(id, w2, bytes32(uint256(1)));
         vm.prank(w1);
         market.challengeInclusion{value: CHBOND}(id, one);
         market.answerChallenge(id, _opening(leaves, 1, _entries3()[1], 2));
-        WorkMarket.Receipt[] memory four = new WorkMarket.Receipt[](4);
-        for (uint256 i = 0; i < 4; i++) {
-            four[i] = _receipt(id, w2, bytes32(i + 1));
-        }
+        WorkMarket.Receipt memory four = _receiptN(id, w2, bytes32(uint256(4)), 4); // w2's 4th lease
         vm.prank(w2);
         market.challengeInclusion{value: CHBOND}(id, four);
         assertEq(market.balanceOf(w1), CHBOND);
-        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND);
+        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND + 3 * JBOND);
     }
 
     // ── commitments are bound to the offer they were made on ──────
@@ -380,12 +374,12 @@ contract WorkMarketSlashTest is WorkMarketTestBase {
 
     function test_constructor_checks_minimum_and_sink() public {
         address[] memory none = new address[](0);
-        vm.expectRevert(WorkMarket.BadMinBond.selector);
-        new WorkMarket(governance, guardian, SINK, 1 ether, 0, none);
+        vm.expectRevert(abi.encodeWithSelector(WorkMarket.BadBondFloor.selector, uint128(0)));
+        new WorkMarket(governance, guardian, SINK, 1 ether, 0, JBOND, none);
         vm.expectRevert(WorkMarket.BadDefaultBond.selector); // the default may not undercut the minimum
-        new WorkMarket(governance, guardian, SINK, 1 ether, 2 ether, none);
+        new WorkMarket(governance, guardian, SINK, 1 ether, 2 ether, JBOND, none);
         vm.expectRevert(InitialAdmin.InitialAdmin_Zero.selector);
-        new WorkMarket(governance, guardian, address(0), 1 ether, MINBOND, none);
+        new WorkMarket(governance, guardian, address(0), 1 ether, MINBOND, JBOND, none);
         assertEq(market.slashSink(), SINK);
         assertEq(market.minCoordinatorBond(), MINBOND);
     }
