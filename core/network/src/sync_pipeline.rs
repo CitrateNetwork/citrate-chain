@@ -75,9 +75,10 @@
 // buffer and the missing-parent walk take over) and the plan restarts from the
 // applied tip.
 //
-// SECURITY HOOK. Which peers may be asked at all is the caller's decision
-// (`PipelinePeer::admissible`). Never choosing a sync peer far behind us is
-// being implemented in a private advisory; it plugs in there.
+// PEER ELIGIBILITY. Which peers may be asked at all is the caller's
+// decision (`PipelinePeer::admissible`, from
+// `sync_peer::pipeline_peer_admissible`); the pipeline only ranks the peers
+// it is given.
 //
 // NOTHING HERE DECIDES VALIDITY. The pipeline only decides what to ask for,
 // from whom, and when blocks go to admission. Every block still passes
@@ -171,8 +172,8 @@ pub struct PipelinePeer {
     /// The head it advertises: a necessary condition only (a window starting
     /// above it is never assigned to it).
     pub head_height: u64,
-    /// The caller's verdict that this peer may be asked at all (the hook the
-    /// far-behind-peer advisory plugs into).
+    /// The caller's verdict that this peer may be asked at all
+    /// (`sync_peer::pipeline_peer_admissible`).
     pub admissible: bool,
 }
 
