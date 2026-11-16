@@ -1411,6 +1411,22 @@ mod tests {
         block
     }
 
+    /// A signed block at `height` on `parent`.
+    fn signed_block_on(height: u64, parent: Hash) -> Block {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+        let key = crypto::generate_keypair();
+        let pubkey = PublicKey::new(key.verifying_key().to_bytes());
+        let mut block = BlockBuilder::new()
+            .parent(parent)
+            .height(height)
+            .proposer(pubkey)
+            .build_unhashed();
+        block.tx_root = citrate_consensus::tx_auth::tx_root_legacy(&[]);
+        block.header.block_hash = block.compute_hash();
+        block.signature = crypto::sign_block(&block.header.block_hash, &key);
+        block
+    }
+
     fn sent(rx: &mut tokio::sync::mpsc::Receiver<NetworkMessage>) -> Vec<NetworkMessage> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
@@ -1440,7 +1456,13 @@ mod tests {
             admissible: true,
         };
         let genesis = Hash::new([1; 32]);
-        let chain: Vec<Block> = (1..=300).map(signed_block_at).collect();
+        let mut chain: Vec<Block> = Vec::new();
+        let mut parent = genesis;
+        for h in 1..=300 {
+            let b = signed_block_on(h, parent);
+            parent = b.header.block_hash;
+            chain.push(b);
+        }
 
         let round = sync
             .pipeline_tick((genesis, 0), vec![(view, peer.clone())], true)

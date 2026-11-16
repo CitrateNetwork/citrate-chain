@@ -598,6 +598,10 @@ impl SyncPeerSelector {
 /// nothing the pipeline could ask it for. The pipeline also never assigns a
 /// window starting above a peer's advertised head, and drops a peer whose
 /// header chain the delivered blocks contradict (`sync_pipeline`).
+///
+/// NOTE: `head_height` is the peer's advertised head, which relayed gossip can
+/// inflate (I4), so it is a necessary condition only. The reported-head check
+/// from the advisory belongs here, in this one function.
 pub fn pipeline_peer_admissible(candidate: &SyncCandidate, applied_height: u64) -> bool {
     candidate.head_height > applied_height
 }
