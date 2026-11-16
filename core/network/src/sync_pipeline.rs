@@ -134,6 +134,9 @@ pub struct PipelineConfig {
     pub exclusion: Duration,
     /// Wait after an empty `Headers` answer before asking that peer again.
     pub header_backoff: Duration,
+    /// How long the pipeline stands aside when deliveries fork at our applied
+    /// tip, so the tick's fork-point search can heal the node.
+    pub stand_down: Duration,
 }
 
 impl Default for PipelineConfig {
@@ -156,6 +159,7 @@ impl Default for PipelineConfig {
             max_strikes: 3,
             exclusion: Duration::from_secs(60),
             header_backoff: Duration::from_secs(2),
+            stand_down: Duration::from_secs(60),
         }
     }
 }
@@ -270,8 +274,10 @@ pub struct PipelineStats {
     pub delivered_blocks: u64,
     /// Deliveries dropped because their chain did not connect to ours.
     pub unconnected: u64,
-    /// Peers charged for a delivery provably off our chain.
-    pub unconnected_charged: u64,
+    /// Peers tried later for a delivery provably off our chain.
+    pub unconnected_deprioritized: u64,
+    /// Times the pipeline stood aside for the fork-point search.
+    pub stood_down: u64,
     /// Blocks not held because the reorder buffer was at its caps.
     pub held_cap_drops: u64,
     /// Heights asked for again because an answer left a block of them out.
@@ -393,6 +399,9 @@ struct PeerSlot {
     excluded_until: Option<Instant>,
     /// Times it has been excluded: each exclusion lasts twice the last.
     exclusions: u32,
+    /// Asked only when no one else can be, until then: its delivery was off
+    /// our chain. Never an exclusion: it stays askable.
+    demoted_until: Option<Instant>,
     header_backoff_until: Option<Instant>,
 }
 
@@ -411,6 +420,7 @@ impl PeerSlot {
             strikes: 0,
             excluded_until: None,
             exclusions: 0,
+            demoted_until: None,
             header_backoff_until: None,
         }
     }
@@ -482,6 +492,12 @@ pub struct BlockPipeline {
     buffer: BTreeMap<u64, Vec<Held>>,
     buffered_bytes: usize,
     buffered_count: usize,
+    /// A delivery forked at our applied tip (see `settle`).
+    off_branch: bool,
+    /// Peers whose deliveries fork at our applied tip.
+    fork_votes: HashSet<PeerId>,
+    /// The pipeline stands aside until then (or until the applied tip moves).
+    stand_down_until: Option<Instant>,
     /// Heights asked for again (once each) because a block above references
     /// a block of them that was never delivered.
     refilled: HashSet<u64>,
@@ -516,6 +532,9 @@ impl BlockPipeline {
             buffered_count: 0,
             refilled: HashSet::new(),
             released_by: BTreeMap::new(),
+            off_branch: false,
+            fork_votes: HashSet::new(),
+            stand_down_until: None,
             max_siblings: 0,
             last_progress: now,
             stats: PipelineStats::default(),
@@ -534,8 +553,14 @@ impl BlockPipeline {
     /// The node's applied tip. Everything at or below it is forgotten; a tip
     /// that moved down (a reorg) restarts the plan from it.
     pub fn observe_applied(&mut self, applied: (Hash, u64), now: Instant) {
-        let (_, old) = self.applied;
+        let (old_hash, old) = self.applied;
         let height = applied.1;
+        if applied.0 != old_hash {
+            // The tip moved (healed or advanced): plan again.
+            self.off_branch = false;
+            self.fork_votes.clear();
+            self.stand_down_until = None;
+        }
         if height > old {
             self.last_progress = now;
         }
@@ -589,7 +614,7 @@ impl BlockPipeline {
     /// Whether the pipeline is doing the downloading (the legacy tick stands
     /// down while it is).
     pub fn active(&self) -> bool {
-        if !self.allowed {
+        if !self.allowed || self.stand_down_until.is_some() {
             return false;
         }
         let gap = self.target.saturating_sub(self.applied.1);
@@ -832,6 +857,13 @@ impl BlockPipeline {
         allowed: bool,
     ) -> Vec<PipelineRequest> {
         self.allowed = allowed;
+        if self.stand_down_until.is_some_and(|t| now >= t) {
+            self.stand_down_until = None;
+            self.off_branch = false;
+            self.fork_votes.clear();
+            self.restart_plan();
+            self.last_progress = now;
+        }
         // Peers that disconnected.
         let present: HashSet<&PeerId> = peers.iter().map(|p| &p.id).collect();
         let gone: Vec<PeerId> = self
@@ -1051,7 +1083,8 @@ impl BlockPipeline {
                 None => true,
                 Some((s, cid, _, _)) => score > *s || (score == *s && id.0 < cid.0),
             };
-            if w.failed.contains(id) {
+            let demoted = slot.demoted_until.is_some_and(|t| now < t);
+            if w.failed.contains(id) || demoted {
                 if better(&fallback) {
                     fallback = Some(cand);
                 }
@@ -1453,6 +1486,21 @@ impl BlockPipeline {
         if h <= self.applied.1.saturating_sub(REFILL_DEPTH) || self.refilled.contains(&h) {
             return;
         }
+        // Asking again needs an anchor one height below on our chain; without
+        // one the height counts as asked (so `settle` can decide).
+        let anchorable = h
+            .checked_sub(1)
+            .is_some_and(|a| a == self.applied.1 || self.received.contains_key(&a));
+        if !anchorable {
+            // Held there and not verified yet: ask once it is.
+            let held_below = h
+                .checked_sub(1)
+                .is_some_and(|a| self.buffer.contains_key(&a));
+            if !held_below {
+                self.refilled.insert(h);
+            }
+            return;
+        }
         // A window not yet asked, or an answer not yet past `h`, may still
         // deliver it: ask later.
         let unasked = self
@@ -1491,10 +1539,14 @@ impl BlockPipeline {
     /// the parent's height is asked for again (an answer cut mid-group, or a
     /// sibling left out). If that does not bring it, the blocks cannot connect
     /// to our chain: they are dropped and their window goes back to the pool,
-    /// with that peer tried last. The peer is charged only when this is
-    /// provable: the parent's height is verified and final (at or below the
-    /// frontier, nothing in flight for it) and was already asked for again.
-    /// The stall valve charges a delivery that was released and never applied.
+    /// with that peer tried last, and tried later in general when this is
+    /// provable (the parent's height is verified and final and was already
+    /// asked for again). That is never a strike: off our applied branch is
+    /// not off the network's, and during a split an honest peer serves the
+    /// heavier sibling branch. When the fork is at our applied tip itself, the
+    /// pipeline stands aside (`stand_down`) so the tick's fork-point search
+    /// heals the node. The stall valve charges a delivery that was released
+    /// (so connected to our chain) and never applied.
     fn settle(&mut self, now: Instant) {
         let Some(next) = self.frontier.checked_add(1) else {
             return;
@@ -1548,18 +1600,52 @@ impl BlockPipeline {
                 if below <= frontier && !proven.contains(&peer) {
                     proven.push(peer.clone());
                 }
+                // Its chain forks at our applied tip: the network extends a
+                // branch other than ours. That is the fork-point search's
+                // job (sync_rejoin, on the tick's path), not the pipeline's.
+                // Only when nothing extends our tip: no verified block above it
+                // and nothing in flight or planned that could bring one.
+                let next_tip = self.applied.1.saturating_add(1);
+                if below == self.applied.1
+                    && !self.received.contains_key(&next_tip)
+                    && !covered_in_flight(next_tip)
+                    && !self
+                        .windows
+                        .iter()
+                        .any(|(lo, w)| *lo <= next_tip && next_tip <= w.hi && w.owner.is_none())
+                {
+                    self.fork_votes.insert(peer.clone());
+                }
                 let key = (peer, win_lo, win_hi);
                 if !drop.contains(&key) {
                     drop.push(key);
                 }
             }
         }
+        // Off OUR chain is not proof of a bad peer: during a split an honest
+        // peer serves the heavier sibling branch. So it is only tried later
+        // (its rate quartered, and for `stand_down` asked only when no one
+        // else can be), never struck or excluded for this.
         for p in &proven {
-            self.stats.unconnected_charged = self.stats.unconnected_charged.saturating_add(1);
+            self.stats.unconnected_deprioritized =
+                self.stats.unconnected_deprioritized.saturating_add(1);
             if let Some(slot) = self.peers.get_mut(p) {
-                slot.rate_milli = slot.rate_milli.map(|r| r / 4);
+                slot.rate_milli = Some(slot.rate_milli.unwrap_or(PRIOR_RATE_MILLI) / 4);
+                slot.demoted_until = now.checked_add(self.config.stand_down);
             }
-            self.strike(p, now);
+        }
+        // More than half of the peers that may be asked deliver a branch
+        // forking at our tip: one peer alone cannot make the pipeline stand
+        // aside.
+        let askable = self.peers.values().filter(|s| s.admissible).count();
+        if self.fork_votes.len().saturating_mul(2) > askable {
+            self.off_branch = true;
+        }
+        if self.off_branch && self.stand_down_until.is_none() {
+            self.stats.stood_down = self.stats.stood_down.saturating_add(1);
+            self.stand_down_until = now.checked_add(self.config.stand_down);
+            // Time standing aside is not a stall of the pipeline's making.
+            self.last_progress = now;
         }
         for (peer, win_lo, win_hi) in drop {
             let mut emptied: Vec<u64> = Vec::new();
@@ -3041,7 +3127,10 @@ mod tests {
             "the buffer filled: {:?}",
             pl.stats()
         );
-        assert!(pl.stats().unconnected_charged > 0, "z charged via settle");
+        assert!(
+            pl.stats().unconnected_deprioritized > 0,
+            "z tried later via settle"
+        );
         assert_eq!(pl.stats().overlapping_requests, 0);
     }
 
