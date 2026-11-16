@@ -2399,6 +2399,26 @@ mod tests {
         assert_eq!(applied, target, "{:?}", pl.stats());
     }
 
+    /// An answer that carries only the anchor's own height-group (nothing of
+    /// the window) ends cleanly when the next answer starts.
+    #[test]
+    fn an_answer_of_only_the_anchor_group_ends_without_panicking() {
+        let now = Instant::now();
+        let mut pl = pipeline(now);
+        let peers = [peer("a", 10_000)];
+        let reqs = pl.plan(now, &peers, true);
+        feed_headers(&mut pl, &reqs, 600, now);
+        let _ = pl.plan(now, &peers, true);
+        let w = pl.in_flight_windows();
+        let (p, lo, _) = w[0].clone();
+        let (_, lo2, hi2) = w[1].clone();
+        let anchor_only = groups(lo - 1, lo - 1);
+        let _ = pl.on_blocks(&p, raw_of(&anchor_only), anchor_only.clone(), now);
+        let next = groups(lo2 - 1, hi2);
+        let o = pl.on_blocks(&p, raw_of(&next), next.clone(), now);
+        assert!(o.is_pipeline());
+    }
+
     /// Many rounds of random answer orders and losses: no two in-flight
     /// windows ever overlap, and every height up to the target is delivered.
     #[test]
