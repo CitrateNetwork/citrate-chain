@@ -3058,6 +3058,54 @@ mod tests {
         assert_eq!(pl.stats().overlapping_requests, 0);
     }
 
+    /// At a fresh start with many peers and the frontier window stalled on a
+    /// slow peer, honest peers whose answers wait behind it go over their
+    /// share of a full buffer. They are evicted from, never struck.
+    #[test]
+    fn honest_peers_over_their_share_behind_a_stalled_frontier_are_never_struck() {
+        let t0 = Instant::now();
+        let config = PipelineConfig {
+            engage_gap: 0,
+            window_heights: 8,
+            lookahead_heights: 256,
+            max_in_flight: 32,
+            max_held_blocks: 300,
+            ..PipelineConfig::default()
+        };
+        let mut pl = BlockPipeline::new(config, t0);
+        pl.observe_applied((hash(0, 0), 0), t0);
+        let target = 256;
+        pl.set_target(target);
+        // "a" sorts first and takes the frontier window; it never answers.
+        let mut peers = vec![peer("a", target)];
+        peers.extend((0..20).map(|i| peer(&format!("p{i:02}"), target)));
+        let mut now = t0;
+        // Well inside the slow peer's timeout: the frontier stays stalled.
+        for _ in 0..150 {
+            now += Duration::from_millis(50);
+            let reqs = pl.plan(now, &peers, true);
+            feed_headers(&mut pl, &reqs, target, now);
+            for (p, lo, hi) in pl.fifo_windows() {
+                if p.0 == "a" {
+                    continue;
+                }
+                let answer = groups(lo - 1, hi);
+                let _ = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+            }
+            let _ = pl.poll(now);
+            for (id, slot) in &pl.peers {
+                assert_eq!(slot.strikes, 0, "{} struck: {:?}", id.0, pl.stats());
+                assert!(!slot.excluded(now), "{} excluded", id.0);
+            }
+        }
+        assert!(
+            pl.stats().held_evictions > 0,
+            "the buffer filled: {:?}",
+            pl.stats()
+        );
+        assert!(pl.stats().buffered_blocks <= 300);
+    }
+
     /// A peer that turns inadmissible loses the windows it held.
     #[test]
     fn a_peer_that_turns_inadmissible_loses_its_windows() {
