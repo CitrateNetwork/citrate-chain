@@ -498,6 +498,16 @@ impl SyncPeerSelector {
         }
     }
 
+    /// Whether `id` is far behind us: its own report is more than
+    /// [`FAR_BEHIND_BAND`] below `applied_height`, and it has never carried us
+    /// above it.
+    pub fn is_far_behind(&self, id: &str, applied_height: u64) -> bool {
+        self.served(id) <= applied_height
+            && self
+                .reported_head(id)
+                .is_some_and(|r| r.saturating_add(FAR_BEHIND_BAND) < applied_height)
+    }
+
     /// The head `id` last reported for itself.
     pub fn reported_head(&self, id: &str) -> Option<u64> {
         self.reported.get(id).map(|(h, _)| *h)
@@ -615,14 +625,7 @@ impl SyncPeerSelector {
         // tie-break, again and again. Ranked after the penalty flag and the
         // score (equal at the floor there), not filtered: with nothing else
         // connected it is still asked (I2).
-        let far_behind = |id: &str| {
-            i32::from(
-                lead(id) == 0
-                    && self
-                        .reported_head(id)
-                        .is_some_and(|r| r.saturating_add(FAR_BEHIND_BAND) < applied_height),
-            )
-        };
+        let far_behind = |id: &str| i32::from(self.is_far_behind(id, applied_height));
         let de_preferred = |id: &str| {
             i32::from(self.failures(id) >= DEPREFER_AT_FAILURES || self.score(id) <= SCORE_MIN)
         };
@@ -651,18 +654,24 @@ pub const FAR_BEHIND_BAND: u64 = ANCESTRY_RECOVERY_WINDOW;
 
 /// #477: may the pipelined downloader ask this peer for windows at all?
 ///
-/// THE HOOK for the sync-peer eligibility rule being fixed in a private
-/// advisory (never choose a sync peer far behind us). Throughput needs only
-/// what is here: a peer that does not claim a head above our applied tip has
-/// nothing the pipeline could ask it for. The pipeline also never assigns a
-/// window starting above a peer's advertised head, and drops a peer whose
-/// header chain the delivered blocks contradict (`sync_pipeline`).
+/// The sync-peer eligibility rule for the pipeline (never ask a peer far
+/// behind us). The pipeline also never assigns a window starting above a
+/// peer's advertised head, and drops a peer whose header chain the delivered
+/// blocks contradict (`sync_pipeline`).
 ///
 /// NOTE: `head_height` is the peer's advertised head, which relayed gossip can
-/// inflate (I4), so it is a necessary condition only. The reported-head check
-/// from the advisory belongs here, in this one function.
-pub fn pipeline_peer_admissible(candidate: &SyncCandidate, applied_height: u64) -> bool {
-    candidate.head_height > applied_height
+/// inflate (I4), so it is a necessary condition only. The peer must also not be
+/// far behind by its own report ([`SyncPeerSelector::is_far_behind`]): such a
+/// peer holds none of the windows above our tip however high gossip has pushed
+/// its advertised head. Unlike `select`, this is a filter, not a ranking: a
+/// peer that gets no windows is still asked by the near-tip driver when it is
+/// all we have.
+pub fn pipeline_peer_admissible(
+    selector: &SyncPeerSelector,
+    candidate: &SyncCandidate,
+    applied_height: u64,
+) -> bool {
+    candidate.head_height > applied_height && !selector.is_far_behind(&candidate.id, applied_height)
 }
 
 /// SPLIT HEALING: how far BELOW our applied height a peer's advertised head
@@ -932,6 +941,44 @@ mod tests {
             Some("noise_26cee14b"),
             "the far-behind member regained the tie-break"
         );
+    }
+
+    /// #477: the pipelined downloader never asks a peer that its
+    /// own report puts far behind us (boot-2's choice of the cold-syncing
+    /// member, now for every window). A peer at our height that carried us
+    /// above our tip stays admissible, as does an unreported one.
+    #[test]
+    fn the_pipeline_never_asks_a_far_behind_peer() {
+        let applied = 104_271u64;
+        let member = SyncCandidate {
+            id: "noise_26cee14b".into(),
+            head_height: 104_546,
+        };
+        let boot = SyncCandidate {
+            id: "noise_2b492467".into(),
+            head_height: 104_546,
+        };
+        let fresh = SyncCandidate {
+            id: "noise_f356d3eb".into(),
+            head_height: 104_546,
+        };
+        let mut sel = SyncPeerSelector::new();
+        let t0 = Instant::now();
+        sel.note_reported_head_at(&member.id, 2_603, t0);
+        sel.note_reported_head_at(&boot.id, 104_400, t0);
+        assert!(!pipeline_peer_admissible(&sel, &member, applied));
+        assert!(pipeline_peer_admissible(&sel, &boot, applied));
+        assert!(pipeline_peer_admissible(&sel, &fresh, applied));
+        // Not ahead at all: never admissible.
+        let behind = SyncCandidate {
+            id: "x".into(),
+            head_height: applied,
+        };
+        assert!(!pipeline_peer_admissible(&sel, &behind, applied));
+        // A peer that has delivered blocks above our tip is a source, whatever
+        // its report said.
+        sel.record_serve(&member.id, 32, applied + 10, 275, 32, false);
+        assert!(pipeline_peer_admissible(&sel, &member, applied));
     }
 
     /// The r1006 bootnodes, 2026-11-03 (boot journals, read-only): boot-2's
