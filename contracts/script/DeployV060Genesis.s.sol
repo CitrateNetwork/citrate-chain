@@ -33,7 +33,7 @@ import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 ///           FLRoundVerifier(FederatedRoundLedger)
 ///           TaskVerifier(72 h)
 ///           WorkMarket(GOVERNANCE, guardian council, slashSink = GOVERNANCE, default bond,
-///                      min bond, [FLRoundVerifier, TaskVerifier])
+///                      coordinator-bond floor, join-bond floor, [FLRoundVerifier, TaskVerifier])
 ///           DatasetRegistry(GOVERNANCE)
 ///           GuardianRecoveryModuleV2(V1 GuardianRecoveryModule)
 ///           UsageReceipts(90 days)
@@ -64,12 +64,16 @@ import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 ///         After the broadcast, `verify` re-reads every contract on chain; it is also a
 ///         standalone step (`--sig "verifyBook()"`) over the step's own output book.
 ///
-///         Coordinator bonds: required inputs with no default anywhere. Without
-///         WORKMARKET_MIN_COORDINATOR_BOND and WORKMARKET_DEFAULT_COORDINATOR_BOND (SALT wei;
-///         min > 0, default >= min) the step refuses before reading anything else. The owner
-///         decided rehearsal values on 2026-11-11 (100 / 1,000 SALT, to revisit with tokenomics),
-///         recorded in scripts/genesis/v060/inputs.v060.env and enforced at P0. They are in
-///         WorkMarket's init code, so its address moves if they change.
+///         Bonds: required inputs with no default anywhere. Without
+///         WORKMARKET_MIN_COORDINATOR_BOND, WORKMARKET_DEFAULT_COORDINATOR_BOND and
+///         WORKMARKET_MIN_JOIN_BOND (SALT wei; each floor within 1 to 100,000 SALT, the default at
+///         least the coordinator floor and at most 100,000 SALT, as WorkMarket's constructor
+///         requires) the step refuses before reading anything else. The owner decided 100 SALT
+///         (coordinator floor) and 1,000 SALT (default) on 2026-11-11 and 10 SALT (join floor) on
+///         2026-11-14, recorded in scripts/genesis/v060/inputs.v060.env and enforced at P0. The two
+///         floors are only the genesis values: after genesis GOVERNANCE (the 48 h timelock) sets
+///         them (setMinCoordinatorBond, setMinJoinBond). All three are in WorkMarket's init code,
+///         so its address moves if they change.
 ///
 ///         Keys (fed #467 section 0.6; D-K3): GENESIS_KEY_INVENTORY (role-tagged allowlist, JSON
 ///         {address: [roles]}; a council owner needs its council's role, GOV_OWNERS/GRD_OWNERS),
@@ -78,7 +82,8 @@ import {FederatedRoundLedger} from "../src/FederatedRoundLedger.sol";
 ///         the inventory and off the retired list; the deployer off the retired list.
 ///
 ///         Inputs:
-///           WORKMARKET_MIN_COORDINATOR_BOND, WORKMARKET_DEFAULT_COORDINATOR_BOND  (pending, above)
+///           WORKMARKET_MIN_COORDINATOR_BOND, WORKMARKET_DEFAULT_COORDINATOR_BOND,
+///           WORKMARKET_MIN_JOIN_BOND  (pending, above)
 ///           GENESIS_KEY_INVENTORY, GENESIS_RETIRED_KEYS, GENESIS_GUARDIAN_VETO_MARGIN  (above)
 ///           V060_INPUT_BOOK    the merged ceremony book so far (P1-P4): GovernanceTimelock,
 ///                              GovernanceMultisig, GuardianTimelock, GuardianMultisig,
@@ -104,6 +109,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         address agentSbt;
         uint128 minCoordinatorBond;
         uint128 defaultCoordinatorBond;
+        uint128 minJoinBond;
         /// the key inventory, the retired keys and the veto margin (fed #467 section 0.6; D-K3)
         V060GovernanceSpec.KeyParams keys;
     }
@@ -123,7 +129,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
 
     function run() external returns (Deployed memory d) {
         // The pending parameter first: nothing else is read, checked or sent without it.
-        (uint128 minBond, uint128 defaultBond) = _bondsFromEnv();
+        (uint128 minBond, uint128 defaultBond, uint128 joinBond) = _bondsFromEnv();
         V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
         address deployer = deployerAddress();
         string memory json = vm.readFile(vm.envString("V060_INPUT_BOOK"));
@@ -141,6 +147,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
             agentSbt: _bookAddr(json, "AgentSBT"),
             minCoordinatorBond: minBond,
             defaultCoordinatorBond: defaultBond,
+            minJoinBond: joinBond,
             keys: k
         });
         d = deployWith(deployer, i);
@@ -151,7 +158,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
     ///         step's own output book (V060_GENESIS_OUT) against the inputs (V060_INPUT_BOOK and
     ///         the bond and key parameters), without broadcasting anything.
     function verifyBook() external {
-        (uint128 minBond, uint128 defaultBond) = _bondsFromEnv();
+        (uint128 minBond, uint128 defaultBond, uint128 joinBond) = _bondsFromEnv();
         V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
         string memory json = vm.readFile(vm.envString("V060_INPUT_BOOK"));
         string memory out = vm.readFile(vm.envString("V060_GENESIS_OUT"));
@@ -167,6 +174,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
             agentSbt: _bookAddr(json, "AgentSBT"),
             minCoordinatorBond: minBond,
             defaultCoordinatorBond: defaultBond,
+            minJoinBond: joinBond,
             keys: k
         });
         Deployed memory p = predict(i);
@@ -286,6 +294,8 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
             vm.toString(uint256(i.minCoordinatorBond)),
             '","defaultCoordinatorBond":"',
             vm.toString(uint256(i.defaultCoordinatorBond)),
+            '","minJoinBond":"',
+            vm.toString(uint256(i.minJoinBond)),
             '","taskReviewWindow":',
             vm.toString(uint256(V060GenesisSpec.TASK_REVIEW_WINDOW)),
             ',"usageMaxBackfillDays":',
@@ -305,9 +315,12 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
 
     // ------------------------------------------------------------------ inputs
 
+    /// The constructor's own bounds, checked before anything is broadcast.
     function _requireBonds(Inputs memory i) internal pure {
+        (uint128 lo, uint128 hi) = (V060GenesisSpec.MIN_BOND_FLOOR, V060GenesisSpec.MAX_BOND_FLOOR);
         require(
-            i.minCoordinatorBond != 0 && i.defaultCoordinatorBond >= i.minCoordinatorBond,
+            i.minCoordinatorBond >= lo && i.minCoordinatorBond <= hi && i.minJoinBond >= lo && i.minJoinBond <= hi
+                && i.defaultCoordinatorBond >= i.minCoordinatorBond && i.defaultCoordinatorBond <= hi,
             V060GenesisSpec.PENDING_COORDINATOR_BONDS
         );
     }
@@ -319,15 +332,19 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         V060GovernanceSpec.requireKeyParams(k);
     }
 
-    function _bondsFromEnv() internal view returns (uint128 minBond, uint128 defaultBond) {
+    function _bondsFromEnv() internal view returns (uint128 minBond, uint128 defaultBond, uint128 joinBond) {
         require(
-            vm.envExists("WORKMARKET_MIN_COORDINATOR_BOND") && vm.envExists("WORKMARKET_DEFAULT_COORDINATOR_BOND"),
+            vm.envExists("WORKMARKET_MIN_COORDINATOR_BOND") && vm.envExists("WORKMARKET_DEFAULT_COORDINATOR_BOND")
+                && vm.envExists("WORKMARKET_MIN_JOIN_BOND"),
             V060GenesisSpec.PENDING_COORDINATOR_BONDS
         );
         uint256 m = vm.envUint("WORKMARKET_MIN_COORDINATOR_BOND");
         uint256 dflt = vm.envUint("WORKMARKET_DEFAULT_COORDINATOR_BOND");
-        require(m <= type(uint128).max && dflt <= type(uint128).max, "coordinator bond exceeds uint128");
-        (minBond, defaultBond) = (uint128(m), uint128(dflt));
+        uint256 j = vm.envUint("WORKMARKET_MIN_JOIN_BOND");
+        require(
+            m <= type(uint128).max && dflt <= type(uint128).max && j <= type(uint128).max, "WorkMarket bond exceeds uint128"
+        );
+        (minBond, defaultBond, joinBond) = (uint128(m), uint128(dflt), uint128(j));
     }
 
     /// @notice `name` from the book's `contracts`, else its `aaStack`; reverts when absent.
@@ -464,6 +481,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
             i.guardianTimelock,
             i.defaultCoordinatorBond,
             i.minCoordinatorBond,
+            i.minJoinBond,
             d.flRoundVerifier,
             d.taskVerifier
         );
@@ -494,6 +512,7 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
                 i.governanceTimelock,
                 i.defaultCoordinatorBond,
                 i.minCoordinatorBond,
+                i.minJoinBond,
                 V060GenesisSpec.initialVerifiers(d.flRoundVerifier, d.taskVerifier)
             )
         );
@@ -554,8 +573,9 @@ contract DeployV060Genesis is ScriptEnv, AdminChecks, Create2Deploy, GenesisBook
         require(m.guardian() == rt, "WorkMarket: guardian is not the guardian council");
         require(m.slashSink() == gt, "WorkMarket: slashSink is not the GOVERNANCE timelock");
         require(
-            m.minCoordinatorBond() == i.minCoordinatorBond && m.defaultCoordinatorBond() == i.defaultCoordinatorBond,
-            "WorkMarket: coordinator bonds"
+            m.minCoordinatorBond() == i.minCoordinatorBond && m.defaultCoordinatorBond() == i.defaultCoordinatorBond
+                && m.minJoinBond() == i.minJoinBond,
+            "WorkMarket: bonds"
         );
         require(
             m.verifierAllowed(d.flRoundVerifier) && m.verifierAllowed(d.taskVerifier), "WorkMarket: verifier allowlist"

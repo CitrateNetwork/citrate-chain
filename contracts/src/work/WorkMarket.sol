@@ -5,7 +5,7 @@ import {Governable} from "../lib/Governable.sol";
 import {ReentrancyGuard} from "../lib/ReentrancyGuard.sol";
 import {InitialAdmin} from "../lib/InitialAdmin.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
-import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {IVerifier, IWorkMarket} from "./IVerifier.sol";
 
@@ -37,11 +37,20 @@ import {IVerifier, IWorkMarket} from "./IVerifier.sol";
 ///      that length and an index below `2^payoutDepth`. A leaf that settles therefore always opens
 ///      in a dispute too.
 ///
+///      Lease receipts: the coordinator signs one receipt per verified lease, and each receipt
+///      carries the worker's running lease count on the offer (`ordinal`: 1 for its first
+///      verified lease, n for its n-th). One receipt therefore proves the worker is owed at least
+///      `ordinal` units, however many units that is. Receipts are plain ECDSA signatures by the
+///      coordinator's key (no EIP-1271): a signed receipt stays valid for the life of the offer,
+///      whatever code the coordinator's address later carries. An FL offer's coordinator must have
+///      no code at `open`. A coordinator must not sign more ordinals across all workers than the
+///      offer's `maxUnits`: no root could pay them all, so every root it posts would be disputable.
+///
 ///      Inclusion challenge (owner 2026-11-09, V60-GEN-Q11): a leaf whose payload has no valid
 ///      preimage cannot be opened, so it could hide one absent worker from a MISSING_LEAF proof.
-///      Inside the dispute window, a joined worker or the poster may instead present
-///      coordinator-signed receipts for a worker and make the coordinator answer: anyone may
-///      answer by opening that worker's leaf with at least the receipted units before
+///      Inside the dispute window, a joined worker or the poster may instead present a
+///      coordinator-signed receipt for a worker and make the coordinator answer: anyone may
+///      answer by opening that worker's leaf with at least the receipt's `ordinal` units before
 ///      `answerBy`; if nobody does, the challenge is upheld like any objective dispute. Settling
 ///      and the coordinator's bond wait while a challenge is open.
 ///
@@ -61,8 +70,10 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     ///         `slashSink`. The poster never receives any part of a slash (owner 2026-11-09, Q4 revised).
     uint16 public constant SLASH_DISPUTER_BPS = 5000;
     uint16 internal constant BPS = 10_000;
-    /// @notice Bounds the receipts one LOW_UNITS dispute may carry (calldata and gas).
-    uint256 public constant MAX_RECEIPTS_PER_DISPUTE = 256;
+    /// @notice Bounds of the governance-set bond floors (`minCoordinatorBond`, `minJoinBond`),
+    ///         SALT wei: 1 to 100,000 SALT (owner 2026-11-14).
+    uint128 public constant MIN_BOND_FLOOR = 1 ether;
+    uint128 public constant MAX_BOND_FLOOR = 100_000 ether;
     /// @notice Subjective (TASK) dispute reason codes start here; lower codes name objective kinds.
     uint16 public constant SUBJECTIVE_REASON_MIN = 256;
     /// @notice How long the coordinator (or anyone holding the tree) has to answer an inclusion
@@ -76,7 +87,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     uint64 public constant RESERVE_CLAIM_PERIOD = 180 days;
 
     bytes32 public constant LEAF_TAG = keccak256("citrate-workmarket-leaf/1");
-    bytes32 public constant RECEIPT_TAG = keccak256("citrate-workmarket-lease-receipt/1");
+    bytes32 public constant RECEIPT_TAG = keccak256("citrate-workmarket-lease-receipt/2");
     bytes32 public constant PAYOUT_TAG = keccak256("citrate-workmarket-payout/1");
 
     /// Dispute evidence tags (first field of the abi-encoded evidence).
@@ -173,7 +184,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         uint32 epoch; // payoutEpoch it was raised under
         bool open;
         address challenger;
-        uint64 claimedUnits; // distinct receipted leases
+        uint64 claimedUnits; // the receipt's ordinal: verified leases the worker is owed for
         uint64 answeredUnits; // highest claim already answered under this epoch
         uint64 answerBy;
         bool answered; // dismissed under this epoch; its bond waits for the root to survive
@@ -204,22 +215,33 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         bytes32[] path;
     }
 
-    /// @notice A coordinator-signed lease receipt `(offerId, worker, leaseId, deltaHash, verified=true)`
-    ///         (06 §2.2). Signed over `receiptDigest` with EIP-191; EIP-1271 for contract coordinators.
+    /// @notice A coordinator-signed lease receipt `(offerId, worker, leaseId, deltaHash, ordinal,
+    ///         verified=true)` (06 §2.2). `ordinal` is the worker's verified-lease count on the offer
+    ///         including this lease (1-based), so the worker is owed at least `ordinal` units.
+    ///         Signed over `receiptDigest` with EIP-191 by the coordinator's key; ECDSA only (no
+    ///         EIP-1271).
     struct Receipt {
         address worker;
         bytes32 leaseId;
         bytes32 deltaHash;
+        uint64 ordinal;
         bytes signature;
     }
 
     // ── state ───────────────────────────────────────────────────────
 
     uint256 public nextOfferId;
-    /// @notice The coordinator bond an offer gets when its poster passes 0 (owner 2026-11-09, Q1).
+    /// @notice The coordinator bond an offer gets when its poster passes 0 (owner 2026-11-09, Q1),
+    ///         raised to `minCoordinatorBond` if governance has since set the floor above it.
     uint128 public immutable defaultCoordinatorBond;
-    /// @notice The least coordinator bond an offer may set.
-    uint128 public immutable minCoordinatorBond;
+    /// @notice The least coordinator bond a new offer may set. Governance-set within
+    ///         [MIN_BOND_FLOOR, MAX_BOND_FLOOR] (owner 2026-11-14; genesis 100 SALT); applies to
+    ///         offers opened after the change only.
+    uint128 public minCoordinatorBond;
+    /// @notice The least join bond a new offer may set. Governance-set within
+    ///         [MIN_BOND_FLOOR, MAX_BOND_FLOOR] (owner 2026-11-14; genesis 10 SALT); applies to
+    ///         offers opened after the change only.
+    uint128 public minJoinBond;
     /// @notice Receives every slash not paid to a rewarded disputer (owner 2026-11-09, Q4 revised).
     address public immutable slashSink;
     address public guardian;
@@ -271,6 +293,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     event DisputeCommitted(uint256 indexed id, address indexed by, bytes32 commitment);
     event IndexChallenged(uint256 indexed id, uint32 indexed index, address indexed challenger, uint64 answerBy);
     event IndexChallengeAnswered(uint256 indexed id, uint32 indexed index, address worker);
+    event MinCoordinatorBondSet(uint128 previous, uint128 current);
+    event MinJoinBondSet(uint128 previous, uint128 current);
 
     // ── errors ──────────────────────────────────────────────────────
 
@@ -312,8 +336,9 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     error TransferFailed();
     error NotGuardianOrGovernance();
     error BadDefaultBond();
-    error BadMinBond();
+    error BadBondFloor(uint128 floor);
     error BondBelowMinimum();
+    error JoinBondBelowMinimum();
     error ChallengeOpen();
     error NoOpenChallenge();
     error AnswerTooLate();
@@ -324,11 +349,14 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
     // ── construction ────────────────────────────────────────────────
 
-    /// @param governance_       the governance timelock (3-of-5 / 48 h); allows verifiers, pauses, unpauses
+    /// @param governance_       the governance timelock (3-of-5 / 48 h); allows verifiers, pauses, unpauses,
+    ///                          sets the bond floors
     /// @param guardian_         the guardian council (2-of-3); may pause new offers, nothing else; not 0 (InitialAdmin)
     /// @param slashSink_        receives every slash not paid to a rewarded disputer (the governance treasury)
-    /// @param defaultCoordinatorBond_ the bond an offer requires when its poster passes 0; above zero
-    /// @param minCoordinatorBond_ the least bond an offer may set; above zero, at most the default
+    /// @param defaultCoordinatorBond_ the bond an offer requires when its poster passes 0; at
+    ///        least `minCoordinatorBond_`, at most MAX_BOND_FLOOR
+    /// @param minCoordinatorBond_ the initial coordinator-bond floor (governance may change it later)
+    /// @param minJoinBond_ the initial join-bond floor (governance may change it later)
     /// @param initialVerifiers_ verifiers allowed at block 0 (CREATE2-predicted FLRoundVerifier and TaskVerifier)
     constructor(
         address governance_,
@@ -336,12 +364,19 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         address slashSink_,
         uint128 defaultCoordinatorBond_,
         uint128 minCoordinatorBond_,
+        uint128 minJoinBond_,
         address[] memory initialVerifiers_
     ) Governable(governance_) {
-        if (minCoordinatorBond_ == 0) revert BadMinBond();
-        if (defaultCoordinatorBond_ < minCoordinatorBond_) revert BadDefaultBond();
+        _checkFloor(minCoordinatorBond_);
+        _checkFloor(minJoinBond_);
+        if (defaultCoordinatorBond_ < minCoordinatorBond_ || defaultCoordinatorBond_ > MAX_BOND_FLOOR) {
+            revert BadDefaultBond();
+        }
         defaultCoordinatorBond = defaultCoordinatorBond_;
         minCoordinatorBond = minCoordinatorBond_;
+        minJoinBond = minJoinBond_;
+        emit MinCoordinatorBondSet(0, minCoordinatorBond_);
+        emit MinJoinBondSet(0, minJoinBond_);
         slashSink = InitialAdmin.check(slashSink_);
         guardian = InitialAdmin.check(guardian_);
         emit GuardianSet(guardian_);
@@ -359,6 +394,22 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (verifier == address(0)) revert BadParty();
         verifierAllowed[verifier] = ok;
         emit VerifierAllowed(verifier, ok);
+    }
+
+    /// @notice Set the least coordinator bond a NEW offer may carry (1 to 100,000 SALT). Offers
+    ///         already open keep the bond they were opened with.
+    function setMinCoordinatorBond(uint128 floor) external onlyGovernance {
+        _checkFloor(floor);
+        emit MinCoordinatorBondSet(minCoordinatorBond, floor);
+        minCoordinatorBond = floor;
+    }
+
+    /// @notice Set the least join bond a NEW offer may carry (1 to 100,000 SALT). Offers already
+    ///         open keep the join bond they were opened with.
+    function setMinJoinBond(uint128 floor) external onlyGovernance {
+        _checkFloor(floor);
+        emit MinJoinBondSet(minJoinBond, floor);
+        minJoinBond = floor;
     }
 
     /// @notice Rotate the guardian seat, or clear it with zero. Never the CREATE2 factory.
@@ -394,7 +445,11 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (p.deadline <= block.timestamp + p.disputeWindow) revert BadDeadline();
         if (p.maxWorkers == 0 || p.maxWorkers > MAX_WORKERS_CAP) revert BadMaxWorkers();
         if (p.coordinator == address(0)) revert BadParty();
+        // FL receipts are ECDSA signatures by the coordinator's key, so an FL coordinator must be
+        // a key, not a contract (a contract could not sign the receipts every dispute rests on).
+        if (p.kind == Kind.FL_ROUND && p.coordinator.code.length != 0) revert BadParty();
         if (p.bindRef == bytes32(0)) revert BadBindRef();
+        if (p.joinBond < minJoinBond) revert JoinBondBelowMinimum();
         // Subjective disputes exist only for group TASK offers (06 §2.2); an admin anywhere
         // else would be a party that can freeze a payout without the contract checking anything.
         if (p.disputeAdmin != address(0) && (p.kind != Kind.TASK || p.groupHash == bytes32(0))) {
@@ -425,7 +480,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         o.coordinator = p.coordinator;
         // A bond too small to matter would neuter both the slash and the challenge bond.
         if (p.coordinatorBond != 0 && p.coordinatorBond < minCoordinatorBond) revert BondBelowMinimum();
-        o.coordinatorBond = p.coordinatorBond == 0 ? defaultCoordinatorBond : p.coordinatorBond;
+        o.coordinatorBond = p.coordinatorBond == 0 ? _defaultBond() : p.coordinatorBond;
         o.disputeAdmin = p.disputeAdmin;
 
         emit OfferOpened(id, p.kind, msg.sender, p.groupHash, p.pricePerUnit, budget, p.deadline, p.requirementsCid);
@@ -472,6 +527,8 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (msg.value != o.coordinatorBond) revert WrongBond();
         if (root == bytes32(0)) revert BadRoot();
         if (units == 0 || units > o.maxUnits) revert BadUnits();
+        // The root's reserve must be backed by what the budget has not already paid.
+        if (uint256(units) * o.pricePerUnit + o.paid > o.budget) revert BadUnits();
         if (o.kind == Kind.TASK && units != 1) revert BadUnits();
         if (depth > _depthFor(o.maxWorkers)) revert BadDepth();
         // TASK: the coordinator is the selected worker and the root's single leaf pays it.
@@ -500,7 +557,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @param evidence `abi.encode(uint8 tag, bytes body)`:
     ///        DISPUTE_SUBJECTIVE  body = abi.encode(uint16 reason)                      TASK, poster only
     ///        DISPUTE_MISSING_LEAF body = abi.encode(Receipt, uint8 mode, LeafOpening lo, LeafOpening hi)
-    ///        DISPUTE_LOW_UNITS   body = abi.encode(LeafOpening leaf, Receipt[] receipts)
+    ///        DISPUTE_LOW_UNITS   body = abi.encode(LeafOpening leaf, Receipt r)       r.ordinal > leaf.units
     ///        DISPUTE_ORDER       body = abi.encode(LeafOpening a, LeafOpening b)       a.index < b.index
     ///        DISPUTE_FIRST_LEAF  body = abi.encode(LeafOpening first)                  index 0
     ///        DISPUTE_TOTAL       body = abi.encode(LeafOpening leaf, LeafOpening next) see _provesBadTotal
@@ -651,13 +708,16 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     /// @notice Return to the poster what no payout can claim.
     ///         - Open/Running after the deadline (no live payout; none can be posted): all of
     ///           `budget - paid`; the offer is Expired.
-    ///         - PayoutPosted at or after `deadline + disputeWindow`: `budget` minus what the posted
-    ///           root reserves (`payoutUnits * price`); unsettled workers can still settle (RT-11).
+    ///         - PayoutPosted at or after `deadline + disputeWindow`: `budget - paid` minus what
+    ///           the posted root still reserves for its unsettled leaves
+    ///           (`(payoutUnits - settledUnits) * price`); unsettled workers can still settle (RT-11).
     ///         - Disputed (unresolved subjective dispute) at or after `deadline + disputeWindow`:
-    ///           all of `budget - paid`; the coordinator's bond is returned to it.
+    ///           all of `budget - paid`; the coordinator's bond is returned to it. Anyone may call
+    ///           this case, so the bonds it holds do not wait on the poster; the refund still goes
+    ///           to the poster.
     function refund(uint256 id) external nonReentrant {
         Offer storage o = _offer(id);
-        if (msg.sender != o.poster) revert NotPoster();
+        if (o.state != State.Disputed && msg.sender != o.poster) revert NotPoster();
         uint256 afterWindow = uint256(o.deadline) + o.disputeWindow;
         uint128 amount = 0;
         State finalState = o.state;
@@ -668,7 +728,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         } else if (o.state == State.PayoutPosted) {
             if (block.timestamp < afterWindow || block.timestamp < _disputeEnd(o)) revert TooEarly();
             if (o.openChallenges != 0) revert ChallengeOpen();
-            amount = o.budget - uint128(uint256(o.payoutUnits) * o.pricePerUnit);
+            amount = o.budget - o.paid - _reserveLeft(o);
             finalState = State.Closed;
         } else if (o.state == State.Disputed) {
             if (block.timestamp < afterWindow) revert TooEarly();
@@ -725,28 +785,22 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
 
     // ── inclusion challenge (V60-GEN-Q11) ───────────────────────────
 
-    /// @notice Inside the dispute window, a joined worker or the poster presents `receipts` (distinct,
-    ///         coordinator-signed, strictly ascending lease ids, all for one joined worker) and makes
-    ///         the root answer for that worker within `CHALLENGE_RESPONSE_WINDOW`. A worker may be
-    ///         challenged again under the same root only with more receipts than the answered leaf pays.
-    function challengeInclusion(uint256 id, Receipt[] calldata receipts) external payable nonReentrant {
+    /// @notice Inside the dispute window, a joined worker or the poster presents one
+    ///         coordinator-signed `receipt` for a joined worker and makes the root answer for that
+    ///         worker, with at least `receipt.ordinal` units, within `CHALLENGE_RESPONSE_WINDOW`. A
+    ///         worker may be challenged again under the same root only with a receipt whose ordinal
+    ///         is above what the answered leaf pays.
+    function challengeInclusion(uint256 id, Receipt calldata receipt) external payable nonReentrant {
         Offer storage o = _offer(id);
         if (o.state != State.PayoutPosted) revert WrongState();
         if (block.timestamp >= uint256(o.payoutPostedAt) + o.disputeWindow) revert WindowClosed();
         if (msg.sender != o.poster && !_slots[id][msg.sender].joined) revert NotDisputer();
-        if (receipts.length == 0 || receipts.length > MAX_RECEIPTS_PER_DISPUTE) revert BadEvidence();
-        address w = receipts[0].worker;
+        address w = receipt.worker;
         if (w == address(0) || !_slots[id][w].joined) revert BadEvidence();
-        bytes32 prevLease = bytes32(0);
-        for (uint256 i = 0; i < receipts.length; i++) {
-            Receipt calldata r = receipts[i];
-            if (r.worker != w || (i > 0 && r.leaseId <= prevLease)) revert BadEvidence();
-            if (!_receiptValid(id, o, r)) revert BadEvidence();
-            prevLease = r.leaseId;
-        }
+        if (!_receiptValid(id, o, receipt)) revert BadEvidence();
         uint128 bond = _takeChallengeBond(id, o);
         Challenge storage c = _challenges[id][w];
-        uint64 claimed = uint64(receipts.length);
+        uint64 claimed = receipt.ordinal;
         if (c.epoch != o.payoutEpoch) {
             // a withdrawn root left this challenge open or answered: its challenger gets the bond
             if (c.bondHeld) _returnChallengeBond(id, o, c.challenger, bond);
@@ -758,7 +812,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         }
         if (c.open) revert ChallengeOpen();
         if (claimed <= c.answeredUnits) revert BadEvidence();
-        // More receipts than the answered leaf pays prove the root faulty (LOW_UNITS), so the
+        // A receipt ordinal above what the answered leaf pays proves the root faulty (LOW_UNITS), so the
         // earlier, dismissed challenge was right after all: its bond goes back to its challenger.
         if (c.bondHeld) _returnChallengeBond(id, o, c.challenger, bond);
         uint64 answerBy = uint64(block.timestamp) + CHALLENGE_RESPONSE_WINDOW;
@@ -935,7 +989,7 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         if (msg.sender != o.poster) revert NotPoster();
         if (o.state != State.Closed || o.payoutRoot == bytes32(0) || o.reserveSwept) revert WrongState();
         if (block.timestamp < uint256(o.deadline) + o.disputeWindow + RESERVE_CLAIM_PERIOD) revert TooEarly();
-        uint128 amount = uint128(uint256(o.payoutUnits) * o.pricePerUnit) - o.paid;
+        uint128 amount = _reserveLeft(o);
         o.reserveSwept = true;
         o.refunded += amount;
         balanceOf[o.poster] += amount;
@@ -998,12 +1052,14 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         return keccak256(abi.encodePacked(bytes1(0x00), index, payload));
     }
 
-    function receiptDigest(uint256 id, address worker, bytes32 leaseId, bytes32 deltaHash)
+    function receiptDigest(uint256 id, address worker, bytes32 leaseId, bytes32 deltaHash, uint64 ordinal)
         public
         view
         returns (bytes32)
     {
-        return keccak256(abi.encode(RECEIPT_TAG, block.chainid, address(this), id, worker, leaseId, deltaHash, true));
+        return keccak256(
+            abi.encode(RECEIPT_TAG, block.chainid, address(this), id, worker, leaseId, deltaHash, ordinal, true)
+        );
     }
 
     // ── internals ───────────────────────────────────────────────────
@@ -1011,6 +1067,20 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
     function _offer(uint256 id) internal view returns (Offer storage o) {
         o = _offers[id];
         if (o.poster == address(0)) revert UnknownOffer();
+    }
+
+    function _checkFloor(uint128 floor) internal pure {
+        if (floor < MIN_BOND_FLOOR || floor > MAX_BOND_FLOOR) revert BadBondFloor(floor);
+    }
+
+    /// The bond an offer opened with 0 carries: the default, or the floor if governance raised it above.
+    function _defaultBond() internal view returns (uint128) {
+        return defaultCoordinatorBond >= minCoordinatorBond ? defaultCoordinatorBond : minCoordinatorBond;
+    }
+
+    /// What the live root still reserves for its unsettled leaves.
+    function _reserveLeft(Offer storage o) internal view returns (uint128) {
+        return uint128(uint256(o.payoutUnits - o.settledUnits) * o.pricePerUnit);
     }
 
     function _clearPayout(Offer storage o) internal {
@@ -1105,9 +1175,15 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         }
     }
 
+    /// A receipt counts only as an ECDSA signature by the coordinator's key over its digest, so no
+    /// code at the coordinator's address (now or later) can take back a receipt it signed.
     function _receiptValid(uint256 id, Offer storage o, Receipt memory r) internal view returns (bool) {
-        bytes32 digest = MessageHashUtils.toEthSignedMessageHash(receiptDigest(id, r.worker, r.leaseId, r.deltaHash));
-        return SignatureChecker.isValidSignatureNow(o.coordinator, digest, r.signature);
+        if (r.ordinal == 0) return false;
+        bytes32 digest =
+            MessageHashUtils.toEthSignedMessageHash(receiptDigest(id, r.worker, r.leaseId, r.deltaHash, r.ordinal));
+        // slither-disable-next-line unused-return (errArg only describes a failure that err already reports)
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, r.signature);
+        return err == ECDSA.RecoverError.NoError && signer == o.coordinator;
     }
 
     /// The coordinator signed a verified lease for a joined worker, and the worker has no leaf.
@@ -1138,20 +1214,13 @@ contract WorkMarket is IWorkMarket, Governable, ReentrancyGuard {
         return false;
     }
 
-    /// The coordinator signed more distinct verified leases for a worker than its leaf pays.
+    /// The coordinator signed a receipt whose ordinal (the worker's verified-lease count) is above
+    /// what the worker's leaf pays.
     function _provesLowUnits(uint256 id, Offer storage o, bytes memory body) internal view returns (bool) {
-        (LeafOpening memory leaf, Receipt[] memory receipts) = abi.decode(body, (LeafOpening, Receipt[]));
+        (LeafOpening memory leaf, Receipt memory r) = abi.decode(body, (LeafOpening, Receipt));
         if (leaf.worker == address(0) || !_opens(id, o, leaf)) return false;
-        if (receipts.length > MAX_RECEIPTS_PER_DISPUTE || receipts.length <= leaf.units) return false;
-        bytes32 prevLease = bytes32(0);
-        for (uint256 i = 0; i < receipts.length; i++) {
-            Receipt memory r = receipts[i];
-            // strictly ascending lease ids: distinct without a set
-            if (r.worker != leaf.worker || (i > 0 && r.leaseId <= prevLease)) return false;
-            if (!_receiptValid(id, o, r)) return false;
-            prevLease = r.leaseId;
-        }
-        return true;
+        if (r.worker != leaf.worker || r.ordinal <= leaf.units) return false;
+        return _receiptValid(id, o, r);
     }
 
     /// Two openable leaves `a.index < b.index` (any two, not only neighbours) break the tree
