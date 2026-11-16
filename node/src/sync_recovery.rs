@@ -25,7 +25,7 @@
 //!   unanswered that long no more steps until it answers. A node-wide budget
 //!   ([`NODE_WALK_BURST`], refilled one step per [`NODE_WALK_REFILL_EVERY`])
 //!   bounds peers that come and go. The
-//!   walk never asks for a parent more than [`MAX_WALK_DEPTH`] below the applied
+//!   walk never asks for a parent more than [`MAX_WALK_DEPTH`] (the reorg window) below the applied
 //!   tip: deeper forks are the fork-point search's job.
 //!
 //!   Stuck parents: a missing parent at the bottom of the orphan buffer that is
@@ -63,15 +63,16 @@ use citrate_consensus::types::{Block, Hash};
 
 /// Steps one peer's walk budget holds. Each recovers one height. Derived, not
 /// picked: gossip ancestry recovery starts from a block at most
-/// [`crate::sync_peer::ANCESTRY_RECOVERY_WINDOW`] above the applied tip, and a
-/// walk goes at most [`MAX_WALK_DEPTH`] below it, so one full budget walks a
-/// branch that forked inside the reorg window while the network moved on as far
-/// as recovery reaches. With 128, a node forked 35 below its tip and ~250
+/// [`crate::sync_peer::ANCESTRY_RECOVERY_WINDOW`] above the applied tip, and one
+/// full budget then walks a further `SNAPSHOT_RING_DEPTH` (100) below it, so a
+/// branch that forked inside the ring is reached in one budget while the
+/// network moved on as far as recovery reaches. A deeper walk, down to
+/// [`MAX_WALK_DEPTH`] , continues on refilled steps. With 128, a node forked 35 below its tip and ~250
 /// behind (DGX devnet phase 3) never reconnected
 /// (`split_heal_tests::four_three_partition_far_behind_heals`). Steps go only
 /// to the peer whose answer asked for them, one per answer.
-pub const MAX_PARENT_WALK_STEPS: u32 =
-    (crate::sync_peer::ANCESTRY_RECOVERY_WINDOW + MAX_WALK_DEPTH) as u32;
+pub const MAX_PARENT_WALK_STEPS: u32 = (crate::sync_peer::ANCESTRY_RECOVERY_WINDOW
+    + crate::canonical_apply::SNAPSHOT_RING_DEPTH) as u32;
 
 /// One step comes back to a peer's spent budget per this interval (one 2 s sync
 /// tick).
@@ -108,14 +109,21 @@ pub const NODE_WALK_BURST: u32 = MAX_PARENT_WALK_STEPS * 2;
 /// One step comes back to the node-wide budget per this interval.
 pub const NODE_WALK_REFILL_EVERY: Duration = Duration::from_millis(250);
 
-/// Deepest parent the walk asks for, below the applied tip: the in-memory
-/// reorg ring (`canonical_apply::SNAPSHOT_RING_DEPTH`, 100), which was the whole
-/// reorg window before S3-4. Kept there when the undo window grew to the prune
-/// retention (10,000): the walk recovers one parent per answer, and tying it to
-/// the window would grow every peer's step budget a hundredfold. A deeper fork
-/// is fetched by the sync fork-point search (`sync_rejoin`) instead, and
-/// switched in place from the undo records.
-pub const MAX_WALK_DEPTH: u64 = crate::canonical_apply::SNAPSHOT_RING_DEPTH;
+/// Deepest parent the walk asks for, below the applied tip: the reorg window
+/// (`canonical_apply::MAX_REORG_DEPTH`, the undo records), i.e. the deepest
+/// fork this node can switch from in place anyway.
+///
+/// (r1007, 2026-11-14): this was the 100-block in-memory ring
+/// (`SNAPSHOT_RING_DEPTH`), on the theory that a deeper fork is fetched by
+/// the fork-point search. It is not, not entirely: a node held on its own
+/// branch above the fork defers the network's blocks whose parents sit more
+/// than 100 below ITS applied tip, and the walk gave every one of them up
+/// (`BeyondWindow`; boot-2 at 95,380 for parents at 95,251, 93,331, 93,203,
+/// 93,171). Four producers and a bootnode never rejoined. The bound is now the
+/// window; the work stays bounded by the step budgets, which are NOT tied to
+/// it ([`MAX_PARENT_WALK_STEPS`] keeps the ring), so a deep walk simply takes
+/// more refill intervals.
+pub const MAX_WALK_DEPTH: u64 = crate::canonical_apply::MAX_REORG_DEPTH;
 
 /// Peers with walk state, at most; the least recently seen is dropped first.
 pub const MAX_WALK_PEERS: usize = 256;
@@ -1208,22 +1216,34 @@ mod tests {
         );
     }
 
-    /// A walk never asks for a parent below the reorg window.
+    /// A walk never asks for a parent below the reorg window, and does ask
+    /// for one at its bottom.
     #[test]
     fn walk_never_goes_below_the_reorg_window() {
         let t = Instant::now();
+        let applied = 50_000u64;
+        let bottom = applied - MAX_WALK_DEPTH;
         let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
-        let applied = 10_000u64;
-        let (steps, last) = descend(&mut w, "a", applied, Some(applied), t);
-        assert_eq!(u64::from(steps), MAX_WALK_DEPTH);
+        assert!(is_ask(w.begin("a", hn(bottom), bottom, applied, t)));
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         assert!(matches!(
-            last,
+            w.begin("a", hn(bottom - 1), bottom - 1, applied, t),
             Step::GaveUp {
                 reason: GiveUp::BeyondWindow,
                 height,
                 ..
-            } if height == applied - MAX_WALK_DEPTH - 1
+            } if height == bottom - 1
         ));
+    }
+
+    /// a node held on its own branch 2,365 above the fork (boot-2
+    /// at 95,380, fork 93,015) asks for a missing parent 2,209 below its tip,
+    /// which the 100-block bound gave up (`BeyondWindow`).
+    #[test]
+    fn a_parent_far_below_a_dead_branch_tip_is_asked_for() {
+        let t = Instant::now();
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
+        assert!(is_ask(w.begin("a", hn(93_171), 93_171, 95_380, t)));
     }
 
     #[test]
@@ -1421,7 +1441,7 @@ mod tests {
     fn give_up_is_reported_once_per_episode_and_rate_limited() {
         let t = Instant::now();
         let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
-        let applied = 10_000u64;
+        let applied = 50_000u64;
         let deep = applied - MAX_WALK_DEPTH - 5;
         let first = w.next("a", ans(Some((deep, hn(deep - 1))), 0, applied), t);
         assert!(matches!(

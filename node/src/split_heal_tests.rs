@@ -839,12 +839,16 @@ impl Fleet {
     /// peer's applied tip, as the transport handshake sets it.
     async fn handshake(&mut self) {
         let n = self.nodes.len();
+        let now = self.now();
         for j in 0..n {
             let (hash, height) = self.nodes[j].applied();
             for i in (0..n).filter(|i| *i != j) {
                 let peer = self.peer(i, j);
                 let mut info = peer.info.write().await;
                 info.head_height = height;
+                info.reported_head_height = height;
+                // The handshake's time on the harness's simulated clock.
+                info.reported_at = now;
                 info.head_hash = hash;
             }
         }
@@ -1514,6 +1518,15 @@ impl Node {
             let info = p.info.read().await;
             if sync_recovery::peer_head_heard(&info.head_hash) {
                 heard = heard.saturating_add(1);
+            }
+            // main.rs: the self-reported head , 0 = none, timed
+            // when reported; the newest wins.
+            if info.reported_head_height > 0 {
+                self.sel.note_reported_head_at(
+                    &info.id.0,
+                    info.reported_head_height,
+                    info.reported_at,
+                );
             }
             best_h = best_h.max(info.head_height);
             candidates.push(sync_peer::SyncCandidate {
@@ -2569,6 +2582,34 @@ mod tests {
                 solo: Some((4, 60)),
                 require_merged: false,
                 prune_retain: Some(HARNESS_PRUNE_RETAIN),
+                ..base(7)
+            },
+        )
+        .await;
+    }
+
+    /// (r1007, 2026-11-14, fork at 93,015): four producers each
+    /// ended up alone on their own branch while the other three kept one
+    /// merged chain, for longer than the 100-block snapshot ring (~2,300
+    /// heights live), with no restart. When the links came back the four
+    /// never rejoined: their fork-point searches found the fork and then
+    /// gave up, the parent walk stopped at the ring, and the producer gate
+    /// held them. Here: the same shape at harness scale, 150 slots apart.
+    #[tokio::test(flavor = "current_thread")]
+    async fn four_lone_producers_forked_past_the_ring_rejoin_the_three() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::four_lone_producers_forked_past_the_ring_rejoin_the_three",
+            );
+        }
+        assert_heals(
+            "4 singletons v 3, forked past the ring",
+            Scenario {
+                groups: vec![vec![0], vec![1], vec![2], vec![3], vec![4, 5, 6]],
+                partition: 150,
+                reconnect: true,
+                heal_rounds: 150,
+                require_merged: false,
                 ..base(7)
             },
         )

@@ -131,10 +131,31 @@ async fn run(
             let to = pid.clone();
             let handle = jobs.spawn(async move {
                 let kind = request.kind();
-                let built =
-                    tokio::task::spawn_blocking(move || answer_frames(&storage, &request)).await;
+                let built = tokio::task::spawn_blocking(move || {
+                    // the anchor of a peer's own sync request is
+                    // its current self-report.
+                    let anchor = match &request {
+                        NetworkMessage::GetBlocks { from, .. }
+                        | NetworkMessage::GetHeaders { from, .. } => {
+                            block_serve::anchor_height(&storage, from)
+                        }
+                        _ => None,
+                    };
+                    (answer_frames(&storage, &request), anchor)
+                })
+                .await;
                 match built {
-                    Ok(frames) => {
+                    Ok((frames, anchor)) => {
+                        // Only ever RAISES the report: a peer probing below
+                        // its own tip (a fork-point search) is not behind.
+                        // Only a handshake sets it lower.
+                        if let (Some(h), Some(p)) = (anchor, pm.get_peer(&to)) {
+                            let mut info = p.info.write().await;
+                            if h > info.reported_head_height {
+                                info.reported_head_height = h;
+                                info.reported_at = std::time::Instant::now();
+                            }
+                        }
                         let blocks: usize = frames
                             .iter()
                             .map(|f| match f {

@@ -2544,13 +2544,34 @@ mod tests {
         // request the next start carries out.
         let policy = Policy::from(&crate::config::RecoveryConfig::default());
         assert!(matches!(
-            cold_resync::evaluate(&n.app, ndir.path(), policy, false, wedge.since_unix)
-                .expect("evaluate"),
+            cold_resync::evaluate(
+                &n.app,
+                &n.storage,
+                None,
+                ndir.path(),
+                policy,
+                false,
+                &citrate_storage::signed_votes::Binding::default(),
+                wedge.since_unix
+            )
+            .await
+            .expect("evaluate"),
             Decision::Waiting { .. }
         ));
         let now = wedge.since_unix + policy.after_secs;
         assert!(matches!(
-            cold_resync::evaluate(&n.app, ndir.path(), policy, false, now).expect("evaluate"),
+            cold_resync::evaluate(
+                &n.app,
+                &n.storage,
+                None,
+                ndir.path(),
+                policy,
+                false,
+                &citrate_storage::signed_votes::Binding::default(),
+                now
+            )
+            .await
+            .expect("evaluate"),
             Decision::Resync(_)
         ));
         std::fs::write(ndir.path().join("noise.key"), b"node identity").expect("identity");
