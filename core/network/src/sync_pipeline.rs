@@ -270,6 +270,8 @@ pub struct PipelineStats {
     pub delivered_blocks: u64,
     /// Deliveries dropped because their chain did not connect to ours.
     pub unconnected: u64,
+    /// Peers charged for a delivery provably off our chain.
+    pub unconnected_charged: u64,
     /// Blocks not held because the reorder buffer was at its caps.
     pub held_cap_drops: u64,
     /// Heights asked for again because an answer left a block of them out.
@@ -391,9 +393,6 @@ struct PeerSlot {
     excluded_until: Option<Instant>,
     /// Times it has been excluded: each exclusion lasts twice the last.
     exclusions: u32,
-    /// Blocks of its released to admission (connected to our chain) since it
-    /// was last charged.
-    connected_since_strike: u64,
     header_backoff_until: Option<Instant>,
 }
 
@@ -412,7 +411,6 @@ impl PeerSlot {
             strikes: 0,
             excluded_until: None,
             exclusions: 0,
-            connected_since_strike: 0,
             header_backoff_until: None,
         }
     }
@@ -484,9 +482,6 @@ pub struct BlockPipeline {
     buffer: BTreeMap<u64, Vec<Held>>,
     buffered_bytes: usize,
     buffered_count: usize,
-    /// Peers over their share of the buffer whose answer already ended: they
-    /// are charged on the next poll.
-    over_share: HashSet<PeerId>,
     /// Heights asked for again (once each) because a block above references
     /// a block of them that was never delivered.
     refilled: HashSet<u64>,
@@ -521,7 +516,6 @@ impl BlockPipeline {
             buffered_count: 0,
             refilled: HashSet::new(),
             released_by: BTreeMap::new(),
-            over_share: HashSet::new(),
             max_siblings: 0,
             last_progress: now,
             stats: PipelineStats::default(),
@@ -990,10 +984,13 @@ impl BlockPipeline {
             )
             .unwrap_or(self.config.request_count)
             .max(1);
-            let overlaps = self
-                .in_flight_windows()
-                .iter()
-                .any(|(_, l, h)| *l <= hi && lo <= *h);
+            // A refill deliberately asks again for one height an answer
+            // already passed; anything else must not overlap.
+            let overlaps = !w.refill
+                && self
+                    .in_flight_windows()
+                    .iter()
+                    .any(|(_, l, h)| *l <= hi && lo <= *h);
             if overlaps {
                 self.stats.overlapping_requests = self.stats.overlapping_requests.saturating_add(1);
             }
@@ -1394,9 +1391,6 @@ impl BlockPipeline {
                 if !by.contains(&x.peer) {
                     by.push(x.peer.clone());
                 }
-                if let Some(slot) = self.peers.get_mut(&x.peer) {
-                    slot.connected_since_strike = slot.connected_since_strike.saturating_add(1);
-                }
                 out.push(x.block);
             }
             if !stay.is_empty() {
@@ -1497,10 +1491,11 @@ impl BlockPipeline {
     /// the parent's height is asked for again (an answer cut mid-group, or a
     /// sibling left out). If that does not bring it, the blocks cannot connect
     /// to our chain: they are dropped and their window goes back to the pool,
-    /// with that peer tried last. No one is charged here: which side is wrong
-    /// is not known from this alone (the stall valve charges a delivery the
-    /// node then cannot apply).
-    fn settle(&mut self) {
+    /// with that peer tried last. The peer is charged only when this is
+    /// provable: the parent's height is verified and final (at or below the
+    /// frontier, nothing in flight for it) and was already asked for again.
+    /// The stall valve charges a delivery that was released and never applied.
+    fn settle(&mut self, now: Instant) {
         let Some(next) = self.frontier.checked_add(1) else {
             return;
         };
@@ -1540,16 +1535,31 @@ impl BlockPipeline {
                 stuck.push((below, x.peer.clone(), x.win_lo, x.win_hi));
             }
         }
+        let frontier = self.frontier;
         let mut drop: Vec<(PeerId, u64, u64)> = Vec::new();
+        let mut proven: Vec<PeerId> = Vec::new();
         for (below, peer, win_lo, win_hi) in stuck {
             if !self.refilled.contains(&below) {
                 self.refill(below);
             } else if !self.refill_pending(below) && !covered_in_flight(below) {
+                // Provably off our chain: its parent's height is verified and
+                // final (at or below the frontier, nothing in flight for it)
+                // and was asked for once more, and the parent is not there.
+                if below <= frontier && !proven.contains(&peer) {
+                    proven.push(peer.clone());
+                }
                 let key = (peer, win_lo, win_hi);
                 if !drop.contains(&key) {
                     drop.push(key);
                 }
             }
+        }
+        for p in &proven {
+            self.stats.unconnected_charged = self.stats.unconnected_charged.saturating_add(1);
+            if let Some(slot) = self.peers.get_mut(p) {
+                slot.rate_milli = slot.rate_milli.map(|r| r / 4);
+            }
+            self.strike(p, now);
         }
         for (peer, win_lo, win_hi) in drop {
             let mut emptied: Vec<u64> = Vec::new();
@@ -1611,15 +1621,6 @@ impl BlockPipeline {
         );
     }
 
-    /// Nothing `peer` delivered has connected to our chain since it was last
-    /// charged. A peer whose holdings are over its share only because they
-    /// wait behind another peer's windows has delivered connected blocks.
-    fn delivered_nothing_connected(&self, peer: &PeerId) -> bool {
-        self.peers
-            .get(peer)
-            .is_some_and(|s| s.connected_since_strike == 0)
-    }
-
     fn over_caps(&self, bytes: usize) -> bool {
         self.buffered_count >= self.config.max_held_blocks
             || self.buffered_bytes.saturating_add(bytes) > self.config.max_held_bytes
@@ -1651,10 +1652,11 @@ impl BlockPipeline {
     /// frontier of the heaviest holder over its share is evicted (its window
     /// goes back to the pool with that peer tried last), provided it lies
     /// above `h` or belongs to another peer. If no room can be made, the
-    /// block is refused. A peer is charged only when it is over its share and
-    /// nothing it delivered has connected since its last charge: a full
-    /// buffer is charged to whoever filled it, never to a peer whose blocks
-    /// are only waiting.
+    /// block is refused. Nobody is charged for volume: eviction bounds the
+    /// memory, and an honest peer's blocks can be over its share only because
+    /// they wait behind a slow peer's gap. A delivery that never connects is
+    /// dropped by `settle`, and one that was released and never applied is
+    /// charged by the stall valve.
     fn make_room(&mut self, peer: &PeerId, h: u64, bytes: usize) -> bool {
         let (share_blocks, share_bytes) = self.share();
         while self.over_caps(bytes) {
@@ -1694,22 +1696,8 @@ impl BlockPipeline {
                 self.plan_gap(start, win_hi.max(start), &vp);
             }
             let _ = win_lo;
-            // A holder over its share that has delivered nothing connected
-            // since it was last charged is charged (once).
-            if self.delivered_nothing_connected(&vp) {
-                self.over_share.insert(vp.clone());
-            }
         }
-        if !self.over_caps(bytes) {
-            return true;
-        }
-        let (n, b) = self.holdings().get(peer).copied().unwrap_or((0, 0));
-        if (n >= share_blocks || b.saturating_add(bytes) > share_bytes)
-            && self.delivered_nothing_connected(peer)
-        {
-            self.over_share.insert(peer.clone());
-        }
-        false
+        !self.over_caps(bytes)
     }
 
     /// One strike against `peer`; at `max_strikes` it is excluded for a while
@@ -1717,7 +1705,6 @@ impl BlockPipeline {
     fn strike(&mut self, peer: &PeerId, now: Instant) {
         let exclude = match self.peers.get_mut(peer) {
             Some(slot) => {
-                slot.connected_since_strike = 0;
                 slot.strikes = slot.strikes.saturating_add(1);
                 if slot.strikes >= self.config.max_strikes {
                     slot.strikes = 0;
@@ -1916,7 +1903,7 @@ impl BlockPipeline {
             self.complete_front(peer, now);
         }
         self.verify_held();
-        self.settle();
+        self.settle(now);
         immediate.extend(self.take_releasable());
         BlocksOutcome {
             attribution: Some(attribution),
@@ -2009,11 +1996,8 @@ impl BlockPipeline {
         // Settle what is held even when no answer is arriving (a refill or a
         // re-plan may be all that is left to do).
         self.verify_held();
-        self.settle();
+        self.settle(now);
         out.flushed.extend(self.take_releasable());
-        for p in std::mem::take(&mut self.over_share) {
-            self.strike(&p, now);
-        }
         let ids: Vec<PeerId> = self.peers.keys().cloned().collect();
         for id in ids {
             while let Some(slot) = self.peers.get(&id) {
@@ -2983,9 +2967,11 @@ mod tests {
         assert!(pl.stats().held_cap_drops > 0);
     }
 
-    /// A peer fills the reorder buffer with blocks that never connect; the
-    /// honest peer answering the frontier windows is never charged for it,
-    /// is never excluded, and its answers keep the node moving.
+    /// A peer fills the reorder buffer with blocks that never connect: its
+    /// blocks are the ones evicted, it is charged only through `settle` (its
+    /// deliveries provably never connect), the honest peer answering the
+    /// frontier windows is never charged or excluded, and the node reaches
+    /// the target.
     #[test]
     fn a_full_buffer_is_charged_to_the_peer_that_filled_it() {
         let t0 = Instant::now();
@@ -3055,6 +3041,7 @@ mod tests {
             "the buffer filled: {:?}",
             pl.stats()
         );
+        assert!(pl.stats().unconnected_charged > 0, "z charged via settle");
         assert_eq!(pl.stats().overlapping_requests, 0);
     }
 
