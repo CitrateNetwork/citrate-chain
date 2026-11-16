@@ -30,6 +30,7 @@ lru = "0.17"
 parking_lot = "0.12"
 dashmap = "5.5"
 hex = "0.4"
+libc = "0.2"  # fcntl lock probe on the RocksDB LOCK file (signed_votes::ensure_unlocked)
 num_cpus = "1.16"
 primitive-types = "0.12"
 ethereum-types = "0.14"

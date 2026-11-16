@@ -451,6 +451,8 @@ async fn handle_inbound(
     let mut info = PeerInfo::new(remote_id.clone(), addr, Direction::Inbound);
     info.state = super::peer::PeerState::Connected;
     info.head_height = remote_head_height;
+    info.reported_head_height = remote_head_height;
+    info.reported_at = Instant::now();
     info.head_hash = remote_head_hash;
     // Gates V2 native transaction relay to this peer (`Peer::send`).
     info.version = Some(version);
@@ -791,6 +793,8 @@ async fn handle_outbound(
         let mut info = PeerInfo::new(remote_id.clone(), addr, Direction::Outbound);
         info.state = super::peer::PeerState::Connected;
         info.head_height = head_height;
+        info.reported_head_height = head_height;
+        info.reported_at = Instant::now();
         info.head_hash = head_hash;
         // Gates V2 native transaction relay to this peer (`Peer::send`).
         info.version = Some(version);

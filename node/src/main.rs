@@ -1957,7 +1957,26 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // dead branch it could not switch from) moves the chain database aside
     // here, before it is opened; the node then syncs from genesis via peers.
     let recovery_policy = cold_resync::Policy::from(&config.recovery);
-    cold_resync::apply_pending(&config.storage.data_dir, recovery_policy)?;
+    // the resync reads the moved database's signed-vote record
+    // with this node's storage key, and binds the carry file to this chain,
+    // genesis and validator.
+    let resync_binding = citrate_storage::signed_votes::Binding {
+        chain_id: Some(config.chain.chain_id),
+        genesis: config
+            .chain
+            .genesis_hash
+            .as_deref()
+            .and_then(citrate_storage::signed_votes::Binding::normalize),
+        validator: citrate_storage::signed_votes::Binding::normalize(&config.mining.coinbase),
+    };
+    cold_resync::apply_pending(
+        &config.storage.data_dir,
+        recovery_policy,
+        &cold_resync::Carry {
+            encryption: storage_encryption.clone(),
+            binding: resync_binding.clone(),
+        },
+    )?;
     let storage = Arc::new(StorageManager::with_config(
         &config.storage.data_dir,
         StorageConfig {
@@ -1971,6 +1990,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             encryption: storage_encryption,
         },
     )?);
+    // a voting validator's signed-vote record carried across that
+    // resync goes back into the new database now, before anything that can
+    // sign is built. A record that cannot be imported stops the start.
+    cold_resync::import_carried_votes_bound(&storage, &config.storage.data_dir, &resync_binding)?;
 
     // A release network's genesis only runs under that network's chain id: the
     // genesis block does not commit to the chain id, so otherwise a node could
@@ -2605,12 +2628,18 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // CV-7c: a node held on a dead branch (the applicator's dead-branch
     // marker) for `[recovery] cold_resync_after_secs` requests a guarded cold
     // resync and exits for the supervisor to restart it (cold_resync.rs).
+    // "votes" means THIS node signs checkpoint votes (finality on
+    // and a consensus identity), not merely that finality is on; such a node
+    // resyncs with its signed-vote record carried (cold_resync.rs).
     if let Some(app) = canonical_applicator.clone() {
         cold_resync::spawn_monitor(
             app,
+            storage.clone(),
+            Some(finality_gadget.clone()),
             config.storage.data_dir.clone(),
             recovery_policy,
-            finality_voting_on,
+            cold_resync::signs_checkpoint_votes(finality_voting_on, &config.mining.coinbase),
+            resync_binding.clone(),
         );
     }
 
@@ -3226,6 +3255,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let mut best_hash = citrate_consensus::types::Hash::new([0u8; 32]);
                 let mut split_candidates: Vec<sync_peer::SplitCandidate> = Vec::new();
                 let mut heard_peers: usize = 0;
+                let mut reported_heads: Vec<(String, u64, std::time::Instant)> = Vec::new();
                 for p in pm_for_sync.get_all_peers() {
                     let info = p.info.read().await;
                     if info.state != citrate_network::peer::PeerState::Connected {
@@ -3243,6 +3273,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         head_height: info.head_height,
                         head_hash: info.head_hash,
                     });
+                    // the head the peer reported for itself, which
+                    // gossip cannot inflate, ranks a far-behind peer last
+                    // (noted below, after the peer locks are released).
+                    reported_heads.push((
+                        info.id.0.clone(),
+                        info.reported_head_height,
+                        info.reported_at,
+                    ));
                     connected_peers.push((
                         sync_peer::SyncCandidate {
                             id: info.id.0.clone(),
@@ -3250,6 +3288,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         },
                         p.clone(),
                     ));
+                }
+                {
+                    let mut sel = sync_peers_for_loop.lock().await;
+                    // 0: no report yet (a genesis peer says nothing either).
+                    // Timed when reported: the handshake, then each sync
+                    // request the peer sends (serve_plane); the newest wins.
+                    for (id, h, at) in reported_heads.iter().filter(|(_, h, _)| *h > 0) {
+                        sel.note_reported_head_at(id, *h, *at);
+                    }
                 }
                 // Drive the sync target off the MAX of the best connected-peer head
                 // and the max height we have evidence for ANYWHERE (gossip / a

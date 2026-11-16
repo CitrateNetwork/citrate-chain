@@ -444,3 +444,76 @@ fn answer_frames_fit_the_noise_cap() {
     );
     assert_eq!(headers.len(), 1);
 }
+
+/// a peer's own sync requests are its current
+/// self-report. A `GetBlocks` (or `GetHeaders`) anchored at a block we hold at
+/// height h refreshes that peer's reported head to h, so a long-lived
+/// connection keeps an up-to-date report without a new handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peers_sync_request_refreshes_its_reported_head() {
+    let (_dir, storage, _tip) = chain_of(40);
+    let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+    let (serve_tx, serve_rx) = mpsc::channel(citrate_network::inbound::SERVE_LANE_CAPACITY);
+    pm.set_serve_sink(serve_tx).await;
+    let serving = crate::serve_plane::spawn(storage.clone(), pm.clone(), serve_rx);
+    let (p, mut outbox) = peer("member");
+    p.info.write().await.reported_head_height = 3;
+    pm.add_peer(p.clone()).await.expect("add peer");
+    let anchor = storage
+        .blocks
+        .get_block_by_height(25)
+        .expect("read")
+        .expect("height 25");
+    pm.forward_incoming(
+        PeerId::new("member".to_string()),
+        NetworkMessage::GetBlocks {
+            from: anchor,
+            count: 8,
+            step: 1,
+        },
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), outbox.recv())
+        .await
+        .expect("answered");
+    assert_eq!(p.info.read().await.reported_head_height, 25);
+    serving.abort();
+}
+
+/// A request anchor only RAISES a peer's reported head. A peer probing below
+/// its own tip (a fork-point search) must not look far behind; only a new
+/// handshake may lower the report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lower_request_anchor_never_lowers_the_reported_head() {
+    let (_dir, storage, _tip) = chain_of(40);
+    let pm = Arc::new(PeerManager::new(PeerManagerConfig::default()));
+    let (serve_tx, serve_rx) = mpsc::channel(citrate_network::inbound::SERVE_LANE_CAPACITY);
+    pm.set_serve_sink(serve_tx).await;
+    let serving = crate::serve_plane::spawn(storage.clone(), pm.clone(), serve_rx);
+    let (p, mut outbox) = peer("prober");
+    p.info.write().await.reported_head_height = 30;
+    pm.add_peer(p.clone()).await.expect("add peer");
+    let anchor = storage
+        .blocks
+        .get_block_by_height(12)
+        .expect("read")
+        .expect("height 12");
+    pm.forward_incoming(
+        PeerId::new("prober".to_string()),
+        NetworkMessage::GetBlocks {
+            from: anchor,
+            count: 8,
+            step: 1,
+        },
+    )
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), outbox.recv())
+        .await
+        .expect("answered");
+    assert_eq!(
+        p.info.read().await.reported_head_height,
+        30,
+        "a lower anchor lowered the report"
+    );
+    serving.abort();
+}
