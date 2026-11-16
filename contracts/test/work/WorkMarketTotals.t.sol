@@ -215,8 +215,7 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         vm.prank(w1);
         vm.expectRevert(WorkMarket.WrongBond.selector);
         market.challengeIndex{value: CHBOND - 1}(id, 0);
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
-        rs[0] = _receipt(id, w2, bytes32(uint256(1)));
+        WorkMarket.Receipt memory rs = _receipt(id, w2, bytes32(uint256(1)));
         vm.prank(w2);
         vm.expectRevert(WorkMarket.WrongBond.selector);
         market.challengeInclusion(id, rs);
@@ -228,14 +227,13 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
         vm.prank(w1);
         market.challengeIndex{value: CHBOND}(id, 3);
-        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND);
+        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND + 3 * JBOND);
         vm.prank(stranger);
         market.answerIndexChallenge(id, _padding(leaves, 3));
         assertEq(market.balanceOf(stranger), 0);
-        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND, "held until the root survives");
+        assertEq(market.owedOn(id), BUDGET + CBOND + CHBOND + 3 * JBOND, "held until the root survives");
 
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
-        rs[0] = _receipt(id, w2, bytes32(uint256(1)));
+        WorkMarket.Receipt memory rs = _receipt(id, w2, bytes32(uint256(1)));
         vm.prank(w2);
         market.challengeInclusion{value: CHBOND}(id, rs);
         vm.prank(coordinator);
@@ -244,7 +242,7 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         market.releaseIndexChallengeBond(id, 3);
         market.releaseChallengeBond(id, w2);
         assertEq(market.balanceOf(coordinator), 2 * CHBOND);
-        assertEq(market.owedOn(id), BUDGET + CBOND);
+        assertEq(market.owedOn(id), BUDGET + CBOND + 3 * JBOND);
     }
 
     function test_upheld_challenge_returns_its_bond() public {
@@ -259,7 +257,7 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         vm.warp(block.timestamp + market.CHALLENGE_RESPONSE_WINDOW() + 1);
         market.resolveIndexChallenge(id, 0);
         assertEq(market.balanceOf(w1), CBOND / 2 + CHBOND);
-        assertEq(market.owedOn(id), BUDGET);
+        assertEq(market.owedOn(id), BUDGET + JBOND);
     }
 
     function test_challenge_left_open_by_a_withdrawn_root_refunds_its_bond() public {
@@ -283,13 +281,12 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         assertEq(market.balanceOf(w2), CHBOND);
         vm.expectRevert(WorkMarket.NothingToClaim.selector);
         market.releaseIndexChallengeBond(id, 1);
-        assertEq(market.owedOn(id), BUDGET);
+        assertEq(market.owedOn(id), BUDGET + 2 * JBOND);
 
         // a worker challenge left open by an upheld dispute is reclaimable too
         (bytes32[] memory l2,) = _leaves(id, _twoEntries(), _noOverride(), 1);
         _postTree(id, l2, 2);
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
-        rs[0] = _receipt(id, w2, bytes32(uint256(1)));
+        WorkMarket.Receipt memory rs = _receipt(id, w2, bytes32(uint256(1)));
         vm.prank(w1);
         market.challengeInclusion{value: CHBOND}(id, rs);
         bytes memory tev = _total(_opening(l2, 1, Entry(w2, 5), 1), _none()); // w2 ends at 6 > 2
@@ -299,7 +296,7 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         market.releaseChallengeBond(id, w2);
         // w1: slash share and bond from the first (upheld) challenge, plus this reclaimed bond
         assertEq(market.balanceOf(w1), CBOND / 2 + 2 * CHBOND);
-        assertEq(market.owedOn(id), BUDGET);
+        assertEq(market.owedOn(id), BUDGET + 2 * JBOND);
     }
 
     /// A challenge a withdrawn root left open hands its bond back when the same slot or worker is
@@ -313,8 +310,7 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         leaves[0] = keccak256("no preimage");
         leaves[1] = keccak256("none either");
         _postTree(id, leaves, 1);
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](1);
-        rs[0] = _receipt(id, w1, bytes32(uint256(1)));
+        WorkMarket.Receipt memory rs = _receipt(id, w1, bytes32(uint256(1)));
         vm.prank(w2);
         market.challengeInclusion{value: CHBOND}(id, rs); // w2 challenges for w1
         vm.prank(w2);
@@ -330,11 +326,11 @@ contract WorkMarketTotalsTest is WorkMarketTestBase {
         vm.prank(w1);
         market.challengeIndex{value: CHBOND}(id, 1);
         assertEq(market.balanceOf(w2), before + CHBOND, "stale index-challenge bond returned");
-        rs[0] = _receipt(id, w1, bytes32(uint256(1)));
+        rs = _receipt(id, w1, bytes32(uint256(1)));
         vm.prank(w1);
         market.challengeInclusion{value: CHBOND}(id, rs);
         assertEq(market.balanceOf(w2), before + 2 * CHBOND, "stale worker-challenge bond returned");
-        assertEq(market.owedOn(id), BUDGET + CBOND + 2 * CHBOND);
+        assertEq(market.owedOn(id), BUDGET + CBOND + 2 * CHBOND + 2 * JBOND);
         // live challenges are not reclaimable
         vm.expectRevert(WorkMarket.NothingToClaim.selector);
         market.releaseChallengeBond(id, w1);

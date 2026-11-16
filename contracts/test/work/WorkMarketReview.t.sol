@@ -14,11 +14,9 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         return abi.encode(tag, body);
     }
 
-    function _receipts(uint256 id, address w, uint256 n) internal view returns (WorkMarket.Receipt[] memory rs) {
-        rs = new WorkMarket.Receipt[](n);
-        for (uint256 i = 0; i < n; i++) {
-            rs[i] = _receipt(id, w, bytes32(i + 1));
-        }
+    /// The receipt for `w`'s `n`-th verified lease: it proves `w` is owed at least `n` units.
+    function _receipts(uint256 id, address w, uint256 n) internal view returns (WorkMarket.Receipt memory) {
+        return _receiptN(id, w, bytes32(n), uint64(n));
     }
 
     /// TASK offer; `w1` joins as a second worker so a non-poster party can challenge.
@@ -70,16 +68,16 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
     function test_answer_records_leaf_units_and_stops_rechallenge_ladder() public {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
         Entry[] memory e = _entries3(); // w2's leaf pays 3
-        WorkMarket.Receipt[] memory one = _receipts(id, w2, 1);
+        WorkMarket.Receipt memory one = _receipts(id, w2, 1);
         vm.prank(w2);
         market.challengeInclusion{value: CHBOND}(id, one);
         market.answerChallenge(id, _opening(leaves, 1, e[1], 2));
         assertEq(market.challengeOf(id, w2).answeredUnits, 3);
-        WorkMarket.Receipt[] memory two = _receipts(id, w2, 2);
+        WorkMarket.Receipt memory two = _receipts(id, w2, 2);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector);
         market.challengeInclusion{value: CHBOND}(id, two);
-        WorkMarket.Receipt[] memory three = _receipts(id, w2, 3);
+        WorkMarket.Receipt memory three = _receipts(id, w2, 3);
         vm.prank(w2);
         vm.expectRevert(WorkMarket.BadEvidence.selector);
         market.challengeInclusion{value: CHBOND}(id, three);
@@ -105,12 +103,12 @@ contract WorkMarketReviewTest is WorkMarketTestBase {
         vm.prank(poster);
         market.refund(id);
         assertEq(market.balanceOf(poster), 3 * PRICE);
-        assertEq(market.owedOn(id), 0);
+        assertEq(market.owedOn(id), 2 * JBOND, "the two join bonds wait for claimBond");
     }
 
     function test_upheld_subjective_dispute_waits_for_open_challenge() public {
         (uint256 id,) = _postedTask(true);
-        WorkMarket.Receipt[] memory rs = _receipts(id, w1, 1);
+        WorkMarket.Receipt memory rs = _receipts(id, w1, 1);
         vm.prank(w1);
         market.challengeInclusion{value: CHBOND}(id, rs);
         vm.prank(poster);

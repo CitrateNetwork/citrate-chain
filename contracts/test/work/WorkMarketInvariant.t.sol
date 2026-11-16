@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {WorkMarket} from "../../src/work/WorkMarket.sol";
 import {IWorkMarket} from "../../src/work/IVerifier.sol";
 import {SwitchVerifier} from "./WorkMarketTestBase.sol";
+import {SignsNothing} from "./WorkMarketHardening.t.sol";
 
 /// @notice Drives WorkMarket through random sequences of every entry point and keeps ghost
 ///         records for the 0.6.0 planset 06 §7 invariants.
@@ -14,7 +15,9 @@ contract WorkMarketHandler is Test {
     address public governance;
     address public guardian;
 
-    address[4] internal actors = [address(0xA1), address(0xA2), address(0xA3), address(0xA4)];
+    uint256 public constant ACTORS = 6;
+    address[6] internal actors =
+        [address(0xA1), address(0xA2), address(0xA3), address(0xA4), address(0xA5), address(0xA6)];
     address public poster = address(0x9001);
     uint256 internal constant COORD_KEY = 0xC0FFEE;
     address public coordinator = vm.addr(COORD_KEY);
@@ -39,7 +42,10 @@ contract WorkMarketHandler is Test {
     uint256 public pcMinLoss;
 
     uint32 internal constant WINDOW = 24 hours;
-    uint8 internal constant DEPTH = 2; // maxWorkers 4: four slots
+    uint8 internal constant DEPTH = 3; // maxWorkers 8: eight slots
+    uint256 internal constant SLOTS = 8;
+    /// Units an offer may buy: past 256, so a leaf can pay more units than any fixed receipt count.
+    uint64 internal constant MAX_UNITS = 600;
 
     /// One slot of the posted tree as the coordinator built it. `idx` is the index hashed into
     /// the leaf (differs from the slot for an out-of-range leaf); `garbage` has no preimage.
@@ -59,12 +65,15 @@ contract WorkMarketHandler is Test {
     uint256[] public ids;
     mapping(uint256 => uint128) public priceAtOpen;
     mapping(uint256 => bytes32[]) internal leavesOf;
-    mapping(uint256 => Slot[4]) internal slotsOf;
+    mapping(uint256 => Slot[8]) internal slotsOf;
     /// The honest watcher of a malformed tree (the worker the tree cheats) and the slots it has seen.
     mapping(uint256 => address) internal watcherOf;
-    mapping(uint256 => bool[4]) internal revealedOf;
+    mapping(uint256 => bool[8]) internal revealedOf;
     /// Slots whose leaf is an honest worker's real claim (receipted work the tree must pay).
-    mapping(uint256 => bool[4]) internal honestOf;
+    mapping(uint256 => bool[8]) internal honestOf;
+    /// A root that short-pays (mode 6) or leaves out (mode 7) a worker holding the coordinator's
+    /// receipt for its `owedOf` leases.
+    mapping(uint256 => bool) internal receiptCheatLive;
     mapping(uint256 => mapping(address => uint256)) public settleCount;
     mapping(bytes32 => Range[]) internal settledRanges; // keccak(id, payoutEpoch)
 
@@ -76,6 +85,10 @@ contract WorkMarketHandler is Test {
     bool public overlapSettled;
     bool public malformedRootPaid;
     bool public honestLeafBlocked;
+    /// A root that short-paid or left out a receipted worker paid anyone.
+    bool public receiptCheatPaid;
+    /// An FL offer opened with a coordinator that has code.
+    bool public contractCoordinatorOpened;
     mapping(uint256 => bool) internal malformedLive;
     uint256 public challengesRaised;
     uint256 public challengesResolved;
@@ -86,6 +99,9 @@ contract WorkMarketHandler is Test {
     uint256 public posts;
     uint256 public maliciousPosts;
     uint256 public settles;
+    uint256 public receiptCheats;
+    uint256 public receiptRemedies;
+    uint256 public coordinatorCodeAdded;
 
     constructor(WorkMarket m, SwitchVerifier v, address gov, address guard) {
         market = m;
@@ -97,7 +113,7 @@ contract WorkMarketHandler is Test {
         vm.deal(pc, type(uint128).max);
         vm.deal(pc2, 1e30);
         vm.deal(pcSy, 1e24);
-        for (uint256 i = 0; i < 4; i++) {
+        for (uint256 i = 0; i < ACTORS; i++) {
             vm.deal(actors[i], 1e24);
         }
     }
@@ -121,9 +137,39 @@ contract WorkMarketHandler is Test {
     }
 
     function _path(bytes32[] memory leaves, uint256 slot) internal pure returns (bytes32[] memory path) {
-        path = new bytes32[](2);
-        path[0] = leaves[slot ^ 1];
-        path[1] = slot < 2 ? _node(leaves[2], leaves[3]) : _node(leaves[0], leaves[1]);
+        path = new bytes32[](DEPTH);
+        bytes32[] memory level = leaves;
+        uint256 idx = slot;
+        for (uint256 d = 0; d < DEPTH; d++) {
+            path[d] = level[idx ^ 1];
+            level = _up(level);
+            idx >>= 1;
+        }
+    }
+
+    function _up(bytes32[] memory level) internal pure returns (bytes32[] memory next) {
+        next = new bytes32[](level.length / 2);
+        for (uint256 i = 0; i < next.length; i++) {
+            next[i] = _node(level[2 * i], level[2 * i + 1]);
+        }
+    }
+
+    function _rootOf(bytes32[] memory leaves) internal pure returns (bytes32) {
+        bytes32[] memory level = leaves;
+        while (level.length > 1) level = _up(level);
+        return level[0];
+    }
+
+    /// The coordinator's signed receipt for `w`'s `ordinal`-th verified lease on `id`.
+    function _receiptFor(uint256 id, address w, uint64 ordinal) internal view returns (WorkMarket.Receipt memory) {
+        bytes32 lease = keccak256(abi.encode("lease", id, w, ordinal));
+        bytes32 delta = keccak256(abi.encode(lease));
+        bytes32 d = market.receiptDigest(id, w, lease, delta, ordinal);
+        (uint8 v, bytes32 r, bytes32 s_) =
+            vm.sign(keyOf[id], keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", d)));
+        return WorkMarket.Receipt({
+            worker: w, leaseId: lease, deltaHash: delta, ordinal: ordinal, signature: abi.encodePacked(r, s_, v)
+        });
     }
 
     /// The opening of `slot` as an honest holder of the tree would present it.
@@ -141,6 +187,7 @@ contract WorkMarketHandler is Test {
         delete revealedOf[id];
         delete honestOf[id];
         delete malformedLive[id];
+        delete receiptCheatLive[id];
     }
 
     /// Records a slash of pc's bond when an upholding call withdrew a pc root.
@@ -164,8 +211,8 @@ contract WorkMarketHandler is Test {
         external
     {
         price = uint128(bound(price, 1, 1e21));
-        units = uint64(bound(units, 1, 50));
-        joinBond = uint128(bound(joinBond, 0, 1e18));
+        units = uint64(bound(units, 1, MAX_UNITS));
+        joinBond = uint128(bound(joinBond, market.minJoinBond(), 2e18));
         // 0 takes the default; otherwise at least the market minimum
         if (cbond != 0) cbond = uint128(bound(cbond, market.minCoordinatorBond(), 1e19));
         bool pcMode = selfCoordinated && !task;
@@ -184,7 +231,7 @@ contract WorkMarketHandler is Test {
             pricePerUnit: price,
             deadline: uint64(block.timestamp + 3 days),
             disputeWindow: WINDOW,
-            maxWorkers: 4,
+            maxWorkers: uint32(SLOTS),
             joinBond: joinBond,
             coordinator: coord,
             coordinatorBond: cbond,
@@ -211,11 +258,11 @@ contract WorkMarketHandler is Test {
         } catch {}
     }
 
-    /// actorSeed % 5 == 4 joins the coordinator (a TASK's selected worker must have joined).
+    /// actorSeed % 7 == 6 joins the coordinator (a TASK's selected worker must have joined).
     function join(uint256 seed, uint256 actorSeed) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        address a = actorSeed % 5 == 4 ? coordinator : actors[actorSeed % 4];
+        address a = actorSeed % 7 == 6 ? coordinator : actors[actorSeed % ACTORS];
         uint128 bond = market.getOffer(id).joinBond;
         bytes32[] memory none;
         vm.prank(a);
@@ -227,7 +274,7 @@ contract WorkMarketHandler is Test {
         verifier.setAccepted(_id(seed), keccak256(abi.encode("digest", seed)));
     }
 
-    /// Posts a payout tree. mode % 4: 0 a well-formed tree over the joined actors (published to
+    /// Posts a payout tree. mode % 8: 0 a well-formed tree over the joined actors (published to
     /// everyone); 1 honest `a` and sybil `b` claim the same range across a garbage separator;
     /// 2 the sybil leaf sits at slot 1 hashed with out-of-range index 5; 3 the same overlap across
     /// a padding slot. In modes 1-3 the coordinator publishes nothing, so the cheated worker `a`
@@ -235,16 +282,28 @@ contract WorkMarketHandler is Test {
     /// Mode 4: the sybil `a` takes `units` at 0 and honest `b` gets 1 unit at `units`, posted
     /// `units` (the leaves sum past payoutUnits). Mode 5: a well-formed tree over `a` (1 unit)
     /// and `b` (`units`), under-posted by one. In modes 4-5 the watcher is `b`, holding its leaf.
+    /// Mode 6: honest `a` did `units` verified leases (it holds the receipt for the last one),
+    /// the well-formed tree pays it fewer and gives the rest to the sybil `b`. Mode 7: the tree
+    /// pays only the sybil `b` and leaves out honest `a`, which holds a receipt. In modes 6-7
+    /// the coordinator's address may gain code (`addCode`) before `a` acts on its receipt.
     function postPayout(uint256 seed, uint64 units, bool acceptFirst, uint8 mode) external {
+        _postPayout(seed, units, acceptFirst, mode, false);
+    }
+
+    function postPayoutThenAddCode(uint256 seed, uint64 units, uint8 mode) external {
+        _postPayout(seed, units, true, 6 + (mode % 2), true);
+    }
+
+    function _postPayout(uint256 seed, uint64 units, bool acceptFirst, uint8 mode, bool addCode) internal {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         if (acceptFirst) verifier.setAccepted(id, keccak256(abi.encode("digest", id)));
         WorkMarket.Offer memory o = market.getOffer(id);
         if (o.maxUnits == 0) return;
         units = uint64(bound(units, 1, o.maxUnits));
-        mode = mode % 6;
+        mode = mode % 8;
 
-        Slot[4] memory slots;
+        Slot[8] memory slots;
         uint64 total;
         if (o.kind == IWorkMarket.Kind.TASK) {
             mode = 0;
@@ -252,16 +311,16 @@ contract WorkMarketHandler is Test {
             total = 1;
         } else {
             (address a, address b) = (address(0), address(0));
-            for (uint256 i = 0; i < 4; i++) {
+            for (uint256 i = 0; i < ACTORS; i++) {
                 if (!market.joined(id, actors[i])) continue;
                 if (a == address(0)) a = actors[i];
                 else b = actors[i];
             }
-            if (b == address(0)) mode = 0;
+            if (b == address(0) || (mode == 6 && units < 2)) mode = 0;
             if (mode == 0) {
                 uint64 left = units;
                 uint256 n;
-                for (uint256 i = 0; i < 4 && left > 0; i++) {
+                for (uint256 i = 0; i < ACTORS && left > 0; i++) {
                     if (!market.joined(id, actors[i])) continue;
                     uint64 u = left / 2 == 0 ? left : left / 2;
                     slots[n] = Slot(actors[i], u, total, uint32(n), false);
@@ -270,6 +329,15 @@ contract WorkMarketHandler is Test {
                     n++;
                 }
                 if (total == 0) total = units;
+            } else if (mode == 6) {
+                // a is owed `units` (its receipt's ordinal); the tree pays it half, b the rest
+                total = units;
+                slots[0] = Slot(a, units / 2, 0, 0, false);
+                slots[1] = Slot(b, units - units / 2, units / 2, 1, false);
+            } else if (mode == 7) {
+                // a is owed 1 + units/2 leases but has no leaf; b takes everything
+                total = units;
+                slots[0] = Slot(b, units, 0, 0, false);
             } else if (mode >= 4) {
                 total = units;
                 slots[0] = Slot(a, mode == 4 ? units : 1, 0, 0, false);
@@ -282,15 +350,15 @@ contract WorkMarketHandler is Test {
                     slots[1].garbage = true;
                     slots[2] = Slot(b, units, 0, 2, false);
                 } else if (mode == 2) {
-                    slots[1] = Slot(b, units, 0, 5, false);
+                    slots[1] = Slot(b, units, 0, 9, false); // index 9 is past the 8 slots
                 } else {
                     slots[2] = Slot(b, units, 0, 2, false);
                 }
             }
         }
 
-        bytes32[] memory leaves = new bytes32[](4);
-        for (uint256 s = 0; s < 4; s++) {
+        bytes32[] memory leaves = new bytes32[](SLOTS);
+        for (uint256 s = 0; s < SLOTS; s++) {
             if (slots[s].garbage) {
                 leaves[s] = keccak256(abi.encode("garbage", id, s));
             } else if (slots[s].worker != address(0)) {
@@ -299,7 +367,7 @@ contract WorkMarketHandler is Test {
                 );
             }
         }
-        bytes32 root = _node(_node(leaves[0], leaves[1]), _node(leaves[2], leaves[3]));
+        bytes32 root = _rootOf(leaves);
         (bool ok,) = verifier.accepted(id, o.bindRef);
         uint128 chBond = market.challengeBondOf(id);
         vm.prank(coordOf[id]);
@@ -309,14 +377,28 @@ contract WorkMarketHandler is Test {
             posts++;
             _clearTree(id);
             leavesOf[id] = leaves;
-            for (uint256 s = 0; s < 4; s++) {
+            for (uint256 s = 0; s < SLOTS; s++) {
                 slotsOf[id][s] = slots[s];
             }
             if (mode == 0) {
-                revealedOf[id] = [true, true, true, true];
-                for (uint256 s = 0; s < 4; s++) {
+                for (uint256 s = 0; s < SLOTS; s++) {
+                    revealedOf[id][s] = true;
                     honestOf[id][s] = slots[s].worker != address(0);
                 }
+            } else if (mode >= 6) {
+                // the cheated worker sorts first among the joined actors
+                address a = mode == 6 ? slots[0].worker : address(0);
+                for (uint256 i = 0; i < ACTORS && a == address(0); i++) {
+                    if (market.joined(id, actors[i])) a = actors[i];
+                }
+                uint64 owed = mode == 6 ? total : 1 + total / 2;
+                receiptCheats++;
+                receiptCheatLive[id] = true;
+                for (uint256 s = 0; s < SLOTS; s++) {
+                    revealedOf[id][s] = true;
+                }
+                if (addCode) _addCode(coordOf[id]);
+                _watchReceipt(id, a, owed, uint256(keccak256(abi.encode(seed, units))));
             } else if (mode >= 4) {
                 maliciousPosts++;
                 malformedLive[id] = true;
@@ -335,7 +417,7 @@ contract WorkMarketHandler is Test {
                 watcherOf[id] = w;
                 revealedOf[id][0] = true;
                 honestOf[id][0] = true;
-                for (uint32 s = 1; s < 4; s++) {
+                for (uint32 s = 1; s < SLOTS; s++) {
                     vm.prank(w);
                     try market.challengeIndex{value: chBond}(id, s) {
                         challengesRaised++;
@@ -350,11 +432,11 @@ contract WorkMarketHandler is Test {
     function _watch(uint256 id) internal {
         address w = watcherOf[id];
         if (w == address(0)) return;
-        bool[4] memory seen = revealedOf[id];
-        for (uint256 i = 0; i < 4; i++) {
+        bool[8] memory seen = revealedOf[id];
+        for (uint256 i = 0; i < SLOTS; i++) {
             if (!seen[i] || slotsOf[id][i].worker == address(0)) continue;
             WorkMarket.LeafOpening memory next;
-            if (i + 1 < 4) next = _openingAt(id, i + 1);
+            if (i + 1 < SLOTS) next = _openingAt(id, i + 1);
             bytes memory tev = abi.encode(uint8(6), abi.encode(_openingAt(id, i), next));
             if (id % 2 == 0 && _commitReveal(id, w, tev)) return;
             if (leavesOf[id].length == 0) return;
@@ -366,8 +448,8 @@ contract WorkMarketHandler is Test {
                 return;
             } catch {}
         }
-        for (uint256 i = 0; i < 4; i++) {
-            for (uint256 j = i + 1; j < 4; j++) {
+        for (uint256 i = 0; i < SLOTS; i++) {
+            for (uint256 j = i + 1; j < SLOTS; j++) {
                 if (!seen[i] || !seen[j]) continue;
                 bytes memory ev = abi.encode(uint8(3), abi.encode(_openingAt(id, i), _openingAt(id, j)));
                 (uint32 ep, bool held, uint128 bond) = _snap(id);
@@ -381,6 +463,87 @@ contract WorkMarketHandler is Test {
         }
     }
 
+    /// The coordinator's address gains code that answers every EIP-1271 query with "not signed"
+    /// (a CREATE2 address deployed later, or a delegated key). Its key's receipts must still count.
+    function _addCode(address c) internal {
+        if (c.code.length != 0) return;
+        vm.etch(c, type(SignsNothing).runtimeCode);
+        coordinatorCodeAdded++;
+    }
+
+    /// A coordinator address that gained code drops it again (so new FL offers can name it).
+    function dropCoordinatorCode(uint256 who) external {
+        address c = who % 3 == 0 ? coordinator : (who % 3 == 1 ? pc : pc2);
+        vm.etch(c, "");
+    }
+
+    function addCoordinatorCode(uint256 who) external {
+        if (opens == 0) return; // let the run open offers first
+        _addCode(who % 3 == 0 ? coordinator : (who % 3 == 1 ? pc : pc2));
+    }
+
+    /// The cheated worker `a` holds the coordinator's receipt for its `owed`-th lease and uses it
+    /// at once: a LOW_UNITS (mode 6) or MISSING_LEAF (mode 7) dispute, directly or by
+    /// commit-reveal, or an inclusion challenge that the root cannot answer.
+    function _watchReceipt(uint256 id, address a, uint64 owed, uint256 how) internal {
+        WorkMarket.Receipt memory r = _receiptFor(id, a, owed);
+        Slot memory s0 = slotsOf[id][0];
+        bytes memory ev;
+        if (s0.worker == a) {
+            ev = abi.encode(uint8(2), abi.encode(_openingAt(id, 0), r)); // LOW_UNITS
+        } else {
+            WorkMarket.LeafOpening memory none;
+            ev = abi.encode(uint8(1), abi.encode(r, uint8(1), none, _openingAt(id, 0))); // ABSENT_BEFORE_FIRST
+        }
+        how %= 3;
+        (uint32 ep, bool held, uint128 bond) = _snap(id);
+        if (how == 0) {
+            vm.prank(a);
+            try market.dispute(id, ev) {
+                _noteUpheld(id, ep, held, bond);
+                receiptRemedies++;
+                _clearTree(id);
+            } catch {}
+        } else if (how == 1) {
+            if (_commitReveal(id, a, ev)) receiptRemedies++;
+        } else {
+            uint128 chBond = market.challengeBondOf(id);
+            vm.prank(a);
+            try market.challengeInclusion{value: chBond}(id, r) {
+                challengesRaised++;
+                receiptRemedies++;
+            } catch {}
+        }
+    }
+
+    /// Tries to open an FL offer whose coordinator is a contract; it must be refused.
+    function openWithContractCoordinator(uint128 price) external {
+        price = uint128(bound(price, 1, 1e21));
+        address c = address(new SignsNothing());
+        WorkMarket.OpenParams memory p = WorkMarket.OpenParams({
+            kind: IWorkMarket.Kind.FL_ROUND,
+            verifier: address(verifier),
+            bindRef: keccak256(abi.encode("contract coordinator", ids.length)),
+            jobSpecHash: bytes32(0),
+            requirementsHash: bytes32(0),
+            requirementsCid: "",
+            groupHash: bytes32(0),
+            allowlistRoot: bytes32(0),
+            pricePerUnit: price,
+            deadline: uint64(block.timestamp + 3 days),
+            disputeWindow: WINDOW,
+            maxWorkers: uint32(SLOTS),
+            joinBond: market.minJoinBond(),
+            coordinator: c,
+            coordinatorBond: 0,
+            disputeAdmin: address(0)
+        });
+        vm.prank(poster);
+        try market.open{value: price}(p) returns (uint256) {
+            contractCoordinatorOpened = true;
+        } catch {}
+    }
+
     function settle(uint256 seed, uint256 slotSeed, bool jumpPastWindow) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
@@ -390,8 +553,8 @@ contract WorkMarketHandler is Test {
         uint256 opensAt = uint256(o.payoutPostedAt) + o.disputeWindow;
         if (o.answerGraceUntil > opensAt) opensAt = o.answerGraceUntil;
         if (jumpPastWindow && o.payoutPostedAt != 0 && block.timestamp < opensAt) vm.warp(opensAt);
-        for (uint256 k = 0; k < 4; k++) {
-            uint256 slot = (slotSeed + k) % 4;
+        for (uint256 k = 0; k < SLOTS; k++) {
+            uint256 slot = (slotSeed + k) % SLOTS;
             Slot memory s = slotsOf[id][slot];
             if (s.worker == address(0)) continue;
             uint32 openBefore = o.openChallenges;
@@ -400,6 +563,7 @@ contract WorkMarketHandler is Test {
                 settleCount[id][s.worker] += 1;
                 settles++;
                 if (malformedLive[id]) malformedRootPaid = true;
+                if (receiptCheatLive[id]) receiptCheatPaid = true;
                 bytes32 key = keccak256(abi.encode(id, o.payoutEpoch));
                 Range[] storage rs = settledRanges[key];
                 uint64 lo = s.cum;
@@ -420,26 +584,23 @@ contract WorkMarketHandler is Test {
         }
     }
 
-    /// The challenger (the worker itself) presents 1..3 coordinator-signed receipts.
+    /// The challenger (the worker itself) presents the coordinator's receipt for its 1st..3rd lease.
     function challenge(uint256 seed, uint256 actorSeed, uint8 count) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        address w = actors[actorSeed % 4];
-        uint256 n = bound(count, 1, 3);
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](n);
-        for (uint256 i = 0; i < n; i++) {
-            bytes32 lease = bytes32(i + 1);
-            bytes32 delta = keccak256(abi.encode(lease));
-            bytes32 d = market.receiptDigest(id, w, lease, delta);
-            (uint8 v, bytes32 r, bytes32 s_) =
-                vm.sign(keyOf[id], keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", d)));
-            rs[i] = WorkMarket.Receipt({
-                worker: w, leaseId: lease, deltaHash: delta, signature: abi.encodePacked(r, s_, v)
-            });
-        }
+        address w = actors[actorSeed % ACTORS];
+        uint64 n = uint64(bound(count, 1, 3));
+        bytes32 lease = bytes32(uint256(n));
+        bytes32 delta = keccak256(abi.encode(lease));
+        bytes32 d = market.receiptDigest(id, w, lease, delta, n);
+        (uint8 v, bytes32 r, bytes32 s_) =
+            vm.sign(keyOf[id], keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", d)));
+        WorkMarket.Receipt memory rc = WorkMarket.Receipt({
+            worker: w, leaseId: lease, deltaHash: delta, ordinal: n, signature: abi.encodePacked(r, s_, v)
+        });
         uint128 chBond = market.challengeBondOf(id);
         vm.prank(w);
-        try market.challengeInclusion{value: chBond}(id, rs) {
+        try market.challengeInclusion{value: chBond}(id, rc) {
             challengesRaised++;
         } catch {}
     }
@@ -449,8 +610,8 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         if (leavesOf[id].length == 0) return;
-        address w = actors[actorSeed % 4];
-        for (uint256 slot = 0; slot < 4; slot++) {
+        address w = actors[actorSeed % ACTORS];
+        for (uint256 slot = 0; slot < SLOTS; slot++) {
             Slot memory s = slotsOf[id][slot];
             if (s.worker != w || s.garbage || s.idx != slot) continue;
             vm.prank(coordOf[id]);
@@ -465,7 +626,7 @@ contract WorkMarketHandler is Test {
     function resolve(uint256 seed, uint256 actorSeed, bool jump) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        address w = actors[actorSeed % 4];
+        address w = actors[actorSeed % ACTORS];
         WorkMarket.Challenge memory c = market.challengeOf(id, w);
         if (jump && c.open && block.timestamp <= c.answerBy) vm.warp(uint256(c.answerBy) + 1);
         (uint32 ep, bool held, uint128 bond) = _snap(id);
@@ -480,10 +641,10 @@ contract WorkMarketHandler is Test {
     function challengeIdx(uint256 seed, uint256 actorSeed, uint8 slot) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        address a = actorSeed % 5 == 4 ? posterOf[id] : actors[actorSeed % 4];
+        address a = actorSeed % 7 == 6 ? posterOf[id] : actors[actorSeed % ACTORS];
         uint128 chBond = market.challengeBondOf(id);
         vm.prank(a);
-        try market.challengeIndex{value: chBond}(id, uint32(slot % 5)) {
+        try market.challengeIndex{value: chBond}(id, uint32(slot % (SLOTS + 1))) {
             if (a == pc) pcIn += chBond;
             challengesRaised++;
         } catch {}
@@ -494,7 +655,7 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         if (leavesOf[id].length == 0) return;
-        uint256 sl = slot % 4;
+        uint256 sl = slot % SLOTS;
         Slot memory s = slotsOf[id][sl];
         if (s.garbage || (s.worker != address(0) && s.idx != sl)) return;
         vm.prank(coordOf[id]);
@@ -507,7 +668,7 @@ contract WorkMarketHandler is Test {
     function resolveIdx(uint256 seed, uint8 slot, bool jump) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        uint32 sl = uint32(slot % 4);
+        uint32 sl = uint32(slot % SLOTS);
         WorkMarket.IndexChallenge memory c = market.indexChallengeOf(id, sl);
         if (jump && c.open && block.timestamp <= c.answerBy) vm.warp(uint256(c.answerBy) + 1);
         (uint32 ep, bool held, uint128 bond) = _snap(id);
@@ -524,8 +685,8 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         uint256 before = _colluders();
-        try market.releaseChallengeBond(id, actors[actorSeed % 4]) {} catch {}
-        try market.releaseIndexChallengeBond(id, uint32(slot % 4)) {} catch {}
+        try market.releaseChallengeBond(id, actors[actorSeed % ACTORS]) {} catch {}
+        try market.releaseIndexChallengeBond(id, uint32(slot % SLOTS)) {} catch {}
         if (posterOf[id] == pc) pcDismissedEarned += _colluders() - before;
     }
 
@@ -543,9 +704,9 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         if (posterOf[id] != pc || leavesOf[id].length == 0) return;
-        uint256 i = slot % 4;
+        uint256 i = slot % SLOTS;
         WorkMarket.LeafOpening memory next;
-        if (i + 1 < 4) next = _openingAt(id, i + 1);
+        if (i + 1 < SLOTS) next = _openingAt(id, i + 1);
         bytes memory ev = slot % 2 == 0
             ? abi.encode(uint8(6), abi.encode(_openingAt(id, i), next))
             : abi.encode(uint8(3), abi.encode(_openingAt(id, i), next));
@@ -558,10 +719,10 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         if (leavesOf[id].length == 0) return;
-        address a = actors[actorSeed % 4];
-        uint256 i = slot % 4;
+        address a = actors[actorSeed % ACTORS];
+        uint256 i = slot % SLOTS;
         WorkMarket.LeafOpening memory next;
-        if (i + 1 < 4) next = _openingAt(id, i + 1);
+        if (i + 1 < SLOTS) next = _openingAt(id, i + 1);
         bytes memory ev = slot % 2 == 0
             ? abi.encode(uint8(6), abi.encode(_openingAt(id, i), next))
             : abi.encode(uint8(3), abi.encode(_openingAt(id, i), next));
@@ -593,9 +754,9 @@ contract WorkMarketHandler is Test {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
         if (leavesOf[id].length == 0) return;
-        uint256 i = slot % 4;
+        uint256 i = slot % SLOTS;
         WorkMarket.LeafOpening memory next;
-        if (i + 1 < 4) next = _openingAt(id, i + 1);
+        if (i + 1 < SLOTS) next = _openingAt(id, i + 1);
         bytes memory ev = slot % 2 == 0
             ? abi.encode(uint8(6), abi.encode(_openingAt(id, i), next))
             : abi.encode(uint8(3), abi.encode(_openingAt(id, i), next));
@@ -632,14 +793,14 @@ contract WorkMarketHandler is Test {
     function claimBond(uint256 seed, uint256 actorSeed, bool asCoordinator) external {
         if (ids.length == 0) return;
         uint256 id = _id(seed);
-        address a = asCoordinator ? coordOf[id] : actors[actorSeed % 4];
+        address a = asCoordinator ? coordOf[id] : actors[actorSeed % ACTORS];
         vm.prank(a);
         try market.claimBond(id) {} catch {}
     }
 
     function withdraw(uint256 actorSeed, uint8 who) external {
         uint8 k = who % 7;
-        address a = k == 0 ? poster : (k == 1 ? coordinator : (k == 2 ? pc : actors[actorSeed % 4]));
+        address a = k == 0 ? poster : (k == 1 ? coordinator : (k == 2 ? pc : actors[actorSeed % ACTORS]));
         if (k == 4) a = market.slashSink();
         if (k == 5) a = pc2;
         if (k == 6) a = pcSy;
@@ -676,7 +837,7 @@ contract WorkMarketInvariantTest is Test {
         vs[0] = address(verifier);
         address gov = makeAddr("gov");
         address guard = makeAddr("guard");
-        market = new WorkMarket(gov, guard, makeAddr("slashSink"), 1 ether, 0.1 ether, vs);
+        market = new WorkMarket(gov, guard, makeAddr("slashSink"), 1 ether, 1 ether, 1 ether, vs);
         handler = new WorkMarketHandler(market, verifier, gov, guard);
         targetContract(address(handler));
     }
@@ -689,11 +850,61 @@ contract WorkMarketInvariantTest is Test {
         }
     }
 
+    /// The handler reaches the receipt paths it is meant to: a leaf short-paid past 256 units, a
+    /// left-out worker after the coordinator's address gained code, and a contract coordinator
+    /// (refused). Each remedy lands and the market stays balanced.
+    function test_handler_reaches_the_receipt_paths() public {
+        handler.open(1 ether, 600, 1 ether, 0, false, false);
+        handler.join(0, 0);
+        handler.join(0, 1);
+        handler.postPayout(0, 400, true, 6); // owed 400, the leaf pays 200
+        assertEq(handler.receiptCheats(), 1);
+        assertEq(handler.receiptRemedies(), 1);
+
+        handler.open(1 ether, 50, 1 ether, 0, false, false);
+        handler.join(1, 0);
+        handler.join(1, 1);
+        handler.postPayoutThenAddCode(1, 5, 1); // left out, then the coordinator gains code
+        assertGt(handler.coordinator().code.length, 0);
+        assertEq(handler.coordinatorCodeAdded(), 1);
+        assertEq(handler.receiptRemedies(), 2);
+
+        handler.openWithContractCoordinator(1 ether);
+        assertFalse(handler.contractCoordinatorOpened());
+        invariant_balance_conservation();
+        invariant_receipted_work_is_never_short_paid();
+    }
+
+    /// Deterministic past-256 short pay through the handler: a worker owed 600 units whose leaf pays
+    /// 300 (both above 256) acts on its one receipt, the short root is withdrawn and never pays.
+    function test_handler_short_pay_past_256_units_is_disputed_and_never_settles() public {
+        handler.open(1 ether, 600, 1 ether, 0, false, false);
+        handler.join(0, 0);
+        handler.join(0, 1);
+        uint256 id = handler.ids(0);
+        handler.postPayout(0, 600, true, 6); // owed 600 (the receipt's ordinal), the leaf pays 300
+        assertEq(handler.receiptCheats(), 1);
+        assertEq(handler.receiptRemedies(), 1, "the receipt for lease 600 lands");
+        WorkMarket.Offer memory o = market.getOffer(id);
+        if (o.state == IWorkMarket.State.PayoutPosted) {
+            // the inclusion-challenge remedy: the root cannot answer, so it is upheld after answerBy
+            assertEq(o.openChallenges, 1);
+            handler.resolve(0, 0, true);
+            o = market.getOffer(id);
+        }
+        assertEq(uint8(o.state), uint8(IWorkMarket.State.Running), "the short root is withdrawn");
+        assertEq(o.payoutRoot, bytes32(0));
+        handler.settle(0, 0, true);
+        assertEq(handler.settles(), 0, "nothing settles under the withdrawn root");
+        invariant_receipted_work_is_never_short_paid();
+        invariant_balance_conservation();
+    }
+
     function _pullTotal() internal view returns (uint256 t) {
         t = market.balanceOf(handler.poster()) + market.balanceOf(handler.coordinator())
             + market.balanceOf(handler.pc()) + market.balanceOf(market.slashSink()) + market.balanceOf(handler.pc2())
             + market.balanceOf(handler.pcSy());
-        for (uint256 i = 0; i < 4; i++) {
+        for (uint256 i = 0; i < handler.ACTORS(); i++) {
             t += market.balanceOf(handler.actorAt(i));
         }
     }
@@ -728,7 +939,7 @@ contract WorkMarketInvariantTest is Test {
     /// forge-config: default.invariant.fail-on-revert = false
     function invariant_paid_at_most_once() public view {
         for (uint256 i = 0; i < handler.idsLength(); i++) {
-            for (uint256 a = 0; a < 4; a++) {
+            for (uint256 a = 0; a < handler.ACTORS(); a++) {
                 assertLe(handler.settleCount(handler.ids(i), handler.actorAt(a)), 1);
             }
         }
@@ -826,6 +1037,26 @@ contract WorkMarketInvariantTest is Test {
             handler.colluderBalances() + handler.pcWithdrawn() + handler.pcMinLoss(),
             handler.pcIn() + handler.pcDismissedEarned()
         );
+    }
+
+    /// Receipts (GHSA-gh3c): a root that short-pays a worker holding the coordinator's receipt for
+    /// more leases than its leaf pays (at any unit count, past 256 included), or that leaves out a
+    /// receipted worker, never pays anyone, given that worker acts on its receipt at once (dispute,
+    /// commit-reveal or inclusion challenge), even when the coordinator's address gains code
+    /// in between.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_receipted_work_is_never_short_paid() public view {
+        assertFalse(handler.receiptCheatPaid());
+    }
+
+    /// An FL offer's coordinator is never a contract at open (its receipts must be ECDSA).
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 200
+    /// forge-config: default.invariant.fail-on-revert = false
+    function invariant_no_fl_offer_has_a_contract_coordinator() public view {
+        assertFalse(handler.contractCoordinatorOpened());
     }
 
     /// 06 §7.7: pause never stops anyone pulling what they are owed.

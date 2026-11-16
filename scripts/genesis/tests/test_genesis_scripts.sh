@@ -1000,8 +1000,9 @@ KINV=$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1"
 # The four inputs DeployEduStack would otherwise default to the deployer.
 KEDU=(SIGNER_1="$KS1" SIGNER_2="$KS2" SIGNER_3="$KS3" RELAYER="$KRL")
 # The coordinator bonds the owner decided on 2026-11-11 (rehearsal values, to revisit with
-# tokenomics): 100 SALT minimum, 1,000 SALT default. They are inputs, not defaults.
-KBONDS=(WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000)
+# tokenomics): 100 SALT minimum, 1,000 SALT default; and the 10 SALT join-bond floor (2026-11-14).
+# They are inputs, not defaults.
+KBONDS=(WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000 WORKMARKET_MIN_JOIN_BOND=10000000000000000000)
 KV060=(GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200 DEPLOYER_ADDRESS="$KDEP" "${KBONDS[@]}" "${KEDU[@]}")
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_KEY_INVENTORY is refused" 3 'GENESIS_KEY_INVENTORY is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_RETIRED_KEYS="$KRK1" GENESIS_GUARDIAN_VETO_MARGIN=7200
 expect "phase inputs keys: GENESIS_V060=1 without GENESIS_RETIRED_KEYS is refused" 3 'GENESIS_RETIRED_KEYS is not set; GENESIS_V060=1 requires it' -- pf GENESIS_V060=1 GENESIS_KEY_INVENTORY="$KINV" GENESIS_GUARDIAN_VETO_MARGIN=7200
@@ -1026,6 +1027,8 @@ for k in RELAYER SIGNER_1 SIGNER_2 SIGNER_3; do
 done
 expect "phase inputs keys: a minimum bond other than the owner's decided 100 SALT is refused" 3 'WORKMARKET_MIN_COORDINATOR_BOND is 3; the owner decided 100000000000000000000' -- pf "${KV060[@]}" WORKMARKET_MIN_COORDINATOR_BOND=3
 expect "phase inputs keys: a default bond other than the owner's decided 1,000 SALT is refused" 3 'WORKMARKET_DEFAULT_COORDINATOR_BOND is 7; the owner decided 1000000000000000000000' -- pf "${KV060[@]}" WORKMARKET_DEFAULT_COORDINATOR_BOND=7
+expect "phase inputs keys: a join-bond floor other than the owner's decided 10 SALT is refused" 3 'WORKMARKET_MIN_JOIN_BOND is 5; the owner decided 10000000000000000000' -- pf "${KV060[@]}" WORKMARKET_MIN_JOIN_BOND=5
+expect "phase inputs keys: GENESIS_V060=1 without the join-bond floor is refused at P0" 3 'WORKMARKET_MIN_JOIN_BOND is not set; GENESIS_V060=1 requires it' -- pf "${KV060[@]}" WORKMARKET_MIN_JOIN_BOND=
 # FAUCET and TEAM are block-0 accounts (base allocations), not role inputs: the inventory may
 # tag them so the alloc check knows them. Post-genesis roles are not ceremony roles.
 expect "phase inputs keys: FAUCET and TEAM are known block-0 account tags" 0 '' -- pf "${KV060[@]}" GENESIS_KEY_INVENTORY="$(kinv "$KNK1" "GOV_OWNERS+GRD_OWNERS+TREASURY" "$KNK2" "GOV_OWNERS" "$KS1" SIGNER_1 "$KS2" SIGNER_2 "$KS3" SIGNER_3 "$KRL" RELAYER 0x00000000000000000000000000000000000000f5 FAUCET 0x00000000000000000000000000000000000000f6 TEAM)"
@@ -1237,7 +1240,7 @@ for a, r in ((s1, "SIGNER_1"), (s2, "SIGNER_2"), (s3, "SIGNER_3"), (rel, "RELAYE
              (aai, "CITRATE_AA_IDENTITY_SIGNER"), (aas, "CITRATE_AA_SPONSOR_SIGNER"), (grant, "MEMBERSHIP_GRANTOR"), (tre, "TREASURY")):
     put(a, r)
 print(json.dumps(inv))' "$(owners 11 12 13 14 15)" "$(owners 21 22 23)" "$(addr 61)" "$(addr 62)" "$(addr 63)" "$(addr 64)" "$(addr 65)" "$(addr 66)" "$(addr 67)" "$(addr 51)" "$(addr 90)")
-V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=7200 GENESIS_KEY_INVENTORY="$V060_INV" WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000)
+V060_KEYS=(GENESIS_V060=1 GENESIS_RETIRED_KEYS="$(addr 99)" GENESIS_GUARDIAN_VETO_MARGIN=7200 GENESIS_KEY_INVENTORY="$V060_INV" WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000 WORKMARKET_MIN_JOIN_BOND=10000000000000000000)
 # P4V, the 0.6.0 phase: planned (deploy, then the required on-chain verify) only in a 0.6.0 run.
 expect "ceremony P4V: a 0.6.0 dry run plans DeployV060Genesis" 0 'DRYRUN .*DeployV060Genesis' -- "${CEENV[@]}" "${V060_KEYS[@]}" bash "$CE"
 expect "ceremony P4V: a 0.6.0 dry run plans the verifyBook step" 0 "DRYRUN .*verifyBook" -- "${CEENV[@]}" "${V060_KEYS[@]}" bash "$CE"
