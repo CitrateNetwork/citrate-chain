@@ -1954,6 +1954,133 @@ mod tests {
         assert!(b.iter().any(|(_, a, lo, _)| *a == 40 && *lo == 41));
     }
 
+    fn block_on(h: u64, id: u64, parent: Hash) -> Block {
+        BlockBuilder::new()
+            .hash(hash(h, id))
+            .parent(parent)
+            .height(h)
+            .timestamp(1_000 + h)
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+    }
+
+    /// An answer may only bring in blocks of the window it answers, that
+    /// chain from its anchor, and no more of them than the request allows:
+    /// continuing past the window, blocks that do not link, and an oversized
+    /// sibling set are all left out.
+    #[test]
+    fn an_answer_only_brings_in_linked_blocks_of_its_own_window() {
+        let now = Instant::now();
+        let mut pl = pipeline(now);
+        let peers = [peer("a", 10_000)];
+        let reqs = pl.plan(now, &peers, true);
+        let (p, _, lo, hi) = blocks_of(&reqs)[0].clone();
+        assert_eq!((lo, hi), (1, 64));
+        let mut released: Vec<Block> = Vec::new();
+        // The window itself, then the same answer "continuing" to 2,000.
+        let mut all = groups(0, 64);
+        all.extend(groups(65, 2_000));
+        for c in all.chunks(200) {
+            released.extend(pl.on_blocks(&p, raw_of(c), c.to_vec(), now).release);
+        }
+        assert!(
+            released.iter().all(|b| b.header.height <= hi),
+            "a block above the window was taken in"
+        );
+        assert!(pl.frontier() <= hi);
+        assert_eq!(pl.stats().buffered_blocks, 0);
+        // A second window: blocks that do not chain from its anchor, and
+        // hundreds of linked siblings per height, are not all held.
+        feed_headers(&mut pl, &reqs, 600, now);
+        let _ = pl.plan(now, &peers, true);
+        let w = pl.in_flight_windows();
+        let (p2, lo2, hi2) = w[1].clone();
+        let mut flood: Vec<Block> = vec![block_on(lo2 - 1, 0, hash(lo2 - 2, 0))];
+        for h in lo2..=hi2 {
+            for i in 0..400 {
+                flood.push(block_on(h, 1_000 + i, hash(h - 1, 0)));
+            }
+            flood.push(block_on(h, 9_999, Hash::new([0xEE; 32])));
+        }
+        for c in flood.chunks(500) {
+            let _ = pl.on_blocks(&p2, raw_of(c), c.to_vec(), now);
+        }
+        let held = pl.stats().buffered_blocks;
+        assert!(held <= 512 + 64, "one answer held {held} blocks");
+    }
+
+    /// A peer that answers its windows with a chain that does not connect to
+    /// ours (and claims headers for it) cannot have honest peers excluded or
+    /// its blocks released: disagreement is charged to the peer that
+    /// delivered the blocks, and heights count as received only on a chain
+    /// that connects to the applied tip.
+    #[test]
+    fn header_disagreement_is_charged_to_the_peer_that_delivered_the_blocks() {
+        let t0 = Instant::now();
+        let config = PipelineConfig {
+            engage_gap: 0,
+            ..PipelineConfig::default()
+        };
+        let mut pl = BlockPipeline::new(config, t0);
+        pl.observe_applied((hash(0, 0), 0), t0);
+        let target = 600;
+        pl.set_target(target);
+        let peers = [peer("a", target), peer("b", target), peer("m", target)];
+        let fake = |from: u64, to: u64| -> Vec<Block> {
+            (from..=to)
+                .flat_map(|h| (0..7).map(move |i| block_on(h, 90 + i, hash(h.saturating_sub(1), 90))))
+                .collect()
+        };
+        let mut now = t0;
+        let mut applied = 0u64;
+        for _ in 0..2_000 {
+            now += Duration::from_millis(50);
+            let reqs = pl.plan(now, &peers, true);
+            for r in &reqs {
+                if let PipelineRequest::Headers {
+                    peer, from_height, ..
+                } = r
+                {
+                    let hs: Vec<(u64, Hash)> = if peer.0 == "m" {
+                        (from_height + 1..=target).map(|h| (h, hash(h, 90))).collect()
+                    } else {
+                        headers(from_height + 1, target)
+                    };
+                    pl.on_headers(peer, &hs, now);
+                }
+            }
+            for (p, lo, hi) in pl.in_flight_windows() {
+                let answer = if p.0 == "m" {
+                    fake(lo - 1, hi)
+                } else {
+                    groups(lo - 1, hi)
+                };
+                let o = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+                for b in &o.release {
+                    assert!(
+                        b.header.block_hash.as_bytes()[8..16] < 90u64.to_be_bytes()[..],
+                        "a block off our chain was released at {}",
+                        b.header.height
+                    );
+                }
+            }
+            let _ = pl.poll(now);
+            if pl.frontier() > applied {
+                applied = pl.frontier();
+                pl.observe_applied((hash(applied, 0), applied), now);
+            }
+            if applied >= target {
+                break;
+            }
+        }
+        let figs = pl.peer_figures(now);
+        for honest in ["a", "b"] {
+            let f = figs.iter().find(|f| f.id.0 == honest).expect("peer");
+            assert!(!f.excluded, "honest peer {honest} excluded: {:?}", pl.stats());
+        }
+        assert_eq!(applied, target, "{:?}", pl.stats());
+    }
+
     /// Many rounds of random answer orders and losses: no two in-flight
     /// windows ever overlap, and every height up to the target is delivered.
     #[test]
