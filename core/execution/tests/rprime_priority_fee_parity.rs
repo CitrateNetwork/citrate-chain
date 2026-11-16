@@ -222,6 +222,7 @@ async fn produce_root(executor: &Executor, block: &Block) -> Hash {
         coinbase: COINBASE,
         prevrandao: *block.header.vrf_reveal.output.as_bytes(),
         block_hashes: HashMap::new(),
+        gas_limit: None,
     });
     let mut receipts = Vec::new();
     for tx in &block.transactions {
@@ -457,6 +458,7 @@ async fn none_policy_below_activation_is_accepted() {
         coinbase: COINBASE,
         prevrandao: *template.header.vrf_reveal.output.as_bytes(),
         block_hashes: HashMap::new(),
+        gas_limit: None,
     });
     let mut receipts = Vec::new();
     for tx in &template.transactions {

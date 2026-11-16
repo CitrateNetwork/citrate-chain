@@ -137,6 +137,7 @@ async fn seal(hardening: PbaHardening, fund: &[(PublicKey, U256)], txs: Vec<Tran
         coinbase: COINBASE,
         prevrandao: *template.header.vrf_reveal.output.as_bytes(),
         block_hashes: HashMap::new(),
+        gas_limit: None,
     });
     let mut receipts = Vec::new();
     for tx in &template.transactions {

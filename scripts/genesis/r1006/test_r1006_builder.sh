@@ -62,7 +62,7 @@ expect "emit_alloc refuses a deployer with code" 1 'deployer has code' -- \
 
 # ------------------------------------------------------------ new_role_keys.sh (stub cast)
 # A stub `cast` stands in for `cast wallet new --json` with FAKE values: cast >= 1.8 wraps the
-# output in {"data": ...}, older versions print the list itself. Both must give 13 keys in
+# output in {"data": ...}, older versions print the list itself. Both must give 19 keys in
 # 0600 files and addresses only on stdout.
 for shape in envelope list; do
   mkdir -p "$T/kb-$shape/bin" "$T/kh-$shape"
@@ -81,14 +81,14 @@ STUB
   perms=$(stat -c '%a' "$T/kh-$shape/keys"/*.key 2>/dev/null | sort -u | tr '\n' ' ')
   dperm=$(stat -c '%a' "$T/kh-$shape/keys" 2>/dev/null)
   n_addr=$(grep -cE '^[A-Z0-9_]+=0x[0-9a-f]{40}$' "$T/kh-$shape/keys/addresses.env" 2>/dev/null)
-  if [[ $rc -eq 0 && $n_keys -eq 13 && "$perms" == "600 " && "$dperm" == 700 && $n_addr -eq 13 ]] && ! grep -q '0xfa0' <<<"$out" &&
+  if [[ $rc -eq 0 && $n_keys -eq 19 && "$perms" == "600 " && "$dperm" == 700 && $n_addr -eq 19 ]] && ! grep -q '0xfa0' <<<"$out" &&
     grep -q '^0xfa' "$T/kh-$shape/keys/TREASURY.key"; then
-    ok "new_role_keys ($shape output): 13 keys in 0600 files (dir 0700), addresses only on stdout"
+    ok "new_role_keys ($shape output): 19 keys in 0600 files (dir 0700), addresses only on stdout"
   else
-    bad "new_role_keys ($shape output): 13 keys in 0600 files (dir 0700), addresses only on stdout" "rc=$rc keys=$n_keys perms=$perms dir=$dperm addrs=$n_addr out=$out"
+    bad "new_role_keys ($shape output): 19 keys in 0600 files (dir 0700), addresses only on stdout" "rc=$rc keys=$n_keys perms=$perms dir=$dperm addrs=$n_addr out=$out"
   fi
   out2=$(PATH="$T/kb-$shape/bin:$PATH" bash "$HERE/new_role_keys.sh" --dir "$T/kh-$shape/keys" 2>&1)
-  if [[ $(grep -c '^keep ' <<<"$out2") -eq 13 && $(wc -l <"$T/kh-$shape/keys/addresses.env") -eq 13 ]]; then
+  if [[ $(grep -c '^keep ' <<<"$out2") -eq 19 && $(wc -l <"$T/kh-$shape/keys/addresses.env") -eq 19 ]]; then
     ok "new_role_keys ($shape): a second run keeps every existing key (never overwrites)"
   else
     bad "new_role_keys ($shape): a second run keeps every existing key (never overwrites)" "$out2"

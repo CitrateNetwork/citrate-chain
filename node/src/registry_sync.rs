@@ -39,12 +39,15 @@ pub const EPOCH: u64 = 1000;
 pub const SNAPSHOT_LAG: u64 = 200;
 
 /// How many recent epoch snapshots to retain in the per-epoch durable store so a reorg
-/// pre-seed can load the EXACT governing epoch's policy. The in-memory reorg fork point is
-/// bounded to `MAX_REORG_DEPTH` (100) blocks below the applied tip, well under one `EPOCH`
-/// (1000), so a reorg crosses at most one S(E) boundary — 2 epochs would suffice. We keep a
-/// generous margin (snapshots are ~KB) so any interplay with the from-genesis rebuild path
-/// or slightly deeper windows is still covered; older snapshots are pruned on each write.
-pub const REWARD_SNAPSHOT_RETENTION_EPOCHS: u64 = 8;
+/// pre-seed can load the EXACT governing epoch's policy. The reorg fork point is bounded to
+/// `MAX_REORG_DEPTH` blocks below the applied tip: 10,000 since S3-4 (the undo window =
+/// the prune retention, CV-7a; 100 before), so a reorg crosses up to
+/// `MAX_REORG_DEPTH / EPOCH` = 10 S(E) boundaries and its governing epoch is up to 11
+/// epochs back. Derived from the window with two epochs of margin (snapshots are ~KB);
+/// older snapshots are pruned on each write.
+pub const REWARD_SNAPSHOT_RETENTION_EPOCHS: u64 =
+    crate::canonical_apply::MAX_REORG_DEPTH.div_ceil(EPOCH) + 2;
+const _: () = assert!(REWARD_SNAPSHOT_RETENTION_EPOCHS >= 8);
 
 /// If `height` is the snapshot block S(E) = E*EPOCH - SNAPSHOT_LAG for some epoch E >= 1,
 /// return that epoch E. Otherwise None. This is the trigger predicate for a resync.
@@ -1232,6 +1235,7 @@ mod tests {
             coinbase: CB,
             prevrandao: [0x5A; 32],
             block_hashes: std::collections::HashMap::new(),
+            gas_limit: None,
         });
         let tmpl = seal_block(FWD_HEIGHT, txs.to_vec(), Hash::default());
         let mut receipts = Vec::new();

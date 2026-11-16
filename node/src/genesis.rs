@@ -80,6 +80,137 @@ impl Default for GenesisConfig {
 /// The genesis profile whose block 0 holds the ceremony's contracts (r1006).
 pub const R1006_PROFILE: &str = "r1006";
 
+/// The block 0 a genesis profile is compiled to produce, if this release pins one
+/// (r1006 today). The genesis-keyed rules a genesis BUILD runs under are resolved
+/// for it (`publish_mpt_rule_for_genesis_build` in main.rs, and the manifest
+/// command); `None` is an unknown genesis (devnets, rehearsals), where the env or
+/// config value decides, as start_node later decides for the block 0 it loads.
+///
+/// The r1007 genesis lane (S3-6) adds its profile here with the ceremony's
+/// block-0 hash, next to its `GENESIS_ACTIVATIONS` entry (`mpt_state_root:
+/// Some(0)`), so the r1007 block 0 is built and re-built under the MPT rule.
+pub fn compiled_genesis_for_profile(profile: Option<&str>) -> Option<[u8; 32]> {
+    match profile {
+        Some(R1006_PROFILE) => Some(citrate_consensus::hardening::R1006_GENESIS),
+        Some(R1007_PROFILE) => Some(citrate_consensus::hardening::R1007_GENESIS),
+        _ => None,
+    }
+}
+
+/// The r1007 genesis profile (ADR-2026-11-03 CV-2, S3-6): the r1006 ceremony state with
+/// its own note, block 0 rooted under the MPT state root rule. Its block 0 is
+/// `citrate_consensus::hardening::R1007_GENESIS`; its rules and chain parameters are the
+/// genesis-keyed entries for that hash (docs/consensus/R1007_GENESIS.md).
+pub const R1007_PROFILE: &str = "r1007";
+
+/// The ValidatorRegistry binding compiled for the genesis a node runs: r1006 and r1007
+/// (block 0 holds the same registry state and producer set) compile it once their
+/// producer set is final; any other genesis gets `None` and the env decides
+/// ([`resolve_validator_registry`]). Data source: `citrate_economics::r1006` /
+/// `citrate_economics::r1007::validator_set_binding` (the compiled validators file).
+pub fn compiled_validator_set(
+    running_genesis: Option<&[u8; 32]>,
+) -> anyhow::Result<Option<([u8; 20], u64)>> {
+    use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+    match running_genesis {
+        Some(g) if *g == R1006_GENESIS => citrate_economics::r1006::validator_set_binding()
+            .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}")),
+        Some(g) if *g == R1007_GENESIS => citrate_economics::r1007::validator_set_binding()
+            .map_err(|e| anyhow::anyhow!("invalid r1007 genesis: {e}")),
+        _ => Ok(None),
+    }
+}
+
+/// On a genesis with compiled chain parameters (r1007), the node's `[checkpoint]`
+/// interval, committee size and vote depth may only repeat them: a per-node value would
+/// make this node propose, select and vote on other checkpoints than the fleet. `None`
+/// (any other genesis): the config decides, as before. Data source: the compiled table
+/// `citrate_consensus::genesis_params::GENESIS_CHAIN_PARAMS`.
+pub fn check_checkpoint_params(
+    params: Option<&citrate_consensus::genesis_params::GenesisChainParams>,
+    checkpoint: &crate::config::CheckpointNodeConfig,
+) -> anyhow::Result<()> {
+    let Some(p) = params else {
+        return Ok(());
+    };
+    let mut bad = Vec::new();
+    if checkpoint.interval != p.checkpoint_interval {
+        bad.push(format!(
+            "interval = {} (compiled {})",
+            checkpoint.interval, p.checkpoint_interval
+        ));
+    }
+    if checkpoint.committee_size != p.committee_size {
+        bad.push(format!(
+            "committee_size = {} (compiled {})",
+            checkpoint.committee_size, p.committee_size
+        ));
+    }
+    if checkpoint.vote_depth != p.checkpoint_vote_depth {
+        bad.push(format!(
+            "vote_depth = {} (compiled {})",
+            checkpoint.vote_depth, p.checkpoint_vote_depth
+        ));
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "[checkpoint] {} differs from the chain parameters this genesis compiles; remove the \
+         setting (a per-node value would split the fleet's checkpoints)",
+        bad.join(", ")
+    )
+}
+
+/// The start-up guard for the r1007 genesis (pure, unit tested), like
+/// [`r1006_boot_guard`]: `running` is the data directory's block 0.
+///
+/// * profile `r1007` with another (or no) block 0: refused (a fresh data directory is
+///   needed);
+/// * the r1007 block 0 on another chain id: refused;
+/// * the r1007 block 0 while the r1006 ceremony inputs it is built from are not
+///   release-ready: refused unless `rehearsal` (`CITRATE_R1006_REHEARSAL=1`);
+/// * any other genesis: not this guard's concern.
+pub fn r1007_boot_guard(
+    chain_id: u64,
+    profile: Option<&str>,
+    running: Option<&[u8; 32]>,
+    readiness: &citrate_economics::r1006::Readiness,
+    rehearsal: bool,
+) -> anyhow::Result<()> {
+    let r1007 = citrate_consensus::hardening::R1007_GENESIS;
+    let is_r1007 = running == Some(&r1007);
+    if profile == Some(R1007_PROFILE) && !is_r1007 {
+        anyhow::bail!(
+            "[chain] genesis_profile = \"r1007\" but this data directory's block 0 ({}) is not \
+             the r1007 genesis this build compiles ({}). Use a fresh data directory.",
+            running.map(hex::encode).unwrap_or_else(|| "missing".into()),
+            hex::encode(r1007)
+        );
+    }
+    if !is_r1007 {
+        return Ok(());
+    }
+    if chain_id != 40204 {
+        anyhow::bail!("the r1007 genesis runs only on chain 40204 (configured: {chain_id})");
+    }
+    if readiness.is_release_ready() {
+        return Ok(());
+    }
+    let missing = readiness.missing().join("; ");
+    if rehearsal {
+        tracing::warn!(
+            "r1007 genesis built from a REHEARSAL r1006 state ({R1006_REHEARSAL_ENV}=1): not \
+             release-ready: {missing}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the r1007 genesis in this build is not release-ready: {missing}. It must not start a \
+         network. For a local rehearsal only, set {R1006_REHEARSAL_ENV}=1."
+    )
+}
+
 /// Rehearsal opt-in: lets a node create or run an r1006 genesis that still has
 /// placeholders (ceremony inputs, producer set, OrangeSeed). Never set on a network node.
 pub const R1006_REHEARSAL_ENV: &str = "CITRATE_R1006_REHEARSAL";
@@ -181,7 +312,8 @@ pub fn resolve_validator_registry(
                 if parse_reg(raw)? != reg {
                     anyhow::bail!(
                         "CITRATE_VALIDATOR_REGISTRY={raw} is not the ValidatorRegistry the r1006 \
-                         genesis compiles (0x{}); remove it",
+                         ceremony registered (0x{}), the compiled ValidatorRegistry of this \
+                         genesis (r1006 and r1007 both compile it); remove it",
                         hex::encode(reg)
                     );
                 }
@@ -189,7 +321,7 @@ pub fn resolve_validator_registry(
             if let Some(raw) = env_activation {
                 if parse_act(raw)? != act {
                     anyhow::bail!(
-                        "CITRATE_VALIDATOR_ACTIVATION_HEIGHT={raw} is not the r1006 genesis's \
+                        "CITRATE_VALIDATOR_ACTIVATION_HEIGHT={raw} is not this genesis's \
                          compiled activation height {act}; remove it"
                     );
                 }
@@ -205,6 +337,43 @@ pub fn resolve_validator_registry(
             }
         },
     }
+}
+
+/// A genesis validator set: `(proposer consensus key, stake)` per validator.
+pub type GenesisCommittee = Vec<(PublicKey, u128)>;
+
+/// The genesis validator set of the chain whose block 0 is `running_genesis`, as
+/// `(proposer consensus key, stake)`: the epoch-0 checkpoint committee's input (spec 06
+/// §7). It is compiled with the genesis, never read from config or env, so every node on
+/// the same block 0 derives the same epoch-0 committee.
+///
+/// - r1006: the producer set `validators.json` registers in the ValidatorRegistry at
+///   block 0 (`citrate_economics::r1006::genesis_validator_set`); `None` while that set
+///   is a placeholder.
+/// - r1007: the same set. Its block 0 registers the r1006 producers from the shared
+///   validators file (R1007_GENESIS.md §3.3; producer keys are unchanged at r1007).
+/// - Any other genesis (or none known): `None`. Such a chain's committees come only from
+///   registry snapshots, from S(1) on. A new genesis adds its own arm here from its own
+///   compiled validator file.
+pub fn genesis_committee_set(
+    running_genesis: Option<&[u8; 32]>,
+) -> anyhow::Result<Option<GenesisCommittee>> {
+    // r1007 registers the r1006 producers in its block 0 (the validators file
+    // is shared, R1007_GENESIS.md §3.3), so both geneses compile the same set.
+    let compiled = [
+        citrate_consensus::hardening::R1006_GENESIS,
+        citrate_consensus::hardening::R1007_GENESIS,
+    ];
+    if !running_genesis.is_some_and(|g| compiled.contains(g)) {
+        return Ok(None);
+    }
+    let set = citrate_economics::r1006::genesis_validator_set()
+        .map_err(|e| anyhow::anyhow!("invalid r1006 genesis validator set: {e}"))?;
+    Ok(set.map(|v| {
+        v.into_iter()
+            .map(|(key, stake)| (PublicKey::new(key), stake))
+            .collect()
+    }))
 }
 
 /// Whether the rehearsal opt-in is set in the environment (exactly `1`).
@@ -249,8 +418,13 @@ pub async fn initialize_genesis_state_with_profile(
     config: &GenesisConfig,
     genesis_profile: Option<&str>,
 ) -> anyhow::Result<Hash> {
-    // Create genesis block
-    let mut genesis = create_genesis_block(config);
+    // Create genesis block. r1007 is stamped at ceremony time
+    // (`citrate_economics::r1007::GENESIS_TIMESTAMP`), not at the canonical timestamp.
+    let mut genesis = if genesis_profile == Some(R1007_PROFILE) {
+        shared_genesis::create_canonical_genesis_block(citrate_economics::r1007::GENESIS_TIMESTAMP)
+    } else {
+        create_genesis_block(config)
+    };
 
     // Select economics genesis config based on explicit profile or chain_id fallback
     let economics_config = match genesis_profile {
@@ -275,11 +449,18 @@ pub async fn initialize_genesis_state_with_profile(
             EconomicsGenesisConfig::r1006()
                 .map_err(|e| anyhow::anyhow!("invalid r1006 genesis: {e}"))?
         }
+        Some(R1007_PROFILE) => {
+            tracing::info!(
+                "Using r1007 genesis profile (r1006 ceremony state, MPT state root from block 0)"
+            );
+            EconomicsGenesisConfig::r1007()
+                .map_err(|e| anyhow::anyhow!("invalid r1007 genesis: {e}"))?
+        }
         Some(other) => {
             anyhow::bail!(
                 "[chain] genesis_profile = {other:?} is not compiled into this build (known: \
-                 default, testnet_beta, team_testnet, mainnet, r1006); refusing to build a genesis \
-                 instead of falling back to the chain-id default"
+                 default, testnet_beta, team_testnet, mainnet, r1006, r1007); refusing to build a \
+                 genesis instead of falling back to the chain-id default"
             );
         }
         None => {
@@ -354,6 +535,13 @@ pub async fn initialize_genesis_with_dag(
 
     Ok(genesis_hash)
 }
+
+/// The MPT state root rule is process-wide, so the r1007 genesis builds in tests run in a
+/// child process (the split_heal pattern): the parent's tests keep the legacy root. Any
+/// test that needs the r1007 block 0 built by the node path runs
+/// `genesis::tests::r1007_child_build_after_publication` with this set.
+#[cfg(test)]
+pub(crate) const R1007_CHILD_ENV: &str = "CITRATE_R1007_GENESIS_CHILD";
 
 #[cfg(test)]
 mod tests {
@@ -577,6 +765,392 @@ mod tests {
         );
     }
 
+    /// The canonical genesis as `initialize_genesis_state_with_profile` stores it:
+    /// state root set, block hash from `calculate_block_hash` (the canonical
+    /// genesis encoding).
+    fn stored_genesis() -> Block {
+        let mut g = create_genesis_block(&GenesisConfig::default());
+        g.state_root = Hash::new([0x5A; 32]);
+        g.header.block_hash = calculate_block_hash(&g);
+        g
+    }
+
+    /// CV-9 / H5: at startup the node re-offers the genesis it stored to the
+    /// strict production DAG store (`seed_genesis`, and the eager load when
+    /// nothing is pruned). Configured by its hash, genesis is exempt from the
+    /// proposer/VRF admission checks. Before the fix the exemption also
+    /// required `verify_hash()`, which recomputes the hash with the block-hash
+    /// encoding, while genesis is hashed with the canonical genesis encoding,
+    /// so the exemption never held and the store refused genesis with "zero
+    /// proposer public key".
+    #[tokio::test]
+    async fn genesis_reoffered_to_strict_store_is_exempt() {
+        let genesis = stored_genesis();
+        assert!(
+            !genesis.verify_hash(),
+            "fixture: the stored genesis is hashed with the canonical genesis encoding"
+        );
+        let dag = DagStore::new(); // strict VRF, as start_node builds it
+        dag.set_configured_genesis(genesis.header.block_hash);
+        dag.set_slot_origin(&genesis.header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
+        dag.store_block(genesis.clone())
+            .await
+            .expect("the configured genesis must be admitted by the strict store");
+        // Re-offered again (a second startup pass): already present, not invalid.
+        let again = dag.store_block(genesis).await;
+        assert!(
+            matches!(again, Err(citrate_consensus::DagStoreError::BlockExists(_))),
+            "a re-offered genesis must be BlockExists, got {again:?}"
+        );
+    }
+
+    /// The exemption is by identity, not by the hash field: a height-0 block
+    /// that names the configured hash but carries other content is not genesis.
+    #[tokio::test]
+    async fn a_block_that_only_names_the_genesis_hash_is_not_exempt() {
+        let genesis = stored_genesis();
+        // Content the canonical genesis hash binds, changed.
+        let mut forged_root = genesis.clone();
+        forged_root.state_root = Hash::new([0x6B; 32]);
+        // Content it does not bind (the proposer), changed: a non-inert genesis.
+        let mut forged_proposer = genesis.clone();
+        forged_proposer.header.proposer_pubkey = PublicKey::new([0x77; 32]);
+        for (name, forged) in [("state root", forged_root), ("proposer", forged_proposer)] {
+            assert!(
+                !forged.is_configured_genesis(Some(genesis.header.block_hash)),
+                "a genesis with a forged {name} passed as the configured genesis"
+            );
+            let dag = DagStore::new();
+            dag.set_configured_genesis(genesis.header.block_hash);
+            dag.set_slot_origin(&genesis.header)
+                .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
+            assert!(
+                dag.store_block(forged).await.is_err(),
+                "the strict store admitted a genesis with a forged {name}"
+            );
+        }
+    }
+
+    // ---- r1007 (ADR-2026-11-03 CV-2, S3-6; docs/consensus/R1007_GENESIS.md) ----
+
+    use super::R1007_CHILD_ENV;
+
+    fn r1007_child(test: &str) {
+        let exe = std::env::current_exe().expect("exe");
+        let out = std::process::Command::new(exe)
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(R1007_CHILD_ENV, "1")
+            .env_remove(citrate_execution::mpt_state_root::MPT_STATE_ROOT_ENV)
+            .output()
+            .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child {test} failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn the_r1007_profile_is_compiled_to_its_block_0() {
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+        assert_eq!(
+            compiled_genesis_for_profile(Some(R1007_PROFILE)),
+            Some(R1007_GENESIS)
+        );
+        assert_eq!(
+            compiled_genesis_for_profile(Some(R1006_PROFILE)),
+            Some(R1006_GENESIS)
+        );
+        for p in [None, Some("default"), Some("testnet_beta"), Some("R1007")] {
+            assert_eq!(compiled_genesis_for_profile(p), None, "{p:?}");
+        }
+    }
+
+    /// The node's genesis build for profile `r1007`: the MPT rule is published for the
+    /// block 0 the profile compiles (main.rs `publish_mpt_rule_for_genesis_build`), and the
+    /// build then produces exactly `R1007_GENESIS` (the fresh-keys alloc, D-K3 done).
+    #[test]
+    fn r1007_profile_builds_the_pinned_block_0_under_the_published_rule() {
+        r1007_child("genesis::tests::r1007_child_build_after_publication");
+    }
+
+    #[test]
+    fn r1007_child_build_after_publication() {
+        if std::env::var(R1007_CHILD_ENV).is_err() {
+            return;
+        }
+        crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), None)
+            .expect("the r1007 rule publishes");
+        assert_eq!(
+            citrate_execution::mpt_state_root::mpt_state_root_height(),
+            Some(0)
+        );
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let g = rt
+            .block_on(build_profile(40204, Some(R1007_PROFILE)))
+            .expect("the r1007 genesis builds from the fresh-keys alloc");
+        assert_eq!(
+            g,
+            citrate_consensus::hardening::R1007_GENESIS,
+            "the node built 0x{} for profile r1007",
+            hex::encode(g)
+        );
+        // A configured per-node height that disagrees with the compiled one is refused.
+        assert!(
+            crate::publish_mpt_rule_for_genesis_build(40204, Some(R1007_PROFILE), Some(5)).is_err()
+        );
+    }
+
+    /// Without the rule published (a caller that skipped the publication) the r1007 build
+    /// is refused, never built under the legacy root. Under D-K3 the pending keys refuse
+    /// it first; the MPT guard on the layout itself is
+    /// `r1007_genesis_state_refuses_to_build_without_the_mpt_rule` (economics).
+    #[test]
+    fn r1007_profile_build_refuses_without_the_published_rule() {
+        r1007_child("genesis::tests::r1007_child_build_without_publication");
+    }
+
+    #[test]
+    fn r1007_child_build_without_publication() {
+        if std::env::var(R1007_CHILD_ENV).is_err() {
+            return;
+        }
+        citrate_execution::mpt_state_root::set_mpt_state_root_height(None);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let e = rt
+            .block_on(build_profile(40204, Some(R1007_PROFILE)))
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("D-K3") || e.contains("MPT state root"), "{e}");
+    }
+
+    /// S3-6 genesis tripwire (fed#465 §7.1): `ValidatorRegistry.activeSet()`
+    /// read against the r1007 block-0 state equals the compiled epoch-0
+    /// committee (`genesis_committee_set`, from the validators file), key for
+    /// key and stake for stake. The registry state delta and the list are built
+    /// from one file today; this fails if a future alloc (D-K3 fresh keys)
+    /// changes one without the other. Runs on the r1007 layout the build has
+    /// (the r1006-keys candidate) under the MPT rule, in a child process.
+    #[test]
+    fn r1007_block0_active_set_is_the_genesis_committee() {
+        r1007_child("genesis::tests::r1007_child_block0_active_set");
+    }
+
+    #[test]
+    fn r1007_child_block0_active_set() {
+        if std::env::var(R1007_CHILD_ENV).is_err() {
+            return;
+        }
+        use citrate_consensus::types::{BlockBuilder, Signature, Transaction};
+        use citrate_execution::StateDB;
+        citrate_execution::mpt_state_root::set_mpt_state_root_height(Some(0));
+        let cfg = EconomicsGenesisConfig::r1007().expect("the r1007 genesis");
+        let ex = Arc::new(Executor::with_chain_id(Arc::new(StateDB::new()), 40204));
+        citrate_economics::genesis::initialize_shared_genesis_state(&ex, &cfg)
+            .expect("r1007 block-0 state");
+        let (registry, _) = citrate_economics::r1007::validator_set_binding()
+            .expect("binding")
+            .expect("the r1007 genesis registers a final producer set");
+        let mut to = [0u8; 32];
+        to[..20].copy_from_slice(&registry);
+        let mut from = [0u8; 32];
+        from[19] = 1;
+        let mut tx = Transaction {
+            hash: Hash::default(),
+            nonce: 0,
+            from: PublicKey::new(from),
+            to: Some(PublicKey::new(to)),
+            value: 0,
+            gas_limit: 50_000_000,
+            gas_price: 1,
+            data: crate::registry_sync::active_set_selector().to_vec(),
+            signature: Signature::new([0u8; 64]),
+            tx_type: None,
+            ..Default::default()
+        };
+        tx.determine_type();
+        let blk = BlockBuilder::new()
+            .base_fee_per_gas(1_000_000_000)
+            .height(0)
+            .build_unhashed();
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let receipt = rt
+            .block_on(ex.simulate_transaction(&blk, &tx))
+            .expect("activeSet() at block 0");
+        assert!(
+            receipt.status,
+            "activeSet() reverted: {:?}",
+            receipt.revert_reason
+        );
+        let mut on_chain: Vec<(PublicKey, u128)> =
+            crate::registry_sync::decode_active_set(&receipt.output)
+                .expect("decode activeSet")
+                .into_iter()
+                .map(|(k, st)| (PublicKey::new(k), st))
+                .collect();
+        let mut compiled =
+            genesis_committee_set(Some(&citrate_consensus::hardening::R1007_GENESIS))
+                .expect("validators file")
+                .expect("the r1007 epoch-0 committee");
+        on_chain.sort_by_key(|(k, st)| (k.0, *st));
+        compiled.sort_by_key(|(k, st)| (k.0, *st));
+        assert_eq!(compiled.len(), 7, "the seven producers");
+        assert_eq!(
+            on_chain, compiled,
+            "block 0's activeSet() must equal the compiled epoch-0 committee"
+        );
+    }
+
+    /// The node builds the r1007 block 0 at the r1007 genesis timestamp (the ceremony
+    /// stamps it), not at the shared canonical one its GenesisConfig carries.
+    #[test]
+    fn the_r1007_profile_stamps_block_0_with_the_r1007_genesis_timestamp() {
+        let src = include_str!("genesis.rs");
+        let build = src
+            .find("pub async fn initialize_genesis_state_with_profile(")
+            .expect("the profile build");
+        let body = &src[build..build + 1_200];
+        assert!(
+            body.contains("citrate_economics::r1007::GENESIS_TIMESTAMP"),
+            "the r1007 profile must use r1007::GENESIS_TIMESTAMP for block 0"
+        );
+    }
+
+    #[test]
+    fn r1007_boot_guard_cases() {
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS, RELEASE_GENESIS};
+        use citrate_economics::r1006::Readiness;
+        let r1005 = RELEASE_GENESIS[0].1;
+        let ready = Readiness {
+            inputs_final: true,
+            validators_final: true,
+            orangeseed_present: true,
+        };
+        let not_ready = Readiness {
+            validators_final: false,
+            ..ready.clone()
+        };
+        let g =
+            |p, run: Option<&[u8; 32]>, r: &Readiness, reh| r1007_boot_guard(40204, p, run, r, reh);
+        assert!(g(Some("r1007"), Some(&R1007_GENESIS), &ready, false).is_ok());
+        let e = g(Some("r1007"), Some(&R1007_GENESIS), &not_ready, false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not release-ready"), "{e}");
+        assert!(g(Some("r1007"), Some(&R1007_GENESIS), &not_ready, true).is_ok());
+        assert!(g(None, Some(&R1007_GENESIS), &not_ready, false).is_err());
+        // Profile r1007 on another block 0 (r1006's, r1005's, unknown, none): refused.
+        for run in [Some(&R1006_GENESIS), Some(&r1005), Some(&[0x42; 32]), None] {
+            let e = g(Some("r1007"), run, &ready, true).unwrap_err().to_string();
+            assert!(e.contains("is not the r1007 genesis"), "{e}");
+        }
+        // The r1007 block 0 under another profile name still runs (the name is display).
+        assert!(g(Some("r1006"), Some(&R1007_GENESIS), &ready, false).is_ok());
+        assert!(g(Some("testnet_beta"), Some(&r1005), &not_ready, false).is_ok());
+        assert!(
+            r1007_boot_guard(1337, Some("r1007"), Some(&R1007_GENESIS), &ready, false).is_err()
+        );
+        // And the r1006 guard leaves the r1007 block 0 alone.
+        assert!(r1006_boot_guard(40204, None, Some(&R1007_GENESIS), &not_ready, false).is_ok());
+    }
+
+    /// The same producer set, the same ValidatorRegistry, compiled: on r1007 the env may
+    /// only repeat it, as on r1006, so registry snapshots and the finality committee form
+    /// from the same set on every node.
+    #[test]
+    fn the_r1007_validator_set_is_compiled_like_r1006() {
+        use citrate_consensus::hardening::{R1006_GENESIS, R1007_GENESIS};
+        let r7 = compiled_validator_set(Some(&R1007_GENESIS)).expect("binding");
+        let r6 = compiled_validator_set(Some(&R1006_GENESIS)).expect("binding");
+        assert!(r7.is_some(), "r1007 compiles its registry binding");
+        assert_eq!(r7, r6, "same registry, same activation height");
+        assert_eq!(
+            compiled_validator_set(Some(&[0x42; 32])).expect("none"),
+            None
+        );
+        assert_eq!(compiled_validator_set(None).expect("none"), None);
+        let (reg, act) = r7.expect("some");
+        let e =
+            resolve_validator_registry(r7, Some(&format!("0x{}", hex::encode([0xCD; 20]))), None)
+                .unwrap_err()
+                .to_string();
+        assert!(e.contains("compiled ValidatorRegistry"), "{e}");
+        assert_eq!(
+            resolve_validator_registry(
+                r7,
+                Some(&format!("0x{}", hex::encode(reg))),
+                Some(&act.to_string())
+            )
+            .expect("repeat ok"),
+            r7
+        );
+    }
+
+    /// The undo window is the prune retention (CV-7a), and the r1007 chain parameters
+    /// name exactly the constants the node and storage run with.
+    #[test]
+    fn r1007_undo_window_is_the_compiled_retention() {
+        let p = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS;
+        assert_eq!(p.undo_window, crate::canonical_apply::MAX_REORG_DEPTH);
+        assert_eq!(
+            p.undo_window,
+            citrate_storage::state::state_store::REORG_UNDO_DEPTH
+        );
+        assert_eq!(p.pruning_depth, crate::dag_prune::MIN_RETAIN_BLOCKS);
+        assert_eq!(p.pruning_depth, crate::dag_prune::DEFAULT_RETAIN_BLOCKS);
+        assert_eq!(
+            p.validator_activation_height,
+            citrate_economics::r1006::R1006_VALIDATOR_ACTIVATION_HEIGHT
+        );
+        assert_eq!(
+            p.include_gas_limit,
+            crate::producer::PRODUCER_BLOCK_GAS_LIMIT,
+            "INCLUDE_GAS_LIMIT"
+        );
+    }
+
+    /// On a genesis with compiled chain parameters the node's `[checkpoint]` section may
+    /// only repeat them: a per-node interval, committee size or vote depth would split
+    /// the fleet's checkpoints. Elsewhere the config decides, as before.
+    #[test]
+    fn r1007_checkpoint_config_must_match_the_compiled_params() {
+        use crate::config::CheckpointNodeConfig;
+        let p = citrate_consensus::genesis_params::R1007_CHAIN_PARAMS;
+        let ok = CheckpointNodeConfig::default();
+        assert!(check_checkpoint_params(Some(&p), &ok).is_ok());
+        for (name, bad) in [
+            (
+                "interval",
+                CheckpointNodeConfig {
+                    interval: 2,
+                    ..ok.clone()
+                },
+            ),
+            (
+                "committee_size",
+                CheckpointNodeConfig {
+                    committee_size: 10,
+                    ..ok.clone()
+                },
+            ),
+            (
+                "vote_depth",
+                CheckpointNodeConfig {
+                    vote_depth: 1,
+                    ..ok.clone()
+                },
+            ),
+        ] {
+            let e = check_checkpoint_params(Some(&p), &bad)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(name), "{name}: {e}");
+        }
+        assert!(check_checkpoint_params(None, &CheckpointNodeConfig { interval: 2, ..ok }).is_ok());
+    }
+
     #[test]
     fn test_standalone_genesis_matches_shared_canonical_block() {
         let config = GenesisConfig::default();
@@ -596,5 +1170,68 @@ mod tests {
             calculate_block_hash(&standalone),
             shared_genesis::calculate_canonical_block_hash(&shared)
         );
+    }
+
+    /// Epoch 0 (lead decision 1, 2026-11-09): the checkpoint committee below the
+    /// first registry snapshot S(1) comes from the genesis validator set, which
+    /// is compiled with the genesis (no config). On r1006 it is exactly the
+    /// producer set `validators.json` registers in the ValidatorRegistry at
+    /// block 0: each proposer key with its stake. Any other genesis compiles
+    /// none (its committees come only from registry snapshots).
+    #[test]
+    fn genesis_committee_is_the_block_0_validator_set() {
+        let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+        let set = genesis_committee_set(Some(&r1006))
+            .expect("the r1006 validator file parses")
+            .expect("r1006 compiles a final producer set");
+        let file: serde_json::Value =
+            serde_json::from_str(citrate_economics::r1006::R1006_VALIDATORS_JSON)
+                .expect("validators.json is JSON");
+        let want: Vec<(PublicKey, u128)> = file["validators"]
+            .as_array()
+            .expect("a validators array")
+            .iter()
+            .map(|v| {
+                let pk = hex::decode(
+                    v["proposer_pubkey"]
+                        .as_str()
+                        .expect("proposer_pubkey")
+                        .trim_start_matches("0x"),
+                )
+                .expect("hex proposer key");
+                let pk: [u8; 32] = pk.as_slice().try_into().expect("32-byte proposer key");
+                let stake: u128 = v["stake_wei"]
+                    .as_str()
+                    .expect("stake_wei")
+                    .parse()
+                    .expect("stake fits u128");
+                (PublicKey::new(pk), stake)
+            })
+            .collect();
+        assert_eq!(want.len(), 7, "the r1006 producer set");
+        assert_eq!(set, want);
+        assert!(set.iter().all(|(_, s)| *s > 0));
+        assert_eq!(
+            genesis_committee_set(Some(&[0x42; 32])).expect("unknown genesis"),
+            None
+        );
+        assert_eq!(genesis_committee_set(None).expect("no genesis"), None);
+    }
+
+    /// r1007 (R1007_GENESIS.md §3.3, integration item §5.2): the r1007 block 0
+    /// registers the same producers as r1006 (the validators file is shared),
+    /// so its epoch-0 committee is the same set. Without this arm r1007 votes
+    /// form only from the first registry snapshot S(1) = 800.
+    #[test]
+    fn r1007_genesis_committee_is_the_shared_validator_set() {
+        let r1006 = citrate_consensus::hardening::R1006_GENESIS;
+        let r1007 = citrate_consensus::hardening::R1007_GENESIS;
+        let want = genesis_committee_set(Some(&r1006))
+            .expect("the r1006 validator file parses")
+            .expect("r1006 compiles a final producer set");
+        let got = genesis_committee_set(Some(&r1007))
+            .expect("the shared validator file parses")
+            .expect("r1007 compiles its epoch-0 committee");
+        assert_eq!(got, want);
     }
 }

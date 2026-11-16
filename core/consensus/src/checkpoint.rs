@@ -33,8 +33,9 @@ pub enum CheckpointError {
     #[error("Invalid signature from {0:?}")]
     InvalidSignature(PublicKey),
 
-    #[error("Quorum not reached: {0}/{1} votes")]
-    QuorumNotReached(usize, usize),
+    /// Voted stake / quorum stake (#185: the quorum counts stake).
+    #[error("Quorum not reached: {0}/{1} stake")]
+    QuorumNotReached(u128, u128),
 
     #[error("Committee too small to finalize: {0} < {1} (minimum)")]
     CommitteeTooSmall(usize, usize),
@@ -55,53 +56,176 @@ pub enum CheckpointError {
 /// docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3 (D-2a): a 1- or 2-member
 /// committee must never self-finalize — that is centralized rubber-stamping,
 /// not BFT. Below this size the manager still proposes and collects votes but
-/// never finalizes. A committee of 4 tolerates 1 Byzantine member at quorum 3.
+/// never finalizes. A committee of 4 equal stakes tolerates 1 Byzantine member.
 pub const MIN_FINALITY_COMMITTEE: usize = 4;
 
-/// Derived BFT quorum for an effective committee of size `n`: `floor(2n/3) + 1`.
+/// Derived BFT quorum over a total of `n` units: `floor(2n/3) + 1`, the least
+/// amount strictly greater than two thirds of `n`.
 ///
-/// docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3 (D-2). This is the standard
-/// BFT threshold (e.g. 67 for n=100, 3 for n=4) and replaces the fixed 67, which
-/// could never be met below 100 validators. Callers gate on
-/// [`MIN_FINALITY_COMMITTEE`] before using this value.
+/// docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3 (D-2). Kept for head counts
+/// (with equal stakes the stake quorum below is exactly this many members).
 pub fn derived_quorum(n: usize) -> usize {
     (n.saturating_mul(2) / 3).saturating_add(1)
 }
 
+/// The stake quorum of a committee whose members hold `total` stake in all:
+/// the least voted stake strictly greater than two thirds of `total`,
+/// `floor(2·total/3) + 1`, computed without overflow for any `u128`.
+///
+/// #185 / spec 06 §7 (reviewer R8): the quorum counts STAKE, not committee
+/// members. With equal stakes it is the same set of votes as
+/// [`derived_quorum`] over the member count.
+pub fn quorum_stake(total: u128) -> u128 {
+    // 2·total/3 = 2·(total/3) + (2·(total%3))/3, exact in integers.
+    let third = total / 3;
+    let rem = total % 3;
+    third
+        .saturating_mul(2)
+        .saturating_add(rem.saturating_mul(2) / 3)
+        .saturating_add(1)
+}
+
 /// Domain separator prefix for checkpoint vote canonical messages.
 ///
-/// RM-B1 / WP-B2.2 (audit H-02): the canonical signing message MUST be
-/// prefixed with this byte string so a vote signed for one chain
-/// cannot be replayed onto a fork or alternate chain. The trailing
-/// version `-V1` lets future protocol changes rotate the separator
-/// without ambiguity. The full canonical layout is:
+/// RM-B1 / WP-B2.2 (audit H-02) introduced the separator so a vote signed for
+/// one chain cannot be replayed onto another. r1007 (spec 06 §7, vote message
+/// v2) rotates it to `-V2` and binds the genesis, the epoch and the state the
+/// checkpoint certifies. The full canonical layout is:
 ///
 /// ```text
 /// CITRATE_VOTE_DOMAIN_SEPARATOR (21 bytes)
-///   || chain_id (8 bytes, little-endian)
-///   || height   (8 bytes, little-endian)
-///   || block_hash (32 bytes)
+///   || chain_id      (8 bytes, little-endian)
+///   || genesis_hash  (32 bytes)
+///   || epoch         (8 bytes, little-endian)
+///   || height        (8 bytes, little-endian)
+///   || block_hash    (32 bytes)
+///   || state_root    (32 bytes)
+///   || accepted_root (32 bytes)
 /// ```
 ///
-/// = 69 bytes total.
-pub const CITRATE_VOTE_DOMAIN_SEPARATOR: &[u8] = b"CITRATE-CHECKPOINT-V1";
+/// = 173 bytes total.
+pub const CITRATE_VOTE_DOMAIN_SEPARATOR: &[u8] = b"CITRATE-CHECKPOINT-V2";
 
-/// Build the canonical signing message for a checkpoint vote.
+/// Domain of the accepted-transactions root (spec 06 §3.9).
+pub const ACCEPTED_ROOT_DOMAIN: &[u8] = b"CITRATE-ACCEPTED-V1";
+
+/// The accepted-transactions root of the EMPTY accepted set (spec 06 §3.9):
+/// `SHA3-256("CITRATE-ACCEPTED-V1" ‖ u64 count = 0)`.
+pub fn empty_accepted_root() -> Hash {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(ACCEPTED_ROOT_DOMAIN);
+    h.update(0u64.to_le_bytes());
+    Hash::new(h.finalize().into())
+}
+
+/// The accepted-transactions root a checkpoint vote binds for `block`.
 ///
-/// RM-B1 / WP-B2.2 (audit H-02). Used by both the producer (when
-/// signing a vote) and the verifier (when checking a vote signature)
-/// — these MUST agree byte-for-byte.
-pub fn canonical_vote_message(chain_id: u64, height: u64, block_hash: &Hash) -> Vec<u8> {
+/// DEPENDENCY (CV-4a, the mergeset-execution lane): `accepted_root` becomes a
+/// committed block field there (spec 06 §3.9). Until it lands, no block in
+/// this build commits one, so the vote binds the root of the empty accepted
+/// set and nothing else: this function is the ONE place that changes to read
+/// `block.accepted_root` when the field exists. It never invents data.
+pub fn checkpoint_accepted_root(_block: &crate::types::Block) -> Hash {
+    empty_accepted_root()
+}
+
+/// What a checkpoint vote certifies besides `(chain_id, genesis, height,
+/// block_hash)` (spec 06 §7, vote message v2).
+///
+/// * `epoch`: the epoch whose validator snapshot selected the committee,
+///   identified by its snapshot height S(E) (`VrfProposerSelector::
+///   governing_snapshot`), the same input the committee is derived from.
+/// * `state_root`: the certified block's committed `state_root`.
+/// * `accepted_root`: its accepted-transactions root
+///   ([`checkpoint_accepted_root`]).
+///
+/// `state_root` and `accepted_root` are already bound through `block_hash`;
+/// stating them lets a certificate certify state without a header source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VoteBinding {
+    pub epoch: u64,
+    pub state_root: Hash,
+    pub accepted_root: Hash,
+}
+
+/// Build the canonical signing message for a checkpoint vote (vote message v2,
+/// spec 06 §7). Used by both the signer and the verifier, which MUST agree
+/// byte-for-byte. See [`CITRATE_VOTE_DOMAIN_SEPARATOR`] for the layout.
+pub fn canonical_vote_message(
+    chain_id: u64,
+    genesis_hash: &Hash,
+    height: u64,
+    block_hash: &Hash,
+    binding: &VoteBinding,
+) -> Vec<u8> {
     let mut msg = Vec::with_capacity(
         CITRATE_VOTE_DOMAIN_SEPARATOR
             .len()
-            .saturating_add(8 + 8 + 32),
+            .saturating_add(8 + 32 + 8 + 8 + 32 + 32 + 32),
     );
     msg.extend_from_slice(CITRATE_VOTE_DOMAIN_SEPARATOR);
     msg.extend_from_slice(&chain_id.to_le_bytes());
+    msg.extend_from_slice(genesis_hash.as_bytes());
+    msg.extend_from_slice(&binding.epoch.to_le_bytes());
     msg.extend_from_slice(&height.to_le_bytes());
     msg.extend_from_slice(block_hash.as_bytes());
+    msg.extend_from_slice(binding.state_root.as_bytes());
+    msg.extend_from_slice(binding.accepted_root.as_bytes());
     msg
+}
+
+/// A checkpoint committee: its epoch and its members with their stake, in
+/// selection order. The quorum is over the members' stake (#185).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Committee {
+    /// The epoch (snapshot height S(E)) whose validator set it was drawn from.
+    pub epoch: u64,
+    /// `(member, stake)`; no member twice, every stake > 0.
+    pub members: Vec<(PublicKey, u128)>,
+}
+
+impl Committee {
+    /// Equal stake 1 for every member: a committee where the stake quorum is
+    /// exactly the head-count quorum. For devnets and tests that have no
+    /// validator registry; production committees come from
+    /// [`CommitteeSelector::select_weighted`] over an epoch snapshot.
+    pub fn equal_stake(epoch: u64, members: Vec<PublicKey>) -> Self {
+        Self {
+            epoch,
+            members: members.into_iter().map(|pk| (pk, 1u128)).collect(),
+        }
+    }
+
+    /// The members' public keys, in order.
+    pub fn pubkeys(&self) -> Vec<PublicKey> {
+        self.members.iter().map(|(pk, _)| *pk).collect()
+    }
+
+    /// The members' stakes, in order.
+    pub fn stakes(&self) -> Vec<u128> {
+        self.members.iter().map(|(_, s)| *s).collect()
+    }
+
+    /// Total stake of the committee (saturating).
+    pub fn total_stake(&self) -> u128 {
+        self.members
+            .iter()
+            .fold(0u128, |acc, (_, s)| acc.saturating_add(*s))
+    }
+
+    /// Whether `pk` is a member.
+    pub fn contains(&self, pk: &PublicKey) -> bool {
+        self.members.iter().any(|(m, _)| m == pk)
+    }
+
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
 }
 
 /// Checkpoint configuration.
@@ -111,10 +235,13 @@ pub struct CheckpointConfig {
     pub interval: u64,
 
     /// Committee size (number of validators selected for each checkpoint).
+    /// The node always runs [`CHECKPOINT_COMMITTEE_SIZE`]; other values are for
+    /// in-process tests.
     pub committee_size: usize,
 
-    /// Quorum threshold (minimum votes for finalization).
-    /// Default: 67/100 (2/3 + 1).
+    /// Legacy fixed quorum (minimum votes), kept for config compatibility.
+    /// NOT used to finalize: the quorum is more than two thirds of the
+    /// committee's STAKE ([`quorum_stake`], #185).
     pub quorum_threshold: usize,
 
     /// Chain ID. RM-B1 / WP-B2.2 (audit H-02): bound into the
@@ -123,6 +250,12 @@ pub struct CheckpointConfig {
     /// the testnet-beta chain id (40204) — production configs MUST
     /// set this explicitly.
     pub chain_id: u64,
+
+    /// Hash of the genesis block this node runs (spec 06 §7, vote message
+    /// v2). r1006 and r1007 share chain id 40204, so the chain id alone does
+    /// not keep a vote on one from verifying on the other. The node sets it
+    /// from the genesis it loaded; the default (zero) is for tests.
+    pub genesis_hash: Hash,
 
     /// Confirmation depth `D` (docs/consensus/CHECKPOINT_FINALITY_WIRING.md §3):
     /// a node votes for the canonical block at boundary height `H` only once its
@@ -133,6 +266,21 @@ pub struct CheckpointConfig {
 
 /// Default confirmation depth `D` (spec §3 chosen parameters: interval 2, D 3).
 pub const DEFAULT_VOTE_DEPTH: u64 = 3;
+
+/// §1.2 `CHECKPOINT_INTERVAL` (spec 06): checkpoints sit at every multiple of
+/// 50 chain heights on r1007, a consensus constant (no override). The G11
+/// pruning point is aligned to it, so a finalized checkpoint there certifies
+/// a state-sync anchor. The node runs finality at this interval; configurable
+/// intervals exist only for in-process tests.
+pub const CHECKPOINT_INTERVAL: u64 = 50;
+
+/// §1.2 `CHECKPOINT_COMMITTEE_SIZE` (spec 06; lead decision 2, 2026-11-09):
+/// seats in every checkpoint committee, a consensus constant like
+/// [`CHECKPOINT_INTERVAL`] (no per-node override): nodes that disagree on it
+/// derive different committees for the same checkpoint. While the eligible set
+/// is at most this size the committee is the whole set. Configurable sizes
+/// exist only for in-process tests.
+pub const CHECKPOINT_COMMITTEE_SIZE: usize = 100;
 
 /// §11.9 memory bound: at most this many checkpoints are pending at once. During
 /// a quorum stall the OLDEST pending checkpoint (and its voted markers) is
@@ -160,10 +308,11 @@ pub enum ProposeOutcome {
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
-            interval: 50,
-            committee_size: 100,
+            interval: CHECKPOINT_INTERVAL,
+            committee_size: CHECKPOINT_COMMITTEE_SIZE,
             quorum_threshold: 67,
             chain_id: 40204,
+            genesis_hash: Hash::default(),
             vote_depth: DEFAULT_VOTE_DEPTH,
         }
     }
@@ -177,6 +326,7 @@ impl CheckpointConfig {
             committee_size: 5,
             quorum_threshold: 4,
             chain_id: 40204,
+            genesis_hash: Hash::default(),
             vote_depth: 2,
         }
     }
@@ -196,10 +346,14 @@ pub struct CheckpointVote {
     /// The block hash at the checkpoint height.
     pub block_hash: Hash,
 
+    /// What the vote certifies about that block (epoch, state root, accepted
+    /// root; spec 06 §7). Signed together with chain id, genesis and height.
+    pub binding: VoteBinding,
+
     /// The voter's public key.
     pub voter: PublicKey,
 
-    /// Signature over (height || block_hash) by the voter.
+    /// Signature over [`canonical_vote_message`] by the voter.
     pub signature: Signature,
 }
 
@@ -222,8 +376,17 @@ pub struct Checkpoint {
     /// The block hash at the checkpoint height.
     pub block_hash: Hash,
 
+    /// What the votes certify about that block (spec 06 §7). Every vote in
+    /// `votes` is a signature over this binding.
+    pub binding: VoteBinding,
+
     /// The committee that voted on this checkpoint.
     pub committee: Vec<PublicKey>,
+
+    /// Each member's stake, aligned with `committee` (#185: the quorum counts
+    /// stake). A checkpoint whose `stakes` do not line up with its committee,
+    /// or whose total stake is zero, never has a quorum.
+    pub stakes: Vec<u128>,
 
     /// Collected votes (voter pubkey → signature).
     pub votes: HashMap<PublicKey, Signature>,
@@ -233,29 +396,93 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Check if quorum has been reached against an explicit threshold.
+    /// A pending checkpoint for `(height, block_hash)` with `committee`.
+    pub fn pending(
+        height: u64,
+        block_hash: Hash,
+        binding: VoteBinding,
+        committee: &Committee,
+    ) -> Self {
+        Self {
+            height,
+            block_hash,
+            binding,
+            committee: committee.pubkeys(),
+            stakes: committee.stakes(),
+            votes: HashMap::new(),
+            status: CheckpointStatus::Pending,
+        }
+    }
+
+    /// The committee as [`Committee`] (epoch from the binding).
+    pub fn weighted_committee(&self) -> Committee {
+        Committee {
+            epoch: self.binding.epoch,
+            members: self
+                .committee
+                .iter()
+                .copied()
+                .zip(self.stakes.iter().copied())
+                .collect(),
+        }
+    }
+
+    /// Whether the stake vector lines up with the committee and every member
+    /// has stake: the shape every stake computation below requires.
+    fn stakes_well_formed(&self) -> bool {
+        self.stakes.len() == self.committee.len() && self.stakes.iter().all(|s| *s > 0)
+    }
+
+    /// Stake of `voter` in this committee (0 if not a member).
+    pub fn stake_of(&self, voter: &PublicKey) -> u128 {
+        self.committee
+            .iter()
+            .position(|m| m == voter)
+            .and_then(|i| self.stakes.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    /// Total stake of the committee (0 if the stakes are malformed).
+    pub fn total_stake(&self) -> u128 {
+        if !self.stakes_well_formed() {
+            return 0;
+        }
+        self.stakes
+            .iter()
+            .fold(0u128, |acc, s| acc.saturating_add(*s))
+    }
+
+    /// Stake of the members that have voted.
+    pub fn voted_stake(&self) -> u128 {
+        self.votes
+            .keys()
+            .fold(0u128, |acc, v| acc.saturating_add(self.stake_of(v)))
+    }
+
+    /// Check if the head count has reached an explicit threshold (legacy).
     pub fn has_quorum(&self, threshold: usize) -> bool {
         self.votes.len() >= threshold
     }
 
-    /// The effective quorum for THIS checkpoint, derived from its own committee
-    /// size: `floor(2n/3)+1`. Returns `None` when the committee is smaller than
-    /// [`MIN_FINALITY_COMMITTEE`], i.e. too small to finalize at all.
-    pub fn effective_quorum(&self) -> Option<usize> {
+    /// The stake quorum for THIS checkpoint: more than two thirds of its
+    /// committee's stake ([`quorum_stake`]). `None` when the committee is
+    /// smaller than [`MIN_FINALITY_COMMITTEE`] (too small to finalize at all)
+    /// or its stakes are malformed.
+    pub fn effective_quorum(&self) -> Option<u128> {
         let n = self.committee.len();
-        if n < MIN_FINALITY_COMMITTEE {
+        if n < MIN_FINALITY_COMMITTEE || !self.stakes_well_formed() {
             None
         } else {
-            Some(derived_quorum(n))
+            Some(quorum_stake(self.total_stake()))
         }
     }
 
-    /// Whether this checkpoint has reached its DERIVED quorum. `false` when the
-    /// committee is below [`MIN_FINALITY_COMMITTEE`] (never self-finalize a tiny
-    /// committee) or when it simply has too few votes.
+    /// Whether this checkpoint's votes hold more than two thirds of its
+    /// committee's stake (#185). `false` when the committee is below
+    /// [`MIN_FINALITY_COMMITTEE`] (never self-finalize a tiny committee).
     pub fn has_derived_quorum(&self) -> bool {
         match self.effective_quorum() {
-            Some(q) => self.votes.len() >= q,
+            Some(q) => self.voted_stake() >= q,
             None => false,
         }
     }
@@ -277,10 +504,16 @@ impl Checkpoint {
     ///    [`canonical_vote_message`]`(chain_id, height, block_hash)`.
     ///
     /// What this does NOT establish: that the committee itself is the one the
-    /// validator registry yields for this height. Certificates are only ever
-    /// produced by this node's own manager (there is no certificate sync yet,
-    /// spec §11.10), whose committee came from its own epoch snapshot.
-    pub fn verify_certificate(&self, chain_id: u64) -> Result<(), CheckpointError> {
+    /// validator registry yields for this height — the certificate's own
+    /// `committee` field is trusted. Anything that reads a certificate from
+    /// storage or from a peer must use [`Self::verify_certificate_against`] with
+    /// a committee it derived itself (the node's floor verifier does, at boot,
+    /// on every poll and at finalization).
+    pub fn verify_certificate(
+        &self,
+        chain_id: u64,
+        genesis_hash: &Hash,
+    ) -> Result<(), CheckpointError> {
         let height = self.height;
         let invalid = |reason: String| CheckpointError::InvalidCertificate { height, reason };
         if self.status != CheckpointStatus::Finalized {
@@ -290,18 +523,22 @@ impl Checkpoint {
             )));
         }
         let n = self.committee.len();
-        let quorum = self.effective_quorum().ok_or_else(|| {
-            invalid(format!(
-                "committee of {n} is below the finality minimum {MIN_FINALITY_COMMITTEE}"
-            ))
-        })?;
-        if self.votes.len() < quorum {
+        if self.stakes.len() != n {
             return Err(invalid(format!(
-                "{} votes; the quorum for a committee of {n} is {quorum}",
-                self.votes.len()
+                "{} stakes for a committee of {n}",
+                self.stakes.len()
             )));
         }
+        let quorum = self.effective_quorum().ok_or_else(|| {
+            invalid(format!(
+                "committee of {n} is below the finality minimum {MIN_FINALITY_COMMITTEE} \
+                 or a member has no stake"
+            ))
+        })?;
         let committee: HashSet<&PublicKey> = self.committee.iter().collect();
+        if committee.len() != n {
+            return Err(invalid("the committee lists a member twice".to_string()));
+        }
         for (voter, signature) in &self.votes {
             if !committee.contains(voter) {
                 return Err(invalid(format!("voter {voter:?} is not in the committee")));
@@ -309,17 +546,107 @@ impl Checkpoint {
             let vote = CheckpointVote {
                 height,
                 block_hash: self.block_hash,
+                binding: self.binding,
                 voter: *voter,
                 signature: *signature,
             };
-            if verify_vote_signature(&vote, chain_id).is_err() {
+            if verify_vote_signature(&vote, chain_id, genesis_hash).is_err() {
                 return Err(invalid(format!(
                     "signature of {voter:?} does not verify for chain {chain_id}"
                 )));
             }
         }
+        let voted = self.voted_stake();
+        if voted < quorum {
+            return Err(invalid(format!(
+                "{} votes hold {voted} of {} stake; the quorum is {quorum}",
+                self.votes.len(),
+                self.total_stake()
+            )));
+        }
         Ok(())
     }
+}
+
+impl Checkpoint {
+    /// [`Self::verify_certificate`] against `committee`, a committee the CALLER
+    /// derived for this height (its epoch's validator set and seed, the same for
+    /// every block at the height; `FinalityGadget::committee_for`) — never the one recorded in
+    /// the certificate — and against `expected`, the binding the caller derived
+    /// from its own copy of the certified block. The recorded committee must be
+    /// exactly that committee (same members, same stakes, no duplicates), the
+    /// recorded binding exactly that binding; then quorum, membership and every
+    /// signature are checked over it. A certificate whose recorded committee is
+    /// any other set — e.g. outsider keys that signed validly — is refused.
+    pub fn verify_certificate_against(
+        &self,
+        chain_id: u64,
+        genesis_hash: &Hash,
+        committee: &Committee,
+        expected: &VoteBinding,
+    ) -> Result<(), CheckpointError> {
+        let height = self.height;
+        let invalid = |reason: String| CheckpointError::InvalidCertificate { height, reason };
+        let derived: HashMap<&PublicKey, u128> =
+            committee.members.iter().map(|(pk, s)| (pk, *s)).collect();
+        if derived.len() != committee.len() {
+            return Err(invalid(
+                "the derived committee lists a member twice".to_string(),
+            ));
+        }
+        let recorded: HashMap<&PublicKey, u128> = self
+            .committee
+            .iter()
+            .zip(self.stakes.iter().copied())
+            .collect();
+        if self.stakes.len() != self.committee.len()
+            || recorded.len() != self.committee.len()
+            || recorded != derived
+        {
+            return Err(invalid(format!(
+                "the recorded committee ({} members) is not the committee this node \
+                 derives for height {height} ({} members, with their stakes)",
+                self.committee.len(),
+                committee.len()
+            )));
+        }
+        if self.binding != *expected || committee.epoch != expected.epoch {
+            return Err(invalid(format!(
+                "the certificate binds {:?}; this node derives {:?} for its block",
+                self.binding, expected
+            )));
+        }
+        self.verify_certificate(chain_id, genesis_hash)
+    }
+}
+
+/// A finalized checkpoint certificate received from a peer (Stage 1b, spec
+/// §11.10) that has passed [`CheckpointManager::verify_synced_certificate`]
+/// against a committee THIS node derived. Only that function constructs one,
+/// so [`CheckpointManager::install_synced_certificate`] cannot be handed a
+/// certificate that skipped verification.
+#[derive(Debug, Clone)]
+pub struct VerifiedCertificate {
+    checkpoint: Checkpoint,
+}
+
+impl VerifiedCertificate {
+    /// The verified certificate (its `committee` is the locally derived one).
+    pub fn checkpoint(&self) -> &Checkpoint {
+        &self.checkpoint
+    }
+}
+
+/// Outcome of [`CheckpointManager::install_synced_certificate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncedInstall {
+    /// Stored as the latest finalized checkpoint (memory + persistent store).
+    /// `guarded`: the manager's [`FinalizationGuard`] ran on it before it
+    /// became visible (`false`: no guard is installed).
+    Installed { height: u64, guarded: bool },
+    /// At or below the latest finalized height this node already holds; nothing
+    /// was changed.
+    Stale { height: u64, latest: u64 },
 }
 
 /// Integer square root of a u128 via Newton's method.
@@ -348,69 +675,120 @@ pub fn integer_sqrt_u128(n: u128) -> u128 {
     }
 }
 
-/// Deterministic committee selection for checkpoint voting.
+/// Deterministic, stake-weighted committee selection for checkpoint voting.
 pub struct CommitteeSelector;
 
+/// Domain of [`committee_epoch_seed`].
+pub const COMMITTEE_EPOCH_SEED_DOMAIN: &[u8] = b"CITRATE-COMMITTEE-EPOCH-V1";
+
+/// The committee seed for every checkpoint of epoch `epoch` (the snapshot
+/// height S(E) its validator set was read at; 0 for the genesis set) on the
+/// chain whose block 0 is `genesis_hash` (spec 06 §7, lead decision 2):
+/// `SHA-256(COMMITTEE_EPOCH_SEED_DOMAIN ‖ genesis_hash ‖ epoch as u64 LE)`.
+///
+/// A function of the epoch only, so every candidate block at a checkpoint
+/// height draws the SAME committee: two disjoint honest committees can no
+/// longer each finalize a different sibling. Binding the genesis keeps
+/// r1006 and r1007 (same chain id) on different draws. The seed is public in
+/// advance; while the eligible set fits the committee
+/// ([`CHECKPOINT_COMMITTEE_SIZE`]) the committee is the whole set and the seed
+/// only orders it, so it cannot be biased. A set larger than the committee
+/// needs an unbiasable per-epoch beacon first (spec 06 §12.2 R8).
+pub fn committee_epoch_seed(genesis_hash: &Hash, epoch: u64) -> Hash {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(COMMITTEE_EPOCH_SEED_DOMAIN);
+    hasher.update(genesis_hash.as_bytes());
+    hasher.update(epoch.to_le_bytes());
+    Hash::new(hasher.finalize().into())
+}
+
+/// Domain of the per-seat draw in [`CommitteeSelector::select_weighted`].
+const COMMITTEE_SEAT_DOMAIN: &[u8] = b"CITRATE-COMMITTEE-SEAT-V1";
+
 impl CommitteeSelector {
-    /// Select a committee deterministically from the validator set.
-    /// Uses the VRF output at the checkpoint boundary block for randomness.
-    ///
-    /// Selection is weighted by stake: higher-stake validators are more likely to be selected.
-    /// The algorithm is deterministic — all honest nodes will compute the same committee.
+    /// [`Self::select_weighted`], public keys only.
     pub fn select(
         validators: &[(PublicKey, u128)], // (pubkey, stake)
         checkpoint_height: u64,
         vrf_seed: &Hash,
         committee_size: usize,
     ) -> Vec<PublicKey> {
-        if validators.is_empty() {
-            return vec![];
-        }
-
-        let actual_size = committee_size.min(validators.len());
-
-        // Score each validator deterministically using VRF seed + their pubkey
-        let mut scored: Vec<(PublicKey, u64)> = validators
-            .iter()
-            .map(|(pk, stake)| {
-                let mut hasher = sha2::Sha256::new();
-                use sha2::Digest;
-                hasher.update(vrf_seed.as_bytes());
-                hasher.update(pk.as_bytes());
-                hasher.update(checkpoint_height.to_le_bytes());
-                let hash = hasher.finalize();
-
-                // Score = hash_value weighted by stake.
-                let hash_prefix: [u8; 8] = hash.first_chunk::<8>().copied().unwrap_or_default();
-                let hash_val = u64::from_be_bytes(hash_prefix);
-                // Weight by sqrt(stake). RM-B1 / WP-B4.2 (audit M-04):
-                // pre-fix used `(*stake as f64).sqrt() as u64` which
-                // lossily quantizes for stake > 2^53 (with 18 decimals,
-                // 0.009 SALT base units already exceeds 2^53), and the
-                // f64→u64 cast saturates differently across rustc/LLVM
-                // versions for special values. Both make committee
-                // membership non-portable. Integer sqrt on u128 is
-                // exact and deterministic on every platform.
-                let weight = integer_sqrt_u128(*stake);
-                // Cap weight at u64::MAX since `wrapping_mul` is u64.
-                let weight_u64 = weight.min(u64::MAX as u128) as u64;
-                let score = hash_val.wrapping_mul(weight_u64.max(1));
-                (*pk, score)
-            })
-            .collect();
-
-        // Sort by score (deterministic tie-breaking via pubkey bytes)
-        scored.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
-        });
-
-        // Take the top committee_size validators
-        scored
+        Self::select_weighted(validators, checkpoint_height, vrf_seed, committee_size)
             .into_iter()
-            .take(actual_size)
             .map(|(pk, _)| pk)
             .collect()
+    }
+
+    /// Select a committee of up to `committee_size` members from `validators`
+    /// by stake-weighted sampling without replacement (#185).
+    ///
+    /// Seat `i` draws `r = SHA-256(domain ‖ seed ‖ height ‖ i)` read as a
+    /// 128-bit integer, reduced mod the stake still unselected, and takes the
+    /// validator whose cumulative-stake interval (over the remaining set,
+    /// ordered by public key) contains `r`. So a validator's chance of each
+    /// seat is proportional to its stake, and every honest node computes the
+    /// same committee from the same `(set, height, seed)`. Exact integer
+    /// arithmetic; the reduction bias is below 2^-37 for any total stake
+    /// under 2^91 (10^27, a billion SALT at 18 decimals).
+    ///
+    /// Validators with zero stake are never selected (they could not count
+    /// toward a stake quorum). When the set fits (`committee_size >=` the
+    /// number of staked validators) the committee is the whole staked set.
+    /// Members are returned in selection order with their stake.
+    ///
+    /// Replaces the pre-r1007 rule, which sorted ascending on
+    /// `hash_prefix.wrapping_mul(isqrt(stake))` and took the lowest scores:
+    /// the wrapping product is uniform whatever the stake, so stake did not
+    /// affect selection.
+    pub fn select_weighted(
+        validators: &[(PublicKey, u128)],
+        checkpoint_height: u64,
+        vrf_seed: &Hash,
+        committee_size: usize,
+    ) -> Vec<(PublicKey, u128)> {
+        use sha2::Digest;
+        let mut remaining: Vec<(PublicKey, u128)> = validators
+            .iter()
+            .filter(|(_, stake)| *stake > 0)
+            .copied()
+            .collect();
+        remaining.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        remaining.dedup_by(|a, b| a.0 == b.0);
+        let seats = committee_size.min(remaining.len());
+        let mut out = Vec::with_capacity(seats);
+        let mut total: u128 = remaining
+            .iter()
+            .fold(0u128, |acc, (_, s)| acc.saturating_add(*s));
+        for seat in 0..seats {
+            if total == 0 || remaining.is_empty() {
+                break;
+            }
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(COMMITTEE_SEAT_DOMAIN);
+            hasher.update(vrf_seed.as_bytes());
+            hasher.update(checkpoint_height.to_le_bytes());
+            hasher.update((seat as u64).to_le_bytes());
+            let digest = hasher.finalize();
+            let prefix: [u8; 16] = digest.first_chunk::<16>().copied().unwrap_or_default();
+            let r = u128::from_be_bytes(prefix).checked_rem(total).unwrap_or(0);
+            let mut acc: u128 = 0;
+            let mut pick = remaining.len().saturating_sub(1);
+            for (i, (_, stake)) in remaining.iter().enumerate() {
+                acc = acc.saturating_add(*stake);
+                if r < acc {
+                    pick = i;
+                    break;
+                }
+            }
+            if pick >= remaining.len() {
+                break;
+            }
+            let chosen = remaining.remove(pick);
+            total = total.saturating_sub(chosen.1);
+            out.push(chosen);
+        }
+        out
     }
 }
 
@@ -421,33 +799,41 @@ impl CommitteeSelector {
 /// registered in `ValidatorRegistry` (spec D-4).
 pub fn sign_checkpoint_vote(
     chain_id: u64,
+    genesis_hash: &Hash,
     height: u64,
     block_hash: Hash,
+    binding: &VoteBinding,
     signing_key: &crate::crypto::Ed25519SigningKey,
 ) -> CheckpointVote {
     use ed25519_dalek::Signer;
-    let message = canonical_vote_message(chain_id, height, &block_hash);
+    let message = canonical_vote_message(chain_id, genesis_hash, height, &block_hash, binding);
     let sig = signing_key.sign(&message);
     CheckpointVote {
         height,
         block_hash,
+        binding: *binding,
         voter: PublicKey::new(signing_key.verifying_key().to_bytes()),
         signature: Signature::new(sig.to_bytes()),
     }
 }
 
-/// Verify a checkpoint vote signature cryptographically (ed25519).
-///
-/// RM-B1 / WP-B2.2 (audit H-02): canonical message is
-/// `CITRATE-CHECKPOINT-V1 || chain_id(8 LE) || height(8 LE) || block_hash(32)`
-/// = 69 bytes — see [`canonical_vote_message`]. Cross-chain replay
-/// is structurally impossible because chain_id is bound into the
-/// signed bytes.
-pub(crate) fn verify_vote_signature(
+/// Verify a checkpoint vote signature cryptographically (ed25519) over the v2
+/// canonical message ([`canonical_vote_message`]): chain id, genesis hash,
+/// epoch, height, block hash, state root and accepted root are all bound into
+/// the signed bytes, so a vote cannot be replayed onto another chain, another
+/// genesis on the same chain id, or another claimed state.
+pub fn verify_vote_signature(
     vote: &CheckpointVote,
     chain_id: u64,
+    genesis_hash: &Hash,
 ) -> Result<(), CheckpointError> {
-    let message = canonical_vote_message(chain_id, vote.height, &vote.block_hash);
+    let message = canonical_vote_message(
+        chain_id,
+        genesis_hash,
+        vote.height,
+        &vote.block_hash,
+        &vote.binding,
+    );
 
     let pubkey = VerifyingKey::from_bytes(vote.voter.as_bytes())
         .map_err(|_| CheckpointError::InvalidSignature(vote.voter))?;
@@ -703,6 +1089,179 @@ impl CheckpointManager {
         heights.into_iter().rev().collect()
     }
 
+    /// Stage 1b serving (spec §11.10): the highest finalized checkpoint with
+    /// `above < height <= at_or_below`, from the in-memory window (the most
+    /// recent [`MAX_FINALIZED_IN_MEMORY`]) or, for the latest, the persistent
+    /// record. Returned AS STORED; the requester verifies it independently.
+    pub async fn latest_finalized_in_range(
+        &self,
+        above: u64,
+        at_or_below: u64,
+    ) -> Option<Checkpoint> {
+        if at_or_below <= above {
+            return None;
+        }
+        let latest = self.latest_finalized_height().await;
+        if latest > above && latest <= at_or_below {
+            if let Some(cp) = self.get_checkpoint(latest).await {
+                return Some(cp);
+            }
+        }
+        let finalized = self.finalized.read().await;
+        finalized
+            .iter()
+            .filter(|(h, cp)| {
+                **h > above && **h <= at_or_below && cp.status == CheckpointStatus::Finalized
+            })
+            .max_by_key(|(h, _)| **h)
+            .map(|(_, cp)| cp.clone())
+    }
+
+    /// Stage 1b (spec §11.10): verify a finalized checkpoint certificate
+    /// received from a peer against `committee` — the committee THIS node
+    /// derived for `height` from the validator set governing it and that
+    /// epoch's seed (`FinalityGadget::committee_for`), whatever the block.
+    /// No committee is ever taken from the peer.
+    ///
+    /// Accepts exactly what [`Checkpoint::verify_certificate`] accepts for a
+    /// certificate over that committee: a boundary height, a committee of at
+    /// least [`MIN_FINALITY_COMMITTEE`], distinct voters holding more than two
+    /// thirds of its stake, every voter a member, the binding the one THIS
+    /// node derives from its own copy of the block (`expected`, see
+    /// [`Self::binding_for`]), and every signature valid over the v2
+    /// [`canonical_vote_message`]. More
+    /// signatures than committee members, or a voter listed twice, is refused
+    /// before any signature is checked (bounds the work a peer can cause).
+    ///
+    /// The `(height, block_hash)` binding to this node's own chain is the
+    /// caller's job (the node checks the block is canonical here before calling
+    /// this, and the floor verifier re-checks it under the advance lock).
+    pub fn verify_synced_certificate(
+        &self,
+        height: u64,
+        block_hash: Hash,
+        binding: VoteBinding,
+        signatures: &[(PublicKey, Signature)],
+        committee: &Committee,
+        expected: &VoteBinding,
+    ) -> Result<VerifiedCertificate, CheckpointError> {
+        let invalid = |reason: String| CheckpointError::InvalidCertificate { height, reason };
+        if !self.config.is_checkpoint_height(height) {
+            return Err(invalid(format!(
+                "height is not a checkpoint boundary (interval {})",
+                self.config.interval
+            )));
+        }
+        if signatures.len() > committee.len() {
+            return Err(invalid(format!(
+                "{} signatures for a committee of {}",
+                signatures.len(),
+                committee.len()
+            )));
+        }
+        let mut votes = HashMap::with_capacity(signatures.len());
+        for (voter, signature) in signatures {
+            if votes.insert(*voter, *signature).is_some() {
+                return Err(invalid(format!("voter {voter:?} is listed twice")));
+            }
+        }
+        let mut checkpoint = Checkpoint::pending(height, block_hash, binding, committee);
+        checkpoint.votes = votes;
+        checkpoint.status = CheckpointStatus::Finalized;
+        checkpoint.verify_certificate_against(
+            self.config.chain_id,
+            &self.config.genesis_hash,
+            committee,
+            expected,
+        )?;
+        Ok(VerifiedCertificate { checkpoint })
+    }
+
+    /// Stage 1b (spec §11.10): store a verified synced certificate exactly as
+    /// [`Self::finalize_checkpoint`] stores a locally finalized one (DAG
+    /// finalized mark, `DAG_METADATA` `checkpoint:{height}`, in-memory window,
+    /// latest finalized height) and drop pending / replay state at or below it.
+    /// A certificate at or below the latest finalized height changes nothing.
+    ///
+    /// Same finalization path as [`Self::finalize_checkpoint`]: serialized
+    /// with every other finalization (`finalize_serial`), and with a
+    /// [`FinalizationGuard`] installed the guard runs on the certificate BEFORE
+    /// any of the above becomes visible, with no other manager lock held (the
+    /// node's guard raises the reorg floor, or engages the finality safety
+    /// stop, in that step). As for a local finalization the guard cannot veto:
+    /// the certificate has a verified quorum of this node's own committee.
+    /// The certificate record is written with the synced write
+    /// ([`KvStore::kv_put_durable`]) BEFORE the guard runs and before anything
+    /// else changes, as for a local finalization (#362): if that write fails
+    /// the guard does not run, nothing is installed and `StorageError` is
+    /// returned (the sync poll asks again later).
+    /// Once the certificate record has been written and the install is
+    /// visible, the guard's [`FinalizationGuard::after_finalize`] runs (the
+    /// node publishes the finalized RPC pair there, only if the certificate
+    /// is persisted).
+    pub async fn install_synced_certificate(
+        &self,
+        cert: VerifiedCertificate,
+    ) -> Result<SyncedInstall, CheckpointError> {
+        let checkpoint = cert.checkpoint;
+        let height = checkpoint.height;
+        // Outermost lock: no other finalization (local or synced) can move the
+        // latest finalized height until this install is done.
+        let _serial = self.finalize_serial.lock().await;
+        {
+            let latest = *self.latest_finalized_height.read().await;
+            if height <= latest {
+                return Ok(SyncedInstall::Stale { height, latest });
+            }
+        }
+        // Durable BEFORE the guard and before anything is visible, exactly as a
+        // local finalization (#362): the guard raises the floor, so the
+        // certificate it acts on must already survive a crash or power loss. A
+        // failed write runs no guard, installs nothing and surfaces as
+        // `StorageError` (the sync poll asks again later).
+        self.persist_certificate(&checkpoint)?;
+        let guarded = match self.finalization_guard.get() {
+            Some(guard) => {
+                // No manager lock is held here (only `finalize_serial`).
+                guard.before_finalize(&checkpoint).await;
+                true
+            }
+            None => false,
+        };
+        let mut latest = self.latest_finalized_height.write().await;
+        if height <= *latest {
+            return Ok(SyncedInstall::Stale {
+                height,
+                latest: *latest,
+            });
+        }
+        if let Err(e) = self.dag_store.finalize_block(&checkpoint.block_hash).await {
+            debug!(
+                "synced checkpoint {}: block {} not marked finalized in the DAG store: {}",
+                height, checkpoint.block_hash, e
+            );
+        }
+        let cp = checkpoint.clone();
+        {
+            let mut finalized = self.finalized.write().await;
+            finalized.insert(height, checkpoint);
+            trim_finalized(&mut finalized);
+        }
+        *latest = height;
+        drop(latest);
+        // Publication after persistence, as for a local finalization: still
+        // under `finalize_serial`, with no other manager lock held.
+        if let Some(guard) = self.finalization_guard.get() {
+            guard.after_finalize(&cp).await;
+        }
+        self.prune_at_or_below(height).await;
+        info!(
+            "Installed synced checkpoint certificate at height {}",
+            height
+        );
+        Ok(SyncedInstall::Installed { height, guarded })
+    }
+
     /// Whether `height` holds a finalized checkpoint (memory or persistent store).
     pub async fn is_finalized(&self, height: u64) -> bool {
         self.get_checkpoint(height).await.is_some()
@@ -728,7 +1287,7 @@ impl CheckpointManager {
         &self,
         height: u64,
         block_hash: Hash,
-        committee: Vec<PublicKey>,
+        committee: Committee,
     ) -> Result<ProposeOutcome, CheckpointError> {
         if !self.config.is_checkpoint_height(height) {
             return Err(CheckpointError::NotCheckpointBoundary);
@@ -737,9 +1296,7 @@ impl CheckpointManager {
         if height <= latest || self.is_finalized(height).await {
             return Ok(ProposeOutcome::AlreadyFinalized);
         }
-        if !self.dag_store.has_block(&block_hash).await {
-            return Err(CheckpointError::BlockNotFound(block_hash));
-        }
+        let binding = self.binding_for(&block_hash, committee.epoch).await?;
         let mut pending = self.pending.write().await;
         if let Some(existing) = pending.get(&height) {
             return Ok(if existing.block_hash == block_hash {
@@ -771,15 +1328,45 @@ impl CheckpointManager {
         );
         pending.insert(
             height,
-            Checkpoint {
-                height,
-                block_hash,
-                committee,
-                votes: HashMap::new(),
-                status: CheckpointStatus::Pending,
-            },
+            Checkpoint::pending(height, block_hash, binding, &committee),
         );
         Ok(ProposeOutcome::Proposed)
+    }
+
+    /// The binding a vote for `block_hash` in epoch `epoch` must carry (spec
+    /// 06 §7), read from this node's own copy of the block: its committed
+    /// `state_root` and its accepted-transactions root
+    /// ([`checkpoint_accepted_root`]). Data source: the DAG store.
+    /// `BlockNotFound` when this node does not hold the block.
+    pub async fn binding_for(
+        &self,
+        block_hash: &Hash,
+        epoch: u64,
+    ) -> Result<VoteBinding, CheckpointError> {
+        let block = self
+            .dag_store
+            .get_block(block_hash)
+            .await
+            .map_err(|_| CheckpointError::BlockNotFound(*block_hash))?;
+        Ok(VoteBinding {
+            epoch,
+            state_root: block.state_root,
+            accepted_root: checkpoint_accepted_root(&block),
+        })
+    }
+
+    /// The binding of the checkpoint pending at `height`, if any.
+    pub async fn pending_binding(&self, height: u64) -> Option<VoteBinding> {
+        self.pending.read().await.get(&height).map(|cp| cp.binding)
+    }
+
+    /// A copy of every pending checkpoint, ascending by height (status
+    /// reporting: `citrate_getFinalityStatus`).
+    pub async fn pending_snapshot(&self) -> Vec<Checkpoint> {
+        let pending = self.pending.read().await;
+        let mut out: Vec<Checkpoint> = pending.values().cloned().collect();
+        out.sort_by_key(|cp| cp.height);
+        out
     }
 
     /// §11.9: drop pending checkpoints and per-height voted markers at or below
@@ -815,7 +1402,7 @@ impl CheckpointManager {
         &self,
         height: u64,
         block_hash: Hash,
-        committee: Vec<PublicKey>,
+        committee: Committee,
     ) -> Result<(), CheckpointError> {
         if !self.config.is_checkpoint_height(height) {
             return Err(CheckpointError::NotCheckpointBoundary);
@@ -836,13 +1423,8 @@ impl CheckpointManager {
             return Err(CheckpointError::AlreadyExists(height));
         }
 
-        let checkpoint = Checkpoint {
-            height,
-            block_hash,
-            committee,
-            votes: HashMap::new(),
-            status: CheckpointStatus::Pending,
-        };
+        let binding = self.binding_for(&block_hash, committee.epoch).await?;
+        let checkpoint = Checkpoint::pending(height, block_hash, binding, &committee);
 
         info!(
             "Proposed checkpoint at height {} for block {}",
@@ -887,14 +1469,15 @@ impl CheckpointManager {
             return Err(CheckpointError::DuplicateVote(vote.voter));
         }
 
-        // 3. Verify vote is for the correct block.
-        if vote.block_hash != checkpoint.block_hash {
+        // 3. Verify vote is for the correct block, and certifies what this
+        //    node's checkpoint certifies (epoch, state root, accepted root).
+        if vote.block_hash != checkpoint.block_hash || vote.binding != checkpoint.binding {
             return Err(CheckpointError::InvalidSignature(vote.voter));
         }
 
-        // 4. Cryptographic ed25519 signature verification (binds
-        //    chain_id + height + block_hash into the signed bytes).
-        verify_vote_signature(&vote, self.config.chain_id)?;
+        // 4. Cryptographic ed25519 signature verification (binds chain id,
+        //    genesis, epoch, height, block hash and both roots, spec 06 §7).
+        verify_vote_signature(&vote, self.config.chain_id, &self.config.genesis_hash)?;
 
         // 5. Replay protection — ONLY mark voted after all validation
         //    succeeds. Pre-fix this happened at step 0; the H-01
@@ -908,21 +1491,22 @@ impl CheckpointManager {
             }
         }
 
+        checkpoint.votes.insert(vote.voter, vote.signature);
+
         debug!(
-            "Vote from {:?} for checkpoint at height {} ({}/{})",
-            &vote.voter.as_bytes()[..4],
+            "Vote from {:?} for checkpoint at height {} ({} of {} stake, quorum {})",
+            vote.voter.as_bytes().get(..4),
             vote.height,
-            checkpoint.votes.len().saturating_add(1),
+            checkpoint.voted_stake(),
+            checkpoint.total_stake(),
             checkpoint
                 .effective_quorum()
                 .map(|q| q.to_string())
                 .unwrap_or_else(|| "n/a (committee < min)".to_string())
         );
 
-        checkpoint.votes.insert(vote.voter, vote.signature);
-
-        // Check quorum. Uses the derived `floor(2n/3)+1` over this checkpoint's
-        // effective committee; a committee below MIN_FINALITY_COMMITTEE never
+        // Check quorum: more than two thirds of this checkpoint's committee
+        // STAKE (#185); a committee below MIN_FINALITY_COMMITTEE never
         // reaches quorum (has_derived_quorum returns false).
         if checkpoint.has_derived_quorum() {
             return Ok(true);
@@ -997,7 +1581,7 @@ impl CheckpointManager {
                                 MIN_FINALITY_COMMITTEE,
                             ))?;
                     if !cp.has_derived_quorum() {
-                        return Err(CheckpointError::QuorumNotReached(cp.votes.len(), quorum));
+                        return Err(CheckpointError::QuorumNotReached(cp.voted_stake(), quorum));
                     }
                     let mut candidate = cp.clone();
                     candidate.status = CheckpointStatus::Finalized;
@@ -1063,9 +1647,9 @@ impl CheckpointManager {
             // change is never left without its certificate.
             debug_assert!(!was_guarded, "guarded certificate lost its quorum");
             // Put it back
-            let votes = checkpoint.votes.len();
+            let voted = checkpoint.voted_stake();
             pending.insert(height, checkpoint);
-            return Err(CheckpointError::QuorumNotReached(votes, effective_quorum));
+            return Err(CheckpointError::QuorumNotReached(voted, effective_quorum));
         }
 
         checkpoint.status = CheckpointStatus::Finalized;
@@ -1116,9 +1700,11 @@ impl CheckpointManager {
         drop(latest);
 
         info!(
-            "Finalized checkpoint at height {} with {}/{} votes",
+            "Finalized checkpoint at height {} with {} votes, {} of {} stake (quorum {})",
             height,
             checkpoint.votes.len(),
+            checkpoint.voted_stake(),
+            checkpoint.total_stake(),
             effective_quorum
         );
 
@@ -1198,7 +1784,9 @@ impl CheckpointManager {
 fn extends_certificate(current: &Checkpoint, guarded: &Checkpoint) -> bool {
     current.height == guarded.height
         && current.block_hash == guarded.block_hash
+        && current.binding == guarded.binding
         && current.committee == guarded.committee
+        && current.stakes == guarded.stakes
         && guarded
             .votes
             .iter()
@@ -1244,6 +1832,16 @@ mod tests {
     }
     use ed25519_dalek::{Signer, SigningKey};
 
+    /// The binding a vote for a test block carries: epoch 0, the default
+    /// (zero) state root the test blocks have, and the empty accepted root.
+    fn tb() -> VoteBinding {
+        VoteBinding {
+            epoch: 0,
+            state_root: Hash::default(),
+            accepted_root: empty_accepted_root(),
+        }
+    }
+
     /// Generate a deterministic ed25519 signing key from a seed byte.
     fn make_signing_key(id: u8) -> SigningKey {
         let mut seed = [0u8; 32];
@@ -1261,7 +1859,7 @@ mod tests {
     /// Sign a checkpoint vote's canonical message with the given signing key.
     /// RM-B1 / WP-B2.2 (H-02): uses canonical_vote_message helper.
     fn sign_vote(height: u64, block_hash: &Hash, signing_key: &SigningKey) -> Signature {
-        let message = canonical_vote_message(40204, height, block_hash);
+        let message = canonical_vote_message(40204, &Hash::default(), height, block_hash, &tb());
         let sig = signing_key.sign(&message);
         Signature::new(sig.to_bytes())
     }
@@ -1270,6 +1868,7 @@ mod tests {
     fn make_signed_vote(id: u8, height: u64, block_hash: &Hash) -> CheckpointVote {
         let sk = make_signing_key(id);
         CheckpointVote {
+            binding: tb(),
             height,
             block_hash: *block_hash,
             voter: make_pubkey(id),
@@ -1299,6 +1898,17 @@ mod tests {
     }
 
     /// Committee selection is deterministic.
+    /// The committee size is a consensus constant (lead decision 2), the
+    /// default every production config uses.
+    #[test]
+    fn committee_size_is_the_consensus_constant() {
+        assert_eq!(CHECKPOINT_COMMITTEE_SIZE, 100);
+        assert_eq!(
+            CheckpointConfig::default().committee_size,
+            CHECKPOINT_COMMITTEE_SIZE
+        );
+    }
+
     #[test]
     fn test_committee_selection_determinism() {
         let validators: Vec<(PublicKey, u128)> = (0..10)
@@ -1336,9 +1946,13 @@ mod tests {
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
         let checkpoint_block = &blocks[5]; // height 5
 
-        mgr.propose(5, checkpoint_block.hash(), committee.clone())
-            .await
-            .unwrap();
+        mgr.propose(
+            5,
+            checkpoint_block.hash(),
+            Committee::equal_stake(0, committee.clone()),
+        )
+        .await
+        .unwrap();
 
         // Submit 3 votes (below quorum of 4)
         for i in 0..3u8 {
@@ -1366,9 +1980,12 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag);
 
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         let vote = CheckpointVote {
+            binding: tb(),
             height: 5,
             block_hash: blocks[5].hash(),
             voter: make_pubkey(0),
@@ -1387,10 +2004,13 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag);
 
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         // Create a vote with non-zero but cryptographically invalid signature
         let vote = CheckpointVote {
+            binding: tb(),
             height: 5,
             block_hash: blocks[5].hash(),
             voter: make_pubkey(0),
@@ -1409,7 +2029,9 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag);
 
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         let vote = make_signed_vote(0, 5, &blocks[5].hash());
         let result = mgr.submit_vote(vote).await;
@@ -1425,7 +2047,9 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag.clone());
 
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         // Submit 4 signed votes to reach quorum
         for i in 0..4u8 {
@@ -1454,7 +2078,9 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag);
 
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         let vote = make_signed_vote(0, 5, &blocks[5].hash());
         mgr.submit_vote(vote.clone()).await.unwrap();
@@ -1473,7 +2099,9 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag);
 
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         // Voter 99 has a valid signature but is NOT in the committee
         let vote = make_signed_vote(99, 5, &blocks[5].hash());
@@ -1490,12 +2118,15 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag);
 
         let committee: Vec<PublicKey> = (0..5).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         // Sign for height 10 but submit for height 5 — crypto check fails
         let sk = make_signing_key(0);
         let wrong_sig = sign_vote(10, &blocks[5].hash(), &sk);
         let vote = CheckpointVote {
+            binding: tb(),
             height: 5,
             block_hash: blocks[5].hash(),
             voter: make_pubkey(0),
@@ -1523,7 +2154,9 @@ mod tests {
         let mk = |n: usize| Checkpoint {
             height: 5,
             block_hash: Hash::new([1; 32]),
+            binding: tb(),
             committee: (0..n as u8).map(make_pubkey).collect(),
+            stakes: vec![1; n],
             votes: HashMap::new(),
             status: CheckpointStatus::Pending,
         };
@@ -1544,7 +2177,9 @@ mod tests {
 
         // Committee of 3 (< MIN_FINALITY_COMMITTEE = 4).
         let committee: Vec<PublicKey> = (0..3).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         // Every one of the 3 members casts a valid vote — none reaches quorum.
         for i in 0..3u8 {
@@ -1576,7 +2211,9 @@ mod tests {
         let mgr = CheckpointManager::new(config, dag);
 
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
-        mgr.propose(5, blocks[5].hash(), committee).await.unwrap();
+        mgr.propose(5, blocks[5].hash(), Committee::equal_stake(0, committee))
+            .await
+            .unwrap();
 
         // 2 votes: below derived quorum (3).
         for i in 0..2u8 {
@@ -1603,23 +2240,34 @@ mod tests {
         let b5 = blocks.get(5).expect("block 5").hash();
         let b6 = blocks.get(6).expect("block 6").hash();
 
-        let first = mgr.ensure_proposed(5, b5, committee.clone()).await;
+        let first = mgr
+            .ensure_proposed(5, b5, Committee::equal_stake(0, committee.clone()))
+            .await;
         assert_eq!(first.expect("propose"), ProposeOutcome::Proposed);
-        let again = mgr.ensure_proposed(5, b5, committee.clone()).await;
+        let again = mgr
+            .ensure_proposed(5, b5, Committee::equal_stake(0, committee.clone()))
+            .await;
         assert_eq!(again.expect("repeat"), ProposeOutcome::AlreadyPending);
-        let other = mgr.ensure_proposed(5, b6, committee.clone()).await;
+        let other = mgr
+            .ensure_proposed(5, b6, Committee::equal_stake(0, committee.clone()))
+            .await;
         assert_eq!(
             other.expect("conflict"),
             ProposeOutcome::ConflictingPending { pending: b5 }
         );
         assert_eq!(mgr.pending_hash(5).await, Some(b5), "never replaced");
         assert!(matches!(
-            mgr.ensure_proposed(6, b6, committee.clone()).await,
+            mgr.ensure_proposed(6, b6, Committee::equal_stake(0, committee.clone()))
+                .await,
             Err(CheckpointError::NotCheckpointBoundary)
         ));
         assert!(matches!(
-            mgr.ensure_proposed(10, Hash::new([0xEE; 32]), committee.clone())
-                .await,
+            mgr.ensure_proposed(
+                10,
+                Hash::new([0xEE; 32]),
+                Committee::equal_stake(0, committee.clone())
+            )
+            .await,
             Err(CheckpointError::BlockNotFound(_))
         ));
 
@@ -1634,7 +2282,9 @@ mod tests {
             0,
             "voted markers dropped on finalize"
         );
-        let reopened = mgr.ensure_proposed(5, b5, committee).await;
+        let reopened = mgr
+            .ensure_proposed(5, b5, Committee::equal_stake(0, committee))
+            .await;
         assert_eq!(
             reopened.expect("finalized"),
             ProposeOutcome::AlreadyFinalized
@@ -1723,7 +2373,7 @@ mod tests {
         assert!(mgr.has_finalization_guard());
         let b5 = blocks.get(5).expect("block 5").hash();
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
-        mgr.ensure_proposed(5, b5, committee)
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee))
             .await
             .expect("propose");
         (mgr, probe, b5)
@@ -1842,7 +2492,7 @@ mod tests {
         assert!(mgr.install_finalization_guard(gate.clone()));
         let b5 = blocks.get(5).expect("block 5").hash();
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
-        mgr.ensure_proposed(5, b5, committee.clone())
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee.clone()))
             .await
             .expect("propose");
         for i in 0..3u8 {
@@ -1881,7 +2531,7 @@ mod tests {
         mgr.prune_at_or_below(5).await;
         assert_eq!(mgr.pending_len().await, 0, "pruned during the guard");
         assert_eq!(
-            mgr.ensure_proposed(5, b5, committee.clone())
+            mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee.clone()))
                 .await
                 .expect("re-propose"),
             ProposeOutcome::Proposed,
@@ -1919,7 +2569,7 @@ mod tests {
         assert_eq!(gate.before.lock().expect("gate lock").len(), 1);
         assert_eq!(gate.after.lock().expect("gate lock").len(), 1);
         assert_eq!(
-            mgr.ensure_proposed(5, b5, committee)
+            mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee))
                 .await
                 .expect("re-open attempt"),
             ProposeOutcome::AlreadyFinalized
@@ -1941,7 +2591,7 @@ mod tests {
         });
         gate.entered.notified().await;
         mgr.prune_at_or_below(5).await;
-        mgr.ensure_proposed(5, b5, committee.clone())
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee.clone()))
             .await
             .expect("re-propose");
         for i in 0..4u8 {
@@ -1964,7 +2614,9 @@ mod tests {
         gate.entered.notified().await;
         mgr.prune_at_or_below(5).await;
         let other: Vec<PublicKey> = (10..14).map(make_pubkey).collect();
-        mgr.ensure_proposed(5, b5, other).await.expect("re-propose");
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, other))
+            .await
+            .expect("re-propose");
         gate.release.notify_one();
         let cp = task.await.expect("task");
         assert!(cp.is_ok(), "{cp:?}");
@@ -2123,7 +2775,7 @@ mod tests {
         assert!(mgr.install_finalization_guard(probe.clone()));
         let b5 = blocks.get(5).expect("block 5").hash();
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
-        mgr.ensure_proposed(5, b5, committee)
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee))
             .await
             .expect("propose");
         for i in 0..3u8 {
@@ -2203,9 +2855,13 @@ mod tests {
             kv.clone(),
         );
         let b5 = blocks.get(5).expect("block 5").hash();
-        mgr.ensure_proposed(5, b5, (0..4).map(make_pubkey).collect())
-            .await
-            .expect("propose");
+        mgr.ensure_proposed(
+            5,
+            b5,
+            Committee::equal_stake(0, (0..4).map(make_pubkey).collect()),
+        )
+        .await
+        .expect("propose");
         for i in 0..3u8 {
             mgr.submit_vote(make_signed_vote(i, 5, &b5))
                 .await
@@ -2269,7 +2925,7 @@ mod tests {
         assert!(mgr.install_finalization_guard(gate.clone()));
         let b5 = blocks.get(5).expect("block 5").hash();
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
-        mgr.ensure_proposed(5, b5, committee.clone())
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee.clone()))
             .await
             .expect("propose");
         for i in 0..3u8 {
@@ -2322,7 +2978,7 @@ mod tests {
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
         for (h, b) in blocks.iter().enumerate().skip(1) {
             let h = u64::try_from(h).expect("height fits");
-            mgr.ensure_proposed(h, b.hash(), committee.clone())
+            mgr.ensure_proposed(h, b.hash(), Committee::equal_stake(0, committee.clone()))
                 .await
                 .expect("propose");
             mgr.submit_vote(make_signed_vote(0, h, &b.hash()))
@@ -2348,16 +3004,16 @@ mod tests {
         let mgr = CheckpointManager::new(cfg, dag);
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
         let b5 = blocks.get(5).expect("block 5").hash();
-        mgr.ensure_proposed(5, b5, committee)
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee))
             .await
             .expect("propose");
         let k0 = make_signing_key(0);
-        let wrong_chain = sign_checkpoint_vote(40204, 5, b5, &k0);
+        let wrong_chain = sign_checkpoint_vote(40204, &Hash::default(), 5, b5, &tb(), &k0);
         assert!(matches!(
             mgr.submit_vote(wrong_chain).await,
             Err(CheckpointError::InvalidSignature(_))
         ));
-        let right = sign_checkpoint_vote(1337, 5, b5, &k0);
+        let right = sign_checkpoint_vote(1337, &Hash::default(), 5, b5, &tb(), &k0);
         assert!(mgr.submit_vote(right).await.is_ok());
     }
 
@@ -2375,7 +3031,7 @@ mod tests {
         );
         let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
         let b5 = blocks.get(5).expect("block 5").hash();
-        mgr.ensure_proposed(5, b5, committee)
+        mgr.ensure_proposed(5, b5, Committee::equal_stake(0, committee))
             .await
             .expect("propose");
         for i in 0..3u8 {
@@ -2389,11 +3045,12 @@ mod tests {
             .await
             .expect("latest certificate");
         assert_eq!((cert.height, cert.block_hash), (5, b5));
-        cert.verify_certificate(40204).expect("honest certificate");
+        cert.verify_certificate(40204, &Hash::default())
+            .expect("honest certificate");
 
         let invalid = |c: &Checkpoint, chain: u64| {
             matches!(
-                c.verify_certificate(chain),
+                c.verify_certificate(chain, &Hash::default()),
                 Err(CheckpointError::InvalidCertificate { height: 5, .. })
             )
         };
@@ -2432,6 +3089,604 @@ mod tests {
         let mut extra = cert.clone();
         let v3 = make_signed_vote(3, 5, &b5);
         extra.votes.insert(v3.voter, v3.signature);
-        extra.verify_certificate(40204).expect("4 of 4 votes");
+        extra
+            .verify_certificate(40204, &Hash::default())
+            .expect("4 of 4 votes");
+    }
+
+    // ── Stage 1b: synced certificate verification / install (spec §11.10) ──
+
+    /// `n` signatures over `(height, hash)` on 40204 from key ids `ids`.
+    fn sigs(ids: &[u8], height: u64, hash: &Hash) -> Vec<(PublicKey, Signature)> {
+        ids.iter()
+            .map(|&i| {
+                (
+                    make_pubkey(i),
+                    sign_vote(height, hash, &make_signing_key(i)),
+                )
+            })
+            .collect()
+    }
+
+    async fn sync_mgr() -> (CheckpointManager, Vec<crate::types::Block>) {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 11).await;
+        // interval 5, chain 40204.
+        (
+            CheckpointManager::new(CheckpointConfig::for_testing(), dag),
+            blocks,
+        )
+    }
+
+    #[tokio::test]
+    async fn synced_certificate_verifies_against_the_local_committee_and_installs() {
+        let (mgr, blocks) = sync_mgr().await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let cert = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &h5),
+                &Committee::equal_stake(0, committee.clone()),
+                &tb(),
+            )
+            .expect("quorum 3 of 4 verifies");
+        assert_eq!(
+            cert.checkpoint().committee,
+            committee,
+            "local committee kept"
+        );
+        assert_eq!(
+            mgr.install_synced_certificate(cert).await.expect("install"),
+            SyncedInstall::Installed {
+                height: 5,
+                guarded: false
+            }
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        let stored = mgr.latest_finalized_certificate().await.expect("stored");
+        assert_eq!(stored.block_hash, h5);
+        stored
+            .verify_certificate(40204, &Hash::default())
+            .expect("stored certificate re-verifies");
+        assert!(mgr.dag_store.is_finalized(&h5).await);
+    }
+
+    #[tokio::test]
+    async fn synced_certificate_with_a_forged_signature_is_rejected() {
+        let (mgr, blocks) = sync_mgr().await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let mut s = sigs(&[0, 1, 2], 5, &h5);
+        // Member 2's slot carries member 3's signature: valid bytes, wrong signer.
+        if let Some(slot) = s.get_mut(2) {
+            slot.1 = sign_vote(5, &h5, &make_signing_key(3));
+        }
+        let err = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &s,
+                &Committee::equal_stake(0, committee),
+                &tb(),
+            )
+            .expect_err("forged signature");
+        assert!(matches!(
+            err,
+            CheckpointError::InvalidCertificate { height: 5, .. }
+        ));
+        assert_eq!(mgr.latest_finalized_height().await, 0);
+    }
+
+    /// Signatures valid for (5, h5) but by a DIFFERENT epoch's validators than
+    /// the committee this node derived: rejected (voter not in committee),
+    /// whatever committee the sender believed in.
+    #[tokio::test]
+    async fn synced_certificate_from_another_epoch_committee_is_rejected() {
+        let (mgr, blocks) = sync_mgr().await;
+        let local_committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let other_epoch = sigs(&[10, 11, 12, 13], 5, &h5);
+        let err = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &other_epoch,
+                &Committee::equal_stake(0, local_committee),
+                &tb(),
+            )
+            .expect_err("other epoch committee");
+        assert!(
+            err.to_string().contains("not in the committee"),
+            "got {err}"
+        );
+    }
+
+    /// Signatures for a sibling hash do not verify for the canonical hash.
+    #[tokio::test]
+    async fn synced_certificate_signed_for_a_sibling_hash_is_rejected() {
+        let (mgr, blocks) = sync_mgr().await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let sibling = Hash::new([0xAB; 32]);
+        let err = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &sibling),
+                &Committee::equal_stake(0, committee),
+                &tb(),
+            )
+            .expect_err("signed for the sibling");
+        assert!(err.to_string().contains("does not verify"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn synced_certificate_shape_checks_run_before_signatures() {
+        let (mgr, blocks) = sync_mgr().await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        // Below quorum.
+        assert!(mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1], 5, &h5),
+                &Committee::equal_stake(0, committee.clone()),
+                &tb()
+            )
+            .is_err());
+        // More signatures than committee members.
+        assert!(mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2, 3, 4], 5, &h5),
+                &Committee::equal_stake(0, committee.clone()),
+                &tb()
+            )
+            .is_err());
+        // A voter listed twice.
+        assert!(mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 1], 5, &h5),
+                &Committee::equal_stake(0, committee.clone()),
+                &tb()
+            )
+            .is_err());
+        // Not a checkpoint boundary.
+        let h4 = blocks[4].hash();
+        assert!(mgr
+            .verify_synced_certificate(
+                4,
+                h4,
+                tb(),
+                &sigs(&[0, 1, 2], 4, &h4),
+                &Committee::equal_stake(0, committee.clone()),
+                &tb()
+            )
+            .is_err());
+        // Committee below the finality minimum.
+        let tiny: Vec<PublicKey> = (0..3).map(make_pubkey).collect();
+        assert!(mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &h5),
+                &Committee::equal_stake(0, tiny),
+                &tb()
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_synced_certificate_changes_nothing() {
+        let (mgr, blocks) = sync_mgr().await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let (h5, h10) = (blocks[5].hash(), blocks[10].hash());
+        let c10 = mgr
+            .verify_synced_certificate(
+                10,
+                h10,
+                tb(),
+                &sigs(&[0, 1, 2], 10, &h10),
+                &Committee::equal_stake(0, committee.clone()),
+                &tb(),
+            )
+            .expect("verifies");
+        mgr.install_synced_certificate(c10).await.expect("install");
+        let c5 = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &h5),
+                &Committee::equal_stake(0, committee),
+                &tb(),
+            )
+            .expect("verifies");
+        assert_eq!(
+            mgr.install_synced_certificate(c5).await.expect("stale"),
+            SyncedInstall::Stale {
+                height: 5,
+                latest: 10
+            }
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 10);
+        assert!(
+            mgr.get_checkpoint(5).await.is_none(),
+            "stale one not stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_finalized_in_range_picks_the_highest_within_bounds() {
+        let (mgr, blocks) = sync_mgr().await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        for h in [5u64, 10] {
+            let hash = blocks[h as usize].hash();
+            let c = mgr
+                .verify_synced_certificate(
+                    h,
+                    hash,
+                    tb(),
+                    &sigs(&[0, 1, 2], h, &hash),
+                    &Committee::equal_stake(0, committee.clone()),
+                    &tb(),
+                )
+                .expect("verifies");
+            mgr.install_synced_certificate(c).await.expect("install");
+        }
+        let pick = |a, b| {
+            let mgr = &mgr;
+            async move { mgr.latest_finalized_in_range(a, b).await.map(|c| c.height) }
+        };
+        assert_eq!(pick(0, 100).await, Some(10));
+        assert_eq!(pick(0, 9).await, Some(5));
+        assert_eq!(pick(5, 9).await, None);
+        assert_eq!(pick(10, 100).await, None);
+        assert_eq!(pick(7, 7).await, None);
+    }
+
+    // Synced certificates are written like locally finalized ones (#362):
+    // through the synced write, before anything is visible; a failed write
+    // installs nothing.
+
+    async fn sync_mgr_over(kv: Arc<FaultKv>) -> (CheckpointManager, Vec<crate::types::Block>) {
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let blocks = build_chain(&dag, 11).await;
+        let kv: Arc<dyn KvStore> = kv;
+        (
+            CheckpointManager::with_persistence(CheckpointConfig::for_testing(), dag, kv),
+            blocks,
+        )
+    }
+
+    #[tokio::test]
+    async fn synced_certificate_is_written_only_through_the_durable_path() {
+        let kv = FaultKv::new(usize::MAX);
+        let (mgr, blocks) = sync_mgr_over(kv.clone()).await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let cert = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &h5),
+                &Committee::equal_stake(0, committee),
+                &tb(),
+            )
+            .expect("verifies");
+        assert!(matches!(
+            mgr.install_synced_certificate(cert).await.expect("install"),
+            SyncedInstall::Installed { height: 5, .. }
+        ));
+        assert_eq!(FaultKv::load(&kv.durable_cert_writes), 1);
+        assert_eq!(
+            FaultKv::load(&kv.plain_cert_writes),
+            0,
+            "a synced certificate must not be written with the buffered kv_put"
+        );
+        let stored = stored_certificate(&kv, 5).expect("on disk");
+        assert_eq!(stored.block_hash, h5);
+        assert!(mgr.is_certificate_persisted(5, &h5));
+    }
+
+    #[tokio::test]
+    async fn synced_certificate_write_failure_installs_nothing() {
+        let kv = FaultKv::new(0);
+        let (mgr, blocks) = sync_mgr_over(kv.clone()).await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let cert = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &h5),
+                &Committee::equal_stake(0, committee.clone()),
+                &tb(),
+            )
+            .expect("verifies");
+        let err = mgr
+            .install_synced_certificate(cert)
+            .await
+            .expect_err("a failed certificate write must surface");
+        assert!(matches!(err, CheckpointError::StorageError(_)), "{err:?}");
+        assert_eq!(FaultKv::load(&kv.failed_cert_writes), 1);
+        assert_eq!(mgr.latest_finalized_height().await, 0, "nothing advanced");
+        assert!(mgr.get_checkpoint(5).await.is_none(), "not recorded");
+        assert!(stored_certificate(&kv, 5).is_none());
+        assert!(
+            !mgr.dag_store.is_finalized(&h5).await,
+            "no DAG finalized mark without a durable certificate"
+        );
+
+        // The store recovers: the same certificate (fetched again) installs.
+        kv.heal();
+        let again = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &h5),
+                &Committee::equal_stake(0, committee),
+                &tb(),
+            )
+            .expect("verifies");
+        assert!(matches!(
+            mgr.install_synced_certificate(again)
+                .await
+                .expect("install"),
+            SyncedInstall::Installed { height: 5, .. }
+        ));
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        assert!(stored_certificate(&kv, 5).is_some());
+        assert!(mgr.dag_store.is_finalized(&h5).await);
+    }
+
+    /// Review of #332 @ 354908b: a synced certificate goes through the same
+    /// finalization path as a local one — the guard runs BEFORE it is visible
+    /// (latest finalized height unchanged, nothing stored), exactly once.
+    #[tokio::test]
+    async fn synced_install_runs_the_finalization_guard_before_it_is_visible() {
+        let (mgr, probe, b5) = guarded(None).await;
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let cert = mgr
+            .verify_synced_certificate(
+                5,
+                b5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &b5),
+                &Committee::equal_stake(0, committee),
+                &tb(),
+            )
+            .expect("verifies");
+        assert_eq!(
+            mgr.install_synced_certificate(cert).await.expect("install"),
+            SyncedInstall::Installed {
+                height: 5,
+                guarded: true
+            }
+        );
+        assert_eq!(
+            *probe.seen.lock().expect("probe lock"),
+            vec![(5, b5, 0, false)],
+            "guard saw the certificate before it was visible"
+        );
+        assert_eq!(mgr.latest_finalized_height().await, 5);
+        assert!(mgr.get_checkpoint(5).await.is_some());
+    }
+
+    /// #362 for synced installs: with a persistent store the guard runs only
+    /// once the certificate is on disk through the synced write; if that write
+    /// fails the guard never runs and nothing is installed.
+    #[tokio::test]
+    async fn synced_install_is_durable_before_the_guard_and_a_failed_write_runs_no_guard() {
+        for allow in [0usize, usize::MAX] {
+            let kv = FaultKv::new(allow);
+            let (mgr, blocks) = sync_mgr_over(kv.clone()).await;
+            let mgr = Arc::new(mgr);
+            let probe = Arc::new(ProbeGuard::default());
+            *probe.mgr.lock().expect("probe lock") = Some(Arc::downgrade(&mgr));
+            assert!(mgr.install_finalization_guard(probe.clone()));
+            let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+            let h5 = blocks[5].hash();
+            let cert = mgr
+                .verify_synced_certificate(
+                    5,
+                    h5,
+                    tb(),
+                    &sigs(&[0, 1, 2], 5, &h5),
+                    &Committee::equal_stake(0, committee),
+                    &tb(),
+                )
+                .expect("verifies");
+            let out = mgr.install_synced_certificate(cert).await;
+            if allow == 0 {
+                assert!(
+                    matches!(out, Err(CheckpointError::StorageError(_))),
+                    "{out:?}"
+                );
+                assert!(
+                    probe.seen.lock().expect("probe lock").is_empty(),
+                    "no guard (no floor) without a durable certificate"
+                );
+                assert!(probe.after.lock().expect("probe lock").is_empty());
+                assert_eq!(mgr.latest_finalized_height().await, 0);
+                assert!(stored_certificate(&kv, 5).is_none());
+            } else {
+                assert_eq!(
+                    out.expect("install"),
+                    SyncedInstall::Installed {
+                        height: 5,
+                        guarded: true
+                    }
+                );
+                assert_eq!(
+                    *probe.seen.lock().expect("probe lock"),
+                    vec![(5, h5, 0, true)],
+                    "the guard runs before the install is visible, on a durable record"
+                );
+                assert_eq!(FaultKv::load(&kv.durable_cert_writes), 1);
+                assert_eq!(FaultKv::load(&kv.plain_cert_writes), 0);
+            }
+        }
+    }
+
+    /// A stale synced certificate never reaches the guard, and a local
+    /// finalization and a synced install of the same height are serialized: the
+    /// second one finds the height already finalized.
+    #[tokio::test]
+    async fn stale_synced_install_does_not_run_the_guard() {
+        let (mgr, probe, b5) = guarded(None).await;
+        for i in 0..3u8 {
+            mgr.submit_vote(make_signed_vote(i, 5, &b5))
+                .await
+                .expect("vote");
+        }
+        mgr.finalize_checkpoint(5).await.expect("finalize");
+        assert_eq!(probe.seen.lock().expect("probe lock").len(), 1);
+        let committee: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let cert = mgr
+            .verify_synced_certificate(
+                5,
+                b5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &b5),
+                &Committee::equal_stake(0, committee),
+                &tb(),
+            )
+            .expect("verifies");
+        assert_eq!(
+            mgr.install_synced_certificate(cert).await.expect("stale"),
+            SyncedInstall::Stale {
+                height: 5,
+                latest: 5
+            }
+        );
+        assert_eq!(
+            probe.seen.lock().expect("probe lock").len(),
+            1,
+            "guard not run for a stale certificate"
+        );
+    }
+
+    /// `verify_certificate_against`: the recorded committee must be exactly the
+    /// caller-derived one (order does not matter); a certificate signed validly
+    /// by a different committee is refused even though it is self-consistent.
+    #[tokio::test]
+    async fn verify_certificate_against_binds_the_recorded_committee() {
+        let (mgr, blocks) = sync_mgr().await;
+        let derived: Vec<PublicKey> = (0..4).map(make_pubkey).collect();
+        let h5 = blocks[5].hash();
+        let cert = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[0, 1, 2], 5, &h5),
+                &Committee::equal_stake(0, derived.clone()),
+                &tb(),
+            )
+            .expect("verifies")
+            .checkpoint()
+            .clone();
+        cert.verify_certificate_against(
+            40204,
+            &Hash::default(),
+            &Committee::equal_stake(0, derived.to_vec()),
+            &tb(),
+        )
+        .expect("same committee");
+        let mut reversed = derived.clone();
+        reversed.reverse();
+        cert.verify_certificate_against(
+            40204,
+            &Hash::default(),
+            &Committee::equal_stake(0, reversed.to_vec()),
+            &tb(),
+        )
+        .expect("order does not matter");
+        assert!(cert
+            .verify_certificate_against(
+                1337,
+                &Hash::default(),
+                &Committee::equal_stake(0, derived.to_vec()),
+                &tb()
+            )
+            .is_err());
+
+        // Self-consistent certificate of an outsider committee.
+        let outsiders: Vec<PublicKey> = (10..14).map(make_pubkey).collect();
+        let foreign = mgr
+            .verify_synced_certificate(
+                5,
+                h5,
+                tb(),
+                &sigs(&[10, 11, 12], 5, &h5),
+                &Committee::equal_stake(0, outsiders),
+                &tb(),
+            )
+            .expect("self-consistent")
+            .checkpoint()
+            .clone();
+        foreign
+            .verify_certificate(40204, &Hash::default())
+            .expect("internally valid");
+        let err = foreign
+            .verify_certificate_against(
+                40204,
+                &Hash::default(),
+                &Committee::equal_stake(0, derived.to_vec()),
+                &tb(),
+            )
+            .expect_err("not this node's committee");
+        assert!(err.to_string().contains("recorded committee"), "got {err}");
+
+        // A recorded superset / subset of the derived committee is refused.
+        let mut superset = cert.clone();
+        superset.committee.push(make_pubkey(9));
+        assert!(superset
+            .verify_certificate_against(
+                40204,
+                &Hash::default(),
+                &Committee::equal_stake(0, derived.to_vec()),
+                &tb()
+            )
+            .is_err());
+        let mut subset = cert.clone();
+        subset.committee.truncate(3);
+        assert!(subset
+            .verify_certificate_against(
+                40204,
+                &Hash::default(),
+                &Committee::equal_stake(0, derived.to_vec()),
+                &tb()
+            )
+            .is_err());
+        // A derived committee listing a member twice is refused.
+        let mut dup = derived.clone();
+        dup.push(make_pubkey(0));
+        assert!(cert
+            .verify_certificate_against(
+                40204,
+                &Hash::default(),
+                &Committee::equal_stake(0, dup.to_vec()),
+                &tb()
+            )
+            .is_err());
     }
 }

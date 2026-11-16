@@ -5,11 +5,12 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/TripwireRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf15Compliance — Stage 13 broadcast
 /// @notice Deploys TripwireRegistry. Deployer self-authorizes as
 ///         both recorder + resolver.
-contract DeployDpf15Compliance is ScriptEnv, GovernanceOps {
+contract DeployDpf15Compliance is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address tripwire) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -19,7 +20,7 @@ contract DeployDpf15Compliance is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv(deployer);
 
         TripwireRegistry reg = new TripwireRegistry(governance);
         console.log("TripwireRegistry:  ", address(reg));

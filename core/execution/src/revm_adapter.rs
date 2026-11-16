@@ -580,6 +580,10 @@ pub struct BlockContext {
     pub prevrandao: [u8; 32],
     /// Recent block hashes for BLOCKHASH opcode (up to 256)
     pub block_hashes: HashMap<u64, [u8; 32]>,
+    /// GASLIMIT opcode. r1007 S3-3b (spec 06 §3.7): ACCEPT_GAS_LIMIT for the
+    /// transactions an accepting block executes. `None` keeps REVM's default
+    /// (simulation, the legacy single-block apply).
+    pub gas_limit: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +849,45 @@ pub fn execute_contract_create_with_context(
     journal_handle: Option<JournalHandle>,
     value_semantics: ValueSemantics,
 ) -> Result<(Address, Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
+    execute_contract_create_traced(
+        state_db,
+        deployer,
+        init_code,
+        value,
+        gas_limit,
+        gas_price,
+        chain_id,
+        block_number,
+        block_timestamp,
+        block_ctx,
+        writes_handle,
+        journal_handle,
+        value_semantics,
+        None,
+    )
+}
+
+/// [`execute_contract_create_with_context`] with an optional call tracer
+/// (S3-7, `crate::trace`). `None` builds the EVM exactly as the untraced
+/// entry point always has; `Some` attaches the observe-only inspector (same
+/// instructions, same gas, same result).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_contract_create_traced(
+    state_db: Arc<StateDB>,
+    deployer: Address,
+    init_code: Vec<u8>,
+    value: U256,
+    gas_limit: u64,
+    gas_price: U256,
+    chain_id: u64,
+    block_number: u64,
+    block_timestamp: u64,
+    block_ctx: BlockContext,
+    writes_handle: Option<WriteSetHandle>,
+    journal_handle: Option<JournalHandle>,
+    value_semantics: ValueSemantics,
+    tracer: Option<&crate::trace::CallTraceHandle>,
+) -> Result<(Address, Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
     debug!("Executing contract creation with revm");
     debug!("  Deployer: {}", deployer);
     debug!("  Init code size: {} bytes", init_code.len());
@@ -866,81 +909,108 @@ pub fn execute_contract_create_with_context(
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
     let prevrandao = block_ctx.prevrandao;
+    let block_gas_limit = block_ctx.gas_limit;
     // PBA-R2: consensus activation for the hardened precompile semantics.
     let pba_hardened = crate::activation::pba_hardening_active(block_number);
     // HUP-S7.2: the agent precompile fork (default: not activated).
     let agent_fork = crate::agent_fork::agent_precompiles_active(block_number);
-    let mut evm = Evm::builder()
-        .with_db(&mut db)
-        // WP-B0 (TD-28): expose the pure Citrate precompile families
-        // (verify/compute/learning/x402) to contract code. Without this,
-        // STATICCALLs to e.g. 0x0108 hit an empty account and silently
-        // return success with no data.
-        .append_handler_register_box(Box::new(move |h| {
-            register_citrate_precompiles(h, pba_hardened, agent_fork)
-        }))
-        .modify_cfg_env(|cfg| {
-            cfg.chain_id = chain_id;
-        })
-        // DPF-VM-1 — CANCUN enables MCOPY (EIP-5656) which Solidity
-        // 0.8.25+ emits for dynamic-bytes ABI return encoding. Pre-
-        // CANCUN halted with InvalidOpcode, which the executor's
-        // status-bit pattern silently swallowed as Ok(receipt{status:
-        // false, output:vec![]}); eth_call then hex-encoded empty
-        // bytes → "0x" with no JSON-RPC error to surface the bug.
-        // See `.agentile/sprints/active/2026-05-12-dpf-vm-1-dynamic-returns/SPRINT.md`.
-        .with_spec_id(SpecId::CANCUN)
-        .modify_tx_env(|tx| {
-            tx.caller = RevmAddress::from_slice(&deployer.0);
-            tx.transact_to = TransactTo::Create;
-            tx.data = Bytes::from(init_code);
-            tx.value = RevmU256::from_limbs(value.0);
-            tx.gas_limit = gas_limit;
-            // ZERO, deliberately — see `DatabaseCommit::commit`.
-            //
-            // The executor is the sole owner of gas accounting: it deducts
-            // gas upfront and refunds on success. If REVM also charged gas,
-            // committing its balance changes would double-deduct — which is
-            // precisely why Sprint EL-1 dropped balances wholesale, and why
-            // contract-initiated value transfers went missing for so long.
-            //
-            // Zeroing the gas price here is how we say "REVM does no gas
-            // accounting on this chain". Its resulting balance deltas are
-            // then exactly the value movement, which `commit` can apply
-            // wholesale. REVM's affordability precheck degrades to
-            // `balance >= value`, the correct residual test given the
-            // executor already took gas out. `block.basefee` is 0 (never
-            // set), so a zero gas price still validates.
-            //
-            // Known, contained deviation: the GASPRICE opcode returns 0
-            // inside REVM-executed code. No contract deployed on 40204 reads
-            // `tx.gasprice` — verified by grep over `contracts/src`.
-            //
-            // Below the activation height the real gas price is passed
-            // through unchanged. That matters even though pre-activation
-            // balances are discarded: REVM's affordability precheck is
-            // `balance >= gas_limit * gas_price + value`, so zeroing the
-            // price early would let transactions succeed that historically
-            // failed, changing replayed history.
-            tx.gas_price = match value_semantics {
-                ValueSemantics::RevmAuthoritative => RevmU256::ZERO,
-                ValueSemantics::LegacyDropInternal => RevmU256::from_limbs(gas_price.0),
-            };
-            tx.chain_id = Some(chain_id);
-        })
-        .modify_block_env(|block| {
-            block.number = RevmU256::from(block_number);
-            block.timestamp = RevmU256::from(block_timestamp);
-            // WP-X.4: Real coinbase and prevrandao
-            block.coinbase = RevmAddress::from_slice(&coinbase);
-            block.prevrandao = Some(B256::from_slice(&prevrandao));
-        })
-        .build();
-
-    // Execute transaction
-    let result = evm
-        .transact_commit()
-        .map_err(|e| ExecutionError::Reverted(format!("revm execution failed: {:?}", e)))?;
+    // S3-7: one EVM configuration, applied to the untraced builder (the
+    // consensus path, unchanged) or to the traced one (an observe-only
+    // inspector, `crate::trace`).
+    macro_rules! citrate_evm_config {
+        ($builder:expr) => {
+            $builder
+                .modify_cfg_env(|cfg| {
+                    cfg.chain_id = chain_id;
+                })
+                // DPF-VM-1 — CANCUN enables MCOPY (EIP-5656) which Solidity
+                // 0.8.25+ emits for dynamic-bytes ABI return encoding. Pre-
+                // CANCUN halted with InvalidOpcode, which the executor's
+                // status-bit pattern silently swallowed as Ok(receipt{status:
+                // false, output:vec![]}); eth_call then hex-encoded empty
+                // bytes → "0x" with no JSON-RPC error to surface the bug.
+                // See `.agentile/sprints/active/2026-05-12-dpf-vm-1-dynamic-returns/SPRINT.md`.
+                .with_spec_id(SpecId::CANCUN)
+                .modify_tx_env(|tx| {
+                    tx.caller = RevmAddress::from_slice(&deployer.0);
+                    tx.transact_to = TransactTo::Create;
+                    tx.data = Bytes::from(init_code);
+                    tx.value = RevmU256::from_limbs(value.0);
+                    tx.gas_limit = gas_limit;
+                    // ZERO, deliberately — see `DatabaseCommit::commit`.
+                    //
+                    // The executor is the sole owner of gas accounting: it deducts
+                    // gas upfront and refunds on success. If REVM also charged gas,
+                    // committing its balance changes would double-deduct — which is
+                    // precisely why Sprint EL-1 dropped balances wholesale, and why
+                    // contract-initiated value transfers went missing for so long.
+                    //
+                    // Zeroing the gas price here is how we say "REVM does no gas
+                    // accounting on this chain". Its resulting balance deltas are
+                    // then exactly the value movement, which `commit` can apply
+                    // wholesale. REVM's affordability precheck degrades to
+                    // `balance >= value`, the correct residual test given the
+                    // executor already took gas out. `block.basefee` is 0 (never
+                    // set), so a zero gas price still validates.
+                    //
+                    // Known, contained deviation: the GASPRICE opcode returns 0
+                    // inside REVM-executed code. No contract deployed on 40204 reads
+                    // `tx.gasprice` — verified by grep over `contracts/src`.
+                    //
+                    // Below the activation height the real gas price is passed
+                    // through unchanged. That matters even though pre-activation
+                    // balances are discarded: REVM's affordability precheck is
+                    // `balance >= gas_limit * gas_price + value`, so zeroing the
+                    // price early would let transactions succeed that historically
+                    // failed, changing replayed history.
+                    tx.gas_price = match value_semantics {
+                        ValueSemantics::RevmAuthoritative => RevmU256::ZERO,
+                        ValueSemantics::LegacyDropInternal => RevmU256::from_limbs(gas_price.0),
+                    };
+                    tx.chain_id = Some(chain_id);
+                })
+                .modify_block_env(|block| {
+                    block.number = RevmU256::from(block_number);
+                    block.timestamp = RevmU256::from(block_timestamp);
+                    // WP-X.4: Real coinbase and prevrandao
+                    block.coinbase = RevmAddress::from_slice(&coinbase);
+                    block.prevrandao = Some(B256::from_slice(&prevrandao));
+                    // r1007 S3-3b (spec 06 §3.7): GASLIMIT inside an accepted
+                    // mergeset is ACCEPT_GAS_LIMIT.
+                    if let Some(limit) = block_gas_limit {
+                        block.gas_limit = RevmU256::from(limit);
+                    }
+                })
+        };
+    }
+    let result = match tracer {
+        None => {
+            let mut evm = citrate_evm_config!(Evm::builder()
+                .with_db(&mut db)
+                // WP-B0 (TD-28): expose the pure Citrate precompile families
+                // (verify/compute/learning/x402) to contract code. Without this,
+                // STATICCALLs to e.g. 0x0108 hit an empty account and silently
+                // return success with no data.
+                .append_handler_register_box(Box::new(move |h| {
+                    register_citrate_precompiles(h, pba_hardened, agent_fork)
+                })))
+            .build();
+            evm.transact_commit()
+        }
+        Some(handle) => {
+            let mut recorder = handle.lock();
+            let mut evm = citrate_evm_config!(Evm::builder()
+                .with_db(&mut db)
+                .with_external_context(&mut *recorder)
+                .append_handler_register(revm::inspector_handle_register)
+                .append_handler_register_box(Box::new(move |h| {
+                    register_citrate_precompiles(h, pba_hardened, agent_fork)
+                })))
+            .build();
+            evm.transact_commit()
+        }
+    }
+    .map_err(|e| ExecutionError::Reverted(format!("revm execution failed: {:?}", e)))?;
 
     match result {
         ExecutionResult::Success {
@@ -1061,6 +1131,49 @@ pub fn execute_contract_call_with_context(
     state_store: Option<Arc<dyn crate::executor::StateStoreTrait>>,
     value_semantics: ValueSemantics,
 ) -> Result<(Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
+    execute_contract_call_traced(
+        state_db,
+        caller,
+        contract,
+        calldata,
+        value,
+        gas_limit,
+        gas_price,
+        chain_id,
+        block_number,
+        block_timestamp,
+        block_ctx,
+        writes_handle,
+        journal_handle,
+        state_store,
+        value_semantics,
+        None,
+    )
+}
+
+/// [`execute_contract_call_with_context`] with an optional call tracer
+/// (S3-7, `crate::trace`). `None` builds the EVM exactly as the untraced
+/// entry point always has; `Some` attaches the observe-only inspector (same
+/// instructions, same gas, same result).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_contract_call_traced(
+    state_db: Arc<StateDB>,
+    caller: Address,
+    contract: Address,
+    calldata: Vec<u8>,
+    value: U256,
+    gas_limit: u64,
+    gas_price: U256,
+    chain_id: u64,
+    block_number: u64,
+    block_timestamp: u64,
+    block_ctx: BlockContext,
+    writes_handle: Option<WriteSetHandle>,
+    journal_handle: Option<JournalHandle>,
+    state_store: Option<Arc<dyn crate::executor::StateStoreTrait>>,
+    value_semantics: ValueSemantics,
+    tracer: Option<&crate::trace::CallTraceHandle>,
+) -> Result<(Vec<u8>, u64, Vec<CitrateLog>), ExecutionError> {
     debug!("Executing contract call with revm");
     debug!("  Caller: {}", caller);
     debug!("  Contract: {}", contract);
@@ -1085,81 +1198,108 @@ pub fn execute_contract_call_with_context(
     // Build EVM with transaction
     let coinbase = block_ctx.coinbase;
     let prevrandao = block_ctx.prevrandao;
+    let block_gas_limit = block_ctx.gas_limit;
     // PBA-R2: consensus activation for the hardened precompile semantics.
     let pba_hardened = crate::activation::pba_hardening_active(block_number);
     // HUP-S7.2: the agent precompile fork (default: not activated).
     let agent_fork = crate::agent_fork::agent_precompiles_active(block_number);
-    let mut evm = Evm::builder()
-        .with_db(&mut db)
-        // WP-B0 (TD-28): expose the pure Citrate precompile families
-        // (verify/compute/learning/x402) to contract code. Without this,
-        // STATICCALLs to e.g. 0x0108 hit an empty account and silently
-        // return success with no data.
-        .append_handler_register_box(Box::new(move |h| {
-            register_citrate_precompiles(h, pba_hardened, agent_fork)
-        }))
-        .modify_cfg_env(|cfg| {
-            cfg.chain_id = chain_id;
-        })
-        // DPF-VM-1 — CANCUN enables MCOPY (EIP-5656) which Solidity
-        // 0.8.25+ emits for dynamic-bytes ABI return encoding. Pre-
-        // CANCUN halted with InvalidOpcode, which the executor's
-        // status-bit pattern silently swallowed as Ok(receipt{status:
-        // false, output:vec![]}); eth_call then hex-encoded empty
-        // bytes → "0x" with no JSON-RPC error to surface the bug.
-        // See `.agentile/sprints/active/2026-05-12-dpf-vm-1-dynamic-returns/SPRINT.md`.
-        .with_spec_id(SpecId::CANCUN)
-        .modify_tx_env(|tx| {
-            tx.caller = RevmAddress::from_slice(&caller.0);
-            tx.transact_to = TransactTo::Call(RevmAddress::from_slice(&contract.0));
-            tx.data = Bytes::from(calldata);
-            tx.value = RevmU256::from_limbs(value.0);
-            tx.gas_limit = gas_limit;
-            // ZERO, deliberately — see `DatabaseCommit::commit`.
-            //
-            // The executor is the sole owner of gas accounting: it deducts
-            // gas upfront and refunds on success. If REVM also charged gas,
-            // committing its balance changes would double-deduct — which is
-            // precisely why Sprint EL-1 dropped balances wholesale, and why
-            // contract-initiated value transfers went missing for so long.
-            //
-            // Zeroing the gas price here is how we say "REVM does no gas
-            // accounting on this chain". Its resulting balance deltas are
-            // then exactly the value movement, which `commit` can apply
-            // wholesale. REVM's affordability precheck degrades to
-            // `balance >= value`, the correct residual test given the
-            // executor already took gas out. `block.basefee` is 0 (never
-            // set), so a zero gas price still validates.
-            //
-            // Known, contained deviation: the GASPRICE opcode returns 0
-            // inside REVM-executed code. No contract deployed on 40204 reads
-            // `tx.gasprice` — verified by grep over `contracts/src`.
-            //
-            // Below the activation height the real gas price is passed
-            // through unchanged. That matters even though pre-activation
-            // balances are discarded: REVM's affordability precheck is
-            // `balance >= gas_limit * gas_price + value`, so zeroing the
-            // price early would let transactions succeed that historically
-            // failed, changing replayed history.
-            tx.gas_price = match value_semantics {
-                ValueSemantics::RevmAuthoritative => RevmU256::ZERO,
-                ValueSemantics::LegacyDropInternal => RevmU256::from_limbs(gas_price.0),
-            };
-            tx.chain_id = Some(chain_id);
-        })
-        .modify_block_env(|block| {
-            block.number = RevmU256::from(block_number);
-            block.timestamp = RevmU256::from(block_timestamp);
-            // WP-X.4: Real coinbase and prevrandao
-            block.coinbase = RevmAddress::from_slice(&coinbase);
-            block.prevrandao = Some(B256::from_slice(&prevrandao));
-        })
-        .build();
-
-    // Execute transaction
-    let result = evm
-        .transact_commit()
-        .map_err(|e| ExecutionError::Reverted(format!("revm execution failed: {:?}", e)))?;
+    // S3-7: one EVM configuration, applied to the untraced builder (the
+    // consensus path, unchanged) or to the traced one (an observe-only
+    // inspector, `crate::trace`).
+    macro_rules! citrate_evm_config {
+        ($builder:expr) => {
+            $builder
+                .modify_cfg_env(|cfg| {
+                    cfg.chain_id = chain_id;
+                })
+                // DPF-VM-1 — CANCUN enables MCOPY (EIP-5656) which Solidity
+                // 0.8.25+ emits for dynamic-bytes ABI return encoding. Pre-
+                // CANCUN halted with InvalidOpcode, which the executor's
+                // status-bit pattern silently swallowed as Ok(receipt{status:
+                // false, output:vec![]}); eth_call then hex-encoded empty
+                // bytes → "0x" with no JSON-RPC error to surface the bug.
+                // See `.agentile/sprints/active/2026-05-12-dpf-vm-1-dynamic-returns/SPRINT.md`.
+                .with_spec_id(SpecId::CANCUN)
+                .modify_tx_env(|tx| {
+                    tx.caller = RevmAddress::from_slice(&caller.0);
+                    tx.transact_to = TransactTo::Call(RevmAddress::from_slice(&contract.0));
+                    tx.data = Bytes::from(calldata);
+                    tx.value = RevmU256::from_limbs(value.0);
+                    tx.gas_limit = gas_limit;
+                    // ZERO, deliberately — see `DatabaseCommit::commit`.
+                    //
+                    // The executor is the sole owner of gas accounting: it deducts
+                    // gas upfront and refunds on success. If REVM also charged gas,
+                    // committing its balance changes would double-deduct — which is
+                    // precisely why Sprint EL-1 dropped balances wholesale, and why
+                    // contract-initiated value transfers went missing for so long.
+                    //
+                    // Zeroing the gas price here is how we say "REVM does no gas
+                    // accounting on this chain". Its resulting balance deltas are
+                    // then exactly the value movement, which `commit` can apply
+                    // wholesale. REVM's affordability precheck degrades to
+                    // `balance >= value`, the correct residual test given the
+                    // executor already took gas out. `block.basefee` is 0 (never
+                    // set), so a zero gas price still validates.
+                    //
+                    // Known, contained deviation: the GASPRICE opcode returns 0
+                    // inside REVM-executed code. No contract deployed on 40204 reads
+                    // `tx.gasprice` — verified by grep over `contracts/src`.
+                    //
+                    // Below the activation height the real gas price is passed
+                    // through unchanged. That matters even though pre-activation
+                    // balances are discarded: REVM's affordability precheck is
+                    // `balance >= gas_limit * gas_price + value`, so zeroing the
+                    // price early would let transactions succeed that historically
+                    // failed, changing replayed history.
+                    tx.gas_price = match value_semantics {
+                        ValueSemantics::RevmAuthoritative => RevmU256::ZERO,
+                        ValueSemantics::LegacyDropInternal => RevmU256::from_limbs(gas_price.0),
+                    };
+                    tx.chain_id = Some(chain_id);
+                })
+                .modify_block_env(|block| {
+                    block.number = RevmU256::from(block_number);
+                    block.timestamp = RevmU256::from(block_timestamp);
+                    // WP-X.4: Real coinbase and prevrandao
+                    block.coinbase = RevmAddress::from_slice(&coinbase);
+                    block.prevrandao = Some(B256::from_slice(&prevrandao));
+                    // r1007 S3-3b (spec 06 §3.7): GASLIMIT inside an accepted
+                    // mergeset is ACCEPT_GAS_LIMIT.
+                    if let Some(limit) = block_gas_limit {
+                        block.gas_limit = RevmU256::from(limit);
+                    }
+                })
+        };
+    }
+    let result = match tracer {
+        None => {
+            let mut evm = citrate_evm_config!(Evm::builder()
+                .with_db(&mut db)
+                // WP-B0 (TD-28): expose the pure Citrate precompile families
+                // (verify/compute/learning/x402) to contract code. Without this,
+                // STATICCALLs to e.g. 0x0108 hit an empty account and silently
+                // return success with no data.
+                .append_handler_register_box(Box::new(move |h| {
+                    register_citrate_precompiles(h, pba_hardened, agent_fork)
+                })))
+            .build();
+            evm.transact_commit()
+        }
+        Some(handle) => {
+            let mut recorder = handle.lock();
+            let mut evm = citrate_evm_config!(Evm::builder()
+                .with_db(&mut db)
+                .with_external_context(&mut *recorder)
+                .append_handler_register(revm::inspector_handle_register)
+                .append_handler_register_box(Box::new(move |h| {
+                    register_citrate_precompiles(h, pba_hardened, agent_fork)
+                })))
+            .build();
+            evm.transact_commit()
+        }
+    }
+    .map_err(|e| ExecutionError::Reverted(format!("revm execution failed: {:?}", e)))?;
 
     match result {
         ExecutionResult::Success {
@@ -1357,6 +1497,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: [0xBE; 32],
             block_hashes: HashMap::new(),
+            gas_limit: None,
         };
 
         // Minimal init code: PUSH1 0x00 PUSH1 0x00 RETURN (deploys empty contract)
@@ -1406,6 +1547,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: [0xBE; 32],
             block_hashes,
+            gas_limit: None,
         };
 
         let result = execute_contract_call_with_context(
@@ -1470,6 +1612,7 @@ mod tests {
             coinbase: [0x42; 20],
             prevrandao: vrf_output,
             block_hashes: HashMap::new(),
+            gas_limit: None,
         };
 
         let (output, _gas, _logs) = execute_contract_call_with_context(

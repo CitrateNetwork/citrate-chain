@@ -166,6 +166,11 @@ async fn m06_persist_then_reload_round_trip() {
 fn m06_checkpoint_serialization_is_total() {
     let voter = PublicKey::new([0x42; 32]);
     let vote = CheckpointVote {
+        binding: citrate_consensus::checkpoint::VoteBinding {
+            epoch: 1,
+            state_root: Hash::new([0x51; 32]),
+            accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+        },
         height: 100,
         block_hash: Hash::new([0xCD; 32]),
         voter,

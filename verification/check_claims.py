@@ -8,8 +8,11 @@ Offline, stdlib only. Fails (exit 1) when:
    than specified-not-running) while the code does not run it. The code counts
    as running only when ALL of these hold (spec §11.11 — a default-off flag
    must not read as "running"):
-     a. the compiled voting pin (CHECKPOINT_VOTING_PINS) is ON for 40204;
-     b. the compiled enforcement pin (CHECKPOINT_ENFORCEMENT_PINS) is ON for 40204;
+     a. voting is compiled ON: r1007's `CHECKPOINT_VOTING_FROM_GENESIS: bool = true`
+        (ADR CV-8, no pin), or the pre-r1007 table CHECKPOINT_VOTING_PINS ON for 40204;
+     b. enforcement is compiled ON: an entry for 40204 in the genesis-keyed
+        CHECKPOINT_ENFORCEMENT_GENESES (r1007), or the pre-r1007 table
+        CHECKPOINT_ENFORCEMENT_PINS ON for 40204;
      c. a non-test code path calls `sign_checkpoint_vote(` (node/src or
         core/consensus/src);
      d. a non-test node/src file BUILDS a `NetworkMessage::CheckpointVote { .. }`
@@ -143,6 +146,10 @@ GADGET = "core/consensus/src/checkpoint_gadget.rs"
 PIN_CHAIN = 40204
 VOTING_PINS = "CHECKPOINT_VOTING_PINS"
 ENFORCEMENT_PINS = "CHECKPOINT_ENFORCEMENT_PINS"
+# r1007 (ADR CV-8): voting is a compiled constant, enforcement a table keyed by
+# (chain id, genesis hash).
+VOTING_CONST = "CHECKPOINT_VOTING_FROM_GENESIS"
+ENFORCEMENT_GENESES = "CHECKPOINT_ENFORCEMENT_GENESES"
 
 
 def strip_comments(src: str) -> str:
@@ -184,6 +191,38 @@ def pin_on(root: Path, table: str, chain_id: int, warns: list[str]) -> bool:
         if int(cid) == chain_id:
             return on == "true"
     return False
+
+
+def r1007_switch(root: Path, kind: str, chain_id: int) -> bool | None:
+    """The r1007 form of a switch, or None when the gadget does not have it.
+
+    kind "voting": `CHECKPOINT_VOTING_FROM_GENESIS: bool = true|false;`.
+    kind "enforcement": `CHECKPOINT_ENFORCEMENT_GENESES: &[(u64, [u8; 32])] = &[..];`,
+    ON when any entry names `chain_id` (it is keyed by genesis; any listed
+    genesis on the chain counts as ON for the claim)."""
+    path = root / GADGET
+    if not path.exists():
+        return None
+    src = production_source(path)
+    if kind == "voting":
+        m = re.search(VOTING_CONST + r"\s*:\s*bool\s*=\s*(true|false)\s*;", src)
+        return None if not m else m.group(1) == "true"
+    m = re.search(
+        ENFORCEMENT_GENESES + r"\s*:\s*&\[\s*\(\s*u64\s*,\s*\[\s*u8\s*;\s*32\s*\]\s*\)\s*\]\s*=\s*&\[(.*?)\]\s*;",
+        src,
+        re.S,
+    )
+    if not m:
+        return None
+    return any(int(cid) == chain_id for cid in re.findall(r"\(\s*(\d+)\s*,", m.group(1)))
+
+
+def switch_on(root: Path, kind: str, table: str, chain_id: int, warns: list[str]) -> bool:
+    """r1007 form when present, else the pre-r1007 pin table."""
+    r = r1007_switch(root, kind, chain_id)
+    if r is not None:
+        return r
+    return pin_on(root, table, chain_id, warns)
 
 
 def production_sign_callers(root: Path) -> list[str]:
@@ -232,8 +271,8 @@ def outbound_vote_files(root: Path) -> list[str]:
 def finality_evidence(root: Path, warns: list[str]) -> dict:
     """What the code says about checkpoint finality running on 40204."""
     ev = {
-        "voting_pin": pin_on(root, VOTING_PINS, PIN_CHAIN, warns),
-        "enforcement_pin": pin_on(root, ENFORCEMENT_PINS, PIN_CHAIN, warns),
+        "voting_pin": switch_on(root, "voting", VOTING_PINS, PIN_CHAIN, warns),
+        "enforcement_pin": switch_on(root, "enforcement", ENFORCEMENT_PINS, PIN_CHAIN, warns),
         "sign_callers": production_sign_callers(root),
         "outbound_files": outbound_vote_files(root),
     }

@@ -1,0 +1,32 @@
+{
+  "name": "r1007",
+  "status": "pending-genesis",
+  "description": "r1007 (chain 40204), new genesis from the r1006 block-0 state and the same 7 producers (ADR-2026-11-03 CV-2, docs/consensus/R1007_GENESIS.md). TEMPLATE: scripts/ops/r1007/ceremony.py render fills the genesis hash (R1007_GENESIS, read from core/consensus/src/hardening.rs), the registry binding (validators.json), the checkpoint values (R1007_CHAIN_PARAMS) and the bootnodes per host, and marks each rendered copy ready. The template stays pending-genesis.",
+  "sources": {
+    "genesis_hash": "core/consensus/src/hardening.rs R1007_GENESIS (filled by render)",
+    "bootstrap_nodes": "scripts/ops/r1007/fleet.r1007.json (filled by render)",
+    "validator_registry": "core/economics/assets/r1006/validators.json (filled by render)",
+    "validator_activation_height": "R1007_CHAIN_PARAMS.validator_activation_height (filled by render)",
+    "env": "as r1006 (RC52 plan fed#394): CITRATE_BLOCK_V2; CITRATE_DAG_PRUNE_RETAIN = R1007_CHAIN_PARAMS.pruning_depth (filled by render)",
+    "checkpoint": "R1007_CHAIN_PARAMS checkpoint_interval / committee_size; vote_depth = the node default, checked equal to checkpoint_vote_depth"
+  },
+  "chain_id": 40204,
+  "genesis_hash": "",
+  "genesis_profile": "r1007",
+  "public_rpc": "http://127.0.0.1:8545",
+  "block_time": 2,
+  "ghostdag_k": 18,
+  "bootstrap_nodes": [],
+  "validator_registry": "",
+  "validator_activation_height": 0,
+  "env": {
+    "CITRATE_BLOCK_V2": "1"
+  },
+  "checkpoint": {
+    "interval": 0,
+    "committee_size": 0,
+    "quorum_threshold": 67
+  },
+  "gas_price_wei": 1000000000,
+  "registration_gas_limit": 600000
+}

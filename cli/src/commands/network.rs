@@ -268,10 +268,35 @@ async fn get_status(config: &Config) -> Result<()> {
         .unwrap_or(&serde_json::Value::Null)
         .is_boolean();
 
+    // Which chain this endpoint serves: eth_chainId and the hash of block 0.
+    let node_chain_id = rpc_result(&client, config, "eth_chainId", json!([]))
+        .await
+        .and_then(|v| v.as_str().map(str::to_string))
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let node_genesis = rpc_result(
+        &client,
+        config,
+        "eth_getBlockByNumber",
+        json!(["0x0", false]),
+    )
+    .await
+    .and_then(|b| b.get("hash").and_then(|h| h.as_str()).map(str::to_string));
+
     println!("{}", "Network Status:".bold());
     println!("RPC Endpoint: {}", config.rpc_endpoint.cyan());
     println!("Network ID: {}", network_id);
-    println!("Chain ID: {}", config.chain_id);
+    for line in super::rpc_hint::chain_lines(
+        node_chain_id,
+        config.chain_id,
+        node_genesis.as_deref(),
+        super::devx::vendored_genesis_hash().as_deref(),
+    ) {
+        if line.starts_with("WARNING") {
+            println!("{}", line.yellow());
+        } else {
+            println!("{}", line);
+        }
+    }
     println!("Latest Block: {}", block_number);
     println!(
         "Syncing: {}",
@@ -283,6 +308,23 @@ async fn get_status(config: &Config) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// One JSON-RPC call; `None` on a transport error, an error reply or a null result.
+async fn rpc_result(
+    client: &reqwest::Client,
+    config: &Config,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let response = client
+        .post(&config.rpc_endpoint)
+        .json(&json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 }))
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = response.json().await.ok()?;
+    body.get("result").filter(|v| !v.is_null()).cloned()
 }
 
 async fn get_block(config: &Config, block: &str) -> Result<()> {
@@ -313,79 +355,10 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(block) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(block) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Block Information:".bold());
-        println!(
-            "Number: {}",
-            u64::from_str_radix(
-                block["number"]
-                    .as_str()
-                    .unwrap_or("0x0")
-                    .trim_start_matches("0x"),
-                16
-            )
-            .unwrap_or(0)
-        );
-        println!("Hash: {}", block["hash"].as_str().unwrap_or("N/A").cyan());
-        println!("Parent: {}", block["parentHash"].as_str().unwrap_or("N/A"));
-        println!(
-            "Timestamp: {}",
-            u64::from_str_radix(
-                block["timestamp"]
-                    .as_str()
-                    .unwrap_or("0x0")
-                    .trim_start_matches("0x"),
-                16
-            )
-            .unwrap_or(0)
-        );
-        println!("Miner: {}", block["miner"].as_str().unwrap_or("N/A"));
-
-        if let Some(txs) = block["transactions"].as_array() {
-            println!("Transactions: {}", txs.len());
-
-            if !txs.is_empty() && txs.len() <= 5 {
-                println!("\nTransactions:");
-                for tx in txs {
-                    if let Some(hash) = tx["hash"].as_str() {
-                        println!("  • {}", hash);
-                    }
-                }
-            } else if txs.len() > 5 {
-                println!("  (showing first 5)");
-                for tx in txs.iter().take(5) {
-                    if let Some(hash) = tx["hash"].as_str() {
-                        println!("  • {}", hash);
-                    }
-                }
-                println!("  ... and {} more", txs.len().saturating_sub(5));
-            }
-        }
-
-        // GhostDAG specific fields
-        if let Some(merge_parents) = block["mergeParents"].as_array() {
-            if !merge_parents.is_empty() {
-                println!("\nGhostDAG Merge Parents: {}", merge_parents.len());
-                for parent in merge_parents.iter().take(3) {
-                    if let Some(hash) = parent.as_str() {
-                        println!("  • {}", hash);
-                    }
-                }
-            }
-        }
-
-        if let Some(blue_score) = block["blueScore"].as_u64() {
-            println!("Blue Score: {}", blue_score);
-        }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+        print!("{}", render_block(block));
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -395,6 +368,96 @@ async fn get_block(config: &Config, block: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The block summary `network block` prints, one line per field.
+///
+/// `block` is the `eth_getBlockByNumber` result. It is indexed as a `Value`, so a
+/// field the node does not send reads as null and prints a placeholder instead
+/// of panicking.
+fn render_block(block: &serde_json::Value) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!(
+        "Number: {}",
+        u64::from_str_radix(
+            block["number"]
+                .as_str()
+                .unwrap_or("0x0")
+                .trim_start_matches("0x"),
+            16
+        )
+        .unwrap_or(0)
+    ));
+    lines.push(format!("Hash: {}", block["hash"].as_str().unwrap_or("N/A")));
+    lines.push(format!(
+        "Parent: {}",
+        block["parentHash"].as_str().unwrap_or("N/A")
+    ));
+    lines.push(format!(
+        "Timestamp: {}",
+        u64::from_str_radix(
+            block["timestamp"]
+                .as_str()
+                .unwrap_or("0x0")
+                .trim_start_matches("0x"),
+            16
+        )
+        .unwrap_or(0)
+    ));
+    lines.push(format!(
+        "Miner: {}",
+        block["miner"].as_str().unwrap_or("N/A")
+    ));
+
+    if let Some(txs) = block["transactions"].as_array() {
+        lines.push(format!("Transactions: {}", txs.len()));
+
+        if !txs.is_empty() && txs.len() <= 5 {
+            lines.push("\nTransactions:".to_string());
+            for tx in txs {
+                if let Some(hash) = tx["hash"].as_str() {
+                    lines.push(format!("  • {}", hash));
+                }
+            }
+        } else if txs.len() > 5 {
+            lines.push("  (showing first 5)".to_string());
+            for tx in txs.iter().take(5) {
+                if let Some(hash) = tx["hash"].as_str() {
+                    lines.push(format!("  • {}", hash));
+                }
+            }
+            lines.push(format!("  ... and {} more", txs.len().saturating_sub(5)));
+        }
+    }
+
+    // GhostDAG specific fields. The node sends `mergeParentHashes`; older
+    // nodes sent `mergeParents`.
+    let merge_parents = block["mergeParentHashes"]
+        .as_array()
+        .or_else(|| block["mergeParents"].as_array());
+    if let Some(merge_parents) = merge_parents {
+        if !merge_parents.is_empty() {
+            lines.push(format!("\nGhostDAG Merge Parents: {}", merge_parents.len()));
+            for parent in merge_parents.iter().take(3) {
+                if let Some(hash) = parent.as_str() {
+                    lines.push(format!("  • {}", hash));
+                }
+            }
+        }
+    }
+
+    // `blueScore` is a hex quantity like every other number in the response.
+    let blue_score = block["blueScore"].as_u64().or_else(|| {
+        block["blueScore"]
+            .as_str()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    });
+    if let Some(blue_score) = blue_score {
+        lines.push(format!("Blue Score: {}", blue_score));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
@@ -414,11 +477,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(tx) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(tx) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Transaction Details:".bold());
         println!("Hash: {}", tx["hash"].as_str().unwrap_or("N/A").cyan());
         println!("From: {}", tx["from"].as_str().unwrap_or("N/A"));
@@ -426,7 +485,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
         if let Some(value_hex) = tx["value"].as_str() {
             let value = u128::from_str_radix(value_hex.trim_start_matches("0x"), 16).unwrap_or(0);
-            println!("Value: {} wei ({} ETH)", value, value as f64 / 1e18);
+            println!("Value: {} wei ({} SALT)", value, value as f64 / 1e18);
         }
 
         println!(
@@ -487,11 +546,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
 
             let receipt_result: serde_json::Value = receipt_response.json().await?;
 
-            if let Some(receipt) = receipt_result
-                .get("result")
-                .unwrap_or(&serde_json::Value::Null)
-                .as_object()
-            {
+            if let Some(receipt) = receipt_result.get("result").filter(|v| v.is_object()) {
                 println!("\nReceipt:");
 
                 let status = receipt["status"].as_str().unwrap_or("0x0");
@@ -526,11 +581,7 @@ async fn get_transaction(config: &Config, tx_hash: &str) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -569,12 +620,8 @@ async fn get_gas_price(config: &Config) -> Result<()> {
         println!("{}", "Current Gas Price:".bold());
         println!("  {} wei", price);
         println!("  {} gwei", price as f64 / 1e9);
-        println!("  {} ETH", price as f64 / 1e18);
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+        println!("  {} SALT", price as f64 / 1e18);
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -651,11 +698,7 @@ async fn get_peers(config: &Config) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -684,11 +727,7 @@ async fn get_sync_status(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(sync) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(sync) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Sync Status: SYNCING".yellow().bold());
 
         if let Some(current) = sync["currentBlock"].as_str() {
@@ -725,11 +764,7 @@ async fn get_sync_status(config: &Config) -> Result<()> {
     {
         println!("{}", "Sync Status: SYNCED".green().bold());
         println!("Node is fully synchronized with the network");
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         anyhow::bail!(
             "Query failed: {}",
             error["message"].as_str().unwrap_or("Unknown error")
@@ -759,11 +794,7 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(stats) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(stats) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "DAG Statistics:".bold());
         // A null field is one the node does not track (citrate_getDagStats);
         // show it as such instead of as 0.
@@ -794,11 +825,7 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
                 }
             }
         }
-    } else if let Some(error) = result
-        .get("error")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    } else if let Some(error) = result.get("error").filter(|v| v.is_object()) {
         // Method might not be available
         if error["message"]
             .as_str()
@@ -821,4 +848,70 @@ async fn get_dag_stats(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_block;
+
+    /// Block 7059 of the live r1007 chain (genesis 0xcf686345…), fetched with
+    /// `eth_getBlockByNumber("0x1b93", true)` from https://rpc.citrate.ai on 2026-11-12.
+    /// It holds one native self-transfer. The node names the merge parents
+    /// `mergeParentHashes` and sends `blueScore` as a hex string.
+    const R1007_BLOCK_7059: &str = include_str!("../../tests/fixtures/r1007_block_7059.json");
+
+    fn block() -> serde_json::Value {
+        match serde_json::from_str::<serde_json::Value>(R1007_BLOCK_7059) {
+            Ok(v) if v.is_object() => v,
+            other => panic!("fixture is not a JSON object: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renders_a_live_r1007_block_without_panicking() {
+        let out = render_block(&block());
+        assert!(out.contains("Number: 7059"), "{out}");
+        assert!(
+            out.contains(
+                "Hash: 0xeb9174b8db765758bb4a807f9a10e608f324268b630b6ba21cc0fc743eb6669d"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("Transactions: 1"), "{out}");
+        assert!(
+            out.contains("0x4f26db08ecb21144dcdc0080967292085031340b846842ef15b606f6024b3c55"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn shows_the_merge_parents_and_blue_score_the_node_sends() {
+        let b = block();
+        let parents = b
+            .get("mergeParentHashes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let blue = b
+            .get("blueScore")
+            .and_then(|v| v.as_str())
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .unwrap_or(u64::MAX);
+        let out = render_block(&b);
+        if parents > 0 {
+            assert!(
+                out.contains(&format!("GhostDAG Merge Parents: {parents}")),
+                "{out}"
+            );
+        }
+        assert!(out.contains(&format!("Blue Score: {blue}")), "{out}");
+    }
+
+    #[test]
+    fn a_block_with_only_a_number_renders_placeholders() {
+        let b = serde_json::json!({ "number": "0x2a" });
+        let out = render_block(&b);
+        assert!(out.contains("Number: 42"), "{out}");
+        assert!(out.contains("Hash: N/A"), "{out}");
+    }
 }

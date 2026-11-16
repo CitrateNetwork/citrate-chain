@@ -23,6 +23,9 @@ export const memberSBT = book.CitrateMemberSBT
 /** nonce-based, MOVES every re-roll — always getCode-verify at boot */
 export const membershipVault = book.MembershipStakeVault
 
+/** operator EOAs (no code), e.g. the bundler signer and the faucet; never contracts, not in getAddress */
+export const accounts = book.accounts || {}
+
 /** the whole canonical book, if you need something not surfaced above */
 export const raw = book
 

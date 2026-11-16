@@ -5,5 +5,6 @@ pub mod state_store;
 
 pub use ai_state::{AIStateTree, InferenceResult, LoRAAdapter};
 pub use state_store::{
-    legacy_hydration_view, StateStore, StorageBytes, StorageRecord, REORG_UNDO_DEPTH,
+    legacy_hydration_view, StateStore, StorageBytes, StorageRecord, TriePruneStats,
+    REORG_UNDO_DEPTH, TRIE_PRUNE_INTERVAL,
 };

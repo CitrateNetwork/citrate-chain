@@ -32,7 +32,7 @@
 
 use citrate_consensus::types::{Block, BlockHeader, Hash};
 use citrate_storage::StorageManager;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Protocol maximum headers returned per `GetHeaders` request.
 pub const MAX_HEADERS_PER_REQUEST: u32 = 2048;
@@ -54,14 +54,79 @@ pub const MAX_BLOCKS_PER_REQUEST: u32 = 512;
 ///
 /// NOTE: this is a SOFT budget. `serve_blocks` deliberately exceeds it for the
 /// first height-group above the anchor (the SYNC-S2 forward-progress guarantee)
-/// and logs a warning when it does — a response that carries nothing new wedges
-/// the requester permanently, which is strictly worse than an oversized one.
+/// — a response that carries nothing new wedges the requester permanently,
+/// which is strictly worse than an oversized one. An over-budget reply is not
+/// sent as one message: the serving plane splits every `Blocks` reply with
+/// [`chunk_for_noise`] so each message fits one Noise message.
 ///
 /// The "no block on 40204 exceeds this" assumption that used to live here was
 /// WRONG and is what wedged every cold sync: block `79e46ed2` at height 245
 /// carries 8 contract-deploy transactions and serializes to **60,515 bytes**.
-/// Genuinely oversized single groups still need Noise-layer chunking (follow-up).
+/// And on r1007 the height-1553 group (seven one-transaction siblings) is
+/// 74,543 bytes, which wedged every fresh node at 1552 until replies were split.
+/// A SINGLE block over the Noise cap still cannot be sent; that needs
+/// Noise-layer fragmentation (a wire change, scheduled for the point release).
 pub const MAX_RESPONSE_BYTES: u64 = 60 * 1024;
+
+/// Split a `Blocks` reply into consecutive batches, each of which serializes as
+/// a `NetworkMessage::Blocks` within one Noise message
+/// ([`citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN`]).
+///
+/// r1007 cold-sync wedge (2026-11-14): the reply anchored at height 1552 was
+/// 14 blocks and ~75 KB, so Noise refused to encrypt it and no fresh node ever
+/// got past 1552. Order is kept, so the requester receives the reply exactly as
+/// `serve_blocks` built it, only in several messages. Splitting a height-group
+/// across messages is safe: siblings never reference each other (every parent
+/// has a strictly lower height), messages to one peer leave in order, and the
+/// requester admits each block of a later message after the earlier ones
+/// (buffering any whose parents are still en route).
+///
+/// A block that alone exceeds the cap cannot be sent at all. The reply stops
+/// before it (anything after it may depend on it) with a warning; the requester
+/// still gets what precedes it. When nothing at all can be sent, one empty
+/// batch is returned so the requester's pending request is answered rather than
+/// left to time out.
+pub fn chunk_for_noise(blocks: Vec<Block>) -> Vec<Vec<Block>> {
+    let cap = citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN as u64;
+    // The enum tag plus the vec length prefix; each block then adds exactly its
+    // own serialized size (bincode encodes a Vec as length + elements).
+    let overhead =
+        bincode::serialized_size(&citrate_network::NetworkMessage::Blocks { blocks: Vec::new() })
+            .unwrap_or(16);
+    let mut out: Vec<Vec<Block>> = Vec::new();
+    let mut current: Vec<Block> = Vec::new();
+    let mut current_bytes = overhead;
+    for block in blocks {
+        let size = bincode::serialized_size(&block).unwrap_or(u64::MAX);
+        if overhead.saturating_add(size) > cap {
+            warn!(
+                "block-serve: block {} at height {} is {} bytes; no Noise message can carry it, \
+                 so the reply stops before it (needs Noise-layer fragmentation)",
+                hex::encode(
+                    block
+                        .header
+                        .block_hash
+                        .as_bytes()
+                        .get(..8)
+                        .unwrap_or_default()
+                ),
+                block.header.height,
+                size
+            );
+            break;
+        }
+        if !current.is_empty() && current_bytes.saturating_add(size) > cap {
+            out.push(std::mem::take(&mut current));
+            current_bytes = overhead;
+        }
+        current_bytes = current_bytes.saturating_add(size);
+        current.push(block);
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
 
 /// Resolve the first height to serve for a request anchor.
 ///
@@ -102,6 +167,15 @@ fn resolve_start_inclusive(storage: &StorageManager, from: &Hash) -> Option<u64>
     }
 }
 
+/// CV-7b (H6): the dead-branch marker, when this node's applied tip is held on
+/// a branch it cannot switch from. Unreadable reads as "no marker": serving
+/// stays as it was.
+fn dead_branch(storage: &StorageManager) -> Option<citrate_storage::chain::wedge::WedgeRecord> {
+    citrate_storage::chain::wedge::read(&storage.db)
+        .ok()
+        .flatten()
+}
+
 /// Walk heights `[start, tip]`, mapping each stored block through `map`,
 /// stopping at the item clamp, the first index gap, or the byte budget.
 fn collect_bounded<T: serde::Serialize>(
@@ -115,6 +189,12 @@ fn collect_bounded<T: serde::Serialize>(
     };
     let Ok(tip) = storage.blocks.get_latest_height() else {
         return Vec::new();
+    };
+    // CV-7b: above the fork point of a dead branch the height index is that
+    // branch; it is not served as this node's chain.
+    let tip = match dead_branch(storage) {
+        Some(w) => tip.min(w.fork_height),
+        None => tip,
     };
     let mut out: Vec<T> = Vec::new();
     let mut budget = MAX_RESPONSE_BYTES;
@@ -225,6 +305,9 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
             .then_with(|| a.1.as_bytes().cmp(b.1.as_bytes()))
     });
 
+    // CV-7b: the dead branch's blocks above its fork point are left out (a
+    // height whose only member was one is an empty group, not a gap).
+    let wedge = dead_branch(storage);
     let mut out: Vec<Block> = Vec::new();
     let mut budget = MAX_RESPONSE_BYTES;
     let mut expected = start;
@@ -247,6 +330,18 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
                 break;
             }
             i = i.saturating_add(1);
+            if let Some(w) = &wedge {
+                if row_h > w.fork_height && row_h <= w.dead_tip_height {
+                    let canonical = storage
+                        .blocks
+                        .get_canonical_block_by_height(row_h)
+                        .ok()
+                        .flatten();
+                    if w.is_dead_block(row_h, &hash, canonical) {
+                        continue;
+                    }
+                }
+            }
             // The anchor's own block IS included. It is tempting to strip it —
             // "they anchored on it, so they have it" — but that assumption is
             // false for the SYNC-S3 recovery request, which anchors at a MISSING
@@ -286,13 +381,12 @@ pub fn serve_blocks(storage: &StorageManager, from: &Hash, count: u32) -> Vec<Bl
                 break;
             }
             if group_bytes > MAX_RESPONSE_BYTES {
-                // Emitted anyway — forward progress beats a permanent wedge — but
-                // this is the one shape the Noise transport may still drop whole.
-                // Make it LOUD: a silent drop is indistinguishable from a stall.
-                warn!(
-                    "block-serve: height-{} group is {} bytes, over the {}-byte soft budget — \
-                     serving it anyway to guarantee sync progress, but it may exceed the Noise \
-                     per-message cap. Noise-layer chunking is the durable fix.",
+                // Emitted anyway: forward progress beats a permanent wedge. The
+                // serving plane splits the reply (`chunk_for_noise`), so it is
+                // delivered across several Noise messages.
+                debug!(
+                    "block-serve: height-{} group is {} bytes, over the {}-byte soft budget; \
+                     serving it anyway to guarantee sync progress (the reply is split)",
                     h, group_bytes, MAX_RESPONSE_BYTES
                 );
             }
@@ -830,5 +924,81 @@ mod tests {
             .map(|h| bincode::serialized_size(h).expect("sizeable"))
             .sum();
         assert!(total <= MAX_RESPONSE_BYTES);
+    }
+
+    fn blocks_message_bytes(blocks: &[Block]) -> u64 {
+        bincode::serialized_size(&citrate_network::NetworkMessage::Blocks {
+            blocks: blocks.to_vec(),
+        })
+        .expect("size")
+    }
+
+    /// r1007 height-1553 shape: seven ~10.6 KB siblings (74.5 KB) after seven
+    /// small ones. Every batch fits one Noise message, and the batches
+    /// concatenate back to the input in order.
+    #[test]
+    fn chunk_for_noise_splits_an_over_cap_reply_in_order() {
+        let g = Hash::new([1; 32]);
+        let mut reply: Vec<Block> = (0..7u8)
+            .map(|i| dag_block(0x10 + i, 1, g, vec![]))
+            .collect();
+        let anchor = reply[0].hash();
+        reply.extend((0..7u8).map(|i| fat_dag_block(0x20 + i, 2, anchor, vec![], 10_650)));
+        let cap = citrate_network::noise::MAX_NOISE_PLAINTEXT_LEN as u64;
+        assert!(
+            blocks_message_bytes(&reply) > cap,
+            "fixture is over the cap"
+        );
+
+        let batches = chunk_for_noise(reply.clone());
+        assert!(batches.len() > 1, "an over-cap reply must be split");
+        for (i, b) in batches.iter().enumerate() {
+            assert!(!b.is_empty(), "batch {i} is empty");
+            let bytes = blocks_message_bytes(b);
+            assert!(bytes <= cap, "batch {i} is {bytes} bytes, over {cap}");
+        }
+        let flat: Vec<Hash> = batches.iter().flatten().map(|b| b.hash()).collect();
+        let want: Vec<Hash> = reply.iter().map(|b| b.hash()).collect();
+        assert_eq!(flat, want, "order and contents preserved");
+        // The first message must carry something above the anchor height, or the
+        // requester scores it as a useless answer.
+        assert!(batches[0].iter().any(|b| b.header.height == 2));
+    }
+
+    /// A reply already under the cap is sent unchanged, as one message.
+    #[test]
+    fn chunk_for_noise_leaves_a_small_reply_whole() {
+        let g = Hash::new([1; 32]);
+        let reply: Vec<Block> = (0..5u8)
+            .map(|i| dag_block(0x30 + i, 1, g, vec![]))
+            .collect();
+        let batches = chunk_for_noise(reply.clone());
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), reply.len());
+    }
+
+    /// A single block over the cap can never be sent: the reply stops before
+    /// it and keeps what precedes it.
+    #[test]
+    fn chunk_for_noise_stops_before_a_block_no_message_can_carry() {
+        let g = Hash::new([1; 32]);
+        let small = dag_block(0x40, 1, g, vec![]);
+        let huge = fat_dag_block(0x41, 2, small.hash(), vec![], 70_000);
+        let after = dag_block(0x42, 3, huge.hash(), vec![]);
+        let batches = chunk_for_noise(vec![small.clone(), huge, after]);
+        assert_eq!(batches.len(), 1);
+        let hashes: Vec<Hash> = batches[0].iter().map(|b| b.hash()).collect();
+        assert_eq!(hashes, vec![small.hash()]);
+    }
+
+    /// Nothing sendable still yields one (empty) message, so the requester's
+    /// pending request is answered instead of timing out.
+    #[test]
+    fn chunk_for_noise_answers_an_empty_reply() {
+        let lens = |b: Vec<Vec<Block>>| b.iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(lens(chunk_for_noise(Vec::new())), vec![0]);
+        let g = Hash::new([1; 32]);
+        let huge = fat_dag_block(0x50, 1, g, vec![], 70_000);
+        assert_eq!(lens(chunk_for_noise(vec![huge])), vec![0]);
     }
 }

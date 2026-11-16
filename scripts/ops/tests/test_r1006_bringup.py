@@ -26,6 +26,18 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_guard  # noqa: E402  (fed #467 round 3: no ops test may reach a fleet host)
+
+
+def setUpModule():
+    fleet_guard.install()
+
+
+def tearDownModule():
+    fleet_guard.uninstall()
+
+
 OPS = REPO / "scripts" / "ops"
 BRINGUP = OPS / "r1006_bringup.sh"
 AGENT = OPS / "r1006" / "host_agent.sh"

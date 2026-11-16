@@ -49,6 +49,7 @@ pub fn is_canonical_empty(block: &Block) -> bool {
         transactions: _,
         signature: _,
         equivocation_vote: _,
+        accepted_root: _,
     } = block;
     params_are_default(ghostdag_params)
         && embedded_models.is_empty()

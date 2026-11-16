@@ -2,7 +2,7 @@
 
 use crate::dag_store::DagStore;
 use crate::ghostdag::GhostDag;
-use crate::types::{Hash, Tip};
+use crate::types::{ForkChoiceKey, Hash, Tip};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -49,23 +49,31 @@ pub(crate) struct TipInfo {
     pub(crate) blue_score: u64,
     pub(crate) height: u64,
     pub(crate) timestamp: u64,
+    /// The header's VRF output, the [`ForkChoiceKey`] tie-break before the hash.
+    pub(crate) vrf_output: Hash,
 }
 
-/// Comparator for sorting tips during parent selection.
+impl TipInfo {
+    /// The tip's [`ForkChoiceKey`]. Work is `blue_score × WORK_UNIT` (G7), so
+    /// ordering by score is ordering by work.
+    fn key(&self) -> ForkChoiceKey {
+        ForkChoiceKey {
+            blue_work: crate::types::blue_work_for_score(self.blue_score),
+            vrf_output: self.vrf_output,
+            hash: self.hash,
+        }
+    }
+}
+
+/// Comparator for sorting tips during parent selection: heaviest first by
+/// [`ForkChoiceKey`] `(blue_work, vrf_output, hash)` (r1007 G3/G8).
 ///
-/// Establishes a strict total order on `TipInfo`:
-///   1. higher `blue_score` precedes lower (descending),
-///   2. ties broken by lower `hash` first (ascending lexicographic).
-///
-/// This closes audit finding **H-08** (`select_parents` non-deterministic
-/// with equal blue scores). The hash tie-break MUST NOT be removed —
-/// without it, `Vec::sort_by` is stable but produces input-order-dependent
-/// output across validators whose `dag_store::get_tips()` iteration differs
-/// (e.g., RocksDB key order vs. HashMap entropy).
+/// A strict total order on `TipInfo`, which closes audit finding **H-08**
+/// (`select_parents` non-deterministic with equal blue scores). It is the
+/// same order `GhostDag::select_tip` and the selected-parent rule use, so the
+/// first tip is always the block G3 requires as the selected parent.
 pub(crate) fn cmp_tip_for_parent_selection(a: &TipInfo, b: &TipInfo) -> std::cmp::Ordering {
-    b.blue_score
-        .cmp(&a.blue_score)
-        .then_with(|| a.hash.cmp(&b.hash))
+    b.key().cmp(&a.key())
 }
 
 impl TipSelector {
@@ -96,36 +104,22 @@ impl TipSelector {
             return Ok(first_tip);
         }
 
-        // Get blue scores for each tip
-        let mut best_tip = first_tip;
-        let mut best_score = 0u64;
-
+        // The heaviest tip by ForkChoiceKey, from committed header values
+        // (r1007 G8). One order everywhere: `cmp_tip_for_parent_selection`
+        // (audit H-08), `GhostDag::select_tip` (the drain's reorg fork choice)
+        // and the selected-parent rule (G3). Two different tie-breaks once
+        // deadlocked chain 40204 at height 90,998 (2026-08-06): the producer
+        // targeted one sibling while the drain ranked the other best.
+        let mut best: Option<ForkChoiceKey> = None;
         for &hash in tip_hashes {
-            // Try to get block from DAG store
-            if let Ok(block) = self.dag_store.get_block(&hash).await {
-                if let Ok(score) = self.ghostdag.calculate_blue_score(&block).await {
-                    // Ties MUST break by SMALLEST hash — the single canonical order
-                    // shared with `cmp_tip_for_parent_selection` (audit H-08) and
-                    // `GhostDag::select_tip` (the drain's reorg fork-choice). This
-                    // path (the producer's parent selection) previously used the
-                    // OPPOSITE order (`hash > best_tip`, largest-hash wins), so on an
-                    // equal-blue_score sibling tie the producer targeted one block
-                    // while the drain's fork-choice targeted the other: the producer
-                    // demanded a parent the drain would never reorg the applied tip
-                    // to, and every production round hit the MP-S1 parent/state guard.
-                    // That deadlocked chain 40204 at height 90,998 on 2026-08-06
-                    // (siblings 0x301d7d58 vs 0x32f48263, equal blueWork) — a ~4h
-                    // halt no restart could clear, because the disagreement is
-                    // deterministic. All three tie-breaks must stay identical.
-                    if score > best_score || (score == best_score && hash < best_tip) {
-                        best_tip = hash;
-                        best_score = score;
-                    }
+            if let Some(key) = self.ghostdag.fork_choice_key(&hash).await {
+                if best.is_none_or(|b| key > b) {
+                    best = Some(key);
                 }
             }
         }
 
-        Ok(best_tip)
+        Ok(best.map(|k| k.hash).unwrap_or(first_tip))
     }
 
     /// Select the best tip according to the configured strategy (using current DAG tips)
@@ -161,21 +155,18 @@ impl TipSelector {
                 .get_block(&tip.hash)
                 .await
                 .map_err(|_| TipSelectionError::BlockNotFound(tip.hash))?;
-            let blue_score = self
-                .ghostdag
-                .calculate_blue_score(&block)
-                .await
-                .map_err(|e| TipSelectionError::DagError(e.to_string()))?;
+            // r1007 G7/G8: the committed header value is the score.
             tip_infos.push(TipInfo {
                 hash: tip.hash,
-                blue_score,
+                blue_score: block.header.blue_score,
                 height: block.header.height,
                 timestamp: block.header.timestamp,
+                vrf_output: block.header.vrf_reveal.output,
             });
         }
 
-        // Sort by blue score (descending), break ties by hash (ascending) —
-        // see `cmp_tip_for_parent_selection` doc + audit finding H-08.
+        // Heaviest first by ForkChoiceKey — see `cmp_tip_for_parent_selection`
+        // doc + audit finding H-08.
         tip_infos.sort_by(cmp_tip_for_parent_selection);
 
         // Select top tips up to max_parents
@@ -210,25 +201,21 @@ impl TipSelector {
         &self,
         tips: &[Tip],
     ) -> Result<Hash, TipSelectionError> {
-        let mut candidates = Vec::new();
-        let mut max_score = 0;
-
-        // Find all tips with maximum blue score
+        // The heaviest by ForkChoiceKey (r1007 G8): blue work, then the VRF
+        // output, then the hash. Every tip must be registered.
+        let mut best: Option<ForkChoiceKey> = None;
         for tip in tips {
-            let score = self.get_blue_score(&tip.hash).await?;
-            if score > max_score {
-                max_score = score;
-                candidates.clear();
-                candidates.push(tip.hash);
-            } else if score == max_score {
-                candidates.push(tip.hash);
+            self.get_blue_score(&tip.hash).await?;
+            let key = self
+                .ghostdag
+                .fork_choice_key(&tip.hash)
+                .await
+                .ok_or(TipSelectionError::BlockNotFound(tip.hash))?;
+            if best.is_none_or(|b| key > b) {
+                best = Some(key);
             }
         }
-
-        // Break ties by hash (deterministic)
-        candidates.sort();
-
-        candidates.first().copied().ok_or(TipSelectionError::NoTips)
+        best.map(|k| k.hash).ok_or(TipSelectionError::NoTips)
     }
 
     /// Select tip using weighted random selection based on blue score
@@ -304,6 +291,7 @@ impl TipSelector {
             blue_score,
             height: block.header.height,
             timestamp: block.header.timestamp,
+            vrf_output: block.header.vrf_reveal.output,
         };
 
         // Cache the result
@@ -438,6 +426,7 @@ mod tests {
             blue_score: blue,
             height: 0,
             timestamp: 0,
+            vrf_output: Hash::default(),
         }
     }
 
@@ -458,17 +447,26 @@ mod tests {
 
     #[test]
     fn h08_equal_blue_score_breaks_tie_by_lower_hash() {
-        // The lower hash strictly precedes the higher hash when scores are equal.
+        // r1007 G8: on equal blue work the tie breaks on the VRF output, then
+        // on the hash, the LARGER first (ForkChoiceKey order, the same order the
+        // selected-parent rule G3 uses). Pre-r1007 the lower hash came first.
         // This is the load-bearing tie-break that closes H-08.
         let lo_hash = ti(0x10, 42);
         let hi_hash = ti(0xF0, 42);
         assert_eq!(
-            cmp_tip_for_parent_selection(&lo_hash, &hi_hash),
+            cmp_tip_for_parent_selection(&hi_hash, &lo_hash),
             std::cmp::Ordering::Less,
         );
         assert_eq!(
-            cmp_tip_for_parent_selection(&hi_hash, &lo_hash),
+            cmp_tip_for_parent_selection(&lo_hash, &hi_hash),
             std::cmp::Ordering::Greater,
+        );
+        // The VRF output decides before the hash.
+        let mut lo_hash_hi_vrf = ti(0x10, 42);
+        lo_hash_hi_vrf.vrf_output = Hash::new([0xFF; 32]);
+        assert_eq!(
+            cmp_tip_for_parent_selection(&lo_hash_hi_vrf, &hi_hash),
+            std::cmp::Ordering::Less,
         );
     }
 
@@ -486,15 +484,16 @@ mod tests {
     fn h08_sort_is_deterministic_across_input_permutations() {
         // Construct 8 tips with mixed blue scores including ties, sort them
         // under multiple input permutations, assert canonical order.
+        // r1007 G8 order: heaviest first, ties on the larger hash.
         let canonical = [
-            ti(0x01, 50), // highest score, lowest hash
-            ti(0x02, 50), // highest score, second-lowest hash
-            ti(0x03, 50), // highest score, third-lowest hash
-            ti(0x10, 30), // mid score, lowest hash
+            ti(0x03, 50), // highest score, highest hash
+            ti(0x02, 50),
+            ti(0x01, 50),
             ti(0x20, 30), // mid score, higher hash
-            ti(0xA0, 10), // lowest score, lowest hash among low-score
+            ti(0x10, 30),
+            ti(0xC0, 10), // lowest score, highest hash among low-score
             ti(0xB0, 10),
-            ti(0xC0, 10),
+            ti(0xA0, 10),
         ];
         let canonical_hashes: Vec<Hash> = canonical.iter().map(|t| t.hash).collect();
 

@@ -12,7 +12,7 @@ abstract contract ScriptEnv is Script {
     ///         recipients, initial owners). Either input may name it; when both are
     ///         set they must name the same address, and a set input that is empty,
     ///         malformed or zero reverts instead of being skipped.
-    function deployerAddress() internal view returns (address deployer) {
+    function deployerAddress() internal view virtual returns (address deployer) {
         address ceremony = _deployerInput("CEREMONY_DEPLOYER_ADDRESS");
         address plain = _deployerInput("DEPLOYER_ADDRESS");
         require(

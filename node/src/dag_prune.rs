@@ -25,22 +25,25 @@
 // removed that walk, so retaining deep ancestry is no longer required and this
 // scheduler becomes safe to wire.
 //
-// SAFETY BOUNDS (why a window of 1_000 is a hard floor)
+// SAFETY BOUNDS (why the retention is never below the undo window)
 //
-//   * `canonical_apply::MAX_REORG_DEPTH` = 100 — a fork older than this is
-//     never reverted in memory. A deeper switch is the from-genesis spine
-//     rebuild, which reads the CHAIN store and is allowed only toward a branch
-//     fork choice ranks above the applied tip whose ancestry meets the applied
-//     chain (`CanonicalApplicator::rebuild_target`). A block pruned from the
-//     DAG store is never read as divergence there.
-//   * `GhostDagParams::finality_depth` = 100 — same order.
+//   * `canonical_apply::MAX_REORG_DEPTH` = 10,000 — the undo window, equal to
+//     the retention (ADR-2026-11-03 CV-7a, S3-4; it was 100 before, and a
+//     pruned node forked deeper than that was wedged for good, root cause
+//     H6). Any fork the DAG store still holds is switched across in place,
+//     from the undo records. A deeper switch is the from-genesis spine
+//     rebuild on an unpruned node, which reads the CHAIN store and is allowed
+//     only toward a branch fork choice ranks above the applied tip whose
+//     ancestry meets the applied chain (`CanonicalApplicator::rebuild_target`);
+//     on a pruned node it is refused and the guarded cold resync takes over
+//     (CV-7b/c). A block pruned from the DAG store is never read as divergence.
+//   * `GhostDagParams::finality_depth` = 100 — far inside it.
 //   * `block_serve` reads the CHAIN store exclusively (verified), so serving
 //     peers is completely unaffected by DAG-store pruning. This is the reason
 //     pruning the DAG is far less dangerous than it sounds: the DAG store is
 //     fork-choice working state, not the archive.
 //
-// The floor is therefore 10x the deepest revertible reorg, and the default
-// window is 100x it.
+// The floor and the default are therefore the undo window itself.
 //
 // MERGE BLOCKS (MS-BOUND)
 //
@@ -65,12 +68,14 @@ use tracing::{debug, info, warn};
 /// on deliberately, not inherited by a node that happened to take an upgrade.
 pub const RETAIN_ENV: &str = "CITRATE_DAG_PRUNE_RETAIN";
 
-/// Hard floor on the retain window: 10x `MAX_REORG_DEPTH`. A smaller request is
-/// clamped up rather than honoured — an operator typo must not be able to prune
-/// inside the revertible-reorg window.
-pub const MIN_RETAIN_BLOCKS: u64 = 1_000;
+/// Hard floor on the retain window: the undo window
+/// (`canonical_apply::MAX_REORG_DEPTH`, CV-7a; spec 06 G11: the retention may
+/// only be larger than PRUNING_DEPTH). A smaller request is clamped up rather
+/// than honoured — an operator typo must not be able to prune inside the
+/// revertible-reorg window.
+pub const MIN_RETAIN_BLOCKS: u64 = 10_000;
 
-/// Window used when the env var is set to a non-numeric value.
+/// Window used when the env var is set to a non-numeric value: the undo window.
 pub const DEFAULT_RETAIN_BLOCKS: u64 = 10_000;
 
 /// The configured retain window, or `None` when pruning is disabled.
@@ -86,15 +91,49 @@ pub fn configured_retain() -> Option<u64> {
 /// `prune()` removes blocks strictly BELOW the pruning point, so this returns
 /// the floor of the retained range. Pure function so the policy is unit-testable
 /// without a store.
+///
+/// Spec 06 G11: a node MUST NOT prune at or above `pruning_point(applied tip)`.
+/// The point is `applied - retain` rounded DOWN to a checkpoint height, so it
+/// is never above the tip's G11 pruning point (`retain >= PRUNING_DEPTH`) and
+/// the tip's committed pruning point block stays in the DAG store.
 pub fn pruning_point_height(applied_height: u64, retain: u64) -> Option<u64> {
     let retain = retain.max(MIN_RETAIN_BLOCKS);
-    let point = applied_height.checked_sub(retain)?;
+    let interval = citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
+    let unaligned = applied_height.checked_sub(retain)?;
+    let point = unaligned
+        .checked_div(interval)
+        .unwrap_or(0)
+        .saturating_mul(interval);
     // point == 0 would make `prune()` a no-op (nothing is below height 0) and
     // would also target genesis itself; skip until the chain is deep enough.
     if point == 0 {
         return None;
     }
     Some(point)
+}
+
+/// G11 (spec 06 §2): the chain store as the [`AncestryHeaders`] source of the
+/// pruning-point walk. DAG pruning drops blocks from the DAG store only; the
+/// chain store keeps their headers (`CF_HEADERS`), so a pruned node validates
+/// the pruning point of a late or side-branch block inside the undo window the
+/// same way an unpruned node does. Data source: `BlockStore::get_header`.
+///
+/// [`AncestryHeaders`]: citrate_consensus::ghostdag::AncestryHeaders
+pub struct ChainStoreHeaders(pub Arc<StorageManager>);
+
+impl citrate_consensus::ghostdag::AncestryHeaders for ChainStoreHeaders {
+    fn header(
+        &self,
+        hash: &citrate_consensus::types::Hash,
+    ) -> Option<citrate_consensus::types::BlockHeader> {
+        match self.0.blocks.get_header(hash) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("dag-prune: chain-store header {hash} unreadable for the G11 walk: {e}");
+                None
+            }
+        }
+    }
 }
 
 /// The height below which DAG pruning has dropped blocks from `dag_store`
@@ -181,7 +220,8 @@ pub fn spawn(storage: Arc<StorageManager>, dag_store: Arc<DagStore>) {
     };
     info!(
         "dag-prune: ENABLED — retaining {retain} blocks in the DAG store \
-         (>= {MIN_RETAIN_BLOCKS}; reorg window is 100)"
+         (>= {MIN_RETAIN_BLOCKS}; reorg window is {})",
+        crate::canonical_apply::MAX_REORG_DEPTH
     );
     tokio::spawn(async move {
         // #310: Skip — never run prunes back to back after a slow pass.
@@ -204,6 +244,136 @@ pub fn spawn(storage: Arc<StorageManager>, dag_store: Arc<DagStore>) {
 mod tests {
     use super::*;
 
+    /// A producer restarted on a pruned store must not reload the pruned range.
+    ///
+    /// The eager load in `BlockProducer::with_shared_dag` walks every canonical
+    /// height from 0 out of the chain store. Below the pruning point the DAG
+    /// store no longer holds the blocks (genesis included), so each one is
+    /// offered to `store_block` again (re-growing exactly what pruning bounds on
+    /// a permissive store, refused with a warn line per height on the strict
+    /// production store) and registered with GhostDag under a fallback score.
+    /// On r1006 that is ~294k heights and tens of thousands of warn lines per
+    /// restart. The load must start at the pruning floor and still register
+    /// the retained chain with its pre-restart scores.
+    #[tokio::test]
+    async fn producer_eager_load_starts_at_the_pruning_floor() {
+        use crate::persistent_dag::RocksDbKvStore;
+        use crate::producer::BlockProducer;
+        use citrate_consensus::crypto::Ed25519SigningKey;
+        use citrate_consensus::dag_store::DagStore;
+        use citrate_consensus::ghostdag::GhostDag;
+        use citrate_consensus::types::{BlockBuilder, GhostDagParams, Hash, PublicKey, VrfProof};
+        use citrate_execution::{Executor, StateDB};
+        use citrate_sequencer::mempool::{Mempool, MempoolConfig};
+        use citrate_storage::pruning::PruningConfig;
+
+        fn mk(height: u64, parent: Hash) -> citrate_consensus::types::Block {
+            let mut b = BlockBuilder::new()
+                .version(2)
+                .height(height)
+                .parent(parent)
+                .coinbase([0x33; 20])
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
+                .vrf_reveal(VrfProof {
+                    proof: vec![],
+                    output: Hash::new([0x5A; 32]),
+                })
+                .transactions(vec![])
+                .state_root(Hash::default())
+                .blue_score(height)
+                .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
+                .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
+            b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
+            b
+        }
+
+        const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+        const N: u64 = RETAIN + 500;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let mut chain = Vec::new();
+        let tip_score;
+        {
+            let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+            let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("dag"));
+            let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
+            let mut parent = Hash::default();
+            for h in 0..=N {
+                let b = mk(h, parent);
+                parent = b.header.block_hash;
+                dag.store_block(b.clone()).await.expect("dag");
+                ghostdag.add_block(&b).await.expect("admit");
+                storage.blocks.put_block(&b).expect("chain");
+                chain.push(b);
+            }
+            storage.blocks.put_applied_tip(&parent, N).expect("tip");
+            tip_score = ghostdag.get_blue_score(&parent).await.expect("tip score");
+            assert_eq!(prune_once(&storage, &dag, N, RETAIN).await, 500);
+        }
+
+        // Restart: a fresh DAG store and GhostDag over the same database, then
+        // the producer's eager load.
+        let kv = Arc::new(RocksDbKvStore::new(storage.db.clone()));
+        let dag = Arc::new(DagStore::persistent_with_strict_vrf(kv, false).expect("reload"));
+        dag.set_configured_genesis(chain[0].header.block_hash);
+        dag.set_slot_origin(&chain[0].header)
+            .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let floor = pruned_below(&dag).await;
+        assert_eq!(floor, 500, "the pruning point survives the restart");
+        let executor = Arc::new(Executor::with_storage_and_chain_id(
+            Arc::new(StateDB::new()),
+            Some(storage.state.clone()),
+            40204,
+        ));
+        let _producer = BlockProducer::with_shared_dag(
+            storage.clone(),
+            executor,
+            Arc::new(Mempool::new(MempoolConfig::default())),
+            None,
+            PublicKey::new([0x10; 32]),
+            Ed25519SigningKey::from_bytes(&[0x60; 32]),
+            2,
+            Arc::new(citrate_economics::UnifiedEconomicsManager::new(
+                citrate_economics::UnifiedEconomicsConfig::default(),
+            )),
+            dag.clone(),
+            ghostdag.clone(),
+        )
+        .await;
+
+        for b in &chain[..floor as usize] {
+            assert!(
+                !dag.has_block(&b.header.block_hash).await,
+                "pruned block @ {} was put back into the DAG store by the eager load",
+                b.header.height
+            );
+            assert_eq!(
+                ghostdag.get_block_height(&b.header.block_hash).await,
+                None,
+                "pruned block @ {} was registered with fork choice by the eager load",
+                b.header.height
+            );
+        }
+        let tip = chain[N as usize].header.block_hash;
+        assert_eq!(
+            ghostdag.get_blue_score(&tip).await.ok(),
+            Some(tip_score),
+            "the retained chain is registered with its pre-restart score"
+        );
+        assert_eq!(ghostdag.select_tip().await.ok(), Some(tip));
+    }
+
     #[test]
     fn nothing_to_prune_on_a_short_chain() {
         // Applied tip below the window: the whole chain is inside it.
@@ -219,14 +389,43 @@ mod tests {
     #[test]
     fn prunes_below_the_retained_window() {
         assert_eq!(pruning_point_height(11_000, 10_000), Some(1_000));
-        assert_eq!(pruning_point_height(67_441, 10_000), Some(57_441));
+        // G11: rounded down to a checkpoint height (57,441 -> 57,400).
+        assert_eq!(pruning_point_height(67_441, 10_000), Some(57_400));
+    }
+
+    /// Spec 06 G11: "a node MUST NOT prune at or above pruning_point(applied
+    /// tip)". The DAG prune point is a checkpoint height (so the tip's own
+    /// committed pruning point stays in the DAG store) and never above the
+    /// tip's G11 pruning point, and the retained range still covers `retain`.
+    #[test]
+    fn prune_floor_never_rises_above_the_tips_g11_pruning_point() {
+        use citrate_consensus::checkpoint::CHECKPOINT_INTERVAL;
+        use citrate_consensus::ghostdag::pruning_point_height as g11_pp_height;
+        for retain in [MIN_RETAIN_BLOCKS, MIN_RETAIN_BLOCKS + 37, 25_000] {
+            for applied in (0..=40_000u64).step_by(7) {
+                let Some(p) = pruning_point_height(applied, retain) else {
+                    continue;
+                };
+                assert_eq!(
+                    p % CHECKPOINT_INTERVAL,
+                    0,
+                    "prune point {p} (applied {applied}, retain {retain}) is a checkpoint height"
+                );
+                assert!(
+                    p <= g11_pp_height(applied),
+                    "prune point {p} above the tip's pruning point {} (applied {applied})",
+                    g11_pp_height(applied)
+                );
+                assert!(applied - p >= retain, "retains at least {retain}");
+            }
+        }
     }
 
     /// An operator typo must never be able to prune inside the revertible-reorg
-    /// window (MAX_REORG_DEPTH = 100). A too-small request is clamped UP.
+    /// window (MAX_REORG_DEPTH = 10,000). A too-small request is clamped UP.
     #[test]
     fn retain_window_is_clamped_to_the_floor() {
-        // Asking to keep 10 blocks must behave as if 1_000 were asked for.
+        // Asking to keep 10 blocks must behave as if 10_000 were asked for.
         assert_eq!(
             pruning_point_height(50_000, 10),
             Some(50_000 - MIN_RETAIN_BLOCKS)
@@ -235,12 +434,14 @@ mod tests {
             pruning_point_height(50_000, 0),
             Some(50_000 - MIN_RETAIN_BLOCKS)
         );
-        // And the retained range always clears the reorg window by 10x.
+        // And the retained range always covers the reorg (undo) window, which
+        // is 100x the merge depth.
         let point = pruning_point_height(50_000, 1).expect("clamped");
         assert!(
-            50_000 - point >= 10 * 100,
-            "retained range must clear MAX_REORG_DEPTH by an order of magnitude"
+            50_000 - point >= crate::canonical_apply::MAX_REORG_DEPTH,
+            "retained range must cover MAX_REORG_DEPTH"
         );
+        assert!(50_000 - point >= 10 * 100);
     }
 
     /// End-to-end: `prune_once` must actually shrink the DAG store against real
@@ -262,7 +463,8 @@ mod tests {
                 .height(height)
                 .parent(parent)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -271,13 +473,20 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
-        const N: u64 = 1_500;
-        const RETAIN: u64 = MIN_RETAIN_BLOCKS; // 1_000
+        const RETAIN: u64 = MIN_RETAIN_BLOCKS; // 10_000
+        const N: u64 = RETAIN + 500;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
@@ -336,15 +545,15 @@ mod tests {
             .add_block(&next)
             .await
             .expect("admission must survive a pruned ancestry");
-        // SECREM-A001 RC-8: the chain ROOT is now the real height-0 genesis
-        // (`is_configured_genesis()` holds), so a block at height h scores h+1.
-        // What matters is that the sequence CONTINUES unbroken across the prune.
+        // r1007 G7: genesis scores 0, so a block at height h of a linear chain
+        // scores h (its committed header value). What matters is that the
+        // sequence CONTINUES unbroken across the prune.
         assert_eq!(
             ghostdag
                 .get_blue_score(&next.header.block_hash)
                 .await
                 .unwrap(),
-            N + 2,
+            N + 1,
             "score sequence continues across the prune"
         );
 
@@ -409,7 +618,8 @@ mod tests {
                 .height(height)
                 .parent(parent)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -418,12 +628,19 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
-        const N: u64 = 1_500;
+        const N: u64 = MIN_RETAIN_BLOCKS + 500;
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
             Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
@@ -450,15 +667,17 @@ mod tests {
             storage.blocks.put_block(&b).expect("chain");
         }
         storage.blocks.put_applied_tip(&parent, N).expect("tip");
+        // r1007 G12: the durable record is the tip's GHOSTDAG record
+        // (`DAG_GHOSTDAG`), which replaced the `score:` anchor.
         assert!(
-            dag.get_derived_blue_score(&parent).is_some(),
-            "the tip's durable anchor must exist, or this test is exercising the \
-             no-anchor path again rather than the question being asked"
+            dag.get_ghostdag_data(&parent).is_some(),
+            "the tip's durable record must exist, or this test is exercising the \
+             no-record path again rather than the question being asked"
         );
         assert_eq!(prune_once(&storage, &dag, N, MIN_RETAIN_BLOCKS).await, 500);
         assert!(
-            dag.get_derived_blue_score(&parent).is_some(),
-            "pruning must not delete the RETAINED tip's anchor"
+            dag.get_ghostdag_data(&parent).is_some(),
+            "pruning must not delete the RETAINED tip's record"
         );
 
         // RESTART, follower-style: a brand-new GhostDag over the SAME (pruned)
@@ -477,8 +696,9 @@ mod tests {
                 .get_blue_score(&next.header.block_hash)
                 .await
                 .expect("score"),
-            N + 2,
-            "the score sequence continues unbroken across prune AND restart"
+            N + 1,
+            "the score sequence continues unbroken across prune AND restart \
+             (r1007 G7: genesis 0, so height N + 1 scores N + 1)"
         );
     }
 
@@ -517,7 +737,8 @@ mod tests {
                 .parent(parent)
                 .merge_parents(merges)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -526,8 +747,15 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
@@ -538,11 +766,14 @@ mod tests {
         let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
         let ghostdag = GhostDag::new(GhostDagParams::default(), dag.clone());
 
-        // The merge block lands at height N+1, so a merge parent at height
-        // `N + 1 - MERGE_PARENT_MAX_DEPTH` is EXACTLY at the bound (admits) and one at
-        // `N - MERGE_PARENT_MAX_DEPTH` is one-past the bound (rejected).
-        let within_bound_height = N + 1 - MERGE_PARENT_MAX_DEPTH; // depth == 100
-        let over_bound_height = N - MERGE_PARENT_MAX_DEPTH; // depth == 101
+        // r1007 G5 (strict merge depth) replaces MP-DEPTH: every mergeset block
+        // must have MDR = the chain block MERGE_DEPTH below the merging block in
+        // its past. The merge block lands at height N+1, so a SIDE block (off
+        // the chain, r1007 G2 forbids merging the selected parent's own
+        // ancestors) at depth MERGE_DEPTH - 1 admits, and one at depth
+        // MERGE_DEPTH is one past the bound (rejected).
+        let within_bound_height = N + 2 - MERGE_PARENT_MAX_DEPTH; // depth == 99
+        let over_bound_height = N + 1 - MERGE_PARENT_MAX_DEPTH; // depth == 100
 
         let mut parent = Hash::default();
         let mut within_bound_hash = Hash::default();
@@ -552,13 +783,21 @@ mod tests {
         // InvalidParents under the genesis-identity binding).
         for h in 0..=N {
             let b = mk(h, parent, vec![]);
+            // The side blocks sit on the chain block below their height. Their
+            // smaller VRF output keeps the chain block the heavier sibling (G3).
+            if h == within_bound_height || h == over_bound_height {
+                let mut side = mk(h, parent, vec![]);
+                side.header.vrf_reveal.output = Hash::new([0x01; 32]);
+                side.header.block_hash = side.compute_hash();
+                if h == within_bound_height {
+                    within_bound_hash = side.header.block_hash;
+                } else {
+                    over_bound_hash = side.header.block_hash;
+                }
+                dag.store_block(side.clone()).await.expect("dag");
+                ghostdag.add_block(&side).await.expect("admit side");
+            }
             parent = b.header.block_hash;
-            if h == within_bound_height {
-                within_bound_hash = b.header.block_hash;
-            }
-            if h == over_bound_height {
-                over_bound_hash = b.header.block_hash;
-            }
             dag.store_block(b.clone()).await.expect("dag");
             ghostdag.add_block(&b).await.expect("admit");
             storage.blocks.put_block(&b).expect("chain");
@@ -577,6 +816,8 @@ mod tests {
 
         // (1) A merge parent at exactly MERGE_PARENT_MAX_DEPTH admits — the legal merge a
         // cold-syncing node must be able to cross.
+        // The side block's anticone (99 chain blocks) is far over K, so it is
+        // red and adds nothing: the merge scores the selected parent's N + 1.
         let ok = mk(N + 1, parent, vec![within_bound_hash]);
         dag.store_block(ok.clone()).await.expect("dag");
         ghostdag
@@ -588,9 +829,9 @@ mod tests {
                 .get_blue_score(&ok.header.block_hash)
                 .await
                 .expect("score"),
-            // SECREM-A001 RC-8: with the real height-0 genesis a block at height
-            // h scores h+1, so the merge at height N+1 scores N+2.
-            N + 2,
+            // r1007 G7: genesis 0, so the chain block at height N scores N and
+            // the merge (one blue: its selected parent) scores N + 1.
+            N + 1,
             "the applied chain advances past a legal merge"
         );
 
@@ -604,9 +845,8 @@ mod tests {
             .await
             .expect_err("a merge parent deeper than MP-DEPTH must be rejected from genesis");
         assert!(
-            format!("{err:?}").contains("MP-DEPTH")
-                || format!("{err:?}").contains("below this block"),
-            "rejection must be the MP-DEPTH linkage error, got: {err:?}"
+            format!("{err:?}").contains("MergeDepthViolation"),
+            "rejection must be the merge-depth (G5) error, got: {err:?}"
         );
     }
 
@@ -656,7 +896,8 @@ mod tests {
                 .parent(parent)
                 .merge_parents(merges)
                 .coinbase([0x33; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -665,13 +906,20 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
-        const N: u64 = 1_500;
         const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+        const N: u64 = RETAIN + 500;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
@@ -747,7 +995,8 @@ mod tests {
                 .parent(parent)
                 .merge_parents(merges)
                 .coinbase([coinbase; 20])
-                .timestamp(1000)
+                // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+                .timestamp(1000 + height)
                 .vrf_reveal(VrfProof {
                     proof: vec![],
                     output: Hash::new([0x5A; 32]),
@@ -756,13 +1005,20 @@ mod tests {
                 .state_root(Hash::default())
                 .blue_score(height)
                 .blue_work(citrate_consensus::types::blue_work_for_score(height))
+                // G11: the committed pruning point (zero below 10,050).
+                .pruning_point(crate::g11_test_seal::pruning_point(height, parent))
                 .build_unhashed();
+            // r1007 G10: a proposer of its own (from its content), so honest siblings
+            // in one slot are not equivocation.
+            b.header.proposer_pubkey =
+                citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
             b.header.block_hash = b.compute_hash();
+            crate::g11_test_seal::record(&b);
             b
         }
 
-        const N: u64 = 2_500;
         const RETAIN: u64 = MIN_RETAIN_BLOCKS;
+        const N: u64 = RETAIN + 1_500;
 
         // Same blocks into two nodes: one prunes, one does not.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -788,10 +1044,29 @@ mod tests {
         let dropped = prune_once(&storage, &pruned_dag, N, RETAIN).await;
         assert!(dropped > 0, "the pruned node must actually have pruned");
 
-        // Two producers seal siblings at N+1; the next block merges them.
+        // Two producers seal siblings at N+1; the next block merges them. r1007
+        // G3: the heavier of the two (larger ForkChoiceKey) is the selected
+        // parent; G7: the merge commits SP's N + 1 plus {SP, other} = N + 3.
         let a = mk(N + 1, parent, vec![], 0x33);
         let b = mk(N + 1, parent, vec![], 0x44);
-        let merge = mk(N + 2, a.header.block_hash, vec![b.header.block_hash], 0x33);
+        let (heavy, light) = if citrate_consensus::types::ForkChoiceKey::of_header(&a.header)
+            > citrate_consensus::types::ForkChoiceKey::of_header(&b.header)
+        {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+        let mut merge = mk(
+            N + 2,
+            heavy.header.block_hash,
+            vec![light.header.block_hash],
+            0x33,
+        );
+        merge.header.blue_score = N + 3;
+        merge.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 3);
+        merge.header.block_hash = merge.compute_hash();
+        // The score fields changed after `mk` sealed it: record the final hash.
+        crate::g11_test_seal::record(&merge);
         for blk in [&a, &b, &merge] {
             for (dag, gd) in [(&pruned_dag, &pruned), (&full_dag, &full)] {
                 dag.store_block(blk.clone()).await.expect("dag");
@@ -811,15 +1086,19 @@ mod tests {
             pruned_score, full_score,
             "pruned and unpruned nodes must agree on a merge block's score"
         );
-        // Genesis..N is N+1 blocks, plus a, plus the blue merge parent b, plus merge.
+        // r1007 G7: blue past(merge) = genesis..N (N+1 blocks), a, b.
         assert_eq!(
             full_score,
-            N + 4,
-            "merge = sp score + 1 + one blue merge parent"
+            N + 3,
+            "merge = sp score + |{{sp, blue merge parent}}|"
         );
 
         // And the chain keeps going on top of it.
-        let child = mk(N + 3, h, vec![], 0x44);
+        let mut child = mk(N + 3, h, vec![], 0x44);
+        child.header.blue_score = N + 4;
+        child.header.blue_work = citrate_consensus::types::blue_work_for_score(N + 4);
+        child.header.block_hash = child.compute_hash();
+        crate::g11_test_seal::record(&child);
         pruned_dag.store_block(child.clone()).await.expect("dag");
         pruned
             .add_block(&child)
@@ -830,7 +1109,32 @@ mod tests {
                 .get_blue_score(&child.header.block_hash)
                 .await
                 .expect("score"),
-            N + 5
+            N + 4
+        );
+    }
+
+    /// S3-4 (ADR-2026-11-03 CV-7a, spec 06 §4.2, root cause H6): the undo
+    /// window is the prune retention. The default retention equals the
+    /// reorg window (`MAX_REORG_DEPTH`), and no accepted retention is
+    /// shorter than it, so a fork the DAG store still holds is always one the
+    /// applied chain can be switched across in place.
+    #[test]
+    fn undo_window_equals_the_prune_retention() {
+        assert_eq!(
+            crate::canonical_apply::MAX_REORG_DEPTH,
+            DEFAULT_RETAIN_BLOCKS,
+            "undo window != prune retention"
+        );
+        const {
+            assert!(
+                MIN_RETAIN_BLOCKS >= crate::canonical_apply::MAX_REORG_DEPTH,
+                "a retention shorter than the undo window is accepted"
+            )
+        };
+        assert_eq!(
+            citrate_storage::state::REORG_UNDO_DEPTH,
+            DEFAULT_RETAIN_BLOCKS,
+            "the store keeps undo records for less than the retention"
         );
     }
 

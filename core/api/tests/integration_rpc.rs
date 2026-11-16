@@ -238,6 +238,7 @@ async fn test_eth_get_tx_and_receipt_by_hash() {
         eth_tx_type: 0,
         effective_gas_price: 0,
         revert_reason: None,
+        acceptance: None,
     };
     storage.transactions.put_receipt(&tx.hash, &rcpt).unwrap();
 

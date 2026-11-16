@@ -70,6 +70,7 @@ fn make_receipt(tx_hash: Hash, block_hash: Hash) -> TransactionReceipt {
         eth_tx_type: 0,
         effective_gas_price: 0,
         revert_reason: None,
+        acceptance: None,
     }
 }
 

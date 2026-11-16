@@ -5,6 +5,7 @@ use crate::types::{AccountState, Address, ExecutionError, ModelId};
 use citrate_consensus::types::Hash;
 use dashmap::DashMap;
 use primitive_types::U256;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -12,6 +13,15 @@ use tracing::{debug, info};
 pub struct AccountManager {
     accounts: Arc<DashMap<Address, AccountState>>,
     dirty: Arc<DashMap<Address, bool>>,
+    /// CV-14 (b): every address whose resident entry changed (by ANY path: a
+    /// write, a non-dirtying load, a restore, a storage change) since the
+    /// incremental MPT state root last folded it. Unlike `dirty` (what the store
+    /// still has to persist), nothing clears it except that fold, so the
+    /// incremental root never misses a change the way the dirty-only fold did
+    /// before ADR-2026-07-21-state-root-purity. Invariant: for every address NOT
+    /// in this set, the account trie's leaf equals the encoding of its resident
+    /// entry (absent if it is absent or empty).
+    root_touched: Arc<parking_lot::Mutex<HashSet<Address>>>,
 }
 
 impl AccountManager {
@@ -19,6 +29,44 @@ impl AccountManager {
         Self {
             accounts: Arc::new(DashMap::new()),
             dirty: Arc::new(DashMap::new()),
+            root_touched: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// The resident entry, or `None` if the address is not resident.
+    pub fn get_resident(&self, address: &Address) -> Option<AccountState> {
+        self.accounts.get(address).map(|a| a.clone())
+    }
+
+    /// Record that `address` must be re-folded into the incremental state root
+    /// (its storage changed). Every account write records it already.
+    pub fn mark_root_touched(&self, address: Address) {
+        self.root_touched.lock().insert(address);
+    }
+
+    /// Take the addresses to re-fold (see `root_touched`), leaving none.
+    pub fn take_root_touched(&self) -> HashSet<Address> {
+        std::mem::take(&mut *self.root_touched.lock())
+    }
+
+    /// Mark every resident address for re-folding (the incremental trie is
+    /// discarded and rebuilt from the resident state).
+    pub fn mark_all_root_touched(&self) {
+        let mut t = self.root_touched.lock();
+        for e in self.accounts.iter() {
+            t.insert(*e.key());
+        }
+    }
+
+    /// Record the storage root the state root just folded for `address`, without
+    /// marking it for re-folding (the fold and this value agree by construction).
+    /// It is marked dirty, as any account write, so the store keeps the same value.
+    pub(crate) fn set_folded_storage_root(&self, address: Address, storage_root: Hash) {
+        if let Some(mut a) = self.accounts.get_mut(&address) {
+            if a.storage_root != storage_root {
+                a.storage_root = storage_root;
+                self.dirty.insert(address, true);
+            }
         }
     }
 
@@ -34,6 +82,7 @@ impl AccountManager {
     pub fn set_account(&self, address: Address, state: AccountState) {
         self.accounts.insert(address, state);
         self.dirty.insert(address, true);
+        self.mark_root_touched(address);
     }
 
     /// Load account state without marking it dirty.
@@ -43,6 +92,8 @@ impl AccountManager {
     pub fn load_account(&self, address: Address, state: AccountState) {
         self.accounts.insert(address, state);
         self.dirty.remove(&address);
+        // Not dirty (the store has it), but the root must still see it.
+        self.mark_root_touched(address);
     }
 
     /// Get balance
@@ -219,19 +270,23 @@ impl AccountManager {
                 .filter(|e| *e.value())
                 .map(|e| *e.key())
                 .collect(),
+            root_touched: self.root_touched.lock().iter().copied().collect(),
         }
     }
 
-    /// Restore from snapshot
+    /// Restore from snapshot. The root-touched set is the snapshot's: it is
+    /// restored together with the account trie the snapshot holds
+    /// (`StateSnapshot`), and the two were consistent when it was taken.
     pub fn restore(&self, snapshot: AccountSnapshot) {
         self.accounts.clear();
         for (addr, state) in snapshot.accounts {
-            self.load_account(addr, state);
+            self.accounts.insert(addr, state);
         }
         self.dirty.clear();
         for addr in snapshot.dirty {
             self.dirty.insert(addr, true);
         }
+        *self.root_touched.lock() = snapshot.root_touched.into_iter().collect();
     }
 }
 
@@ -246,15 +301,27 @@ impl Default for AccountManager {
 pub struct AccountSnapshot {
     accounts: Vec<(Address, AccountState)>,
     dirty: Vec<Address>,
+    /// `AccountManager::root_touched` at snapshot time.
+    root_touched: Vec<Address>,
 }
 
 impl AccountSnapshot {
-    /// A snapshot holding exactly `accounts`, none of them dirty.
-    pub(crate) fn from_entries(accounts: Vec<(Address, AccountState)>) -> Self {
+    /// A snapshot holding exactly `accounts`, none of them dirty, with
+    /// `root_touched` still to be folded into the snapshot's account trie.
+    pub(crate) fn from_entries(
+        accounts: Vec<(Address, AccountState)>,
+        root_touched: Vec<Address>,
+    ) -> Self {
         Self {
             accounts,
             dirty: Vec::new(),
+            root_touched,
         }
+    }
+
+    /// The addresses still to be folded into the snapshot's account trie.
+    pub(crate) fn root_touched(&self) -> &[Address] {
+        &self.root_touched
     }
 
     /// All captured accounts (every account resident in the cache at snapshot

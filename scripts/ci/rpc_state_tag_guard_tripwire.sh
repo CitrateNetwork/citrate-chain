@@ -5,7 +5,10 @@
 # accepts a block tag and answers from that state labels the head's state as the state of
 # whatever block the client named (chain#425). Every handler of eth_call, eth_estimateGas,
 # eth_getBalance, eth_getCode, eth_getStorageAt and eth_getTransactionCount must therefore call
-# `require_executed_head_state(`, which serves the executed head and refuses any other block.
+# `require_executed_head_state(`, which serves the executed head and refuses any other block,
+# or route the read through `resolve_state_read(` (core/api/src/historical_state.rs, S3-7):
+# it serves a block of the applied chain below the head from the undo records and sends every
+# other tag through `require_executed_head_state` unchanged.
 #
 # The scan segments core/api/src production code (`*_tests.rs` files and `#[cfg(test)]` modules
 # skipped, comments and string contents blanked except the registered method name) into one unit
@@ -32,7 +35,7 @@ scan() { # <root>
     sub flush {
       return unless defined $name && $state{$name};
       print "$file:$at: [$name] state read without require_executed_head_state\n"
-        unless $seg =~ /\brequire_executed_head_state\s*\(/;
+        unless $seg =~ /\b(?:require_executed_head_state|resolve_state_read)\s*\(/;
     }
     for $file (@ARGV) {
       open(my $fh, "<", $file) or next;

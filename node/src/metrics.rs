@@ -63,6 +63,7 @@ pub const METRIC_PEER_CONNECTIONS_TOTAL: &str = "citrate_peer_connections_total"
 pub const METRIC_PEER_DISCONNECTIONS_TOTAL: &str = "citrate_peer_disconnections_total";
 pub const METRIC_PEER_LATENCY: &str = "citrate_peer_latency_seconds";
 pub const METRIC_P2P_INBOUND_DROPPED_TOTAL: &str = "citrate_p2p_inbound_dropped_total";
+pub const METRIC_P2P_SERVE_DROPPED_TOTAL: &str = "citrate_p2p_serve_dropped_total";
 
 // Mempool
 pub const METRIC_MEMPOOL_SIZE: &str = "citrate_mempool_size";
@@ -118,6 +119,10 @@ pub const METRIC_FINALITY_HALTED: &str = "citrate_finality_halted";
 /// Safety stops entered: a finalized certificate that does not match this
 /// node's applied chain, or does not verify.
 pub const METRIC_FINALITY_CERT_MISMATCH_TOTAL: &str = "citrate_finality_certificate_mismatch_total";
+/// Observed mode: distinct finality conflicts (a verified finalized
+/// certificate whose block is not on this node's applied chain, e.g. after a
+/// reorg below it). Counted, not a safety stop: voting continues.
+pub const METRIC_FINALITY_CONFLICTS_TOTAL: &str = "citrate_finality_conflicts_total";
 /// Highest finalized checkpoint height verified against this node's chain.
 /// The only place it is visible in Observed mode (voting ON, enforcement OFF);
 /// the `finalized`/`safe` RPC tags follow it in Enforced mode only.
@@ -202,6 +207,10 @@ fn register_metric_descriptions() {
     describe_counter!(
         METRIC_P2P_INBOUND_DROPPED_TOTAL,
         "Inbound P2P messages shed because the inbound queue was full, by message type"
+    );
+    describe_counter!(
+        METRIC_P2P_SERVE_DROPPED_TOTAL,
+        "Peer history requests (GetBlocks/GetHeaders) shed by the serving lane, by message type"
     );
     describe_histogram!(
         METRIC_PEER_LATENCY,
@@ -310,6 +319,10 @@ fn register_metric_descriptions() {
         METRIC_FINALITY_CERT_MISMATCH_TOTAL,
         "Checkpoint finality safety stops entered (certificate not on this node's chain, or invalid)"
     );
+    describe_counter!(
+        METRIC_FINALITY_CONFLICTS_TOTAL,
+        "Checkpoint finality conflicts in observed mode (a verified certificate not on this node's chain; voting continues)"
+    );
     describe_gauge!(
         METRIC_FINALITY_VERIFIED_HEIGHT,
         "Highest finalized checkpoint height verified against this node's applied chain"
@@ -399,6 +412,14 @@ pub fn record_inbound_drops(by_kind: &[(&'static str, u64)]) {
     }
 }
 
+/// Publish the serving-lane drop counters (`PeerManager::serve_drops_by_kind`).
+pub fn record_serve_drops(by_kind: &[(&'static str, u64)]) {
+    for (kind, count) in by_kind {
+        let labels = [("type", kind.to_string())];
+        absolute_counter!(METRIC_P2P_SERVE_DROPPED_TOTAL, *count, &labels);
+    }
+}
+
 /// Record peer latency
 pub fn record_peer_latency(latency: Duration) {
     histogram!(METRIC_PEER_LATENCY, latency.as_secs_f64());
@@ -479,6 +500,11 @@ pub fn record_finality_finalize_retry(attempts: usize, recovered: usize, pending
 /// Count one checkpoint-finality safety stop (certificate mismatch / invalid).
 pub fn record_finality_certificate_mismatch() {
     counter!(METRIC_FINALITY_CERT_MISMATCH_TOTAL, 1);
+}
+
+/// Count one distinct checkpoint-finality conflict (observed mode).
+pub fn record_finality_conflict() {
+    counter!(METRIC_FINALITY_CONFLICTS_TOTAL, 1);
 }
 
 /// Record sync status
@@ -612,6 +638,7 @@ mod tests {
         record_block_height(100);
         record_mempool_size(10, 1000);
         record_inbound_drops(&[("NewBlock", 2), ("GetBlocks", 7)]);
+        record_serve_drops(&[("GetHeaders", 3)]);
     }
 
     /// PIL-13 WP-13.5: the RSS sampler reads a real, plausible value from the

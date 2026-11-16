@@ -302,11 +302,7 @@ async fn monitor_network(
                 .await
             {
                 if let Ok(result) = response.json::<serde_json::Value>().await {
-                    if let Some(dag_info) = result
-                        .get("result")
-                        .unwrap_or(&serde_json::Value::Null)
-                        .as_object()
-                    {
+                    if let Some(dag_info) = result.get("result").filter(|v| v.is_object()) {
                         println!(
                             "  Blue Score: {}",
                             dag_info["blue_score"].as_str().unwrap_or("0").cyan()
@@ -347,11 +343,7 @@ async fn monitor_network(
                 .await
             {
                 if let Ok(result) = response.json::<serde_json::Value>().await {
-                    if let Some(mempool_info) = result
-                        .get("result")
-                        .unwrap_or(&serde_json::Value::Null)
-                        .as_object()
-                    {
+                    if let Some(mempool_info) = result.get("result").filter(|v| v.is_object()) {
                         println!(
                             "  Pending Txs: {}",
                             mempool_info["pending_count"]
@@ -741,11 +733,7 @@ async fn debug_transaction(config: &Config, tx_hash: &str, show_trace: bool) -> 
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(tx) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(tx) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Transaction Details:".bold());
         println!("  From: {}", tx["from"].as_str().unwrap_or("N/A"));
         println!("  To: {}", tx["to"].as_str().unwrap_or("N/A"));
@@ -775,11 +763,7 @@ async fn debug_transaction(config: &Config, tx_hash: &str, show_trace: bool) -> 
 
             if let Ok(receipt_response) = receipt_response {
                 if let Ok(receipt_result) = receipt_response.json::<serde_json::Value>().await {
-                    if let Some(receipt) = receipt_result
-                        .get("result")
-                        .unwrap_or(&serde_json::Value::Null)
-                        .as_object()
-                    {
+                    if let Some(receipt) = receipt_result.get("result").filter(|v| v.is_object()) {
                         println!(
                             "  Status: {}",
                             if receipt["status"].as_str().unwrap_or("0x0") == "0x1" {
@@ -837,10 +821,8 @@ async fn debug_transaction(config: &Config, tx_hash: &str, show_trace: bool) -> 
                             if let Ok(trace_result) =
                                 trace_response.json::<serde_json::Value>().await
                             {
-                                if let Some(trace) = trace_result
-                                    .get("result")
-                                    .unwrap_or(&serde_json::Value::Null)
-                                    .as_object()
+                                if let Some(trace) =
+                                    trace_result.get("result").filter(|v| v.is_object())
                                 {
                                     println!(
                                         "  Call Type: {}",
@@ -907,11 +889,7 @@ async fn model_analytics(
 
     let result: serde_json::Value = response.json().await?;
 
-    if let Some(stats) = result
-        .get("result")
-        .unwrap_or(&serde_json::Value::Null)
-        .as_object()
-    {
+    if let Some(stats) = result.get("result").filter(|v| v.is_object()) {
         println!("{}", "Model Statistics:".bold());
         println!(
             "  Total Inferences: {}",

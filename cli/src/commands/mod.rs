@@ -7,5 +7,7 @@ pub mod devx;
 pub mod governance;
 pub mod model;
 pub mod network;
+pub mod rpc_hint;
+pub mod signer;
 pub mod verify;
 pub mod wizard;

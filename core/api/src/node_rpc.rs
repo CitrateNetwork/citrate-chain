@@ -86,13 +86,96 @@ fn genesis_hash(storage: &StorageManager) -> Result<Option<String>, jsonrpc_core
         .map_err(|e| internal_error(format!("genesis lookup failed: {e}")))
 }
 
+/// The `syncState` object of `citrate_nodeIdentity` (ADR-2026-11-03 CV-7b).
+///
+/// - `wedged`: the node's applied tip is held on a dead branch it cannot
+///   switch from. Source: the durable dead-branch marker
+///   (`citrate_storage::chain::wedge`) the node's applicator records when it
+///   refuses the switch. `reason`, `forkDepth`, `deadTip`, `forkPoint`,
+///   `networkHead` and `since` come from that record.
+/// - `catching_up`: not wedged, and the highest network height the node's
+///   sync driver has seen (`highest_seen`, the same signal `eth_syncing`
+///   reads) is above the applied tip (`BlockStore::get_applied_tip`).
+/// - `synced`: neither.
+///
+/// `highestSeen` is `null` when no sync signal is wired. `appliedBlueScore`
+/// is the applied tip's `header.blue_score` (CF_HEADERS), `null` when unknown.
+pub fn sync_state_json(
+    storage: &StorageManager,
+    highest_seen: Option<u64>,
+) -> Result<Value, jsonrpc_core::Error> {
+    let tip = storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?;
+    let applied = tip.as_ref().map(|(_, h)| *h).unwrap_or(0);
+    // CV-3: the applied tip's header-committed GHOSTDAG blue score (the unit of
+    // `net_peerInfo[].headBlueScore`). Source: CF_HEADERS[applied tip hash];
+    // `null` when no tip is recorded or its header is not stored.
+    let applied_blue_score = match tip {
+        Some((hash, _)) => storage
+            .blocks
+            .get_header(&hash)
+            .map_err(|e| internal_error(format!("applied tip header lookup failed: {e}")))?
+            .map(|h| h.blue_score),
+        None => None,
+    };
+    let hex_hash = |h: &citrate_consensus::types::Hash| format!("0x{}", hex::encode(h.as_bytes()));
+    let wedge = citrate_storage::chain::wedge::read(&storage.db)
+        .map_err(|e| internal_error(format!("dead-branch marker unreadable: {e}")))?;
+    if let Some(w) = wedge {
+        return Ok(json!({
+            "state": "wedged",
+            "reason": w.reason,
+            "forkDepth": w.fork_depth(),
+            "appliedHeight": applied,
+            "appliedBlueScore": applied_blue_score,
+            "highestSeen": highest_seen,
+            "deadTip": { "hash": hex_hash(&w.dead_tip), "height": w.dead_tip_height },
+            "forkPoint": { "hash": hex_hash(&w.fork_point), "height": w.fork_height },
+            "networkHead": { "hash": hex_hash(&w.head), "height": w.head_height },
+            "since": w.since_unix,
+        }));
+    }
+    let (state, reason) = match highest_seen {
+        Some(h) if h > applied => (
+            "catching_up",
+            Some(format!(
+                "applied tip {applied} is below the highest network height seen {h}"
+            )),
+        ),
+        _ => ("synced", None),
+    };
+    Ok(json!({
+        "state": state,
+        "reason": reason,
+        "forkDepth": Value::Null,
+        "appliedHeight": applied,
+        "appliedBlueScore": applied_blue_score,
+        "highestSeen": highest_seen,
+    }))
+}
+
 /// The `citrate_nodeIdentity` result.
 pub fn node_identity_json(
     storage: &StorageManager,
     chain_id: u64,
     identity: Option<&NodeIdentity>,
 ) -> Result<Value, jsonrpc_core::Error> {
+    node_identity_with_sync_json(storage, chain_id, identity, None)
+}
+
+/// The `citrate_nodeIdentity` result, with the sync driver's highest seen
+/// network height for `syncState` (see [`sync_state_json`]).
+pub fn node_identity_with_sync_json(
+    storage: &StorageManager,
+    chain_id: u64,
+    identity: Option<&NodeIdentity>,
+    highest_seen: Option<u64>,
+) -> Result<Value, jsonrpc_core::Error> {
     Ok(json!({
+        // Source: see `sync_state_json` (dead-branch marker, applied tip, sync driver).
+        "syncState": sync_state_json(storage, highest_seen)?,
         // Source: the node's configured `[chain] chain_id` (same value eth_chainId serves).
         "chainId": format!("0x{chain_id:x}"),
         // Source: BlockStore::get_block_by_height(0); null before genesis is stored.
@@ -110,19 +193,31 @@ pub fn node_identity_json(
     }))
 }
 
-/// The `citrate_getDagStats` result.
+/// The `citrate_getDagStats` result (chain#317: no estimates).
 ///
-/// The node does not keep a blue/red classification count or a total block
-/// count, so `totalBlocks`, `blueBlocks` and `redBlocks` are `null` (they used
-/// to be estimated as height and height x 0.95). `ghostdagParams` are the
-/// parameters the running `GhostDag` uses, or `null` if the embedding binary
-/// did not supply them.
+/// - `totalBlocks`: blocks in this node's chain store. Source: the maintained
+///   stored-block counter (`BlockStore::stored_block_count`, `CF_METADATA
+///   block_count_v1`, changed in the same batch as every block write or
+///   removal). `null` only if the counter could not be built on open. A
+///   pruned store counts what it still holds.
+/// - `selectedTip`: the applied tip and its persisted GHOSTDAG record
+///   (`CF_DAG_GHOSTDAG`). Its `blueScore` IS the number of blue blocks in the
+///   tip's past (GHOSTDAG's definition), a real count; `null` when the record
+///   is not held.
+/// - The former `blueBlocks` / `redBlocks` fields are removed: a store-wide
+///   blue/red tally is not a GHOSTDAG quantity (colour is relative to the
+///   selected chain and changes on a reorg) and the node keeps no red count.
+///   Per-block colour is `citrate_getGhostdagData`. Do not derive a red count
+///   from `totalBlocks - selectedTip.blueScore`: the two count different sets.
+/// - `ghostdagParams`: the parameters the running `GhostDag` uses, or `null`
+///   if the embedding binary did not supply them.
 pub fn dag_stats_json(
     storage: &Arc<StorageManager>,
     ghostdag_params: Option<&GhostDagParams>,
 ) -> Result<Value, jsonrpc_core::Error> {
     let api = ChainApi::new(storage.clone());
     // Source: BlockStore::get_tips() (blocks with no stored child), via ChainApi.
+    // O(tips): read from the maintained tips index, not a store scan (H7).
     let tips = block_on(api.get_tips()).map_err(|e| internal_error(e.to_string()))?;
     // Source: BlockStore::get_latest_height(), via ChainApi.
     let height = block_on(api.get_height()).map_err(|e| internal_error(e.to_string()))?;
@@ -156,11 +251,34 @@ pub fn dag_stats_json(
         })
     });
 
+    // Source: the maintained stored-block counter (see the doc above).
+    let total = storage
+        .blocks
+        .stored_block_count()
+        .map_err(|e| internal_error(format!("stored block count: {e}")))?;
+
+    // Source: the applied tip (`BlockStore::get_applied_tip`) and its GHOSTDAG
+    // record (`CF_DAG_GHOSTDAG`).
+    let selected_tip = match storage
+        .blocks
+        .get_applied_tip()
+        .map_err(|e| internal_error(format!("applied tip lookup failed: {e}")))?
+    {
+        None => Value::Null,
+        Some((hash, h)) => {
+            let record = crate::explorer_rpc::ghostdag_record(storage, &hash)?;
+            json!({
+                "hash": format!("0x{}", hex::encode(hash.as_bytes())),
+                "height": h,
+                "blueScore": record.as_ref().map(|r| r.blue_score),
+                "blueWork": record.as_ref().map(|r| format!("0x{:x}", r.blue_work)),
+            })
+        }
+    };
+
     Ok(json!({
-        // Not tracked by the node (no block counter, no blue/red tally).
-        "totalBlocks": Value::Null,
-        "blueBlocks": Value::Null,
-        "redBlocks": Value::Null,
+        "totalBlocks": total,
+        "selectedTip": selected_tip,
         "tipsCount": tips.len(),
         "maxBlueScore": max_blue_score,
         "currentTips": tips_hex,
@@ -177,6 +295,18 @@ pub fn register_node_methods(
     chain_id: u64,
     identity: Option<Arc<NodeIdentity>>,
 ) {
+    register_node_methods_with_sync(io_handler, storage, chain_id, identity, None)
+}
+
+/// [`register_node_methods`], with the sync driver's highest seen network
+/// height (the `eth_syncing` signal) for `citrate_nodeIdentity.syncState`.
+pub fn register_node_methods_with_sync(
+    io_handler: &mut IoHandler,
+    storage: Arc<StorageManager>,
+    chain_id: u64,
+    identity: Option<Arc<NodeIdentity>>,
+    sync_highest: Option<Arc<std::sync::atomic::AtomicU64>>,
+) {
     let version = client_version(identity.as_deref());
     io_handler.add_sync_method("web3_clientVersion", move |_params: Params| {
         rpc_request("web3_clientVersion");
@@ -187,7 +317,10 @@ pub fn register_node_methods(
     let identity_id = identity.clone();
     io_handler.add_sync_method("citrate_nodeIdentity", move |_params: Params| {
         rpc_request("citrate_nodeIdentity");
-        node_identity_json(&storage_id, chain_id, identity_id.as_deref())
+        let highest = sync_highest
+            .as_ref()
+            .map(|h| h.load(std::sync::atomic::Ordering::Relaxed));
+        node_identity_with_sync_json(&storage_id, chain_id, identity_id.as_deref(), highest)
     });
 
     io_handler.add_sync_method("citrate_getDagStats", move |_params: Params| {

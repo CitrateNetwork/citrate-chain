@@ -14,6 +14,15 @@ use zeroize::Zeroizing;
 
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_NOISE_MSG_LEN: usize = 65535;
+/// ChaCha20-Poly1305 authentication tag Noise appends to every message.
+const NOISE_TAG_LEN: usize = 16;
+/// Largest plaintext one Noise transport message can carry (65,519 bytes).
+///
+/// Every transport message is encrypted with a single `write_message`, which
+/// refuses anything larger. A sender must keep each serialized message within
+/// this, or split its payload across several messages (`block_serve`'s
+/// reply chunking does the latter for `Blocks`).
+pub const MAX_NOISE_PLAINTEXT_LEN: usize = MAX_NOISE_MSG_LEN - NOISE_TAG_LEN;
 
 /// Static keypair for Noise protocol identity.
 ///

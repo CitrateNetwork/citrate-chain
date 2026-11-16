@@ -15,9 +15,11 @@
         clippy::string_slice
     )
 )]
+pub mod acceptance;
 pub mod activation;
 pub mod agent_fork;
 pub mod exact_code;
+pub mod mpt_state_root;
 pub mod storage_root_hardening;
 pub mod supply_hardening;
 
@@ -54,6 +56,7 @@ pub mod precompiles;
 pub mod revm_adapter;
 pub mod state;
 pub mod tensor;
+pub mod trace;
 pub mod types;
 
 // Multi-Version Concurrency Control (MVCC) primitives. Unconditional

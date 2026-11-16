@@ -27,9 +27,34 @@ fn make_block(
         .merge_parents(merge_parents)
         .height(height)
         .timestamp(height)
+        // r1007 G10: each block its own proposer, so siblings in one slot
+        // are honest width, not equivocation.
+        .proposer(citrate_consensus::types::PublicKey::new(hash))
         .blue_score(blue_score)
         // SECREM-01: admission enforces the canonical score→work relation.
         .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
+        .build_unhashed()
+}
+
+/// r1007 (S3-1): a block naming `parents`, with the header the producer
+/// writes: the heaviest parent as selected parent (G3) and the GHOSTDAG
+/// blue_score / blue_work (G7).
+async fn sealed(ghostdag: &GhostDag, hash: [u8; 32], parents: Vec<Hash>) -> Block {
+    let (sp, merges, height, data) = ghostdag
+        .ghostdag_for_parents(&parents)
+        .await
+        .expect("valid parents");
+    BlockBuilder::new()
+        .hash(Hash::new(hash))
+        .parent(sp)
+        .merge_parents(merges)
+        .height(height)
+        .timestamp(height)
+        // r1007 G10: each block its own proposer, so siblings in one slot
+        // are honest width, not equivocation.
+        .proposer(citrate_consensus::types::PublicKey::new(hash))
+        .blue_score(data.blue_score)
+        .blue_work(data.blue_work)
         .build_unhashed()
 }
 
@@ -86,9 +111,14 @@ async fn test_dag_with_100_parallel_blocks() {
     );
 
     // Create a merge block that references some of these as parents
-    let merge_parents: Vec<Hash> = block_hashes[1..5].to_vec();
+    // r1007 G3: the heaviest of the five is the selected parent.
     let merge_hash = hash_for(200);
-    let merge_block = make_block(merge_hash, block_hashes[0], merge_parents, 2, 2);
+    let merge_block = sealed(&ghostdag, merge_hash, block_hashes[0..5].to_vec()).await;
+    assert_eq!(
+        merge_block.header.blue_score,
+        1 + 5,
+        "all five blue at k = 18"
+    );
     dag_store.store_block(merge_block.clone()).await.unwrap();
     ghostdag.add_block(&merge_block).await.unwrap();
 
@@ -125,11 +155,11 @@ async fn test_bfs_depth_limit_respected() {
     let tip_block = dag_store.get_block(&prev).await.unwrap();
     let blue_set = ghostdag.calculate_blue_set(&tip_block).await.unwrap();
 
-    // In a linear chain with k=18, all blocks should be blue:
-    // 1 genesis (from setup_genesis) + 100 chain blocks = 101, plus the
-    // genesis add_block added it with score 1. The tip's blue set includes itself.
+    // In a linear chain with k=18, all blocks should be blue. r1007 G7: the
+    // tip's blue set is its blue past, genesis + the 99 chain blocks below it
+    // = 100 (the block is not in its own blue set; genesis scores 0).
     assert!(
-        blue_set.score >= 101,
+        blue_set.score >= 100 && blue_set.blocks.len() as u64 == blue_set.score,
         "Linear chain of 101 blocks: all should be in the blue set, got {}",
         blue_set.score
     );
@@ -169,25 +199,27 @@ async fn test_conflicting_blocks_same_parent() {
     assert!(tips.contains(&block_a.hash()));
     assert!(tips.contains(&block_b.hash()));
 
-    // Each block's own blue set should contain genesis + self
+    // Each block's own blue set is its blue past (r1007 G7): genesis, not self
     let blue_a = ghostdag.calculate_blue_set(&block_a).await.unwrap();
     let blue_b = ghostdag.calculate_blue_set(&block_b).await.unwrap();
     assert!(blue_a.contains(&genesis_hash));
-    assert!(blue_a.contains(&block_a.hash()));
+    assert!(!blue_a.contains(&block_a.hash()));
     assert!(blue_b.contains(&genesis_hash));
-    assert!(blue_b.contains(&block_b.hash()));
+    assert!(!blue_b.contains(&block_b.hash()));
 
-    // Create a merge block that references both
-    let merge = make_block([0xCC; 32], block_a.hash(), vec![block_b.hash()], 2, 2);
+    // Create a merge block that references both (G3: b, the heavier key, is SP)
+    let merge = sealed(&ghostdag, [0xCC; 32], vec![block_a.hash(), block_b.hash()]).await;
+    assert_eq!(merge.selected_parent(), block_b.hash());
     dag_store.store_block(merge.clone()).await.unwrap();
     ghostdag.add_block(&merge).await.unwrap();
 
-    // The merge block's blue set should contain all 4 blocks
+    // The merge block's blue set is the other 3 blocks
     let blue_merge = ghostdag.calculate_blue_set(&merge).await.unwrap();
     assert!(blue_merge.contains(&genesis_hash));
     assert!(blue_merge.contains(&block_a.hash()));
     assert!(blue_merge.contains(&block_b.hash()));
-    assert!(blue_merge.contains(&merge.hash()));
+    assert!(!blue_merge.contains(&merge.hash()));
+    assert_eq!(blue_merge.score, 3);
 }
 
 // ============================================================================
@@ -319,9 +351,10 @@ async fn test_blue_score_monotonicity() {
         .get_blue_score(block_hashes.last().unwrap())
         .await
         .unwrap();
+    // r1007 G7: genesis scores 0, so the 51st block (height 50) scores 50.
     assert!(
-        final_score >= 51,
-        "Final block in a 51-block chain should have blue score >= 51, got {}",
+        final_score >= 50,
+        "Final block in a 51-block chain should have blue score >= 50, got {}",
         final_score
     );
 }
