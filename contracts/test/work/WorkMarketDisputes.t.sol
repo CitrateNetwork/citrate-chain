@@ -61,7 +61,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         assertEq(market.balanceOf(w2), 0);
         assertEq(market.balanceOf(poster), 0);
         assertEq(market.balanceOf(SINK), CBOND);
-        assertEq(market.owedOn(id), BUDGET);
+        assertEq(market.owedOn(id), BUDGET + 3 * JBOND);
     }
 
     function test_dispute_by_poster_sends_the_slash_to_the_sink() public {
@@ -86,7 +86,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         _postTree(id, l3, 6);
         vm.warp(block.timestamp + WINDOW);
         _settle(id, l3, 1, _entries3()[1], 2);
-        assertEq(market.balanceOf(w2), 3 * PRICE);
+        assertEq(market.balanceOf(w2), 3 * PRICE + JBOND);
     }
 
     function test_dispute_missing_before_first() public {
@@ -190,33 +190,38 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
 
     // ── low units ──────────────────────────────────────────────────
 
-    function test_dispute_low_units_upheld_with_more_receipts_than_units() public {
+    function test_dispute_low_units_upheld_with_a_receipt_ordinal_above_the_units() public {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
         Entry[] memory e = _entries3();
-        // w3's leaf pays 1 unit; the coordinator signed 2 leases
-        WorkMarket.Receipt[] memory rs = new WorkMarket.Receipt[](2);
-        rs[0] = _receipt(id, w3, bytes32(uint256(1)));
-        rs[1] = _receipt(id, w3, bytes32(uint256(2)));
-        bytes memory ev = _ev(market.DISPUTE_LOW_UNITS(), abi.encode(_opening(leaves, 2, e[2], 5), rs));
+        // w3's leaf pays 1 unit; the coordinator signed w3's 2nd lease
+        WorkMarket.Receipt memory r = _receiptN(id, w3, bytes32(uint256(2)), 2);
+        bytes memory ev = _ev(market.DISPUTE_LOW_UNITS(), abi.encode(_opening(leaves, 2, e[2], 5), r));
         vm.prank(w3);
         market.dispute(id, ev);
         assertEq(uint8(market.getOffer(id).state), uint8(IWorkMarket.State.Running));
     }
 
-    function test_dispute_low_units_rejects_duplicate_or_too_few_receipts() public {
+    function test_dispute_low_units_rejects_an_ordinal_the_leaf_pays_or_another_worker() public {
         (uint256 id, bytes32[] memory leaves) = _postedFl3();
         Entry[] memory e = _entries3();
-        WorkMarket.Receipt[] memory dup = new WorkMarket.Receipt[](2);
-        dup[0] = _receipt(id, w3, bytes32(uint256(1)));
-        dup[1] = _receipt(id, w3, bytes32(uint256(1)));
-        bytes memory ev = _ev(market.DISPUTE_LOW_UNITS(), abi.encode(_opening(leaves, 2, e[2], 5), dup));
+        // w3's leaf pays 1: ordinal 1 is paid in full
+        WorkMarket.Receipt memory one = _receipt(id, w3, bytes32(uint256(1)));
+        bytes memory ev = _ev(market.DISPUTE_LOW_UNITS(), abi.encode(_opening(leaves, 2, e[2], 5), one));
         vm.prank(w3);
         vm.expectRevert(WorkMarket.DisputeNotProven.selector);
         market.dispute(id, ev);
 
-        WorkMarket.Receipt[] memory one = new WorkMarket.Receipt[](1);
-        one[0] = _receipt(id, w3, bytes32(uint256(1)));
-        ev = _ev(market.DISPUTE_LOW_UNITS(), abi.encode(_opening(leaves, 2, e[2], 5), one));
+        // w2's 4th lease says nothing about w3's leaf
+        WorkMarket.Receipt memory other = _receiptN(id, w2, bytes32(uint256(4)), 4);
+        ev = _ev(market.DISPUTE_LOW_UNITS(), abi.encode(_opening(leaves, 2, e[2], 5), other));
+        vm.prank(w3);
+        vm.expectRevert(WorkMarket.DisputeNotProven.selector);
+        market.dispute(id, ev);
+
+        // an ordinal the coordinator did not sign
+        WorkMarket.Receipt memory raised = _receipt(id, w3, bytes32(uint256(1)));
+        raised.ordinal = 2;
+        ev = _ev(market.DISPUTE_LOW_UNITS(), abi.encode(_opening(leaves, 2, e[2], 5), raised));
         vm.prank(w3);
         vm.expectRevert(WorkMarket.DisputeNotProven.selector);
         market.dispute(id, ev);
@@ -365,7 +370,7 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         market.dispute(id, _subjective(301));
         vm.warp(block.timestamp + WINDOW);
         market.settle(id, coordinator, 1, 0, 0, new bytes32[](0));
-        assertEq(market.balanceOf(coordinator), PRICE);
+        assertEq(market.balanceOf(coordinator), PRICE + JBOND);
     }
 
     function test_subjective_open_task_refunds_after_timeout() public {
@@ -383,6 +388,9 @@ contract WorkMarketDisputesTest is WorkMarketTestBase {
         market.refund(id);
         assertEq(market.balanceOf(poster), 3 * PRICE);
         assertEq(market.balanceOf(coordinator), CBOND);
+        assertEq(market.owedOn(id), JBOND, "the selected worker's join bond waits for claimBond");
+        vm.prank(coordinator);
+        market.claimBond(id);
         assertEq(market.owedOn(id), 0);
     }
 

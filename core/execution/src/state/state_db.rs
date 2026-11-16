@@ -1,6 +1,8 @@
 // citrate/core/execution/src/state/state_db.rs
 
 // State database managing all state
+use crate::state::mpt::{Mpt, EMPTY_ROOT};
+use crate::state::mpt_state::{account_trie_key, encode_account, storage_trie_key};
 use crate::state::{AccountManager, Trie};
 use crate::types::{Address, ExecutionError, JobId, ModelId, ModelState, TrainingJob};
 use citrate_consensus::types::Hash;
@@ -21,7 +23,10 @@ pub struct StateDB {
     /// another reference to each trie instead of a deep copy, and a write after
     /// a snapshot copies only the one trie it touches (`Arc::make_mut`). The
     /// reorg ring keeps 100 snapshots, so this is what keeps its cost
-    /// proportional to what changed rather than 100x the contract state.
+    /// proportional to what changed rather than 100x the contract state. The
+    /// copy itself is O(1) in the contract's slots (the slot set is a
+    /// persistent map, `crate::state::slot_map`), and the write copies one
+    /// O(log n) path: see [`write_trie`].
     storage_tries: Arc<DashMap<Address, Arc<Trie>>>,
 
     /// Contract code storage
@@ -62,6 +67,72 @@ pub struct StateDB {
     /// db means neither registry changed in between: the undo record of a
     /// block that touches neither needs no model/job comparison.
     model_job_generation: AtomicU64,
+
+    /// CV-14: the standard secure account MPT, folded incrementally from
+    /// `AccountManager::take_root_touched` (see `Self::mpt_state_root`). Shared,
+    /// not copied, by snapshots (its nodes are immutable).
+    account_mpt: Arc<parking_lot::Mutex<Mpt>>,
+
+    /// Accounts folded since the trie nodes were last handed to the node store,
+    /// and whether a restore made every trie a candidate (see
+    /// `Self::persist_trie_nodes`).
+    unpersisted: Arc<parking_lot::Mutex<(std::collections::HashSet<Address>, bool)>>,
+
+    /// Accounts re-encoded into the account MPT so far (a cost counter: a
+    /// restart that reuses persisted trie nodes folds none).
+    folded_accounts: Arc<AtomicU64>,
+}
+
+/// The sink [`StateDB::persist_trie_nodes`] hands a state's new trie nodes to,
+/// with its root.
+pub type TrieNodeWriter<'a> =
+    dyn FnMut(&StateRoot, &[crate::state::mpt::TrieNodeRecord]) -> anyhow::Result<()> + 'a;
+
+/// Which state-root function applies to a post-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootRule {
+    /// The legacy structural root; `canonical` = storage roots from the slot set
+    /// (`crate::storage_root_hardening`).
+    Legacy { canonical: bool },
+    /// The standard MPT root (`crate::mpt_state_root`, CV-14).
+    Mpt,
+}
+
+/// What [`StateDB::reuse_persisted_trie`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrieReuse {
+    /// Accounts whose leaves were checked against the resident state.
+    pub accounts: usize,
+    /// Storage tries loaded from the node store and installed.
+    pub storage_tries: usize,
+}
+
+/// A slot proof (`eth_getProof` `storageProof` entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageProof {
+    /// The slot key as stored (32 bytes for an EVM slot).
+    pub key: Vec<u8>,
+    /// The resident value (`None`: absent).
+    pub value: Option<Vec<u8>>,
+    /// RLP of the storage-trie nodes on keccak256(key)'s path, root first.
+    pub proof: Vec<Vec<u8>>,
+}
+
+/// An account proof against the MPT state root (`eth_getProof`).
+/// Data source: the node's incremental account and storage MPTs in this
+/// `StateDB` (the same tries the block's committed state root is the root of).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateProof {
+    pub state_root: StateRoot,
+    pub address: Address,
+    /// RLP of the account-trie nodes on keccak256(address)'s path, root first.
+    pub account_proof: Vec<Vec<u8>>,
+    /// The account leaf (`None`: absent or empty). Its encoding is
+    /// `crate::state::mpt_state::encode_account`.
+    pub account_leaf: Option<Vec<u8>>,
+    /// The account's storage root (`EMPTY_ROOT` when it holds no slot).
+    pub storage_hash: [u8; 32],
+    pub storage: Vec<StorageProof>,
 }
 
 impl StateDB {
@@ -77,6 +148,9 @@ impl StateDB {
             dirty_code: Arc::new(DashSet::new()),
             root_height: AtomicU64::new(0),
             model_job_generation: AtomicU64::new(0),
+            account_mpt: Arc::new(parking_lot::Mutex::new(Mpt::new())),
+            unpersisted: Arc::new(parking_lot::Mutex::new((Default::default(), true))),
+            folded_accounts: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -99,6 +173,9 @@ impl StateDB {
             dirty_code: Arc::new(DashSet::new()),
             root_height: AtomicU64::new(0),
             model_job_generation: AtomicU64::new(0),
+            account_mpt: Arc::new(parking_lot::Mutex::new(Mpt::new())),
+            unpersisted: Arc::new(parking_lot::Mutex::new((Default::default(), true))),
+            folded_accounts: Arc::new(AtomicU64::new(0)),
         };
         iso.restore(self.snapshot());
         iso
@@ -128,11 +205,11 @@ impl StateDB {
     /// SRP-S3b diagnostic: recompute an account's storage_root FRESH from its resident
     /// storage trie (what `calculate_state_root` folds), or `None` if no trie is resident.
     pub fn get_storage_root_recomputed(&self, address: &Address) -> Option<Hash> {
-        let canonical = self.canonical_storage_roots_at(
+        let rule = self.root_rule(
             crate::storage_root_hardening::storage_root_hardening_height(),
             self.root_height(),
         );
-        self.storage_root_with_rule(address, canonical)
+        self.storage_root_with_rule(address, rule)
     }
 
     /// An account's storage_root under an explicit activation and height (the
@@ -144,27 +221,36 @@ impl StateDB {
         height: u64,
         address: &Address,
     ) -> Option<Hash> {
-        self.storage_root_with_rule(address, self.canonical_storage_roots_at(activation, height))
+        self.storage_root_with_rule(address, self.root_rule(activation, height))
     }
 
-    fn storage_root_with_rule(&self, address: &Address, canonical: bool) -> Option<Hash> {
+    fn storage_root_with_rule(&self, address: &Address, rule: RootRule) -> Option<Hash> {
         self.storage_tries
             .get(address)
-            .map(|t| Self::storage_root_of(&t, canonical))
+            .map(|t| Self::storage_root_of(&t, rule))
     }
 
-    /// The storage root of one trie: a function of its slot set from the
-    /// hardening height, the legacy structural hash below it.
-    fn storage_root_of(trie: &Trie, canonical: bool) -> Hash {
-        if canonical {
-            trie.root_hash()
-        } else {
-            trie.legacy_root_hash()
+    /// The storage root of one trie: the MPT root under the MPT rule; else a
+    /// function of its slot set from the hardening height, the legacy
+    /// structural hash below it.
+    fn storage_root_of(trie: &Trie, rule: RootRule) -> Hash {
+        match rule {
+            RootRule::Mpt => Hash::new(trie.mpt_root()),
+            RootRule::Legacy { canonical: true } => trie.root_hash(),
+            RootRule::Legacy { canonical: false } => trie.legacy_root_hash(),
         }
     }
 
-    fn canonical_storage_roots_at(&self, activation: Option<u64>, height: u64) -> bool {
-        crate::storage_root_hardening::active_at(activation, height)
+    /// The root rule for the post-state of the block at `height`, under the
+    /// storage-root hardening `activation` and the process-wide MPT activation.
+    fn root_rule(&self, activation: Option<u64>, height: u64) -> RootRule {
+        if crate::mpt_state_root::mpt_state_root_active(height) {
+            RootRule::Mpt
+        } else {
+            RootRule::Legacy {
+                canonical: crate::storage_root_hardening::active_at(activation, height),
+            }
+        }
     }
 
     /// Record the height of the block whose post-state this db now holds.
@@ -181,8 +267,13 @@ impl StateDB {
     /// Set storage value
     pub fn set_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
         self.dirty_storage.insert((address, key.clone()));
-        let mut trie = self.storage_tries.entry(address).or_default();
-        Arc::make_mut(trie.value_mut()).insert(key, value);
+        let mut trie = self
+            .storage_tries
+            .entry(address)
+            .or_insert_with(|| Arc::new(Trie::for_current_rule()));
+        write_trie(trie.value_mut()).insert(key, value);
+        drop(trie);
+        self.accounts.mark_root_touched(address);
     }
 
     /// PIL-13b: warm the in-memory storage cache from the persistent
@@ -191,16 +282,23 @@ impl StateDB {
     /// it would create a no-op flush at next commit. Used by the REVM
     /// Database adapter to hydrate cold-cache misses for view calls.
     pub fn cache_storage(&self, address: Address, key: Vec<u8>, value: Vec<u8>) {
-        let mut trie = self.storage_tries.entry(address).or_default();
-        Arc::make_mut(trie.value_mut()).insert(key, value);
+        let mut trie = self
+            .storage_tries
+            .entry(address)
+            .or_insert_with(|| Arc::new(Trie::for_current_rule()));
+        write_trie(trie.value_mut()).insert(key, value);
+        drop(trie);
+        // Not dirty (the store has it), but the root must still see it.
+        self.accounts.mark_root_touched(address);
     }
 
     /// Delete storage value
     pub fn delete_storage(&self, address: Address, key: &[u8]) {
         self.dirty_storage.insert((address, key.to_vec()));
         if let Some(mut trie) = self.storage_tries.get_mut(&address) {
-            Arc::make_mut(trie.value_mut()).remove(key);
+            write_trie(trie.value_mut()).remove(key);
         }
+        self.accounts.mark_root_touched(address);
     }
 
     /// Get all dirty storage slots and clear dirty tracking
@@ -416,7 +514,11 @@ impl StateDB {
     /// it (and with no activation) it is the legacy structural hash, so every
     /// historical root is reproduced byte for byte.
     pub fn calculate_state_root_with(&self, activation: Option<u64>, height: u64) -> StateRoot {
-        let canonical = self.canonical_storage_roots_at(activation, height);
+        // CV-14: from the MPT activation, the standard incremental root.
+        let rule = self.root_rule(activation, height);
+        if rule == RootRule::Mpt {
+            return self.mpt_state_root();
+        }
         let mut state_trie_slot = self.state_trie.write();
         let mut state_trie = Trie::new();
 
@@ -446,7 +548,7 @@ impl StateDB {
             // trie — for EVERY account, not just dirty ones — so a slot change via any
             // path is reflected. (Recomputes identically each call → idempotent.)
             if let Some(storage_trie) = self.storage_tries.get(&address) {
-                account.storage_root = Self::storage_root_of(&storage_trie, canonical);
+                account.storage_root = Self::storage_root_of(&storage_trie, rule);
                 // Keep the resident account consistent with what we hash.
                 self.accounts.set_account(address, account.clone());
             }
@@ -480,6 +582,315 @@ impl StateDB {
         root
     }
 
+    /// CV-14 (a)+(b): the standard secure MPT state root, computed
+    /// incrementally.
+    ///
+    /// PURITY (ADR-2026-07-21-state-root-purity keeps its intent: the root
+    /// commits to the committed state and to nothing else). The account trie
+    /// is NOT rebuilt from the resident set every call. Instead:
+    ///
+    ///   * every change to a resident account or to its storage, by any path
+    ///     (writes, non-dirtying loads and read-throughs, restores, undo
+    ///     pre-images), records the address in `AccountManager::root_touched`,
+    ///     and every storage-trie change records the slot key in that trie;
+    ///   * this fold re-encodes exactly those accounts (with their storage
+    ///     roots, themselves caught up the same way) and updates their paths;
+    ///   * so between folds, every address not recorded has a leaf equal to the
+    ///     encoding of its resident entry, and after the fold all of them do.
+    ///
+    /// The MPT has one shape per key/value set and each node's cached hash is a
+    /// function of that node alone, so the result equals the from-scratch root
+    /// of the same state ([`Self::reference_state_root`]) whatever was cached,
+    /// in whatever order the changes came (`incremental_root_equals_from_scratch`,
+    /// `root_is_pure_function_of_state`). Cost: O(changed keys x depth).
+    pub fn mpt_state_root(&self) -> StateRoot {
+        let mut trie = self.account_mpt.lock();
+        let touched = self.accounts.take_root_touched();
+        if touched.is_empty() {
+            return Hash::new(trie.root_hash());
+        }
+        for address in &touched {
+            let key = account_trie_key(&address.0);
+            let storage_root = self
+                .storage_tries
+                .get(address)
+                .map(|t| t.mpt_root())
+                .unwrap_or(EMPTY_ROOT);
+            match self.committed_account(address) {
+                None => trie.remove(&key),
+                Some(account) => {
+                    // Keep the resident account consistent with what is hashed
+                    // (`Hash::default()` is how the executor spells "no storage").
+                    let folded = if storage_root == EMPTY_ROOT {
+                        Hash::default()
+                    } else {
+                        Hash::new(storage_root)
+                    };
+                    self.accounts.set_folded_storage_root(*address, folded);
+                    match encode_account(&account, &storage_root) {
+                        Some(leaf) => trie.insert(&key, &leaf),
+                        None => trie.remove(&key),
+                    }
+                }
+            }
+        }
+        self.folded_accounts
+            .fetch_add(touched.len() as u64, Ordering::Relaxed);
+        self.unpersisted.lock().0.extend(touched);
+        let root = Hash::new(trie.root_hash());
+        drop(trie);
+        // Debug builds (every test, every debug devnet) check the incremental
+        // root against the from-scratch reference on every fold: a change that
+        // reached the state without reaching `root_touched` fails here, at the
+        // block that made it.
+        #[cfg(debug_assertions)]
+        {
+            let reference = self.reference_state_root();
+            debug_assert_eq!(
+                root, reference,
+                "CV-14: incremental MPT root != from-scratch reference (a state change bypassed root_touched)"
+            );
+        }
+        root
+    }
+
+    /// Accounts re-encoded into the account MPT since this db was created.
+    pub fn mpt_folded_accounts(&self) -> u64 {
+        self.folded_accounts.load(Ordering::Relaxed)
+    }
+
+    /// The account the MPT state root commits for `address`: its resident
+    /// entry, or, for an address that holds storage but has no resident entry
+    /// (the governance precompile writes its slots without creating one), the
+    /// default account holding those slots. `None`: nothing to commit.
+    /// Spec: docs/consensus/STATE_ROOT_MPT.md §3.
+    fn committed_account(&self, address: &Address) -> Option<crate::types::AccountState> {
+        self.accounts.get_resident(address).or_else(|| {
+            self.storage_tries
+                .contains_key(address)
+                .then(crate::types::AccountState::default)
+        })
+    }
+
+    /// Every (address, account) [`Self::committed_account`] names: the resident
+    /// accounts plus the storage-only addresses.
+    fn committed_accounts(&self) -> Vec<(Address, crate::types::AccountState)> {
+        let mut all = self.accounts.all_accounts();
+        let resident: std::collections::HashSet<Address> = all.iter().map(|(a, _)| *a).collect();
+        for entry in self.storage_tries.iter() {
+            if !resident.contains(entry.key()) {
+                all.push((*entry.key(), crate::types::AccountState::default()));
+            }
+        }
+        all
+    }
+
+    /// The MPT state root of the resident state computed FROM SCRATCH: every
+    /// committed account (resident, or storage-only) and slot re-encoded and
+    /// the whole trie built in one pass (`mpt::root_from_sorted`), with no cache, no incremental trie and
+    /// no side effect. The reference [`Self::mpt_state_root`] is tested and
+    /// replayed against (tools/replay-ref).
+    pub fn reference_state_root(&self) -> StateRoot {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .committed_accounts()
+            .into_iter()
+            .filter_map(|(address, account)| {
+                let storage_root = self
+                    .storage_tries
+                    .get(&address)
+                    .map(|t| t.reference_mpt_root())
+                    .unwrap_or(EMPTY_ROOT);
+                encode_account(&account, &storage_root)
+                    .map(|leaf| (account_trie_key(&address.0).to_vec(), leaf))
+            })
+            .collect();
+        Hash::new(crate::state::mpt::root_from_sorted(entries))
+    }
+
+    /// The from-scratch reference for [`Self::calculate_state_root_with`]: the
+    /// MPT reference under the MPT rule; the legacy root (already rebuilt from
+    /// scratch every call) below it.
+    pub fn reference_state_root_with(&self, activation: Option<u64>, height: u64) -> StateRoot {
+        match self.root_rule(activation, height) {
+            RootRule::Mpt => self.reference_state_root(),
+            RootRule::Legacy { .. } => self.calculate_state_root_with(activation, height),
+        }
+    }
+
+    /// Whether this db's post-state is rooted by the MPT rule.
+    pub fn mpt_rule_active(&self) -> bool {
+        crate::mpt_state_root::mpt_state_root_active(self.root_height())
+    }
+
+    /// The `eth_getProof` proof of `address` and its slots `keys` against the
+    /// current MPT state root. Data source: this db's incremental account and
+    /// storage MPTs. An error when the MPT rule is not active for this
+    /// post-state (the legacy root has no proofs).
+    pub fn get_proof(&self, address: &Address, keys: &[Vec<u8>]) -> Result<StateProof, String> {
+        if !self.mpt_rule_active() {
+            return Err(format!(
+                "state proofs need the MPT state root (CV-14); it is not active at height {}",
+                self.root_height()
+            ));
+        }
+        let state_root = self.mpt_state_root();
+        let account_trie = self.account_mpt.lock().clone();
+        let account_key = account_trie_key(&address.0);
+        let storage = self
+            .storage_tries
+            .get(address)
+            .map(|t| t.mpt())
+            .unwrap_or_default();
+        Ok(StateProof {
+            state_root,
+            address: *address,
+            account_proof: account_trie.proof(&account_key),
+            account_leaf: account_trie.get(&account_key).map(<[u8]>::to_vec),
+            storage_hash: storage.root_hash(),
+            storage: keys
+                .iter()
+                .map(|k| StorageProof {
+                    key: k.clone(),
+                    value: self.get_storage(address, k),
+                    proof: storage.proof(&storage_trie_key(k)),
+                })
+                .collect(),
+        })
+    }
+
+    /// Hand every trie node of the current MPT state that the node store does
+    /// not have yet to `write` (with the state root), then record them as
+    /// persisted. Returns (root, nodes written). Under the legacy rule there
+    /// is nothing to persist.
+    ///
+    /// The node store is a cache: a node it lacks (a failed write, a crash, a
+    /// prune) makes a restart rebuild the trie from state
+    /// ([`Self::reuse_persisted_trie`] fails over), never changes a root.
+    pub fn persist_trie_nodes(
+        &self,
+        write: &mut TrieNodeWriter<'_>,
+    ) -> anyhow::Result<(StateRoot, usize)> {
+        let root = self.mpt_state_root();
+        let account = self.account_mpt.lock().clone();
+        let (addresses, all) = {
+            let mut u = self.unpersisted.lock();
+            (std::mem::take(&mut u.0), std::mem::replace(&mut u.1, false))
+        };
+        let storage: Vec<Mpt> = if all {
+            self.storage_tries.iter().map(|t| t.value().mpt()).collect()
+        } else {
+            addresses
+                .iter()
+                .filter_map(|a| self.storage_tries.get(a).map(|t| t.mpt()))
+                .collect()
+        };
+        let mut nodes = Vec::new();
+        account.collect_unpersisted(&mut nodes);
+        for m in &storage {
+            m.collect_unpersisted(&mut nodes);
+        }
+        nodes.sort_unstable_by_key(|a| a.0);
+        nodes.dedup_by(|a, b| a.0 == b.0);
+        if let Err(e) = write(&root, &nodes) {
+            // Keep them candidates for the next attempt.
+            let mut u = self.unpersisted.lock();
+            u.0.extend(addresses);
+            u.1 |= all;
+            return Err(e);
+        }
+        account.mark_persisted();
+        for m in &storage {
+            m.mark_persisted();
+        }
+        Ok((root, nodes.len()))
+    }
+
+    /// Restart: reuse the persisted trie with root `root` (from `source`, RLP
+    /// by node hash) instead of rebuilding it from the hydrated state.
+    ///
+    /// Every node is checked as it loads (hash, canonical encoding and shape),
+    /// and every leaf against the hydrated resident state: each account leaf
+    /// must be the encoding of its resident account, each storage trie must
+    /// hold exactly the resident slots, and every resident account without a
+    /// leaf must be empty. Only then is the trie installed. On any difference
+    /// nothing in the account trie changes and the error says why; the next
+    /// root is then built from the resident state as on a cold start. Either
+    /// way the root is the same function of the state (purity), the store only
+    /// saves the rebuild.
+    pub fn reuse_persisted_trie(
+        &self,
+        root: &StateRoot,
+        source: &dyn Fn(&[u8; 32]) -> Option<Vec<u8>>,
+    ) -> Result<TrieReuse, String> {
+        use std::collections::HashMap;
+        let account_trie = Mpt::load(root.as_bytes(), source).map_err(|e| e.to_string())?;
+        let mut by_key: HashMap<[u8; 32], (Address, crate::types::AccountState)> = self
+            .committed_accounts()
+            .into_iter()
+            .map(|(a, s)| (account_trie_key(&a.0), (a, s)))
+            .collect();
+        let mut reuse = TrieReuse {
+            accounts: 0,
+            storage_tries: 0,
+        };
+        let mut folded: Vec<(Address, Hash)> = Vec::new();
+        for (key, leaf) in account_trie.entries() {
+            let key = <[u8; 32]>::try_from(key.as_slice())
+                .map_err(|_| "an account-trie key that is not 32 bytes".to_string())?;
+            let (address, account) = by_key
+                .remove(&key)
+                .ok_or_else(|| format!("a leaf 0x{} for no resident account", hex::encode(key)))?;
+            let storage_root = crate::state::mpt_state::account_leaf_storage_root(&leaf)
+                .ok_or_else(|| format!("account {address}: malformed leaf"))?;
+            let installed = match self.storage_tries.get(&address) {
+                Some(t) => {
+                    let m = Mpt::load(&storage_root, source).map_err(|e| e.to_string())?;
+                    t.install_mpt_if_matches(m)
+                }
+                None => storage_root == EMPTY_ROOT,
+            };
+            if !installed {
+                return Err(format!("account {address}: storage differs from its trie"));
+            }
+            if storage_root != EMPTY_ROOT {
+                reuse.storage_tries = reuse.storage_tries.saturating_add(1);
+            }
+            if encode_account(&account, &storage_root).as_deref() != Some(leaf.as_slice()) {
+                return Err(format!(
+                    "account {address}: resident state differs from its leaf"
+                ));
+            }
+            folded.push((
+                address,
+                if storage_root == EMPTY_ROOT {
+                    Hash::default()
+                } else {
+                    Hash::new(storage_root)
+                },
+            ));
+            reuse.accounts = reuse.accounts.saturating_add(1);
+        }
+        // Resident accounts with no leaf must be empty (absent from the trie).
+        for (address, account) in by_key.values() {
+            let empty_storage = match self.storage_tries.get(address) {
+                Some(t) => t.install_mpt_if_matches(Mpt::new()),
+                None => true,
+            };
+            if !empty_storage || encode_account(account, &EMPTY_ROOT).is_some() {
+                return Err(format!("account {address}: resident but not in the trie"));
+            }
+        }
+        let mut trie = self.account_mpt.lock();
+        *trie = account_trie;
+        let _ = self.accounts.take_root_touched();
+        for (address, sr) in folded {
+            self.accounts.set_folded_storage_root(address, sr);
+        }
+        // Everything installed came from the store.
+        *self.unpersisted.lock() = (Default::default(), false);
+        Ok(reuse)
+    }
+
     /// SRP-S4 diagnostic — an INJECTIVE full-state fingerprint that DISTINGUISHES two
     /// states which `calculate_state_root` maps to the SAME root. Unlike the consensus
     /// root it (a) folds EVERY resident account INCLUDING the EIP-158-empty ones the root
@@ -490,7 +901,7 @@ impl StateDB {
     /// diff two nodes at a wedge height. DIAGNOSTIC ONLY — never a consensus value.
     pub fn full_state_fingerprint(&self) -> Hash {
         use sha3::{Digest, Keccak256};
-        let canonical = self.canonical_storage_roots_at(
+        let rule = self.root_rule(
             crate::storage_root_hardening::storage_root_hardening_height(),
             self.root_height(),
         );
@@ -500,7 +911,7 @@ impl StateDB {
         for (address, mut account) in all {
             let slots: Vec<(Vec<u8>, Vec<u8>)> = match self.storage_tries.get(&address) {
                 Some(t) => {
-                    account.storage_root = Self::storage_root_of(&t, canonical);
+                    account.storage_root = Self::storage_root_of(&t, rule);
                     let mut s: Vec<(Vec<u8>, Vec<u8>)> = t.entries_map().into_iter().collect();
                     s.sort();
                     s
@@ -528,7 +939,7 @@ impl StateDB {
     /// SRP-S4 diagnostic — per-account lines for the injective fingerprint above, so a
     /// diff of two nodes' dumps at a wedge height NAMES the diverging account/slot-count.
     pub fn full_state_digest_lines(&self) -> Vec<String> {
-        let canonical = self.canonical_storage_roots_at(
+        let rule = self.root_rule(
             crate::storage_root_hardening::storage_root_hardening_height(),
             self.root_height(),
         );
@@ -538,8 +949,8 @@ impl StateDB {
             .map(|(address, mut account)| {
                 let nslots = match self.storage_tries.get(&address) {
                     Some(t) => {
-                        account.storage_root = Self::storage_root_of(&t, canonical);
-                        t.entries_map().len()
+                        account.storage_root = Self::storage_root_of(&t, rule);
+                        t.len()
                     }
                     None => 0,
                 };
@@ -600,6 +1011,7 @@ impl StateDB {
             dirty_code: self.dirty_code.iter().map(|h| *h).collect(),
             state_trie: self.state_trie.read().clone(),
             root_height: self.root_height(),
+            account_mpt: self.account_mpt.lock().clone(),
         }
     }
 
@@ -629,6 +1041,11 @@ impl StateDB {
         // Restore the accumulating account trie (see StateSnapshot::state_trie).
         *self.state_trie.write() = snapshot.state_trie;
         self.set_root_height(snapshot.root_height);
+        // CV-14: the account MPT the snapshot's accounts were folded into, with
+        // the snapshot's root-touched set (restored by `accounts.restore`).
+        *self.account_mpt.lock() = snapshot.account_mpt;
+        // The restored tries may hold nodes never handed to the store.
+        self.unpersisted.lock().1 = true;
 
         // Restore models
         self.models.clear();
@@ -694,6 +1111,10 @@ pub struct StateSnapshot {
     /// `StateDB::root_height` at snapshot time, so a revert also restores the
     /// storage-root rule of the restored state.
     root_height: u64,
+    /// CV-14: the account MPT at snapshot time (shared nodes, O(1) to hold).
+    /// Together with the accounts' root-touched set it is consistent with the
+    /// snapshot's accounts: restoring both restores the incremental root.
+    account_mpt: Mpt,
 }
 
 impl StateSnapshot {
@@ -740,24 +1161,20 @@ impl StateSnapshot {
             if old.is_some_and(|o| Arc::ptr_eq(o, trie)) {
                 continue;
             }
-            let now = trie.entries_map();
-            let was = old.map(|o| o.entries_map()).unwrap_or_default();
-            for (key, value) in &now {
-                if was.get(key) != Some(value) {
-                    storage.push((**addr, key.clone(), was.get(key).cloned()));
-                }
-            }
-            for (key, value) in &was {
-                if !now.contains_key(key) {
-                    storage.push((**addr, key.clone(), Some(value.clone())));
-                }
+            // Only the slots that differ are visited: the two versions share
+            // every other node of the slot map.
+            match old {
+                Some(o) => o.diff_slots(trie, |key, was, _now| {
+                    storage.push((**addr, key.to_vec(), was.map(<[u8]>::to_vec)));
+                }),
+                None => trie.for_each_slot(|key, _| storage.push((**addr, key.to_vec(), None))),
             }
         }
         for (addr, trie) in &before_tries {
             if !after_tries.contains_key(addr) {
-                for (key, value) in trie.entries_map() {
-                    storage.push((**addr, key, Some(value)));
-                }
+                trie.for_each_slot(|key, value| {
+                    storage.push((**addr, key.to_vec(), Some(value.to_vec())));
+                });
             }
         }
         (accounts, storage)
@@ -810,24 +1227,33 @@ impl StateSnapshot {
         }
         let mut tries: HashMap<Address, Arc<Trie>> = self.storage_tries.iter().cloned().collect();
         let mut shrunk: HashSet<Address> = HashSet::new();
+        // CV-14: every account the pre-images change, or whose storage they
+        // change, must be re-folded into the (shared) account MPT.
+        let mut root_touched: HashSet<Address> =
+            self.accounts.root_touched().iter().copied().collect();
+        root_touched.extend(accounts.iter().map(|(a, _)| *a));
+        root_touched.extend(storage.iter().map(|(a, _, _)| *a));
         for (addr, key, value) in storage {
-            let trie = tries.entry(*addr).or_insert_with(|| Arc::new(Trie::new()));
+            let trie = tries
+                .entry(*addr)
+                .or_insert_with(|| Arc::new(Trie::for_current_rule()));
             match value {
-                Some(v) => Arc::make_mut(trie).insert(key.clone(), v.clone()),
+                Some(v) => write_trie(trie).insert(key.clone(), v.clone()),
                 None => {
-                    Arc::make_mut(trie).remove(key);
+                    write_trie(trie).remove(key);
                     shrunk.insert(*addr);
                 }
             }
         }
         for addr in shrunk {
-            if tries.get(&addr).is_some_and(|t| t.entries_map().is_empty()) {
+            if tries.get(&addr).is_some_and(|t| t.is_empty()) {
                 tries.remove(&addr);
             }
         }
         StateSnapshot {
             accounts: crate::state::account::AccountSnapshot::from_entries(
                 account_map.into_iter().collect(),
+                root_touched.into_iter().collect(),
             ),
             storage_tries: tries.into_iter().collect(),
             models: self.models.clone(),
@@ -836,6 +1262,7 @@ impl StateSnapshot {
             dirty_code: Vec::new(),
             state_trie: self.state_trie.clone(),
             root_height,
+            account_mpt: self.account_mpt.clone(),
         }
     }
 
@@ -849,6 +1276,18 @@ impl StateSnapshot {
             .map(|(addr, trie)| (*addr, trie.entries_map()))
             .collect()
     }
+}
+
+/// A storage trie made writable: copied if a snapshot shares it (O(1) in its
+/// slots, see `Trie`'s `Clone`), and without its legacy tree once no legacy
+/// root is reachable in this process (`crate::mpt_state_root::legacy_root_reachable`:
+/// the MPT rule from genesis), so no old-format tree is maintained under it.
+fn write_trie(trie: &mut Arc<Trie>) -> &mut Trie {
+    let t = Arc::make_mut(trie);
+    if t.has_legacy_tree() && !crate::mpt_state_root::legacy_root_reachable() {
+        t.drop_legacy();
+    }
+    t
 }
 
 /// The entries of `before` that differ in `after` (by encoding), with their

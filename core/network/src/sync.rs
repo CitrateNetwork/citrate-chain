@@ -7,7 +7,7 @@ use crate::{
 };
 use citrate_consensus::crypto;
 use citrate_consensus::types::{Block, BlockHeader, Hash};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -544,9 +544,23 @@ impl SyncManager {
         // streaming solicited-looking header batches. Cap the retained heap by
         // an estimated byte budget and drop the OLDEST headers first (FIFO):
         // the un-consumed tail is always re-derivable from a fresh request.
+        //
+        // r1007 (2026-11-14): while block download is driven from the applied
+        // tip, the 2 s tick re-requests the same window, and nothing drains this
+        // buffer until a batch reaches the target. A node stuck at 1552 held the
+        // same 64 headers thousands of times and evicted on every batch. Keep
+        // each (hash, height) once, and nothing the node has already applied.
         {
             let mut dl = self.downloaded_headers.write().await;
-            dl.extend(headers);
+            let applied = self.applied_height();
+            if let Some(a) = applied {
+                dl.retain(|h| h.height > a);
+            }
+            let mut held: HashSet<(Hash, u64)> =
+                dl.iter().map(|h| (h.block_hash, h.height)).collect();
+            dl.extend(headers.into_iter().filter(|h| {
+                applied.is_none_or(|a| h.height > a) && held.insert((h.block_hash, h.height))
+            }));
             let mut total: usize = dl.iter().map(estimated_header_bytes).sum();
             if total > MAX_DOWNLOADED_HEADERS_BYTES {
                 let mut drop_count = 0usize;
@@ -652,10 +666,19 @@ impl SyncManager {
         let mut validated = Vec::with_capacity(total);
         let mut rejected = 0usize;
 
+        // The wall clock, plus a simulation's clock offset (none in a node), so
+        // a simulated network that stamps blocks with its own time judges them
+        // against that time (r1007 G9: the drift is 15 s, not 900 s).
+        let offset_secs = self
+            .clock_offset_ms
+            .as_ref()
+            .map(|o| o.load(Ordering::Relaxed) / 1_000)
+            .unwrap_or(0);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_secs()
+            .saturating_add(offset_secs);
         for block in blocks {
             // 0. PBA-L1b-003: the same wall-clock future bound gossip applies.
             // This path (which also receives unsolicited `Blocks`) skipped it,
@@ -1428,5 +1451,61 @@ mod tests {
             bytes,
             dl.len()
         );
+    }
+
+    /// r1007 (2026-11-14): a node stuck at applied height 1552 re-downloaded
+    /// the SAME 64 headers (1553-1616) on every 2 s tick — 2,540 times in five
+    /// hours. `downloaded_headers` is only drained when a batch reaches the
+    /// target, so it filled to the 64 MiB cap with duplicates and then logged
+    /// "SYNC_CAP: ... evicting 64 oldest headers" on every batch. RED on main:
+    /// the buffer holds every repeat. GREEN: a repeated batch is held once.
+    #[tokio::test]
+    async fn a_repeated_header_batch_is_held_once() {
+        use citrate_consensus::types::{BlockBuilder, PublicKey};
+
+        let applied = Arc::new(AtomicU64::new(1_552));
+        let sync = SyncManager::new(SyncConfig::default()).with_local_height(applied.clone());
+        sync.set_target(96_291).await;
+        let template = BlockBuilder::new()
+            .parent(Hash::new([7u8; 32]))
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+            .header;
+        let batch = |from: u64| -> Vec<BlockHeader> {
+            (from..from + 64)
+                .map(|height| {
+                    let mut h = template.clone();
+                    h.height = height;
+                    let mut bytes = [9u8; 32];
+                    bytes[..8].copy_from_slice(&height.to_be_bytes());
+                    h.block_hash = Hash::new(bytes);
+                    h
+                })
+                .collect()
+        };
+
+        for _ in 0..3_000 {
+            sync.handle_headers(&crate::PeerId("p".into()), batch(1_553))
+                .await
+                .expect("monotonic batch");
+        }
+        assert_eq!(
+            sync.downloaded_headers.read().await.len(),
+            64,
+            "3,000 copies of the same 64 headers must be held once"
+        );
+
+        // Once the node applies past part of the window, those headers are no
+        // longer needed: they are dropped, and the next batch only adds new ones.
+        applied.store(1_600, Ordering::Relaxed);
+        sync.handle_headers(&crate::PeerId("p".into()), batch(1_601))
+            .await
+            .expect("monotonic batch");
+        let dl = sync.downloaded_headers.read().await;
+        assert!(
+            dl.iter().all(|h| h.height > 1_600),
+            "headers at or below the applied height are dropped"
+        );
+        assert_eq!(dl.len(), 64, "heights 1601..=1664, each once");
     }
 }

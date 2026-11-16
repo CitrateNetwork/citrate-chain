@@ -10,6 +10,8 @@ import {V060GovernanceSpec} from "../../script/lib/V060GovernanceSpec.sol";
 import {Salts} from "../../script/Salts.sol";
 import {AdminChecks} from "../../script/lib/AdminChecks.sol";
 import {MultisigProposer} from "../../src/genesis/MultisigProposer.sol";
+import {WorkMarket} from "../../src/work/WorkMarket.sol";
+import {Governable} from "../../src/lib/Governable.sol";
 import {GuardianCanceller} from "../../src/genesis/GuardianCanceller.sol";
 import {GuardianCancellerV2} from "../../src/genesis/GuardianCancellerV2.sol";
 import {GuardianRecoveryModule} from "../../src/aa/recovery/GuardianRecoveryModule.sol";
@@ -75,6 +77,7 @@ contract V060LiveR1007Test is Test {
     uint128 constant MIN_BOND = 100 ether; // owner 2026-11-11 (rehearsal values)
     uint256 constant LIVE_KEY = 0xA11CE; // test-only key for the env-key signing path
     uint128 constant DEFAULT_BOND = 1000 ether;
+    uint128 constant MIN_JOIN_BOND = 10 ether; // owner 2026-11-14
 
     RoleLogArchive internal archive;
     DeployGenesisGovernance.Deployed internal gov;
@@ -165,6 +168,7 @@ contract V060LiveR1007Test is Test {
         i.agentSbt = address(agentSbt);
         i.minCoordinatorBond = MIN_BOND;
         i.defaultCoordinatorBond = DEFAULT_BOND;
+        i.minJoinBond = MIN_JOIN_BOND;
         i.keys = _keys();
     }
 
@@ -211,6 +215,35 @@ contract V060LiveR1007Test is Test {
         // Pre-swap, v1 is still the canceller; the full (post-swap) verify must not pass yet.
         vm.expectRevert(bytes("GuardianCancellerV2 lacks CANCELLER on GOVERNANCE"));
         s.verify(i, d);
+    }
+
+    /// The live mode deploys WorkMarket with the owner's floors (100 SALT coordinator, 10 SALT
+    /// join), verifies them, and afterwards only the GOVERNANCE timelock can change them.
+    function test_live_mode_deploys_the_owner_bond_floors_and_only_governance_changes_them() public {
+        DeployV060Genesis s = _builder();
+        DeployV060Genesis.Inputs memory i = _inputs();
+        DeployV060Genesis.Deployed memory d = s.deployLive(liveDeployer, i, _rot());
+        WorkMarket m = WorkMarket(payable(d.workMarket));
+        assertEq(m.minCoordinatorBond(), 100 ether);
+        assertEq(m.minJoinBond(), 10 ether);
+        assertEq(m.defaultCoordinatorBond(), 1000 ether);
+        DeployV060Genesis.Inputs memory other = _inputs();
+        other.minJoinBond = 11 ether;
+        vm.expectRevert(bytes("WorkMarket: bonds"));
+        s.verifyLive(other, d);
+
+        vm.prank(liveDeployer);
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
+        m.setMinJoinBond(20 ether);
+        vm.prank(i.guardianTimelock);
+        vm.expectRevert(Governable.Governable_NotGovernance.selector);
+        m.setMinCoordinatorBond(200 ether);
+        vm.startPrank(i.governanceTimelock);
+        m.setMinCoordinatorBond(200 ether);
+        m.setMinJoinBond(20 ether);
+        vm.stopPrank();
+        assertEq(m.minCoordinatorBond(), 200 ether);
+        assertEq(m.minJoinBond(), 20 ether);
     }
 
     function test_live_mode_refuses_a_deployer_not_inventoried_as_v060_deployer() public {

@@ -172,7 +172,7 @@ async fn cons2_u64max_blue_score_rejected_at_admission() {
     assert!(
         matches!(
             err,
-            GhostDagError::BlueScoreOutOfRange {
+            GhostDagError::BlueScoreMismatch {
                 claimed: u64::MAX,
                 ..
             }
@@ -181,8 +181,9 @@ async fn cons2_u64max_blue_score_rejected_at_admission() {
     );
 }
 
-/// Inflation is bounded by the feasible band [sp+1, sp+1+|merge_parents|]:
-/// with no merge parents, exactly sp+1 is admissible.
+/// r1007 G7: the score must equal the GHOSTDAG value (formerly: lie within
+/// the feasible band [sp+1, sp+1+|merge_parents|]). With no merge parents,
+/// exactly sp+1 is admissible either way.
 #[tokio::test]
 async fn cons2_blue_score_band_enforced() {
     let (_store, ghostdag, tip) = dag_with_chain(3).await;
@@ -299,7 +300,9 @@ async fn cons3_missing_merge_parent_rejected() {
 async fn cons3_duplicate_and_aliased_merge_parents_rejected() {
     let (dag_store, ghostdag, tip) = dag_with_chain(2).await;
 
-    // A sibling so we have a legitimate merge candidate.
+    // A sibling so we have a legitimate merge candidate. r1007 G3: its tag
+    // sorts below the tip's at equal work, so the tip stays the heaviest
+    // parent and the legitimate merge below names it as selected parent.
     let sibling = {
         let parent = dag_store
             .get_block(&tip.header.selected_parent_hash)
@@ -307,7 +310,7 @@ async fn cons3_duplicate_and_aliased_merge_parents_rejected() {
             .expect("parent exists");
         let score = parent.header.blue_score + 1;
         let b = BlockBuilder::new()
-            .hash(height_hash(0xC3, parent.header.height + 1))
+            .hash(height_hash(0x03, parent.header.height + 1))
             .parent(parent.hash())
             .height(parent.header.height + 1)
             .timestamp(1_700_000_090)
@@ -353,7 +356,7 @@ async fn cons3_duplicate_and_aliased_merge_parents_rejected() {
             .is_err(),
         "merge parent aliasing selected parent admitted"
     );
-    // Legitimate single merge parent (in band): admitted.
+    // Legitimate single merge parent (the exact GHOSTDAG score, G7): admitted.
     ghostdag
         .add_block(&mk(vec![sibling.hash()], 0xC6, score + 1))
         .await
@@ -455,10 +458,11 @@ async fn cons3_selected_parent_must_be_heaviest() {
         .proposer(PublicKey::new([2; 32]))
         .build_unhashed();
 
+    // r1007 G3: the selected parent is derived; the rule has its own error.
     assert!(
         matches!(
             ghostdag.add_block(&b).await,
-            Err(GhostDagError::InvalidLinkage(_))
+            Err(GhostDagError::SelectedParentNotHeaviest { .. })
         ),
         "light selected parent with heavier merge parent admitted"
     );

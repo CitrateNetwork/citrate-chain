@@ -51,6 +51,73 @@ impl NetworkApi {
         })
     }
 
+    /// `net_peerInfo` (S3-7, core#605): every peer the peer manager holds,
+    /// with the head the node's sync scoring reads for it.
+    ///
+    /// Data source: `PeerManager::get_all_peers()` → each `PeerInfo`
+    /// (`core/network/src/peer.rs`). `headHeight` / `headHash` are
+    /// `PeerInfo.head_height` / `head_hash`: seeded from the peer's
+    /// Hello/HelloAck at the handshake (`transport.rs`) and raised by every
+    /// gossiped block from that peer (`node/src/main.rs`, block gossip arm),
+    /// the values the 2 s sync tick selects on (`node/src/sync_peer.rs`).
+    /// They are ADVERTISED, not proven held (`sync_peer.rs` invariant I4), so
+    /// `headSource` is `"advertised"`. Before the handshake completes
+    /// (`Connecting` / `Handshaking`) no head is known and both are `null`.
+    ///
+    /// Units (CV-3, one blue-score unit): `headHeight` is the block height
+    /// (`header.height`, `heightUnit: "header.height"`), the unit of
+    /// `eth_blockNumber` and `citrate_nodeIdentity.syncState.appliedHeight`.
+    /// `headBlueScore` is the GHOSTDAG blue score of the same head block
+    /// (`header.blue_score`, header-committed and validated at admission;
+    /// `blueScoreUnit: "ghostdag.blue_score"`), the unit of
+    /// `syncState.appliedBlueScore`. Data source: `PeerInfo.head_blue_score`,
+    /// set with the head by every gossiped block from the peer
+    /// (`PeerInfo::observe_gossiped_head`); Hello/HelloAck carry none, so it
+    /// is `null` (`headBlueScoreSource: null`) until gossip names it.
+    pub async fn get_peer_info(&self) -> Result<Vec<serde_json::Value>, ApiError> {
+        use citrate_network::peer::{Direction, PeerState};
+        let mut out = Vec::new();
+        for peer in self.peer_manager.get_all_peers() {
+            let info = peer.info.read().await;
+            let direction = match info.direction {
+                Direction::Inbound => "inbound",
+                Direction::Outbound => "outbound",
+            };
+            let state = match info.state {
+                PeerState::Connecting => "connecting",
+                PeerState::Handshaking => "handshaking",
+                PeerState::Connected => "connected",
+                PeerState::Disconnecting => "disconnecting",
+                PeerState::Disconnected => "disconnected",
+            };
+            let head_known = !matches!(info.state, PeerState::Connecting | PeerState::Handshaking);
+            out.push(serde_json::json!({
+                "id": info.id.to_string(),
+                "addr": info.addr.to_string(),
+                "direction": direction,
+                "state": state,
+                "headHeight": head_known.then(|| format!("0x{:x}", info.head_height)),
+                "headHash": head_known
+                    .then(|| format!("0x{}", hex::encode(info.head_hash.as_bytes()))),
+                "headSource": "advertised",
+                "heightUnit": "header.height",
+                "headBlueScore": info
+                    .head_blue_score
+                    .filter(|_| head_known)
+                    .map(|b| format!("0x{b:x}")),
+                "headBlueScoreSource": info
+                    .head_blue_score
+                    .filter(|_| head_known)
+                    .map(|_| "gossip"),
+                "blueScoreUnit": "ghostdag.blue_score",
+                "lastSeenSecsAgo": info.last_seen.elapsed().as_secs(),
+                "connectedSecs": info.connected_at.elapsed().as_secs(),
+                "score": info.score,
+            }));
+        }
+        Ok(out)
+    }
+
     /// Get connected peers
     pub async fn get_peers(&self) -> Result<Vec<String>, ApiError> {
         let peers = self.peer_manager.get_all_peers();

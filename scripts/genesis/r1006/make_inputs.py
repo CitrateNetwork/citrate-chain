@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""make_inputs.py: the FINAL r1006 ceremony inputs (addresses only) from the owner's decision.
+"""make_inputs.py: ceremony inputs (addresses only) from an addresses.env.
 
-  make_inputs.py --addresses ~/.citrate-r1006-keys/addresses.env > inputs.r1006.env
+  make_inputs.py --addresses ~/.citrate-r1007-keys/addresses.env > inputs.env
 
-GOVERNANCE (3-of-5) = the three R2 governance signers + the fresh GOV4, GOV5; GUARDIAN
-(2-of-3) = the three R2 guardian signers; every other role is a fresh key (new_role_keys.sh).
-Refuses anything that is not a 20-byte address, a duplicate, or a council overlap.
+Every owner is a parameter: GOVERNANCE (3-of-5) = GOV1..GOV5, GUARDIAN (2-of-3) = GRD1..GRD3,
+and every other role below, all read from addresses.env. Nothing is hard-coded, so a rebuild
+cannot silently keep an earlier chain's owners (fed #493; owner 2026-11-10: rotate every
+non-producer EVM key for r1007). r1006 kept the three R2 governance and three R2 guardian
+owners; reproducing its inputs means passing those as GOV1-3 / GRD1-3 explicitly.
+The council seats may be written GOV_OWNER_1..5 / GRD_OWNER_1..3 (the owner's r1007 keygen) instead;
+one spelling per file. Refuses a missing role, anything that is not a 20-byte address, a role
+given twice (in either spelling), a mix of spellings, and an address in two roles.
 """
 import argparse
 import re
 import sys
 
-R2_GOVERNANCE = ["0xB4E186CBeab88C8220F3D69f4263FfFCf4C6aDA9", "0xa6BB945bD72684951721ff99AecFDdb48aE22B8b",
-                 "0xe154af73bb03bC6073A4f08d6868184774014daf"]
-R2_GUARDIAN = ["0xcC9eE1f2c11C53E2B9C30C61848Ee50F12a690Dc", "0x1B0C84e457605a065Beb0B2306efa0Fb54B33e8A",
-               "0x8547D47D144877a75dE0097D5E35DA8A355C8E3F"]
-FRESH = ["TREASURY", "FAUCET", "RELAYER", "TEAM", "SIGNER_1", "SIGNER_2", "SIGNER_3", "CITRATE_AA_OWNER",
-         "CITRATE_AA_IDENTITY_SIGNER", "CITRATE_AA_SPONSOR_SIGNER", "MEMBERSHIP_GRANTOR", "GOV4", "GOV5"]
+GOV = ["GOV1", "GOV2", "GOV3", "GOV4", "GOV5"]
+GRD = ["GRD1", "GRD2", "GRD3"]
+OTHER = ["TREASURY", "FAUCET", "RELAYER", "TEAM", "SIGNER_1", "SIGNER_2", "SIGNER_3", "CITRATE_AA_OWNER",
+         "CITRATE_AA_IDENTITY_SIGNER", "CITRATE_AA_SPONSOR_SIGNER", "MEMBERSHIP_GRANTOR"]
+REQUIRED = GOV + GRD + OTHER
+# The owner's r1007 keygen (2026-11-11) names the council seats GOV_OWNER_1..5 / GRD_OWNER_1..3.
+# Either spelling is accepted for the whole file; mixing them, or naming a seat twice, is refused.
+ALIASES = {**{f"GOV_OWNER_{i}": f"GOV{i}" for i in range(1, 6)}, **{f"GRD_OWNER_{i}": f"GRD{i}" for i in range(1, 4)}}
 ADDR = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
@@ -29,6 +36,8 @@ def main():
     ap.add_argument("--addresses", required=True)
     a = ap.parse_args()
     got = {}
+    name = {}
+    spellings = set()
     for line in open(a.addresses):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -36,18 +45,29 @@ def main():
         k, _, v = line.partition("=")
         if not ADDR.match(v):
             fail(f"{k}: not an address")
-        got[k] = v.lower()
-    missing = [r for r in FRESH if r not in got]
+        if k in ALIASES:
+            spellings.add("GOV_OWNER_n/GRD_OWNER_n")
+        elif k in GOV + GRD:
+            spellings.add("GOVn/GRDn")
+        seat = ALIASES.get(k, k)
+        if seat in got:
+            if name[seat] != k:
+                fail(f"{seat}: named by both spellings ({name[seat]} and {k})")
+            fail(f"{k}: given more than once")
+        got[seat] = v.lower()
+        name[seat] = k
+    if len(spellings) > 1:
+        fail("the file mixes the council spellings GOVn/GRDn and GOV_OWNER_n/GRD_OWNER_n; use one")
+    missing = [r for r in REQUIRED if r not in got]
     if missing:
-        fail(f"missing fresh role addresses: {missing}")
-    gov = [x.lower() for x in R2_GOVERNANCE] + [got["GOV4"], got["GOV5"]]
-    grd = [x.lower() for x in R2_GUARDIAN]
-    every = gov + grd + [got[r] for r in FRESH if r not in ("GOV4", "GOV5")]
+        fail(f"missing role addresses (every owner is a parameter): {missing}")
+    gov = [got[r] for r in GOV]
+    grd = [got[r] for r in GRD]
+    every = [got[r] for r in REQUIRED]
     if len(set(every)) != len(every):
         fail("an address appears in two roles")
-    out = ["# r1006 ceremony inputs: PUBLIC ADDRESSES ONLY. STATUS final (owner decision 2026-10-26):",
-           "# GOVERNANCE = R2 governance signers + fresh GOV4/GOV5; GUARDIAN = R2 guardian signers;",
-           "# every other role a fresh key (new_role_keys.sh). Written by make_inputs.py.",
+    out = ["# Ceremony inputs: PUBLIC ADDRESSES ONLY. Written by make_inputs.py from addresses.env:",
+           "# GOVERNANCE = GOV1..GOV5, GUARDIAN = GRD1..GRD3, every other role as passed.",
            "R1006_INPUTS_STATUS=final",
            f"GOV_OWNERS={','.join(gov)}", "GOV_THRESHOLD=3", "GOV_MIN_DELAY=172800", "GOV_PROPOSAL_TTL=1209600",
            f"GRD_OWNERS={','.join(grd)}", "GRD_THRESHOLD=2", "GRD_MIN_DELAY=3600", "GRD_PROPOSAL_TTL=1209600"]

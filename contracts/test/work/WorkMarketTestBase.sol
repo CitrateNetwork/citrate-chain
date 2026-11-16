@@ -58,7 +58,7 @@ abstract contract WorkMarketTestBase is Test {
     address internal stranger = makeAddr("stranger");
     /// The governance treasury stand-in: receives every slash not paid to a rewarded disputer.
     address internal SINK = makeAddr("slashSink");
-    uint128 internal constant MINBOND = 0.1 ether;
+    uint128 internal constant MINBOND = 1 ether; // the least floor governance may set
     uint256 internal coordKey = 0xC00D;
     address internal coordinator;
 
@@ -66,6 +66,8 @@ abstract contract WorkMarketTestBase is Test {
     uint128 internal constant BUDGET = 10 ether;
     uint32 internal constant WINDOW = 24 hours;
     uint128 internal constant CBOND = 2 ether;
+    /// The join bond offers carry by default: the least floor governance may set (1 SALT).
+    uint128 internal constant JBOND = 1 ether;
     /// Challenge bond for CBOND offers: CHALLENGE_BOND_BPS (10 %) of the coordinator bond.
     uint128 internal constant CHBOND = 0.2 ether;
     bytes32 internal constant BIND = keccak256("bind");
@@ -86,7 +88,7 @@ abstract contract WorkMarketTestBase is Test {
         verifier = new SwitchVerifier();
         address[] memory vs = new address[](1);
         vs[0] = address(verifier);
-        market = new WorkMarket(governance, guardian, SINK, 1 ether, MINBOND, vs);
+        market = new WorkMarket(governance, guardian, SINK, 1 ether, MINBOND, JBOND, vs);
         vm.deal(poster, 1_000_000 ether);
         vm.deal(coordinator, 1_000 ether);
         vm.deal(w1, 100 ether);
@@ -112,7 +114,7 @@ abstract contract WorkMarketTestBase is Test {
             deadline: uint64(block.timestamp + 7 days),
             disputeWindow: WINDOW,
             maxWorkers: 16,
-            joinBond: 0,
+            joinBond: JBOND,
             coordinator: coordinator,
             coordinatorBond: CBOND,
             disputeAdmin: address(0)
@@ -131,6 +133,7 @@ abstract contract WorkMarketTestBase is Test {
     function _join(uint256 id, address w) internal {
         bytes32[] memory none;
         uint128 bond = market.getOffer(id).joinBond;
+        if (w.balance < bond) vm.deal(w, uint256(bond) + w.balance); // a fresh sybil address can pay its bond
         vm.prank(w);
         market.join{value: bond}(id, 0, none);
     }
@@ -232,15 +235,23 @@ abstract contract WorkMarketTestBase is Test {
         });
     }
 
+    /// The coordinator's receipt for `worker`'s first verified lease (ordinal 1).
     function _receipt(uint256 id, address worker, bytes32 leaseId) internal view returns (WorkMarket.Receipt memory r) {
-        bytes32 d = market.receiptDigest(id, worker, leaseId, keccak256(abi.encode("delta", leaseId)));
+        r = _receiptN(id, worker, leaseId, 1);
+    }
+
+    /// The coordinator's receipt for `worker`'s `ordinal`-th verified lease on offer `id`.
+    function _receiptN(uint256 id, address worker, bytes32 leaseId, uint64 ordinal)
+        internal
+        view
+        returns (WorkMarket.Receipt memory r)
+    {
+        bytes32 delta = keccak256(abi.encode("delta", leaseId));
+        bytes32 d = market.receiptDigest(id, worker, leaseId, delta, ordinal);
         bytes32 eth = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", d));
         (uint8 v, bytes32 rr, bytes32 s) = vm.sign(coordKey, eth);
         r = WorkMarket.Receipt({
-            worker: worker,
-            leaseId: leaseId,
-            deltaHash: keccak256(abi.encode("delta", leaseId)),
-            signature: abi.encodePacked(rr, s, v)
+            worker: worker, leaseId: leaseId, deltaHash: delta, ordinal: ordinal, signature: abi.encodePacked(rr, s, v)
         });
     }
 

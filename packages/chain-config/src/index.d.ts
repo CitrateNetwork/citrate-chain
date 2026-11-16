@@ -17,6 +17,8 @@ export const precompiles: AddressMap
 export const memberSBT: Address
 /** nonce-based, MOVES every re-roll — always getCode-verify at boot */
 export const membershipVault: Address
+/** operator EOAs (no code), e.g. Bundler and Faucet; not contracts, not resolved by getAddress */
+export const accounts: Record<string, Address>
 
 export interface AddressBook {
   chainId: number

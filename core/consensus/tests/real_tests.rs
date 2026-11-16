@@ -212,11 +212,12 @@ mod tip_tiebreak_tests {
         assert_eq!(tips.len(), 2);
         let tip_hashes: Vec<Hash> = tips.iter().map(|t| t.hash).collect();
 
-        // Tie-breaker: choose lexicographically SMALLEST hash — the one canonical
-        // order shared with cmp_tip_for_parent_selection (H-08) and
-        // GhostDag::select_tip. (Producer/drain disagreement here caused the
+        // Tie-breaker: the LARGER ForkChoiceKey (r1007 G8; equal work and VRF
+        // here, so the larger hash) — the one canonical order shared with
+        // cmp_tip_for_parent_selection (H-08), GhostDag::select_tip and the
+        // selected-parent rule G3. (Producer/drain disagreement here caused the
         // 2026-08-06 height-90,998 halt.)
-        let expected = if child_a.hash() < child_b.hash() {
+        let expected = if child_a.hash() > child_b.hash() {
             child_a.hash()
         } else {
             child_b.hash()
@@ -328,9 +329,9 @@ mod ghostdag_tests {
         // Calculate blue set for genesis
         let blue_set = ghostdag.calculate_blue_set(&genesis).await.unwrap();
 
-        // Genesis should be in its own blue set
-        assert!(blue_set.blocks.contains(&genesis.hash()));
-        assert_eq!(blue_set.score, 1);
+        // r1007 G7: a block's blue set is its blue past; genesis has none
+        assert!(!blue_set.blocks.contains(&genesis.hash()));
+        assert_eq!(blue_set.score, 0);
     }
 
     #[tokio::test]
@@ -546,13 +547,13 @@ mod tip_selection_tests {
         dag_store.store_block(child1.clone()).await.unwrap();
         dag_store.store_block(child2.clone()).await.unwrap();
 
-        // With equal scores, tie-breaker selects the SMALLEST hash (canonical H-08
-        // order, shared with the drain's GhostDag::select_tip — see the 2026-08-06
-        // height-90,998 halt).
+        // With equal scores, tie-breaker selects the larger ForkChoiceKey (r1007
+        // G8; canonical H-08 order, shared with the drain's GhostDag::select_tip —
+        // see the 2026-08-06 height-90,998 halt).
         let tips = dag_store.get_tips().await;
         let tip_hashes: Vec<Hash> = tips.iter().map(|t| t.hash).collect();
 
-        let expected = if child1.hash() < child2.hash() {
+        let expected = if child1.hash() > child2.hash() {
             child1.hash()
         } else {
             child2.hash()

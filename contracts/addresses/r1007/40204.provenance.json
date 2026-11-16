@@ -1,0 +1,554 @@
+{
+  "comment": "Read-only probe of the live r1007 chain (eth_chainId, eth_getBlockByNumber(0), eth_getCode, eth_getTransactionCount, eth_call) that the r1007 books are built from. Block-0 contracts sit at their r1006 addresses (CREATE2, unchanged by the key rotation); the post-genesis contracts are cast compute-address --nonce 0..28 of the r1007 POSTGENESIS_DEPLOYER. Every address listed has code (codehash = keccak256 of eth_getCode at probe.block); the accounts have none. Written once from the probe; never edited by hand.",
+  "chainId": 40204,
+  "genesisHash": "0xcf68634502b4fca1e977ac8dd35aa006bb40c04208d5cd55f1c2b508bba96631",
+  "genesisTimestamp": "2026-11-12T14:00:00Z",
+  "rpcUrl": "https://rpc.citrate.ai",
+  "probe": {
+    "block": 3661,
+    "probedAt": "2026-11-12T16:05:00Z",
+    "tool": "cast (foundry), read-only calls only"
+  },
+  "genesisDeployer": "0xE92A75519e9915E57d88E4e207e4EbcB3664cf23",
+  "postGenesisDeployer": {
+    "address": "0x402c63FdbCdeF652b3989ad1522a4Ba9da309414",
+    "nonceAtProbe": 30,
+    "note": "nonces 0-28 are the 29 contract creations below (nonce 4 is the AgentDecisionRegistryV2 duplicate, kept out of the book as on r1006); nonce 29 is TenantHierarchy.initRoot"
+  },
+  "blockZero": {
+    "contracts.ModelRegistry": {
+      "address": "0x4c367f7742059b5bf39f6fbe5837ce6164afd33f",
+      "codehash": "0x469428e51c6ef3835e9d82899c114ce9a47c2921816261df53c61f759c9bc4ee"
+    },
+    "contracts.WrappedSALT": {
+      "address": "0xaa918302b94a4b0e75e01e019cc6b819b4f7c906",
+      "codehash": "0xc57dd28e39252053c4a0b576fc4ceac8a80449d82ad214c2645bb6f8d77099d9"
+    },
+    "contracts.AgentDecisionRegistry": {
+      "address": "0x74eb3393d3be1b732adf5002334383dbfbe28f8d",
+      "codehash": "0x108e89b7f7d552ac845261a845ed52f47e6a386ba563939e0eee125285d7e357"
+    },
+    "contracts.SpecRegistry": {
+      "address": "0xba9aa1ca90de62d0857839420491899abb2826d4",
+      "codehash": "0x0e533956a7ffff6703c56489e456e0321b57d3b4396ec9ee126a845fbb51c9d2"
+    },
+    "contracts.IPFSIncentives": {
+      "address": "0xce5e13bf7c9d7320b4cafd0ef326febfba95dd52",
+      "codehash": "0xd149ab24f8b578ce96fc1559bcfea066f44db98d2ca9102eb10a93da960fbf12"
+    },
+    "contracts.X402Facilitator": {
+      "address": "0x0c5167e9b1db3423ad2c068edc51da84db03dc44",
+      "codehash": "0x5549e04c40e0cf84c442172d7159406b982a2633cd34aca71d089b30b98d9ce2"
+    },
+    "contracts.X402Paywall": {
+      "address": "0x30e1dcca7a222fdaeef2e1410d2d49ee8fb9ab44",
+      "codehash": "0x08f674e3aa2f009728bc9ae1900f815513104c16cb7e7fea4fdaf62b93d4dd79"
+    },
+    "contracts.ContributionAccounting": {
+      "address": "0x621395beb46a6f59c0e3a94ba5248db94af1896f",
+      "codehash": "0x1f0a872cd52574b28459e97588bfa8130ce2a7cdcc6324e8a66a98932e5c75fb"
+    },
+    "contracts.NematocystSlashing": {
+      "address": "0xce8dc4f9bd74729f275a84184cf245f5aad7cbf1",
+      "codehash": "0x6960ff61a4264dc2f2c9f695705ee7b0edd568aa0008e2e8081a82dccb9fde9c"
+    },
+    "contracts.MarketMakerAllocation": {
+      "address": "0x63dd6c064db0c54513b6711887a2c9284b755348",
+      "codehash": "0x983046d5e3595ad700ae0a6e6974e2c25fdc5b8f8b17d1fe1afe15be362117da"
+    },
+    "contracts.ModelMarketplace": {
+      "address": "0xb7ea46dc2ecaed8595149b415f25e5b7d806278a",
+      "codehash": "0x8a2fba2c0affae4b96b82098687c3d8161730386550c9b8ea0cdd8f3eda977c7"
+    },
+    "contracts.InferenceRouter": {
+      "address": "0x165b811cdf1edd330d3ed77b87da38e9e0c9bd0f",
+      "codehash": "0xc2f594d8b8dc8d2a02d359c2ca31419aa5530c8f6eabb81a856ba1f039a91202"
+    },
+    "contracts.LoRAFactory": {
+      "address": "0x62e9aabec26288e60db2503f518eacf9cdcc8890",
+      "codehash": "0x56e3c1a10501f054f0667ffc606f42d05e1a6548252743d085c3aedf75121697"
+    },
+    "contracts.LearningPool": {
+      "address": "0xba5c9c886d65a969d02e40d7fbbade316ad81e66",
+      "codehash": "0xccd00c6d243b742de9047430358d75f169b65025c5c8a8fff3afd9b2a00eb4e1"
+    },
+    "contracts.LearningCycleManager": {
+      "address": "0xff400ad31c9f203d4a0a0d744833a135ac951268",
+      "codehash": "0x8ad27911e6f7ef950ea68bd4c3b690964471f05e996914c0d8969d6334195d6d"
+    },
+    "contracts.ClassroomRegistry": {
+      "address": "0xe2b56b2bfcaeb3c8d14400184eab01bbc980cc05",
+      "codehash": "0x1299e83812da0545222f24ff93d31739fa93bb7c21cf702c48c6f3540c923f4a"
+    },
+    "contracts.MentorMatcher": {
+      "address": "0xa29d2ad464c579de580ce72951f1d01f48d49879",
+      "codehash": "0x1859c1024bb7760a5d7f7fc479ccb3b55d301634f545f7e8bdf7b4b2ebcdd123"
+    },
+    "contracts.ComputeVerifier": {
+      "address": "0xbaa6cc72886a5958e3902470fca17d471e563449",
+      "codehash": "0x5c621300283230160c0f7718e2d92369b9d27a6d1cb8a91289c18ef145261c39"
+    },
+    "contracts.ComputeMarketplace": {
+      "address": "0x2fec2ac1dde3a1a749c84d487738904cd2ed50c2",
+      "codehash": "0x2a679254340a909892d8a649e15030b008862058310dbd808a69cdcf91f1fe84"
+    },
+    "contracts.ComputePool": {
+      "address": "0x7fbe2cb7c983d7b732fb2b8cb91fbbb2ee841787",
+      "codehash": "0x5daf5f411c426ae007cf278db62c2181bd44424174dc66182ef5fce37e9033dd"
+    },
+    "contracts.HeartbeatMonitor": {
+      "address": "0x7add85321992306e106a82345bc7867a5c557747",
+      "codehash": "0x4f8a5e691a0966f64f421135242c2cd14f1d0260225e110f83f9c5a9c37d3d47"
+    },
+    "contracts.DisputeResolution": {
+      "address": "0xbc3f09bd846bdb04f70b7b905fc5d34801b1f14a",
+      "codehash": "0x7b07a8c6b4b1e163191cad81fe5b7b3bcc70415e8c819cc095d006173597df23"
+    },
+    "contracts.ComputePricingOracle": {
+      "address": "0xc3b66ef29726dfd3bb27e7c841efa664634a5027",
+      "codehash": "0xa4f8c8ce387df295ec719a217de76ca9cf6e691e95f1e07a49d3fd4fa1158c70"
+    },
+    "contracts.StablecoinTreasury": {
+      "address": "0xb2c19472903ab7d9298ac1dabdfd37b2e3b25158",
+      "codehash": "0x5629f6a2a361e8eaa40d1cc21e459a81b15e9d2e989c2a1bc546b7f247c131d1"
+    },
+    "contracts.BulkComputeGateway": {
+      "address": "0x37a9dec7ea9b7e7ef6fd9d094540d22933ddd8d0",
+      "codehash": "0x698aea271998df76c6569e3587013a4a8e524cb31c426f7feaa4f6d16136b77d"
+    },
+    "contracts.TestnetFarmingAccounting": {
+      "address": "0x866b40857af3105043c1c932f8728a3058173839",
+      "codehash": "0x2a3de5444b974c21971d186bfdad5404c390a569ded3a3654bdd555c96ffa50b"
+    },
+    "contracts.TreasuryGovernor": {
+      "address": "0xf3591f9ec1738508f648dfc252d4a3493a1dfd6c",
+      "codehash": "0xf5bcd88e16f352ab16e182c90ca1cb76353ebeaae387c114d6bdfde137dad062"
+    },
+    "contracts.InstitutionalVault": {
+      "address": "0x9fea5d6bcfa82fa5879a7061381b40647aa67938",
+      "codehash": "0xaf13c40d51791b806b8d99e3c1d25fe3e2cea65cae21cd0f81f767c90c13fd10"
+    },
+    "contracts.ClassroomClusterV1": {
+      "address": "0x6015f82f95762e3a31205a4f6c391410652301f9",
+      "codehash": "0xa308738841a3f0f415b5b86dbf1933e06c9b5003c84a16c160b3446a7ff12a3a"
+    },
+    "contracts.BudgetAllocation": {
+      "address": "0xcc98a91155e170bdc4d92b2d425dd13b44cdb4cf",
+      "codehash": "0x195914c00259c1824d282790788e0b0be57576045780b2b058157bd1e8c9671d"
+    },
+    "contracts.CashoutRequest": {
+      "address": "0x82775eadc5803861f99d90b43dc6ebc0390edaff",
+      "codehash": "0x616e1142d03b3e5d9b6372bc7c351aace994177d21f16926faf4ef9d5ace058d"
+    },
+    "contracts.AIModelRegistryPortable": {
+      "address": "0xda30a0408b1690afa739fb63901a6608547f4da6",
+      "codehash": "0x74d2abce48f6c5ee79a09358aa7cd5e032fd4aaa5e3cbfba2e514faec0e8b337"
+    },
+    "contracts.AIInferenceRouterPortable": {
+      "address": "0x02912ede26224b5ab217f30a2b66e285d914f03d",
+      "codehash": "0x8eaf226ee23a2452a3f8060a47f86e27a1e3ebbf61c243fe43bb5cdb6c876719"
+    },
+    "contracts.AILearningCycleCorePortable": {
+      "address": "0x696e330dfca80a870dbcaf4d0b08155d0b828e2c",
+      "codehash": "0x25e2ec42d223aea8558c8dc0dd7a8ec2a71507fcf91d2bfa7e848da22bf98def"
+    },
+    "contracts.ModelAccessControl": {
+      "address": "0xb562faf611c903de86976f519401c967b8f8f97b",
+      "codehash": "0x49c5518c5b268cb83689d72d9790effc569a32e94fdab23e51a7f056ab6220eb"
+    },
+    "contracts.TEEAttestationRegistry": {
+      "address": "0xa6b7a6c1e6a7388a29352bd12a26cbc25c63c4da",
+      "codehash": "0x2dfe3814eb0974a033203b6dc9b48c2b93700697d6cd6df5bb613f1ac92d0409"
+    },
+    "contracts.ComputePoolTraining": {
+      "address": "0x736034d7a01f1e9c1812c6404564e64cf22decbc",
+      "codehash": "0x614a1d25b89bd0ac1511dc3b94c3a7a8c3d4bf8f6e0cc18636fd218a0f1d159b"
+    },
+    "contracts.ValidatorRegistry": {
+      "address": "0xf511327ef586908bc34990621e3624d5de4131cd",
+      "codehash": "0xa2f625ec147f0f83774855d55acad0475ac230dff955a8d8e114af3b5ba18e78"
+    },
+    "contracts.CitrateMemberSBT": {
+      "address": "0x883165132776171fbcfde2d3c789ef5bdb0d060d",
+      "codehash": "0xd2d6df26b1cbe788771c5a12f28f908b7780ee658cc24850ec61b22db9f3d979"
+    },
+    "contracts.MemberBond": {
+      "address": "0x25118a63b614901c1871fef91b447602e11e1e9b",
+      "codehash": "0xddfcfe53ce3a39bc06fd6ced5b1790dd27cb89b527b49dfbe87500df325892d1"
+    },
+    "contracts.MembershipStakeVaultImpl": {
+      "address": "0x46eae8b70644f5d3e0c67faa16a9f2383246f211",
+      "codehash": "0x2a92928fd5624dbc39b406acd4a7c5d79e9a8e97d9abf6aa55c41e87151f0cec"
+    },
+    "contracts.MembershipStakeVault": {
+      "address": "0xd6632ea2179d047d2460f1de90abcc519839555e",
+      "codehash": "0x46a010df31eb642b47284650e80051e8f6239a0c995003d230b437810bc4b9b4"
+    },
+    "contracts.EduForwarder": {
+      "address": "0x9fb93ee5607accb7ac3cff7987f2ed9528caacce",
+      "codehash": "0x926d8bfc34792bbb5430ae503778b3f213e047f8cad1bc0982529248a38c823b"
+    },
+    "contracts.GovernanceTimelock": {
+      "address": "0x038bc87f5c0a0204127e47f4f6cc5348094dd467",
+      "codehash": "0x3c6c872fba523174f3079bcda9bee3956949673e9a21d2bf1b21bcf6bbbdffea"
+    },
+    "contracts.GovernanceMultisig": {
+      "address": "0x3975c796e3ca6825de3c8ac7dae0820a1c0b2c5c",
+      "codehash": "0xc1bf7987d62353afca8669514bf828c861bf2723fe04a6651b2e986a4fbda0ba"
+    },
+    "contracts.GuardianTimelock": {
+      "address": "0x1f1883c468a145d3dd8771a72182e74aa4c70200",
+      "codehash": "0x3c6c872fba523174f3079bcda9bee3956949673e9a21d2bf1b21bcf6bbbdffea"
+    },
+    "contracts.GuardianMultisig": {
+      "address": "0xc6ed3ed2a3a302f1ed2249fb43e94808c9fbaf1d",
+      "codehash": "0x607c4f5c0b8819b7a726e7e35d8e33eb55deab82446b1cb043102bafea642553"
+    },
+    "contracts.GuardianCanceller": {
+      "address": "0xf84cb95142c876d44df1ea0c817838b440a4256d",
+      "codehash": "0x85cab30118ef6513db9bcf341c9fba518d0535346e7defd0e0d6d33da1716bdb"
+    },
+    "contracts.TeamVesting_team_1": {
+      "address": "0x2a60d582019e002dce914c8a24f28435605a47be",
+      "codehash": "0x17adf14f853b5df711ff160362c8fe18d799c74f36217fc0c731266768f8e81f"
+    },
+    "contracts.FederatedRoundLedger": {
+      "address": "0x25fc02fbfad9589d0dde84f858d0962bfa0253c5",
+      "codehash": "0x542a2cb3ea0febdf15ecd02774af4d7765d7e6c3e9558cb9b00305fb3bc28455"
+    },
+    "contracts.PatronageLedger": {
+      "address": "0x41f68b9e710585b064459a0ec706148fbf503659",
+      "codehash": "0xd59fb0af578034a325bf2c3f01c5496ae4af03f77180fd98c96ad2f7dc4834f9"
+    },
+    "contracts.AgentDecisionRegistryV2": {
+      "address": "0xbd7996c4fde4116cbeaf0c796378f45828b135b2",
+      "codehash": "0x02d28b0ae2d14cd356270338fc338c1929a7b5ad47deaf555d486d5df7d502b9"
+    },
+    "contracts.AgentSBT": {
+      "address": "0xa087094ffaaf774c22d594520b39e3b1a66e32f2",
+      "codehash": "0x00bbf6cff65138b3c54daa281e718a14601b283a7ffb5c0ebfb3a8dfa0e9fcb6"
+    },
+    "contracts.AggregationChallenge": {
+      "address": "0x88128d3f666f46f8d6aa5aa2e72c07379d2c560e",
+      "codehash": "0x4c74412de134d8659a31f1c2a05e818d7cba1f55813cc42ae7f22bda32923f6b"
+    },
+    "contracts.AnchorRegistry": {
+      "address": "0xab87534ef027b52bb6233e889f758767127bf47a",
+      "codehash": "0x9dfcd3b9a4799cd02930a8c974004e7bec21024f5a9fc7646f1121a8fa45531d"
+    },
+    "contracts.BenchmarkRegistry": {
+      "address": "0x1231b7629d7febd3bf24b0ce8788b944b10242c5",
+      "codehash": "0x70c2e414722edead7e929513daaf25244436b31bea26a6b375df93129025fb9f"
+    },
+    "contracts.CapsuleRegistry": {
+      "address": "0x46a3a5be60d919f30de3cb3d545709c557e9ef02",
+      "codehash": "0x96cc716575a2d637684fa561f050b481cd64878e22ac9f1028e529c6dc180d17"
+    },
+    "contracts.ComplianceRegistry": {
+      "address": "0xd504c9ac2a36b6ac13150d14315e27977971c145",
+      "codehash": "0x17e5b3f5ea683437160162ae1b4df88473f2d0d1ebcf5bb5e3cc6fc5aa716601"
+    },
+    "contracts.ComputePoolPipeline": {
+      "address": "0xafa0a4a75b4e135930eff30c856612904bf3eafd",
+      "codehash": "0xc94f1297db77931fa5fe354c3fb83e6fd82299a3326c75d1125bb9cc32b99fc8"
+    },
+    "contracts.FacilitySBT": {
+      "address": "0x5980214bea79d4174df69d604f913bd469adca4c",
+      "codehash": "0x46a010df31eb642b47284650e80051e8f6239a0c995003d230b437810bc4b9b4"
+    },
+    "contracts.FacilitySBTImpl": {
+      "address": "0x58ac5816c42a3d293552fe368c4db53b89edb02c",
+      "codehash": "0xa99578c70a3d85510a217768cab8dc95205f0abdf7dd3ac1fa1ebc352aafdae9"
+    },
+    "contracts.IPFSIncentivesV2": {
+      "address": "0x23ae921cc49ed1dd3435696a274608605335b2dd",
+      "codehash": "0x62c078353f55f028a11689107d09f01c5391625591a31d10b1d41658dfee0e04"
+    },
+    "contracts.IPFSIncentivesV3": {
+      "address": "0xc596caab803219f0f5b7e8639c0cfd3b3248b268",
+      "codehash": "0xff980e8589c1883c128e9ab179e304ab221e8ac0d62058badde0168f41665370"
+    },
+    "contracts.InstitutionTreeV1": {
+      "address": "0x539315c9f43580d67e572b9ec305f5aa167f52c1",
+      "codehash": "0x4e7f9fe3248421c5b5156356e272115c679da6088af6624e733a468735431ca1"
+    },
+    "contracts.KYCRegistry": {
+      "address": "0x4270895ff826b1093976f892fba8ae02fb8fdf5d",
+      "codehash": "0x6f69fc409bc1395cf6e4f894d5fb5f8b85c4ed3d18005d536a033279c313f8ab"
+    },
+    "contracts.NetworkSBT": {
+      "address": "0x7e7a5a040efc5d7f1900ecc25e0e7f775b417345",
+      "codehash": "0x46a010df31eb642b47284650e80051e8f6239a0c995003d230b437810bc4b9b4"
+    },
+    "contracts.NetworkSBTImpl": {
+      "address": "0x01d34046343a171ec7cd4db8978adbab095ef955",
+      "codehash": "0xc9f113acd7dda95de6397113ec9b021ca621fbec44e8d683c119436b5a0761c2"
+    },
+    "contracts.OrganizationSBT": {
+      "address": "0x960bc81a48f29cf1912ac29b2b15203ebd35dda6",
+      "codehash": "0x5414b70702d68b44fc1e596aa31989e9e6d708fde107bf8fc39e84978c60487a"
+    },
+    "contracts.SkillRegistry": {
+      "address": "0xbedad7a474785ecb27fc0aa02ca583bdb3761a49",
+      "codehash": "0x5da07046ba06a76d1af4d45f1393089939d20aea4ea2ea1dc85fcb945b63cf01"
+    },
+    "aaStack.EntryPoint": {
+      "address": "0x97d5391a647429233e202f99231743c53a648f3c",
+      "codehash": "0x9296465eef6d1b0bb0221d322ec96791455e25b026ae26a3d6fdba4529c01f77"
+    },
+    "aaStack.CitrateWallet": {
+      "address": "0x2d742b98d867fc7363f530dd6d756622e4eb768d",
+      "codehash": "0x19263115c1fc2e8f0c4c85c8f47736678a18d6e64e5d534824055b7027cae56f"
+    },
+    "aaStack.CitrateWalletFactory": {
+      "address": "0x6ee3b59099c9c812cdf1c9e7e6ff166b2558434c",
+      "codehash": "0x9a6320650acd9df8b6289bf196e3efe6b424dfb759b261ca37c09d79708574a9"
+    },
+    "aaStack.CitratePaymaster": {
+      "address": "0x5a1e2d73f8154a01a78b56e551c977cb8327ff56",
+      "codehash": "0xbaeb486eaac13e97abfe1838ee647e342a6b5b77e7cb1c6f08d7bfd527f79f88"
+    },
+    "aaStack.WebAuthnP256Validator": {
+      "address": "0x0f421a99a0b8f6138dea12f45a523cb896d09fc7",
+      "codehash": "0x2fc0122c2ae85b7b639a8c5c9328143583019162c9331a1bec9d201a8ed60a2f"
+    },
+    "aaStack.CitrateECDSAValidator": {
+      "address": "0xd2d35421379ae5b461e216bfcdd1b7e6a64bbc40",
+      "codehash": "0x1224c045b2383ac86ab236e03ce4d69ff7e5552a8024ba3a5d5cf1dd13e45c7d"
+    },
+    "aaStack.GuardianRecoveryModule": {
+      "address": "0x0a909769160c1945401b8f37a9310d37dbb6a891",
+      "codehash": "0xc40577ade448e3ea732fa9ac7675cbf30013d68c2f5ef9139ed96a9319bc953d"
+    },
+    "genesis.ArachnidDeterministicDeployer": {
+      "address": "0x4e59b44847b379578588920ca78fbf26c0b4956c",
+      "codehash": "0x2fa86add0aed31f33a762c9d88e807c475bd51d0f52bd0955754b2608f7e4989"
+    },
+    "genesis.P256Verifier": {
+      "address": "0xc2b78104907f722dabac4c69f826a522b2754de4",
+      "codehash": "0x3cd725b6ba67b40b7979190c41a015e82cf21e098eb61832ba623f8538bab7fc"
+    },
+    "genesis.OrangeSeed": {
+      "address": "0x000000000000000000000000000000c17a7e5eed",
+      "codehash": "0x46a010df31eb642b47284650e80051e8f6239a0c995003d230b437810bc4b9b4"
+    },
+    "genesis.OrangeSeedV0": {
+      "address": "0x000000000000000000000000000000c17a7e5ee0",
+      "codehash": "0xd2a228771b614b678ea1bf4c9ecf415ceefc8f6af7462267d90947c91df6e96c"
+    }
+  },
+  "postGenesis": [
+    {
+      "nonce": 0,
+      "name": "TenantHierarchy",
+      "address": "0x92f2bc7e1b33841de1b138fe28cf202222562cc3",
+      "codehash": "0x0bbd9ed7978eefb940fc8fac6e0faac749db603927f52bf60924e469364c50b4"
+    },
+    {
+      "nonce": 1,
+      "name": "ClassificationRegistry",
+      "address": "0xdbf07d10f27011d0a7bbb0e73804393854c4ff11",
+      "codehash": "0xd1ea129a33264b2888322f227e48533b7f9952c896b9d03f0d2557821175eac1"
+    },
+    {
+      "nonce": 2,
+      "name": "RoleEscalation",
+      "address": "0x6c3f7903d12c28b976d8170e3a5639ec420cb65c",
+      "codehash": "0xdff1993017e6ddda5e9ef50a58274c09eaa28e2e6e4a40d70fe3a02ac2797c94"
+    },
+    {
+      "nonce": 3,
+      "name": "MultiSigEnvelope",
+      "address": "0x7e893a47434486f39bfa4cd157e5346315371f48",
+      "codehash": "0xd26dfda626135b411b65ac9da2960a5ca1da7f22dec17cb26619c7f5f0a8291c"
+    },
+    {
+      "nonce": 4,
+      "name": "AgentDecisionRegistryV2 (nonce-4 duplicate, not in the book)",
+      "address": "0x6bf5225e5f848837958e585cfc241f3077337660",
+      "codehash": "0x02d28b0ae2d14cd356270338fc338c1929a7b5ad47deaf555d486d5df7d502b9"
+    },
+    {
+      "nonce": 5,
+      "name": "ContradictionLedger",
+      "address": "0xbe6d4e2ccb72181588c25e0689ec5a662f7fea95",
+      "codehash": "0x474acdb341f169435d026682b1f646add3f7965b71ff7ca09963839fe723bbc5"
+    },
+    {
+      "nonce": 6,
+      "name": "SupplierRegistry",
+      "address": "0x8cff9083202b19a8201d5cdeadbfca41fedc5efc",
+      "codehash": "0x26729e3dc58b84c2f3964338c6f9b47514700710e5e2cb2d7f74b3158e7acbb4"
+    },
+    {
+      "nonce": 7,
+      "name": "MoqRegistry",
+      "address": "0x019b077cb8188150fa1d563e01107d13e827a574",
+      "codehash": "0xb6cc240f664d241d3aae27b01a4a62cfb7605a73300a22d7c670277145d8c562"
+    },
+    {
+      "nonce": 8,
+      "name": "DefensePrimeFLScopeIndex",
+      "address": "0x9ee2bf0fac5b57ee83431ae8a76a3085d846212b",
+      "codehash": "0x221efe95bfcb5ba6da5ffd90a1e1b9c5459ddd4ec1e16d31338adbc3ed5bf450"
+    },
+    {
+      "nonce": 9,
+      "name": "Quorum.AnchorRegistry",
+      "address": "0x902d63e13fadd0669ad8ebfc03fbfe78f8fc4a21",
+      "codehash": "0x9dfcd3b9a4799cd02930a8c974004e7bec21024f5a9fc7646f1121a8fa45531d"
+    },
+    {
+      "nonce": 10,
+      "name": "MeetingRegistry",
+      "address": "0x3295ba290f983071fa6924a91ec6417a11fe4b4c",
+      "codehash": "0x35736095b64cb278b67552ed0ca28c6dd64a136ad59dd690c6a835c25e2776f6"
+    },
+    {
+      "nonce": 11,
+      "name": "GovernanceTemplateRegistry",
+      "address": "0xbbc275117f157affdf7a50c067dfa1cf73baa5bf",
+      "codehash": "0x5b915834f3437fa703041dfaaceee4af7a10f090868997a51eb769be05e22d7d"
+    },
+    {
+      "nonce": 12,
+      "name": "GovernanceProtocolFactory",
+      "address": "0xa37244e0097e02328fd5e32d1392e72f49edbda1",
+      "codehash": "0x644838c141eb21d9135f7e60e75c7f471a2bf35379f679d2702754eca5796cc0"
+    },
+    {
+      "nonce": 13,
+      "name": "PolicyBinding",
+      "address": "0x2e7b88f0c5ced218c9a825ef2510900aaa625923",
+      "codehash": "0x202807f2f12573b7e387479916a13a648d24531b82c336be30cf50e81e075dd6"
+    },
+    {
+      "nonce": 14,
+      "name": "CapabilityGrant",
+      "address": "0xcc0e43ba3cee0de6a5d1942bce41d1d48584671e",
+      "codehash": "0x93f3b31c9889444af13dcd1e41b926ee6032afd84959fe8f2d95f2364bde5de8"
+    },
+    {
+      "nonce": 15,
+      "name": "VoteAllowance",
+      "address": "0xc98df3ede1d913e5c304be9e1239db90f56343a0",
+      "codehash": "0xb7e16b558e00a5c99c19349f4dc4342149d513d6627bf58d29915ae750bc55eb"
+    },
+    {
+      "nonce": 16,
+      "name": "Sortition",
+      "address": "0xab30a3db0b5904fefe62bd7ec7292bc32f36628e",
+      "codehash": "0xd680214c07c7777ee6d348dd34ca11a072aa53774f1ecfea1fdd232ef9cfa451"
+    },
+    {
+      "nonce": 17,
+      "name": "PartProvenanceRegistry",
+      "address": "0x5d8362d8ebdf4a6a20a7164d7865f6ed30d40142",
+      "codehash": "0x7edd47d45fe8708617bee550d49cbb98cb3e7f7f75ae7d856cf3ef6fa8876429"
+    },
+    {
+      "nonce": 18,
+      "name": "AppRegistry",
+      "address": "0xe6fa75fb5aca6b0824edd5cfd3efeaa5d82ea2e4",
+      "codehash": "0x63fdc968f817f8c98649008206ae42c197fee5176b1f62777b21c942e458e2e0"
+    },
+    {
+      "nonce": 19,
+      "name": "CrossOrgIndex",
+      "address": "0xb35adeca982129687aa07b03ad446f48bf0db010",
+      "codehash": "0xa37c955ed1ed766e4baf3fe4245731f983e71a8443c1e3fef587fec12bad90d5"
+    },
+    {
+      "nonce": 20,
+      "name": "AuditBundleRegistry",
+      "address": "0x784a6fbc97766b000998b00e38ad1110461ca984",
+      "codehash": "0x3f828b0361f7caea7eae8085dd6cc316f959c57ab689b49e218de51d987a8fde"
+    },
+    {
+      "nonce": 21,
+      "name": "DefensePrimeComplianceRegistry",
+      "address": "0xabfe0c9d358ce8af37dc4d50aa4eaebdb250c914",
+      "codehash": "0x7cc4bdc1d4dc98ad84ff41019146a8812605601843b2f43f3ae72f45a40c9a38"
+    },
+    {
+      "nonce": 22,
+      "name": "RoleGrantTenantIndex",
+      "address": "0x1309f2120e69fd9598ccf171b70d645033c358e9",
+      "codehash": "0xc0971ddec89d319ff821a35a06e58aaee03e2bb0341a157da85937eb072a5e6b"
+    },
+    {
+      "nonce": 23,
+      "name": "EntityRegistry",
+      "address": "0x7cac6481c4352a00a443da2d07bc558282bd5099",
+      "codehash": "0x71524c14a924a95dcf2dbff5b7e9104b5182ce1649bffdec81bce211733c4a73"
+    },
+    {
+      "nonce": 24,
+      "name": "TinaWorkpaperRegistry",
+      "address": "0x086f128ed3babdfde8b556bb9458216e6e720b52",
+      "codehash": "0xab86486c132694545bd297d633be1d16a70ba922a6e2577e4b1e8c6810647939"
+    },
+    {
+      "nonce": 25,
+      "name": "CrossOrgEnvelope",
+      "address": "0x5685fc31158553d7f93f01c7ee0f5871eaeb2949",
+      "codehash": "0xb7caa3cee873f7782fc573bd04c0f7546e88d5c965afc40020a81898fec4f6f9"
+    },
+    {
+      "nonce": 26,
+      "name": "TripwireRegistry",
+      "address": "0x6da8d9fe0647ef68930d917aebdfdd5f379af6e8",
+      "codehash": "0x42c71ed2c12e69211224a9fddcab6cdc0180bf6eb3d77c4155a9475390254950"
+    },
+    {
+      "nonce": 27,
+      "name": "SponsorEvidenceRegistry",
+      "address": "0x2d04435e49393d7816f4e35e5c8406e76ab99cf1",
+      "codehash": "0xe17620809f4e73e2025058ab6f126d1c91f4ab99814d9601777ead4239319098"
+    },
+    {
+      "nonce": 28,
+      "name": "ReleaseManifestRegistry",
+      "address": "0xd6a8b3134340ca1e78843db5eb6640b1dbbc8b20",
+      "codehash": "0xdadfaef6a8d761e8879d832604013acf68d78a4260e3dfd4716d961655cff4c4"
+    }
+  ],
+  "precompilesWithoutCode": [
+    "ModelDeploy",
+    "ModelInference",
+    "BatchInference",
+    "ModelMetadata",
+    "ModelBenchmark",
+    "ModelEncryption",
+    "TensorCommit",
+    "InferenceProofVerify",
+    "MerkleVerifyTensor",
+    "TensorMatmulQ16",
+    "TensorDotQ16",
+    "TensorSoftmaxQ16",
+    "TensorReluQ16",
+    "TensorLinearQ16",
+    "TensorTransposeQ16",
+    "BelnapAggregate",
+    "RoutingInference",
+    "Ed25519Verify",
+    "X402Eip712Verify",
+    "X402TransferAuthVerify",
+    "X402BatchPaymentVerify"
+  ],
+  "checks": {
+    "TenantHierarchy.root()": "0x4e38fc205411c880a1eca4e136e62ce4e1b8c45872e8eb8bbb15144fdbe39611",
+    "CitrateWalletFactory.paymaster()": "0x5a1e2d73f8154a01a78b56e551c977cb8327ff56",
+    "EntryPoint.balanceOf(CitratePaymaster) wei": "15000000000000000000"
+  },
+  "accounts": {
+    "Bundler": {
+      "address": "0x7e711E78ca7636f2307E91bCB6855e64F591F7ea",
+      "code": "0x"
+    },
+    "Faucet": {
+      "address": "0x61F9Fb46631c14728De21E683DB69BA6f771F385",
+      "code": "0x"
+    }
+  }
+}

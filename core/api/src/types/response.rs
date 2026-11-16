@@ -33,6 +33,17 @@ pub struct BlockResponse {
     pub state_root: Hash,
     pub tx_root: Hash,
     pub receipt_root: Hash,
+    /// r1007 S3-3b (spec 06 §5.2): the hashes of the block's OWN list (what it
+    /// included). `transactions` is what it EXECUTED when it is served as an
+    /// accepting chain block (`ChainApi::get_block`).
+    #[serde(default)]
+    pub included_transactions: Vec<Hash>,
+    /// r1007 S3-3b: the block's `accepted_root` (zero before r1007).
+    #[serde(default)]
+    pub accepted_root: Hash,
+    /// The block's VRF output (`mixHash` in the accepting view).
+    #[serde(default)]
+    pub vrf_output: Hash,
 }
 
 impl From<Block> for BlockResponse {
@@ -51,10 +62,13 @@ impl From<Block> for BlockResponse {
             base_fee_per_gas: block.header.base_fee_per_gas,
             proposer_pubkey: hex::encode(block.header.proposer_pubkey.as_bytes()),
             coinbase: hex::encode(block.header.coinbase),
+            included_transactions: block.transactions.iter().map(|t| t.hash).collect(),
             transactions: block.transactions.into_iter().map(Into::into).collect(),
             state_root: block.state_root,
             tx_root: block.tx_root,
             receipt_root: block.receipt_root,
+            accepted_root: block.accepted_root,
+            vrf_output: block.header.vrf_reveal.output,
         }
     }
 }

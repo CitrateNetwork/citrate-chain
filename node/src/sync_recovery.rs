@@ -25,7 +25,7 @@
 //!   unanswered that long no more steps until it answers. A node-wide budget
 //!   ([`NODE_WALK_BURST`], refilled one step per [`NODE_WALK_REFILL_EVERY`])
 //!   bounds peers that come and go. The
-//!   walk never asks for a parent more than [`MAX_WALK_DEPTH`] below the applied
+//!   walk never asks for a parent more than [`MAX_WALK_DEPTH`] (the reorg window) below the applied
 //!   tip: deeper forks are the fork-point search's job.
 //!
 //!   Stuck parents: a missing parent at the bottom of the orphan buffer that is
@@ -63,15 +63,16 @@ use citrate_consensus::types::{Block, Hash};
 
 /// Steps one peer's walk budget holds. Each recovers one height. Derived, not
 /// picked: gossip ancestry recovery starts from a block at most
-/// [`crate::sync_peer::ANCESTRY_RECOVERY_WINDOW`] above the applied tip, and a
-/// walk goes at most [`MAX_WALK_DEPTH`] below it, so one full budget walks a
-/// branch that forked inside the reorg window while the network moved on as far
-/// as recovery reaches. With 128, a node forked 35 below its tip and ~250
+/// [`crate::sync_peer::ANCESTRY_RECOVERY_WINDOW`] above the applied tip, and one
+/// full budget then walks a further `SNAPSHOT_RING_DEPTH` (100) below it, so a
+/// branch that forked inside the ring is reached in one budget while the
+/// network moved on as far as recovery reaches. A deeper walk, down to
+/// [`MAX_WALK_DEPTH`] , continues on refilled steps. With 128, a node forked 35 below its tip and ~250
 /// behind (DGX devnet phase 3) never reconnected
 /// (`split_heal_tests::four_three_partition_far_behind_heals`). Steps go only
 /// to the peer whose answer asked for them, one per answer.
-pub const MAX_PARENT_WALK_STEPS: u32 =
-    (crate::sync_peer::ANCESTRY_RECOVERY_WINDOW + MAX_WALK_DEPTH) as u32;
+pub const MAX_PARENT_WALK_STEPS: u32 = (crate::sync_peer::ANCESTRY_RECOVERY_WINDOW
+    + crate::canonical_apply::SNAPSHOT_RING_DEPTH) as u32;
 
 /// One step comes back to a peer's spent budget per this interval (one 2 s sync
 /// tick).
@@ -108,9 +109,20 @@ pub const NODE_WALK_BURST: u32 = MAX_PARENT_WALK_STEPS * 2;
 /// One step comes back to the node-wide budget per this interval.
 pub const NODE_WALK_REFILL_EVERY: Duration = Duration::from_millis(250);
 
-/// Deepest parent the walk asks for, below the applied tip: the reorg window,
-/// the deepest fork point the applied chain can move across without a rebuild
-/// (the DAG pruner retains at least this much, see `dag_prune`).
+/// Deepest parent the walk asks for, below the applied tip: the reorg window
+/// (`canonical_apply::MAX_REORG_DEPTH`, the undo records), i.e. the deepest
+/// fork this node can switch from in place anyway.
+///
+/// (r1007, 2026-11-14): this was the 100-block in-memory ring
+/// (`SNAPSHOT_RING_DEPTH`), on the theory that a deeper fork is fetched by
+/// the fork-point search. It is not, not entirely: a node held on its own
+/// branch above the fork defers the network's blocks whose parents sit more
+/// than 100 below ITS applied tip, and the walk gave every one of them up
+/// (`BeyondWindow`; boot-2 at 95,380 for parents at 95,251, 93,331, 93,203,
+/// 93,171). Four producers and a bootnode never rejoined. The bound is now the
+/// window; the work stays bounded by the step budgets, which are NOT tied to
+/// it ([`MAX_PARENT_WALK_STEPS`] keeps the ring), so a deep walk simply takes
+/// more refill intervals.
 pub const MAX_WALK_DEPTH: u64 = crate::canonical_apply::MAX_REORG_DEPTH;
 
 /// Peers with walk state, at most; the least recently seen is dropped first.
@@ -791,26 +803,200 @@ pub fn answer_anchor_was_stale(anchor_height: u64, applied_now: u64, served: usi
     served > 0 && anchor_height < applied_now
 }
 
+/// A tip-anchored `GetBlocks` whose last answer held nothing new is re-asked
+/// after this long even if the applied tip has not moved.
+pub const HELD_AHEAD_REASK_AFTER: Duration = Duration::from_secs(30);
+
+/// Whether an answer admitted nothing because this node already holds every
+/// block it served above its applied tip (admission is ahead of apply).
+/// `answer_top` is the highest verified block height in the answer.
+///
+/// Such an answer is the peer serving exactly what was asked; the question was
+/// the problem (rcBLUE-2 (g)). One that serves nothing above the applied tip is
+/// a peer at or behind us (#153), and one with deferred blocks did not connect.
+pub fn answer_is_held_ahead(
+    answer_top: Option<u64>,
+    newly_admitted: usize,
+    deferred: usize,
+    applied_now: u64,
+) -> bool {
+    newly_admitted == 0 && deferred == 0 && answer_top.is_some_and(|top| top > applied_now)
+}
+
+/// Holds back re-asking the applied-tip anchor after an answer that was
+/// entirely held ahead of apply (see [`answer_is_held_ahead`]).
+#[derive(Debug, Default)]
+pub struct TipReask {
+    /// The applied tip the held-ahead answer was judged against, and when.
+    held: Option<(Hash, Instant)>,
+}
+
+impl TipReask {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold in an answer: `applied_tip` is the applied tip after admitting it.
+    ///
+    /// Any `Blocks` message reaches here, unsolicited ones included, so a
+    /// held-ahead answer never extends a live hold on the same tip: its start
+    /// is kept, and the tick re-asks at most [`HELD_AHEAD_REASK_AFTER`] after
+    /// it began however often a peer replays held blocks. Only an expired hold
+    /// or a different tip starts a new one.
+    pub fn note_answer(&mut self, applied_tip: Hash, held_ahead: bool, now: Instant) {
+        if !held_ahead {
+            self.held = None;
+            return;
+        }
+        let live = self.held.is_some_and(|(tip, at)| {
+            tip == applied_tip && now.saturating_duration_since(at) < HELD_AHEAD_REASK_AFTER
+        });
+        if !live {
+            self.held = Some((applied_tip, now));
+        }
+    }
+
+    /// Whether the sync tick should skip a `GetBlocks` anchored at `anchor`:
+    /// only the applied-tip anchor, only while the tip is the one the
+    /// held-ahead answer was judged against, and for at most
+    /// [`HELD_AHEAD_REASK_AFTER`]. Fork-point probes and follow cursors anchor
+    /// elsewhere and are never held.
+    pub fn hold(&self, anchor: Hash, applied_tip: Hash, now: Instant) -> bool {
+        match self.held {
+            Some((tip, at)) => {
+                anchor == applied_tip
+                    && tip == applied_tip
+                    && now.saturating_duration_since(at) < HELD_AHEAD_REASK_AFTER
+            }
+            None => false,
+        }
+    }
+}
+
 /// The producer's one-time initial-sync condition, evaluated on every sync tick
 /// until it first holds.
+///
+/// `heard_peers` counts the connected peers whose head this node has heard
+/// ([`peer_head_heard`]), not every connected peer. A peer whose head is not
+/// known yet says nothing about where the network is, so it cannot show that
+/// this node is caught up (R2 early seal, devnet fin-r2-k1000-1: a producer
+/// restored ~23 behind declared initial sync complete with one connected peer
+/// it had not heard and sealed on its stale tip). With no heard peer the node
+/// waits as a solo node does: until it hears one, or the solo grace runs out.
 pub fn initial_sync_complete(
     applied: u64,
     target: u64,
-    connected_peers: usize,
+    heard_peers: usize,
     since_start: Duration,
 ) -> bool {
     if since_start >= INITIAL_SYNC_MAX_WAIT {
         return true;
     }
-    if connected_peers == 0 {
+    if heard_peers == 0 {
         return since_start >= INITIAL_SYNC_SOLO_GRACE;
     }
     applied.saturating_add(INITIAL_SYNC_LEAD) >= target
 }
 
+/// Whether this node has heard a connected peer's head: the handshake or a
+/// gossiped block gave it a head hash. A peer registered with no head yet
+/// carries the zero hash.
+pub fn peer_head_heard(head_hash: &citrate_consensus::types::Hash) -> bool {
+    *head_hash != citrate_consensus::types::Hash::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RED (rcBLUE-2 (g)). Admission ahead of apply: the answer to the
+    /// applied-tip anchor serves blocks above the tip that this node already
+    /// holds. Nothing the peer could do would add more, so the answer is
+    /// Redundant, not Barren (Barren drove every peer to -8). An answer that
+    /// serves nothing above the applied tip (the peer is at or behind us,
+    /// #153's boot3) is still Barren.
+    #[test]
+    fn rcseal_red_held_ahead_answer_is_redundant_not_barren() {
+        use crate::sync_peer::{classify_serve, ServeQuality};
+        let applied = 305_849;
+        let held = answer_is_held_ahead(Some(applied + 32), 0, 0, applied);
+        assert!(held, "32 held blocks above the applied tip");
+        let stale = answer_anchor_was_stale(applied, applied, 32) || held;
+        assert_eq!(classify_serve(0, 135, 32, stale), ServeQuality::Redundant);
+        // Controls: the anchor group only, deferred blocks, or progress.
+        assert!(!answer_is_held_ahead(Some(applied), 0, 0, applied));
+        assert!(!answer_is_held_ahead(Some(applied + 32), 0, 1, applied));
+        assert!(!answer_is_held_ahead(Some(applied + 32), 1, 0, applied));
+        assert!(!answer_is_held_ahead(None, 0, 0, applied));
+        assert_eq!(classify_serve(0, 135, 32, false), ServeQuality::Barren);
+    }
+
+    /// RED (review of 48844386, P2). Every `Blocks` message, unsolicited ones
+    /// included, is judged against the hold. A peer replaying one held block
+    /// every tick renewed the hold's start each time, so the tip request never
+    /// went out again (1 request in 120 s). The hold's start is kept while the
+    /// tip is unchanged and the hold is live, so the tick re-asks within 30 s.
+    #[test]
+    fn rcseal_red_replayed_held_answers_do_not_extend_the_hold() {
+        let tip = Hash::new([1; 32]);
+        let t0 = Instant::now();
+        let mut r = TipReask::new();
+        let mut asked_at = Vec::new();
+        for tick in 0..=60u64 {
+            let now = t0 + Duration::from_secs(tick * 2);
+            if !r.hold(tip, tip, now) {
+                asked_at.push(tick * 2);
+            }
+            // The answer (or a replay) holds nothing new.
+            r.note_answer(tip, true, now);
+        }
+        assert!(
+            asked_at.len() >= 4,
+            "the tip request went out {} time(s) in 120 s: {asked_at:?}",
+            asked_at.len()
+        );
+        for w in asked_at.windows(2) {
+            assert!(
+                w[1] - w[0] <= 30,
+                "a {}s gap between tip requests",
+                w[1] - w[0]
+            );
+        }
+    }
+
+    /// RED (rcBLUE-2 (g)). After a held-ahead answer the tick does not re-ask
+    /// the same applied-tip anchor until the tip moves (or 30 s pass). Other
+    /// anchors (a fork-point probe, a follow cursor) are never held.
+    #[test]
+    fn rcseal_red_tip_anchor_is_not_reasked_until_the_tip_moves() {
+        let tip = Hash::new([1; 32]);
+        let moved = Hash::new([2; 32]);
+        let probe = Hash::new([3; 32]);
+        let t0 = Instant::now();
+        let mut r = TipReask::new();
+        assert!(!r.hold(tip, tip, t0), "nothing held yet");
+        r.note_answer(tip, true, t0);
+        assert!(
+            r.hold(tip, tip, t0 + Duration::from_secs(2)),
+            "re-asked at the next tick"
+        );
+        assert!(r.hold(tip, tip, t0 + Duration::from_secs(29)));
+        assert!(
+            !r.hold(tip, tip, t0 + Duration::from_secs(30)),
+            "re-ask after 30 s"
+        );
+        assert!(
+            !r.hold(moved, moved, t0 + Duration::from_secs(2)),
+            "the tip moved"
+        );
+        assert!(
+            !r.hold(probe, tip, t0 + Duration::from_secs(2)),
+            "a probe anchor"
+        );
+        // An answer that added something clears the hold.
+        r.note_answer(tip, false, t0 + Duration::from_secs(4));
+        assert!(!r.hold(tip, tip, t0 + Duration::from_secs(6)));
+    }
 
     /// The sync manager's default request timeout (`SyncConfig`).
     const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -883,6 +1069,29 @@ mod tests {
             3,
             INITIAL_SYNC_MAX_WAIT
         ));
+    }
+
+    /// R2 early seal: connected peers whose head is unknown are not counted. A
+    /// node that heard none waits like a solo node, so it cannot complete on
+    /// its own stale tip at 1 s; it completes once a heard peer shows it is
+    /// within the lead, or when the solo grace runs out.
+    #[test]
+    fn initial_sync_counts_only_peers_whose_head_was_heard() {
+        let s = Duration::from_secs(1);
+        // Applied 23,271, target 23,271 (nothing above the tip heard), no heard peer.
+        assert!(!initial_sync_complete(23_271, 23_271, 0, s));
+        assert!(initial_sync_complete(
+            23_271,
+            23_271,
+            0,
+            INITIAL_SYNC_SOLO_GRACE
+        ));
+        // One heard peer at the same height: caught up.
+        assert!(initial_sync_complete(23_271, 23_271, 1, s));
+        assert!(!peer_head_heard(&citrate_consensus::types::Hash::default()));
+        assert!(peer_head_heard(&citrate_consensus::types::Hash::new(
+            [1; 32]
+        )));
     }
 
     #[test]
@@ -1007,22 +1216,34 @@ mod tests {
         );
     }
 
-    /// A walk never asks for a parent below the reorg window.
+    /// A walk never asks for a parent below the reorg window, and does ask
+    /// for one at its bottom.
     #[test]
     fn walk_never_goes_below_the_reorg_window() {
         let t = Instant::now();
+        let applied = 50_000u64;
+        let bottom = applied - MAX_WALK_DEPTH;
         let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
-        let applied = 10_000u64;
-        let (steps, last) = descend(&mut w, "a", applied, Some(applied), t);
-        assert_eq!(u64::from(steps), MAX_WALK_DEPTH);
+        assert!(is_ask(w.begin("a", hn(bottom), bottom, applied, t)));
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
         assert!(matches!(
-            last,
+            w.begin("a", hn(bottom - 1), bottom - 1, applied, t),
             Step::GaveUp {
                 reason: GiveUp::BeyondWindow,
                 height,
                 ..
-            } if height == applied - MAX_WALK_DEPTH - 1
+            } if height == bottom - 1
         ));
+    }
+
+    /// a node held on its own branch 2,365 above the fork (boot-2
+    /// at 95,380, fork 93,015) asks for a missing parent 2,209 below its tip,
+    /// which the 100-block bound gave up (`BeyondWindow`).
+    #[test]
+    fn a_parent_far_below_a_dead_branch_tip_is_asked_for() {
+        let t = Instant::now();
+        let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
+        assert!(is_ask(w.begin("a", hn(93_171), 93_171, 95_380, t)));
     }
 
     #[test]
@@ -1220,7 +1441,7 @@ mod tests {
     fn give_up_is_reported_once_per_episode_and_rate_limited() {
         let t = Instant::now();
         let mut w = ParentWalks::new(t, TEST_REQUEST_TIMEOUT);
-        let applied = 10_000u64;
+        let applied = 50_000u64;
         let deep = applied - MAX_WALK_DEPTH - 5;
         let first = w.next("a", ans(Some((deep, hn(deep - 1))), 0, applied), t);
         assert!(matches!(
@@ -1333,6 +1554,8 @@ mod tests {
             "attested_for_rx.observe_deferred(&block)",
             "with_initial_sync_gate(initial_sync_done.clone())",
             "sync_recovery::initial_sync_complete(",
+            // RC-10: the startup recovery waits for the head to be stored.
+            "storage_rec.blocks.has_block(&head)",
             // Both give-up sites: the sync tick (no answer) and the receive loop
             // (after the serve credit, which would otherwise clear the count).
             "sync_peers_for_loop.lock().await.record_give_up(&pid.0)",

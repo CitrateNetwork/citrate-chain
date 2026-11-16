@@ -63,6 +63,7 @@ fn spec_defines_every_action_the_code_maps_to() {
         "Reorg(n, h0, c) ==",
         "Restart(n) ==",
         "BootNoCertificate(n) ==",
+        "SyncCert(n, m, h) ==",
     ] {
         assert!(SPEC.contains(action), "TLA+ action `{action}` missing");
     }
@@ -80,6 +81,7 @@ fn spec_defines_every_action_the_code_maps_to() {
         "Reorg(",
         "Restart(",
         "BootNoCertificate(",
+        "SyncCert(",
     ] {
         assert!(next.contains(name), "{name} not in Next");
     }
@@ -113,6 +115,7 @@ fn gating_config_checks_s1_and_s2() {
         "CheckpointFinalitySafety_pollonly.cfg",
         "CheckpointFinalitySafety_restart.cfg",
         "CheckpointFinalitySafety_bootlimit.cfg",
+        "CheckpointFinalitySafety_syncnoguard.cfg",
     ] {
         assert!(CI_SCRIPT.contains(cfg), "{cfg} not run by tla_finality.sh");
     }
@@ -136,6 +139,26 @@ fn strict_s2_config_checks_the_floor_at_finalization() {
     assert!(SPEC_CFG.contains("SyncFloor = TRUE"));
     assert!(CI_SCRIPT
         .contains("expect_pass CheckpointFinalitySafety CheckpointFinalitySafety_strict.cfg"));
+}
+
+/// Stage 1b certificate sync (review of #332 @ 354908b): the gating and strict
+/// configs run SyncCert with the guarded install (the code), and the unguarded
+/// mutation keeps its counterexample alive.
+#[test]
+fn certificate_sync_configs_check_the_guarded_install() {
+    const STRICT: &str =
+        include_str!("../../../specs/tla/consensus/CheckpointFinalitySafety_strict.cfg");
+    const NOGUARD: &str =
+        include_str!("../../../specs/tla/consensus/CheckpointFinalitySafety_syncnoguard.cfg");
+    assert!(SPEC.contains("SyncCert(n, m, h) =="));
+    assert!(SPEC_CFG.contains("CertSync = \"guarded\""));
+    assert!(STRICT.contains("CertSync = \"guarded\""));
+    assert!(NOGUARD.contains("CertSync = \"unguarded\""));
+    assert!(NOGUARD.contains("PROPERTY FinalizedNeverReverted"));
+    assert!(CI_SCRIPT.contains(
+        "expect_violation CheckpointFinalitySafety CheckpointFinalitySafety_syncnoguard.cfg \
+         FinalizedNeverReverted"
+    ));
 }
 
 /// S2 across restarts (review of #335 @ 5236d2b): the boot check consults
@@ -215,19 +238,47 @@ fn vote_message_layout_matches_the_specs() {
     // CheckpointVoteSafety.tla H-02: (chain_id, height, block_hash) are bound
     // inside a domain-separated prefix.
     assert!(VOTE_SPEC.contains("CanonicalMessageBindsChain"));
-    assert_eq!(CITRATE_VOTE_DOMAIN_SEPARATOR, b"CITRATE-CHECKPOINT-V1");
+    // r1007 vote message v2 (spec 06 §7) binds more than the model's
+    // (chain, height, hash): genesis, epoch, state root, accepted root. The
+    // model's binding properties are a projection of it. (Pinned v1 before.)
+    assert_eq!(CITRATE_VOTE_DOMAIN_SEPARATOR, b"CITRATE-CHECKPOINT-V2");
     let hash = Hash::new([0xAB; 32]);
-    let m = canonical_vote_message(40204, 42, &hash);
-    assert_eq!(m.len(), 69, "21 + 8 + 8 + 32");
+    let g = citrate_consensus::types::Hash::default();
+    let m = canonical_vote_message(40204, &g, 42, &hash, &tb());
+    assert_eq!(m.len(), 173, "21 + 8 + 32 + 8 + 8 + 32 + 32 + 32");
     let (sep, rest) = m.split_at(21);
     let (chain, rest) = rest.split_at(8);
-    let (height, h) = rest.split_at(8);
+    let (genesis, rest) = rest.split_at(32);
+    let (epoch, rest) = rest.split_at(8);
+    let (height, rest) = rest.split_at(8);
+    let (h, roots) = rest.split_at(32);
     assert_eq!(sep, CITRATE_VOTE_DOMAIN_SEPARATOR);
     assert_eq!(chain, 40204u64.to_le_bytes());
+    assert_eq!(genesis, g.as_bytes());
+    assert_eq!(epoch, tb().epoch.to_le_bytes());
     assert_eq!(height, 42u64.to_le_bytes());
     assert_eq!(h, hash.as_bytes());
-    assert_ne!(m, canonical_vote_message(1337, 42, &hash));
-    assert_ne!(m, canonical_vote_message(40204, 44, &hash));
+    assert_eq!(roots.len(), 64);
+    assert_ne!(
+        m,
+        canonical_vote_message(
+            1337,
+            &citrate_consensus::types::Hash::default(),
+            42,
+            &hash,
+            &tb()
+        )
+    );
+    assert_ne!(
+        m,
+        canonical_vote_message(
+            40204,
+            &citrate_consensus::types::Hash::default(),
+            44,
+            &hash,
+            &tb()
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +384,7 @@ async fn gadget(kv: &Arc<MemKv>, set: &[(PublicKey, u128)]) -> FinalityGadget {
         committee_size: 100,
         quorum_threshold: 67,
         chain_id: CHAIN,
+        genesis_hash: citrate_consensus::types::Hash::default(),
         vote_depth: 3,
     };
     let sel = VrfProposerSelector::new().with_snapshot_schedule(1000, 999);
@@ -382,7 +434,11 @@ async fn check_invariants(nodes: &[Honest], shadow: &Shadow, step: &str) {
             seen = Some(cp.block_hash);
             // FinalizedHasQuorum: the certificate verifies, and the model's sent
             // votes support it with a quorum.
-            assert!(cp.verify_certificate(CHAIN).is_ok(), "{step}");
+            assert!(
+                cp.verify_certificate(CHAIN, &citrate_consensus::types::Hash::default())
+                    .is_ok(),
+                "{step}"
+            );
             let x = u8::from(cp.block_hash == block(h, 1));
             assert!(
                 shadow.supporters(h, x) >= derived_quorum(HONEST + 1),
@@ -420,7 +476,6 @@ async fn walk(seed: u64, steps: usize) -> (usize, usize) {
     // Votes in flight (sent, not yet delivered everywhere): (vote, receivers left).
     let mut inflight: Vec<(CheckpointVote, Vec<usize>)> = Vec::new();
     let mut refusals = 0usize;
-    let seed_hash = Hash::new([9; 32]);
 
     for step in 0..steps {
         let n = rng.below(HONEST);
@@ -432,10 +487,7 @@ async fn walk(seed: u64, steps: usize) -> (usize, usize) {
             label = format!("Propose(n{n}, {h})");
             let node = nodes.get(n).expect("node");
             let x = *node.canon.get(&h).expect("canon");
-            let _ = node
-                .gadget
-                .on_buried_checkpoint(h, block(h, x), &seed_hash, None)
-                .await;
+            let _ = node.gadget.on_buried_checkpoint(h, block(h, x), None).await;
         } else if action < 40 {
             // SignVote(n, h): report again with the signer. Rust signs iff the
             // node has the pending checkpoint for its canonical block, has not
@@ -452,7 +504,7 @@ async fn walk(seed: u64, steps: usize) -> (usize, usize) {
                 .await;
             let out = node
                 .gadget
-                .on_buried_checkpoint(h, block(h, x), &seed_hash, Some(&node.key))
+                .on_buried_checkpoint(h, block(h, x), Some(&node.key))
                 .await;
             let model_guard = !shadow.sent.contains(&(n, h, 1 - x));
             if out.signed_own_vote {
@@ -504,7 +556,14 @@ async fn walk(seed: u64, steps: usize) -> (usize, usize) {
             label = format!("Byz({h}, {x})");
             shadow.byz.insert((h, x));
             inflight.push((
-                sign_checkpoint_vote(CHAIN, h, block(h, x), byz),
+                sign_checkpoint_vote(
+                    CHAIN,
+                    &citrate_consensus::types::Hash::default(),
+                    h,
+                    block(h, x),
+                    &tb(),
+                    byz,
+                ),
                 (0..HONEST).collect(),
             ));
         } else if action < 95 {
@@ -554,4 +613,15 @@ async fn rust_gadget_conforms_to_the_tla_actions_and_invariants() {
         "no walk ever finalized: the invariants were vacuous"
     );
     eprintln!("conformance walks: {finalized} finalized checkpoints, {refusals} guarded refusals");
+}
+
+/// S3-5 (spec 06 §7): the binding a vote for a test block carries: epoch 0,
+/// the default state root test blocks have, the empty accepted root.
+#[allow(dead_code)]
+fn tb() -> citrate_consensus::checkpoint::VoteBinding {
+    citrate_consensus::checkpoint::VoteBinding {
+        epoch: 0,
+        state_root: citrate_consensus::types::Hash::default(),
+        accepted_root: citrate_consensus::checkpoint::empty_accepted_root(),
+    }
 }

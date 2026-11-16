@@ -32,6 +32,7 @@ pub mod crypto;
 pub mod db;
 pub mod ipfs;
 pub mod pruning;
+pub mod signed_votes;
 pub mod state;
 pub mod state_manager;
 

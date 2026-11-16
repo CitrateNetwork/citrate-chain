@@ -225,12 +225,60 @@ class FinalityTripwire(unittest.TestCase):
         self.assertEqual(warns, [])
 
 
+GADGET_R1007 = """
+pub const CHECKPOINT_VOTING_FROM_GENESIS: bool = {voting};
+pub const CHECKPOINT_ENFORCEMENT_GENESES: &[(u64, [u8; 32])] = &[{entries}];
+
+pub fn on_buried(key: &Key) {{
+    let vote = sign_checkpoint_vote(chain_id, &genesis, height, block_hash, &binding, key);
+}}
+"""
+
+
+class R1007Switches(unittest.TestCase):
+    """r1007 (ADR CV-8): voting is a compiled constant, enforcement a table
+    keyed by (chain id, genesis hash)."""
+
+    def setUp(self) -> None:
+        self.t = Tree()
+        self.t.write("node/src/finality_driver.rs", DRIVER_BUILDS)
+
+    def gadget(self, voting: str, entries: str) -> None:
+        self.t.write(check_claims.GADGET, GADGET_R1007.format(voting=voting, entries=entries))
+
+    def test_voting_from_genesis_without_enforcement_is_not_running(self) -> None:
+        self.gadget("true", "")
+        ev = check_claims.finality_evidence(self.t.root, [])
+        self.assertTrue(ev["voting_pin"])
+        self.assertFalse(ev["enforcement_pin"])
+        self.assertFalse(ev["running"])
+        self.t.claim(running=False)
+        errs, _ = self.t.check()
+        self.assertEqual(errs, [])
+
+    def test_enforcement_listed_for_the_chain_is_running(self) -> None:
+        self.gadget("true", "(40204, [7u8; 32])")
+        ev = check_claims.finality_evidence(self.t.root, [])
+        self.assertTrue(ev["running"], ev)
+
+    def test_enforcement_for_another_chain_only_is_not_running(self) -> None:
+        self.gadget("true", "(1337, [7u8; 32])")
+        self.assertFalse(check_claims.finality_evidence(self.t.root, [])["running"])
+
+    def test_voting_constant_false_is_not_running(self) -> None:
+        self.gadget("false", "(40204, [7u8; 32])")
+        self.assertFalse(check_claims.finality_evidence(self.t.root, [])["voting_pin"])
+
+
 class ThisRepository(unittest.TestCase):
     def test_repository_passes_and_finality_is_not_running(self) -> None:
         errs, _ = check_claims.check(REPO)
         self.assertEqual(errs, [])
         ev = check_claims.finality_evidence(REPO, [])
-        self.assertFalse(ev["voting_pin"], "40204 voting is pinned OFF in this release")
+        # r1007 (ADR CV-8): voting runs from genesis; enforcement stays off
+        # until governance flips it, so finality does not count as running.
+        # (Was: voting pinned OFF.)
+        self.assertTrue(ev["voting_pin"], "r1007 votes from genesis")
         self.assertFalse(ev["enforcement_pin"], "40204 enforcement is pinned OFF in this release")
         self.assertFalse(ev["running"])
         self.assertIn("node/src/finality_driver.rs", ev["outbound_files"])

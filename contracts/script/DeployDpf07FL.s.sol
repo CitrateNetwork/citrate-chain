@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
 import {DefensePrimeFLScopeIndex} from "../src/defense_prime/DefensePrimeFLScopeIndex.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf07FL — Foundry deployment script for DPF-07 Federated Learning scope index
 /// @notice Deploys DefensePrimeFLScopeIndex to chain 40204 (Citrate testnet),
@@ -55,7 +56,7 @@ import {DefensePrimeFLScopeIndex} from "../src/defense_prime/DefensePrimeFLScope
 ///   4. (Operator step) authorize the DPF-07 FL recorder address:
 ///        cast send <addr> "setRecorder(address,bool)" <recorder> true \
 ///            --private-key $GOVERNANCE_KEY
-contract DeployDpf07FL is Script {
+contract DeployDpf07FL is EnvSigner {
     struct DeployedAddresses {
         address defense_primeFLScopeIndex;
     }
@@ -64,7 +65,7 @@ contract DeployDpf07FL is Script {
     ///         In dry-run this is `msg.sender`; in live broadcast it
     ///         must be the root-tenant multi-sig executor passed via
     ///         env `ROOT_GOVERNANCE`.
-    function _governance() internal view returns (address) {
+    function _governance() internal view virtual returns (address) {
         try vm.envAddress("ROOT_GOVERNANCE") returns (address g) {
             return g;
         } catch {
@@ -74,8 +75,9 @@ contract DeployDpf07FL is Script {
 
     function run() external returns (DeployedAddresses memory addrs) {
         address governance = _governance();
+        _requireRootGovernance(governance);
 
-        vm.startBroadcast();
+        _startBroadcastEnv();
 
         // DefensePrimeFLScopeIndex — single contract for DPF-07.
         // Tags FL pools with DefensePrime scope identifiers. The pool/scope

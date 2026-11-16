@@ -171,6 +171,37 @@ pub fn should_attempt_ancestry_recovery(block_height: u64, applied_height: u64) 
 /// This is a preference, not a ban — see I2 and [`SyncPeerSelector::select`].
 pub const DEPREFER_AT_FAILURES: u32 = 3;
 
+/// Sync-request timeouts after which the sync driver drops a peer so it
+/// re-handshakes (main.rs).
+pub const DROP_AFTER_TIMEOUTS: u32 = 5;
+
+/// A peer that delivered any message within this long has a working connection,
+/// whatever its sync timeouts say. Equal to the sync request timeout
+/// (`SyncConfig::request_timeout`), so a peer is dropped only after a request
+/// timed out with nothing at all heard from it since the request went out.
+pub const HEARD_RECENTLY: Duration = Duration::from_secs(30);
+
+/// Whether the sync driver should drop `peer` after a sync timeout. `failures`
+/// is its timeout count, `total_peers` the connected count, `still_mapped`
+/// whether the peer is still in the peer map, and `last_inbound_age` how long
+/// ago the node last received any message from it (`None`: never).
+///
+/// Never drops the only peer: that strands a fresh node with zero peers.
+/// Never drops a peer heard from within [`HEARD_RECENTLY`]: its timeouts mean a
+/// request or an answer was shed under load (often in this node's own inbound
+/// queue, r1006 2026-11-01), and a re-handshake costs its block gossip while
+/// fixing nothing. Its timeouts still de-prefer it as a sync source. The drop is
+/// for connections that deliver nothing (#149, #151).
+pub fn drop_after_timeouts(
+    failures: u32,
+    total_peers: usize,
+    still_mapped: bool,
+    last_inbound_age: Option<Duration>,
+) -> bool {
+    let talking = last_inbound_age.is_some_and(|age| age < HEARD_RECENTLY);
+    failures >= DROP_AFTER_TIMEOUTS && total_peers > 1 && still_mapped && !talking
+}
+
 /// PBA-L1b-006: the most an UNVERIFIED height claim may raise the node's
 /// network-height evidence (`max_seen_height`, which drives the sync target
 /// and `eth_syncing.highestBlock`) above its own applied tip. Matches the
@@ -347,6 +378,15 @@ pub struct SyncPeerSelector {
     /// tie-break and for diagnostics: unlike advertised head it cannot be
     /// inflated by relayed gossip (I4).
     served: HashMap<String, u64>,
+    /// The head each peer reported for ITSELF in its handshake
+    /// (Hello/HelloAck: its applied tip, or a dead branch's fork point).
+    /// Unlike the advertised head it is never raised by relayed gossip, so
+    /// it can show a peer is far behind (see `select`). With the
+    /// time the report was made: the handshake, then every sync request the
+    /// peer sends us (`serve_plane` refreshes it). The newest report wins; a
+    /// report is never dropped for age, so a far-behind
+    /// peer on a long connection stays far behind.
+    reported: HashMap<String, (u64, Instant)>,
 }
 
 impl SyncPeerSelector {
@@ -440,6 +480,29 @@ impl SyncPeerSelector {
         quality
     }
 
+    /// Record the head `id` reported for itself, reported now (tests; the
+    /// tick times reports at the handshake).
+    #[cfg(test)]
+    pub fn note_reported_head(&mut self, id: &str, height: u64) {
+        self.note_reported_head_at(id, height, Instant::now());
+    }
+
+    /// Record the head `id` reported for itself `at` (its handshake or its
+    /// latest sync request). An older report than the one held is ignored.
+    pub fn note_reported_head_at(&mut self, id: &str, height: u64, at: Instant) {
+        match self.reported.get(id) {
+            Some((_, held)) if *held > at => {}
+            _ => {
+                self.reported.insert(id.to_string(), (height, at));
+            }
+        }
+    }
+
+    /// The head `id` last reported for itself.
+    pub fn reported_head(&self, id: &str) -> Option<u64> {
+        self.reported.get(id).map(|(h, _)| *h)
+    }
+
     /// Current usefulness score (0 when never pulled from).
     pub fn score(&self, id: &str) -> i32 {
         self.score.get(id).copied().unwrap_or(0)
@@ -462,8 +525,9 @@ impl SyncPeerSelector {
     /// or below our tip cannot advance us, and selecting one is what made the
     /// live fleet re-import its own anchor every 2 s for seven hours.
     ///
-    /// I2: among those, de-preferred peers (>= [`DEPREFER_AT_FAILURES`]) are
-    /// skipped ONLY while a clean useful peer exists. When every useful peer is
+    /// I2: among those, de-preferred peers (>= [`DEPREFER_AT_FAILURES`]
+    /// timeouts, or a score at [`SCORE_MIN`]) are skipped ONLY while a clean
+    /// useful peer exists. When every useful peer is
     /// de-preferred, the best is used anyway — otherwise the penalty box can
     /// blacklist the entire network. Counters are NOT cleared on that escape;
     /// see the module docs for why that would disable the drop-and-re-handshake
@@ -505,7 +569,7 @@ impl SyncPeerSelector {
         // order of decreasing authority:
         //
         //   1. usefulness score  — what the peer has actually DONE for us
-        //   2. served watermark  — how far it has actually carried us
+        //   2. served watermark  — how far it has actually carried us ABOVE our tip
         //   3. advertised head   — the weakest evidence, gossip-inflatable (I4)
         //   4. peer id           — deterministic tie-break, never oscillates
         //
@@ -523,18 +587,67 @@ impl SyncPeerSelector {
         // filter: a peer with failures is ranked below an equal peer without them,
         // and can still be selected when it is all we have — which is what
         // unfreezes its counter.
+        //
+        // The served watermark counts only ABOVE our applied tip: a peer that
+        // carried us to a height we have since passed says nothing about
+        // whether it can carry us now. Two dead-fork bootnodes that served the
+        // shared history before a split otherwise outrank, forever, the one
+        // peer actually ahead on the network's chain once every score has
+        // bottomed out (r1006 bootnodes, 2026-11-03).
+        //
+        // De-preferred means timed out (>= DEPREFER_AT_FAILURES) OR bottomed
+        // out (score at SCORE_MIN: its answers carried nothing usable, again and
+        // again). A timeout penalty clears only when the peer is asked again;
+        // if a peer that answers every request with nothing still counted as
+        // clean, it would shut every timed-out peer out for good, however far
+        // ahead they are. That is H1 (r1007 planset): after a split whose
+        // serving was starved, the stopped side's siblings answered with
+        // their own tip forever and the peers that held the heavier chain were
+        // never asked again. With both kinds de-preferred, the score decides
+        // between them, and a peer that has not proven useless is asked.
+        let lead = |id: &str| self.served(id).saturating_sub(applied_height);
+        // (r1007, 2026-11-14): FAR BEHIND. A peer
+        // whose own handshake put it more than FAR_BEHIND_BAND below our
+        // applied tip, and that has never carried us above it, cannot be the
+        // source we need, whatever relayed gossip did to its advertised head.
+        // boot-2, rejoining at 104,271 with every peer's score at the floor,
+        // otherwise picked a member cold-syncing at ~2,600 by the id
+        // tie-break, again and again. Ranked after the penalty flag and the
+        // score (equal at the floor there), not filtered: with nothing else
+        // connected it is still asked (I2).
+        let far_behind = |id: &str| {
+            i32::from(
+                lead(id) == 0
+                    && self
+                        .reported_head(id)
+                        .is_some_and(|r| r.saturating_add(FAR_BEHIND_BAND) < applied_height),
+            )
+        };
+        let de_preferred = |id: &str| {
+            i32::from(self.failures(id) >= DEPREFER_AT_FAILURES || self.score(id) <= SCORE_MIN)
+        };
         useful.into_iter().max_by(|a, b| {
-            let fa = i32::from(self.failures(&a.id) >= DEPREFER_AT_FAILURES);
-            let fb = i32::from(self.failures(&b.id) >= DEPREFER_AT_FAILURES);
-            // Lower penalty flag is better, so compare b to a.
+            let fa = de_preferred(&a.id);
+            let fb = de_preferred(&b.id);
+            // Lower flags are better, so compare b to a. Far-behind ranks
+            // AFTER the penalty flag and the score:
+            // what a peer has done for us outranks what it said about itself
+            // at connect, so a reconnect that refreshes a report buys nothing.
             fb.cmp(&fa)
                 .then_with(|| self.score(&a.id).cmp(&self.score(&b.id)))
-                .then_with(|| self.served(&a.id).cmp(&self.served(&b.id)))
+                .then_with(|| far_behind(&b.id).cmp(&far_behind(&a.id)))
+                .then_with(|| lead(&a.id).cmp(&lead(&b.id)))
                 .then_with(|| a.head_height.cmp(&b.head_height))
                 .then_with(|| b.id.cmp(&a.id))
         })
     }
 }
+
+/// A peer whose own reported head is more than this far below our applied
+/// tip is far behind ([`SyncPeerSelector::select`]): one full
+/// window of in-flight sync ([`ANCESTRY_RECOVERY_WINDOW`]), so an honest peer
+/// whose handshake is a little stale is never caught by it.
+pub const FAR_BEHIND_BAND: u64 = ANCESTRY_RECOVERY_WINDOW;
 
 /// SPLIT HEALING: how far BELOW our applied height a peer's advertised head
 /// may sit and still be treated as a sibling branch worth pulling. A peer above
@@ -648,6 +761,208 @@ mod tests {
         assert_eq!(sel.select(&only_a, 50).map(|c| c.id.as_str()), Some("a"));
     }
 
+    /// (r1007, 2026-11-14, boot-2 journal): boot-2 rejoining at
+    /// applied 104,271 picked a member node that was itself cold-syncing at
+    /// ~2,600 as its sync peer, again and again (284 `Barren` in 3 min). That
+    /// member relays new blocks, so gossip had raised its advertised head to
+    /// the network tip like every other peer's; once every score had bottomed
+    /// out at the floor, the id tie-break named it. Its own handshake said it
+    /// was at 2,600. A peer whose own report puts it far below our applied
+    /// tip, and that has never carried us above it, must rank below every
+    /// peer that does not, whatever gossip says about it.
+    #[test]
+    fn a_far_behind_peer_is_never_chosen_over_one_that_is_not() {
+        let applied = 104_271u64;
+        let cands = vec![
+            // Smallest id, gossip-inflated head: the old tie-break's pick.
+            SyncCandidate {
+                id: "noise_26cee14b".into(),
+                head_height: 104_546,
+            },
+            SyncCandidate {
+                id: "noise_2b492467".into(),
+                head_height: 104_546,
+            },
+            SyncCandidate {
+                id: "noise_f356d3eb".into(),
+                head_height: 104_546,
+            },
+        ];
+        let mut sel = SyncPeerSelector::new();
+        for c in &cands {
+            for _ in 0..8 {
+                sel.record_serve(&c.id, 0, 0, 275, 32, false);
+            }
+            assert_eq!(sel.score(&c.id), SCORE_MIN);
+        }
+        sel.note_reported_head("noise_26cee14b", 2_603);
+        sel.note_reported_head("noise_2b492467", 104_400);
+        sel.note_reported_head("noise_f356d3eb", 104_390);
+        let picked = sel.select(&cands, applied).map(|c| c.id.as_str());
+        assert_ne!(
+            picked,
+            Some("noise_26cee14b"),
+            "picked the far-behind member"
+        );
+        // With the far-behind peer as the only one, it is still used (I2).
+        let only = vec![cands[0].clone()];
+        assert_eq!(
+            sel.select(&only, applied).map(|c| c.id.as_str()),
+            Some("noise_26cee14b")
+        );
+        // A peer that actually carried us above our tip is not "far behind",
+        // whatever its handshake said when it connected.
+        let mut sel2 = SyncPeerSelector::new();
+        sel2.note_reported_head("noise_26cee14b", 2_603);
+        sel2.record_serve("noise_26cee14b", 32, applied + 4, 275, 32, false);
+        assert_eq!(
+            sel2.select(&cands[..1], applied).map(|c| c.id.as_str()),
+            Some("noise_26cee14b")
+        );
+    }
+
+    /// the handshake report is set once per
+    /// connection. On a long-lived connection an honest peer's report falls
+    /// more than the band behind as we advance, and a peer that reconnects to
+    /// refresh its report must not win over it on that alone. Standing (the
+    /// score) outranks the far-behind flag, and a report that has aged out says
+    /// nothing.
+    #[test]
+    fn a_reconnecting_peer_does_not_outrank_an_honest_long_lived_one() {
+        let applied = 104_271u64;
+        let cands = vec![
+            SyncCandidate {
+                id: "honest".into(),
+                head_height: 104_600,
+            },
+            SyncCandidate {
+                id: "gamer".into(),
+                head_height: 104_600,
+            },
+        ];
+        let mut sel = SyncPeerSelector::new();
+        // The honest peer has served us well; its report is from when it
+        // connected, 600 heights ago.
+        for _ in 0..4 {
+            sel.record_serve("honest", 32, 104_200, 400, 32, false);
+        }
+        sel.note_reported_head("honest", applied - 600);
+        // The gamer has served nothing, and just reconnected with a high report.
+        for _ in 0..3 {
+            sel.record_serve("gamer", 0, 0, 400, 32, false);
+        }
+        sel.note_reported_head("gamer", 104_590);
+        assert_eq!(
+            sel.select(&cands, applied).map(|c| c.id.as_str()),
+            Some("honest"),
+            "a reconnect must not buy precedence over a peer that has served us"
+        );
+    }
+
+    /// The newest report wins; an older one (a stale snapshot noted late)
+    /// never replaces it. A refreshed report clears "far behind" once the
+    /// peer has caught up.
+    #[test]
+    fn the_newest_report_wins() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(60);
+        let mut sel = SyncPeerSelector::new();
+        sel.note_reported_head_at("p", 100, t0);
+        sel.note_reported_head_at("p", 7_990, t1);
+        sel.note_reported_head_at("p", 100, t0);
+        assert_eq!(sel.reported_head("p"), Some(7_990));
+        let cands = vec![
+            SyncCandidate {
+                id: "a".into(),
+                head_height: 9_000,
+            },
+            SyncCandidate {
+                id: "p".into(),
+                head_height: 9_000,
+            },
+        ];
+        sel.note_reported_head_at("a", 100, t1);
+        assert_eq!(sel.select(&cands, 8_000).map(|c| c.id.as_str()), Some("p"));
+    }
+
+    /// on a connection that outlives the report
+    /// window, a far-behind peer (the cold-syncing member boot-2 chose) must
+    /// stay far behind. Dropping its report hands it the id tie-break again.
+    #[test]
+    fn a_far_behind_peer_stays_far_behind_on_a_long_connection() {
+        let applied = 104_271u64;
+        let t0 = Instant::now();
+        let cands = vec![
+            SyncCandidate {
+                id: "noise_26cee14b".into(),
+                head_height: 104_546,
+            },
+            SyncCandidate {
+                id: "noise_2b492467".into(),
+                head_height: 104_546,
+            },
+        ];
+        let mut sel = SyncPeerSelector::new();
+        for c in &cands {
+            for _ in 0..8 {
+                sel.record_serve(&c.id, 0, 0, 275, 32, false);
+            }
+        }
+        sel.note_reported_head_at("noise_26cee14b", 2_603, t0);
+        sel.note_reported_head_at("noise_2b492467", 104_400, t0);
+        // An hour on the same connection, no new report: still far behind.
+        assert_ne!(
+            sel.select(&cands, applied).map(|c| c.id.as_str()),
+            Some("noise_26cee14b"),
+            "the far-behind member regained the tie-break"
+        );
+    }
+
+    /// The r1006 bootnodes, 2026-11-03 (boot journals, read-only): boot-2's
+    /// peers were boot-1 and boot-3, each on its own dead fork, and rpc-1 on
+    /// the network's chain, far ahead. boot-1 and boot-3 had carried boot-2
+    /// along the shared history before the split, so their served watermark
+    /// was high; since the split every answer from any of them admitted
+    /// nothing (each node's tip anchor is unknown to the others). Once the
+    /// scores bottom out equal, the watermark decides, and it names a
+    /// dead-fork peer forever: `SYNCPEER switched` between the dead forks,
+    /// never to rpc-1.
+    ///
+    /// A watermark at or below our applied tip says nothing about whether a
+    /// peer can carry us now. Among equally barren peers, the one that is
+    /// actually ahead must be chosen.
+    #[test]
+    fn sync_peer_choice_converges_on_the_far_ahead_peer_over_dead_forks() {
+        let applied = 303_704u64;
+        let mut sel = SyncPeerSelector::new();
+        for p in ["boot-1", "boot-3"] {
+            for _ in 0..SCORE_MAX {
+                sel.record_serve(p, 32, 298_000, 1_000, 32, false);
+            }
+        }
+        let peers = [
+            cand("boot-1", 303_900),
+            cand("boot-3", 304_100),
+            cand("rpc-1", 312_000),
+        ];
+        // Every answer since the split admits nothing.
+        let mut chosen = Vec::new();
+        for _ in 0..60 {
+            let pick = sel
+                .select(&peers, applied)
+                .expect("a peer is ahead")
+                .id
+                .clone();
+            sel.record_serve(&pick, 0, 0, 312_000 - applied, 32, false);
+            chosen.push(pick);
+        }
+        let tail = &chosen[chosen.len() - 20..];
+        assert!(
+            tail.iter().all(|p| p == "rpc-1"),
+            "the selector settled on a dead-fork peer: last picks {tail:?}"
+        );
+    }
+
     fn cand(id: &str, head_height: u64) -> SyncCandidate {
         SyncCandidate {
             id: id.to_string(),
@@ -749,6 +1064,43 @@ mod tests {
             assert!(ticks < 50, "counter must escalate, not plateau");
         }
         assert_eq!(sel.failures("dead"), DROP_AT);
+    }
+
+    /// RED (r1006 2026-11-01, prod-3 after the reseed: "6 Dropped peer … after
+    /// repeated sync timeouts" while it served six catching-up nodes). A peer
+    /// whose messages are still arriving has a working connection; its timeouts
+    /// mean the request or the answer was shed under load (often in this node's
+    /// own inbound queue). Dropping it costs its block gossip and a re-handshake
+    /// and fixes nothing. Timeouts still de-prefer it as a sync source.
+    #[test]
+    fn rcseal_red_a_peer_still_talking_is_not_dropped_for_timeouts() {
+        let heard = Some(Duration::from_secs(1));
+        assert!(
+            !drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, true, heard),
+            "dropped a peer heard from 1 s ago"
+        );
+        assert!(
+            !drop_after_timeouts(50, 7, true, Some(Duration::from_secs(29))),
+            "dropped a peer heard from within the 30 s request timeout"
+        );
+    }
+
+    /// The drop still happens where it is the fix: a silent connection (nothing
+    /// received for longer than the request timeout, or ever), never for the
+    /// only peer, never below the threshold, never for an unmapped peer.
+    #[test]
+    fn rcseal_silent_peers_are_still_dropped() {
+        let silent = Some(Duration::from_secs(31));
+        assert!(drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, true, silent));
+        assert!(drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, true, None));
+        assert!(!drop_after_timeouts(
+            DROP_AFTER_TIMEOUTS - 1,
+            7,
+            true,
+            silent
+        ));
+        assert!(!drop_after_timeouts(DROP_AFTER_TIMEOUTS, 1, true, silent));
+        assert!(!drop_after_timeouts(DROP_AFTER_TIMEOUTS, 7, false, silent));
     }
 
     /// `reset` is the drop-path clear; it must behave as a clean slate so the
@@ -1037,6 +1389,80 @@ mod tests {
             sel.select(&peers, 100).map(|c| c.id.as_str()),
             Some("clean")
         );
+    }
+
+    /// H1 (split_heal `stopped_side_rejoins_after_a_long_serving_cut`): after a
+    /// 4v3 split the three hear the four's blocks, but answers across the split
+    /// are lost for a while, so every one of the four reaches the timeout
+    /// threshold. The three's own siblings answer every request, with nothing
+    /// above the tip (they are on the same branch): they bottom out but never
+    /// time out. A timeout penalty clears only when the peer is asked again, so
+    /// if the bottomed-out siblings still count as clean, the four are never
+    /// asked again and the three stay on their branch after serving returns.
+    ///
+    /// A peer whose every answer carried nothing (score at the floor) is no
+    /// cleaner a source than one that timed out: both are de-preferred, and
+    /// among de-preferred peers the one that has not proven useless is asked.
+    #[test]
+    fn a_bottomed_out_peer_does_not_shut_out_timed_out_peers_ahead() {
+        let applied = 107u64;
+        let mut sel = SyncPeerSelector::new();
+        for p in ["p0", "p1", "p2", "p3"] {
+            for _ in 0..DEPREFER_AT_FAILURES {
+                sel.record_timeout(p);
+            }
+        }
+        for p in ["p5", "p6"] {
+            for _ in 0..8 {
+                // Nothing new on a current anchor: Barren.
+                sel.record_serve(p, 0, 0, 370, 32, false);
+            }
+            assert_eq!(sel.score(p), SCORE_MIN);
+        }
+        // Relayed gossip: every peer advertises the four's head.
+        let peers = [
+            cand("p0", 477),
+            cand("p1", 477),
+            cand("p2", 477),
+            cand("p3", 477),
+            cand("p5", 477),
+            cand("p6", 477),
+        ];
+        let pick = sel.select(&peers, applied).map(|c| c.id.clone());
+        assert!(
+            pick.as_deref().is_some_and(|p| p < "p4"),
+            "a timed-out peer ahead must be asked again once the clean peers \
+             have bottomed out, got {pick:?}"
+        );
+        // Its answer clears its timeouts; even an empty one (it lacks our tip)
+        // keeps it ahead of the bottomed-out siblings, so the strikes that
+        // start the fork-point search count against one peer.
+        let p = pick.expect("a peer");
+        sel.record_serve(&p, 0, 0, 370, 32, false);
+        assert_eq!(
+            sel.select(&peers, applied).map(|c| c.id.as_str()),
+            Some(p.as_str())
+        );
+    }
+
+    /// The floor rule does not override a clean peer that still serves: a
+    /// bottomed-out peer and a timed-out peer both lose to it.
+    #[test]
+    fn a_clean_serving_peer_outranks_both_de_preferred_kinds() {
+        let mut sel = SyncPeerSelector::new();
+        for _ in 0..DEPREFER_AT_FAILURES {
+            sel.record_timeout("flaky");
+        }
+        for _ in 0..8 {
+            sel.record_serve("barren", 0, 0, 500, 32, false);
+        }
+        sel.record_serve("good", 1, 101, 500, 32, false);
+        let peers = [
+            cand("flaky", 9_000),
+            cand("barren", 9_000),
+            cand("good", 900),
+        ];
+        assert_eq!(sel.select(&peers, 100).map(|c| c.id.as_str()), Some("good"));
     }
 
     /// RED TEST — #150, at boot1's measured shape. A node 33,000 blocks behind

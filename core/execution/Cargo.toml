@@ -98,6 +98,14 @@ cc = "1.0"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# CV-14 conformance: an independent MPT implementation (alloy, as used by reth)
+# that the state root is cross-checked against on random states. Tests only.
+alloy-trie = "0.4"
+alloy-primitives = "0.7"
+# A second independent MPT (parity/OpenEthereum's), which also covers embedded
+# (< 32-byte) nodes; alloy-trie 0.4's HashBuilder assumes every child is hashed.
+triehash = "0.8"
+keccak-hasher = "0.15"
 proptest = { workspace = true }
 rand = { workspace = true }
 criterion = { workspace = true }

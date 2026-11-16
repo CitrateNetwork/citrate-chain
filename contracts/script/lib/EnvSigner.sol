@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import "forge-std/Script.sol";
+import "./GenesisProfile.sol";
 
 /// @title EnvSigner: broadcast from a key held only in the process environment.
 /// @notice r1007 ceremony option A (fed GO2_COMMAND_SHEET section 12, lead decision 2026-11-11).
@@ -17,13 +18,7 @@ import "forge-std/Script.sol";
 ///         nonces creates the same contracts at the same addresses, so this changes no address
 ///         and no deployed bytecode. The hooks are virtual so tests can supply a key without
 ///         vm.setEnv, which is process-global and would leak into tests running in parallel.
-///
-///         This copy (public main, for the 0.6.0 live mode) is the signer part of
-///         env-key-signing-2's EnvSigner. It leaves out `_requireRootGovernance`, which the
-///         live mode does not use and which branches on a bare `block.chainid` (the
-///         forge-chainid-profile tripwire): a script that needs it resolves the chain through
-///         GenesisProfile._resolveChainProfile instead.
-abstract contract EnvSigner is Script {
+abstract contract EnvSigner is GenesisProfile {
     function _envSignerKey() internal view virtual returns (uint256) {
         return vm.envOr("PRIVATE_KEY", uint256(0));
     }
@@ -63,5 +58,19 @@ abstract contract EnvSigner is Script {
         require(_scriptSender() == expected, "EnvSigner: run forge with --sender EXPECTED_SENDER");
         require(deployer == address(0) || deployer == expected, "EnvSigner: EXPECTED_SENDER is not the script's deployer");
         vm.startBroadcast(key);
+    }
+
+    /// On 40204 the root governance must be named explicitly and must not be the sender: no
+    /// fallback to msg.sender, which would make the deployer the governance of what it deploys.
+    /// "On 40204" is the node's answer (GenesisProfile._resolveChainProfile: eth_chainId, which
+    /// must equal forge's simulated id), never block.chainid alone: `--chain-id`, `--chain` or
+    /// FOUNDRY_CHAIN_ID set forge's id independently of the node the run broadcasts to. On 40204
+    /// with no node to ask, the run refuses.
+    function _requireRootGovernance(address governance) internal {
+        ChainProfile memory p = _resolveChainProfile(false);
+        require(
+            !p.genesis || (governance != address(0) && governance != _scriptSender()),
+            "ROOT_GOVERNANCE must be set to a non-deployer address on 40204"
+        );
     }
 }

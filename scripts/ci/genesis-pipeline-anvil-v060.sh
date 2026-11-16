@@ -10,15 +10,19 @@
 #   -> CheckDeployedAdmins over the governance, dormant-ledger and 0.6.0 books: 0 failures.
 #
 # Then the negatives, each of which must be refused:
-#   - DeployV060Genesis without the coordinator bonds (required inputs; no default): nothing sent;
+#   - DeployV060Genesis without the WorkMarket bonds (required inputs; no default): nothing sent;
+#   - DeployV060Genesis with the two coordinator bonds but no join-bond floor: nothing sent;
 #   - DeployV060Genesis with a council owner on the retired list: nothing sent;
 #   - DeployV060Genesis with a veto margin other than the owner's decided 7200 s: nothing sent;
 #   - verifyBook after the GOVERNANCE timelock (impersonated) changes WorkMarket's verifier
-#     allowlist.
+#     allowlist;
+#   - a bond-floor change by anyone but the GOVERNANCE timelock; and verifyBook after the
+#     GOVERNANCE timelock changes the join-bond floor.
 #
 # Every key-like value here is a public placeholder. The deployer is anvil's public test
 # mnemonic; the council owners, the key inventory and the retired keys are test values (the
-# owner's are pending). The bonds are the owner's decided rehearsal values (2026-11-11).
+# owner's are pending). The bonds are the owner's decided values: 100 SALT coordinator floor and
+# 1,000 SALT default (2026-11-11, rehearsal values), 10 SALT join floor (2026-11-14).
 # Env: ANVIL_PORT (default 8546; must be free), KEEP_OUTPUT=1 keeps contracts/genesis/anvil-v060/.
 # Requires foundry (anvil, forge, cast) and python3 on PATH. Exit 0 = rehearsal + gate passed.
 set -euo pipefail
@@ -80,7 +84,7 @@ import json, sys
 gov, grd = sys.argv[1].split(","), sys.argv[2].split(",")
 print(json.dumps({**{a: ["GOV_OWNERS"] for a in gov}, **{a: ["GRD_OWNERS"] for a in grd}}))' "$GOV_OWNERS" "$GRD_OWNERS")"
 export GENESIS_KEY_INVENTORY
-BONDS=(WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000)
+BONDS=(WORKMARKET_MIN_COORDINATOR_BOND=100000000000000000000 WORKMARKET_DEFAULT_COORDINATOR_BOND=1000000000000000000000 WORKMARKET_MIN_JOIN_BOND=10000000000000000000)
 export GENESIS_GOVERNANCE_OUT="$OUT_REL/governance.json" GENESIS_GOVERNANCE_BOOK="$OUT_REL/governance.json"
 export DORMANT_LEDGERS_OUT="$OUT_REL/dormant.json"
 export V060_INPUT_BOOK="$OUT_REL/v060-input-book.json" V060_GENESIS_OUT="$OUT_REL/v060-genesis.json"
@@ -140,9 +144,14 @@ PY
 echo "=== negatives before the real run (each refused, nothing sent) ==="
 before="$(nonce "$DEPLOYER")"
 if forge script script/DeployV060Genesis.s.sol --rpc-url "$RPC" --broadcast --private-key "$KEY" >"$OUT/neg-bonds.log" 2>&1; then
-  fail "DeployV060Genesis ran without the coordinator bonds"
+  fail "DeployV060Genesis ran without the WorkMarket bonds"
 fi
-grep -q "REQUIRED INPUT: the WorkMarket coordinator bonds" "$OUT/neg-bonds.log" || fail "no-bonds run: not refused on the missing bonds"
+grep -q "REQUIRED INPUT: the WorkMarket bonds" "$OUT/neg-bonds.log" || fail "no-bonds run: not refused on the missing bonds"
+if env "${BONDS[0]}" "${BONDS[1]}" forge script script/DeployV060Genesis.s.sol --rpc-url "$RPC" \
+  --broadcast --private-key "$KEY" >"$OUT/neg-join-bond.log" 2>&1; then
+  fail "DeployV060Genesis ran without the join-bond floor"
+fi
+grep -q "REQUIRED INPUT: the WorkMarket bonds" "$OUT/neg-join-bond.log" || fail "no-join-bond run: not refused on the missing join-bond floor"
 if env "${BONDS[@]}" GENESIS_RETIRED_KEYS="${GRD_LIST[1]}" forge script script/DeployV060Genesis.s.sol --rpc-url "$RPC" \
   --broadcast --private-key "$KEY" >"$OUT/neg-retired.log" 2>&1; then
   fail "DeployV060Genesis ran with a council owner on the retired list"
@@ -154,7 +163,7 @@ if env "${BONDS[@]}" GENESIS_GUARDIAN_VETO_MARGIN=3600 forge script script/Deplo
 fi
 grep -q "is not the owner's decided value" "$OUT/neg-margin.log" || fail "margin run: not refused on the decided value"
 [ "$(nonce "$DEPLOYER")" = "$before" ] || fail "a refused DeployV060Genesis run sent a transaction"
-echo "refused (no bonds, retired council owner, undecided margin), nothing sent"
+echo "refused (no bonds, no join-bond floor, retired council owner, undecided margin), nothing sent"
 
 export "${BONDS[@]}"
 run_script script/DeployV060Genesis.s.sol
@@ -184,6 +193,10 @@ V2="$(book "$GOV_JSON" GuardianCanceller)"
 WM="$(book "$V060_JSON" WorkMarket)"
 [ "$(cast call --rpc-url "$RPC" "$WM" 'slashSink()(address)' | tr 'A-F' 'a-f')" = "$(echo "$GOVERNANCE_TIMELOCK" | tr 'A-F' 'a-f')" ] ||
   fail "WorkMarket.slashSink is not the GOVERNANCE timelock"
+u128() { cast call --rpc-url "$RPC" "$WM" "$1" | awk '{print $1}'; }
+[ "$(u128 'minCoordinatorBond()(uint128)')" = 100000000000000000000 ] || fail "WorkMarket coordinator-bond floor is not 100 SALT"
+[ "$(u128 'minJoinBond()(uint128)')" = 10000000000000000000 ] || fail "WorkMarket join-bond floor is not 10 SALT"
+[ "$(u128 'defaultCoordinatorBond()(uint128)')" = 1000000000000000000000 ] || fail "WorkMarket default coordinator bond is not 1,000 SALT"
 echo "genesis-pipeline-anvil-v060: rehearsal PASS (verifyBook PASS; 0 FACTORY-ADMIN / DEPLOYER-ADMIN / TIMELOCK-HOLDERS / GENESIS-FLOOR)"
 
 echo "=== negative: verifyBook after the allowlist changes (GOVERNANCE impersonated) ==="
@@ -196,4 +209,17 @@ if forge script script/DeployV060Genesis.s.sol --sig 'verifyBook()' --rpc-url "$
 fi
 grep -q "WorkMarket: verifier allowlist" "$OUT/neg-verify.log" || fail "verifyBook: not refused on the allowlist"
 echo "refused (verifyBook caught the changed allowlist)"
+
+echo "=== negatives: the bond floors are GOVERNANCE's to change, and verifyBook sees a change ==="
+if cast send --rpc-url "$RPC" --private-key "$KEY" "$WM" 'setMinJoinBond(uint128)' 20000000000000000000 >"$OUT/neg-floor-caller.log" 2>&1; then
+  fail "the deployer changed WorkMarket's join-bond floor"
+fi
+[ "$(u128 'minJoinBond()(uint128)')" = 10000000000000000000 ] || fail "the join-bond floor moved after a refused change"
+cast send --rpc-url "$RPC" --unlocked --from "$GOVERNANCE_TIMELOCK" "$WM" 'setMinJoinBond(uint128)' 20000000000000000000 >/dev/null
+[ "$(u128 'minJoinBond()(uint128)')" = 20000000000000000000 ] || fail "the GOVERNANCE timelock could not set the join-bond floor"
+if forge script script/DeployV060Genesis.s.sol --sig 'verifyBook()' --rpc-url "$RPC" >"$OUT/neg-verify-floor.log" 2>&1; then
+  fail "verifyBook passed after the join-bond floor changed"
+fi
+grep -q "WorkMarket: bonds" "$OUT/neg-verify-floor.log" || fail "verifyBook: not refused on the changed join-bond floor"
+echo "refused (a non-governance floor change; verifyBook caught the governance one)"
 echo "genesis-pipeline-anvil-v060: PASS"

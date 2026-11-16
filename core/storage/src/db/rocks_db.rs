@@ -136,6 +136,66 @@ impl RocksDB {
         Ok(db)
     }
 
+    /// Open an existing database READ-ONLY (no encryption at rest), with
+    /// every column family it has. Nothing is created and nothing can be
+    /// written: a write through the handle fails at RocksDB. Works while the
+    /// node that owns the directory is running (RocksDB read-only opens take
+    /// no lock), so tools such as the replay recorder
+    /// (`tools/replay-ref`) can dump a live node's data dir.
+    ///
+    /// An encrypted database is refused (its values need the key).
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if EncryptionMeta::load(path)?.is_some() {
+            return Err(
+                AtRestError::EncryptedDbWithoutEncryption(path.display().to_string()).into(),
+            );
+        }
+        let opts = Options::default();
+        let cfs = DB::list_cf(&opts, path)?;
+        let db = DB::open_cf_for_read_only(&opts, path, cfs, false)?;
+        let db = Self {
+            db: Arc::new(db),
+            cipher: None,
+            write_batch_count: Arc::new(AtomicU64::new(0)),
+            write_batch_sync_count: Arc::new(AtomicU64::new(0)),
+        };
+        db.probe_for_sealed_values(path)?;
+        Ok(db)
+    }
+
+    /// Open an existing database READ-ONLY with every column family it has,
+    /// encrypted at rest when `encryption` is given (the key is verified
+    /// against the stored commitment; a wrong key is an error), plaintext
+    /// otherwise ([`Self::open_read_only`]). Nothing is created or written.
+    /// lets a cold resync read the signed-vote record out of a
+    /// moved encrypted chain database.
+    pub fn open_read_only_with(
+        path: impl AsRef<Path>,
+        encryption: Option<&EncryptionAtRestConfig>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let Some(config) = encryption else {
+            return Self::open_read_only(path);
+        };
+        if EncryptionMeta::load(path)?.is_none() {
+            anyhow::bail!(
+                "{} is not an encrypted database (no encryption.meta)",
+                path.display()
+            );
+        }
+        let cipher = AtRestCipher::open_or_init(path, config)?;
+        let opts = Options::default();
+        let cfs = DB::list_cf(&opts, path)?;
+        let db = DB::open_cf_for_read_only(&opts, path, cfs, false)?;
+        Ok(Self {
+            db: Arc::new(db),
+            cipher: Some(Arc::new(cipher)),
+            write_batch_count: Arc::new(AtomicU64::new(0)),
+            write_batch_sync_count: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
     /// Open database with encryption at rest enabled.
     ///
     /// Key/meta lifecycle (see [`AtRestCipher::open_or_init`]): a fresh
@@ -421,6 +481,27 @@ impl RocksDB {
             .filter_map(move |item| Self::map_iter_item(&cipher, &cf_name, item)))
     }
 
+    /// Every entry of `cf` whose key starts with `prefix`, in key order, values
+    /// decrypted. Unlike [`Self::prefix_iter_cf`], a read error or a value that
+    /// does not decrypt is an `Err`, never a silently missing entry: for data
+    /// whose absence is unsafe (the signed-vote record).
+    pub fn prefix_entries_strict_cf(&self, cf: &str, prefix: &[u8]) -> Result<Vec<KvItem>> {
+        let cf_handle = self.cf_handle(cf)?;
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator_cf(&cf_handle, prefix) {
+            let (key, stored) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let value = match &self.cipher {
+                None => stored,
+                Some(c) => c.open_value(cf, &key, &stored)?.into_boxed_slice(),
+            };
+            out.push((key, value));
+        }
+        Ok(out)
+    }
+
     /// Visit the keys of `cf` that start with `prefix`, in key order, without
     /// collecting them. Unlike [`Self::prefix_iter_cf`], a storage error ends
     /// the scan with `Err` instead of being skipped, so a caller never mistakes
@@ -437,6 +518,36 @@ impl RocksDB {
             let (key, _) = item?;
             if !key.starts_with(prefix) {
                 break;
+            }
+            visit(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Visit the keys of `cf` from `from` (inclusive) up to `to` (exclusive;
+    /// `None`: no upper bound) that start with `prefix`, in key order, without
+    /// reading values or collecting them. The scan ends at the first key past
+    /// `to` or without `prefix`. Errors end the scan as in
+    /// [`Self::for_each_prefix_key_cf`].
+    pub fn for_each_key_in_range_cf(
+        &self,
+        cf: &str,
+        from: &[u8],
+        to: Option<&[u8]>,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cf_handle = self.cf_handle(cf)?;
+        let mode = rocksdb::IteratorMode::From(from, rocksdb::Direction::Forward);
+        for item in self.db.iterator_cf(&cf_handle, mode) {
+            let (key, _) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if let Some(end) = to {
+                if key.as_ref() >= end {
+                    break;
+                }
             }
             visit(&key)?;
         }
@@ -526,6 +637,60 @@ impl Clone for RocksDB {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// a signed-vote value that does not decrypt must
+    /// fail the export, never vanish from it (a missing vote is a vote this
+    /// validator may sign again with a different hash).
+    #[test]
+    fn signed_vote_export_fails_on_an_undecryptable_value() {
+        let dir = TempDir::new().expect("tempdir");
+        let db =
+            RocksDB::open_encrypted(dir.path(), &EncryptionAtRestConfig::with_raw_key([7u8; 32]))
+                .expect("open");
+        let good = citrate_consensus::checkpoint_gadget::signed_vote_key(40204, 50);
+        let bad = citrate_consensus::checkpoint_gadget::signed_vote_key(40204, 100);
+        db.put_cf("dag_metadata", &good, &[1u8; 32]).expect("seal");
+        // A sealed-looking value whose tag cannot verify.
+        let cf = db.cf_handle("dag_metadata").expect("cf");
+        let mut garbage = db.db.get_cf(cf, &good).expect("raw read").expect("present");
+        if let Some(last) = garbage.last_mut() {
+            *last ^= 0xFF;
+        }
+        db.db.put_cf(cf, &bad, &garbage).expect("raw write");
+        assert!(
+            crate::signed_votes::export(&db).is_err(),
+            "an undecryptable vote must fail the export"
+        );
+    }
+
+    /// The replay recorder's open: reads what a writer left, beside a live
+    /// writer too, and can never write.
+    #[test]
+    fn read_only_open_reads_and_never_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let writer = RocksDB::open(dir.path()).expect("open");
+        writer.put_cf("blocks", b"k", b"v").expect("put");
+        writer.flush().expect("flush");
+        let reader = RocksDB::open_read_only(dir.path()).expect("read-only open");
+        assert_eq!(
+            reader.get_cf("blocks", b"k").expect("get"),
+            Some(b"v".to_vec())
+        );
+        assert!(
+            reader.put_cf("blocks", b"k2", b"v").is_err(),
+            "a write went through"
+        );
+        drop(writer);
+        let reader2 = RocksDB::open_read_only(dir.path()).expect("reopen");
+        assert_eq!(
+            reader2.get_cf("blocks", b"k").expect("get"),
+            Some(b"v".to_vec())
+        );
+        assert!(
+            RocksDB::open_read_only(dir.path().join("missing")).is_err(),
+            "nothing is created"
+        );
+    }
 
     #[test]
     fn memory_budget_overrides_parse_and_clamp() {

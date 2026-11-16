@@ -144,6 +144,65 @@ fn node_identity_reports_genesis_chain_and_fingerprints() {
     assert_eq!(r["gitDirty"], false);
 }
 
+/// CV-7b: `citrate_nodeIdentity.syncState` reads the node's own sources: the
+/// durable dead-branch marker, the applied tip and the sync driver's highest
+/// seen height (the `eth_syncing` signal).
+#[test]
+fn node_identity_sync_state_reads_the_marker_and_the_sync_signal() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (storage, _tmp, g) = storage_with_genesis();
+    let tip = put(&storage, [0x01; 32], g, 1, 1);
+    storage.blocks.put_applied_tip(&tip, 1).expect("tip");
+    let highest = Arc::new(AtomicU64::new(1));
+    let mut io = jsonrpc_core::IoHandler::new();
+    node_rpc::register_node_methods_with_sync(
+        &mut io,
+        storage.clone(),
+        40204,
+        None,
+        Some(highest.clone()),
+    );
+    let st = |io: &jsonrpc_core::IoHandler| {
+        call(io, "citrate_nodeIdentity", "[]")["result"]["syncState"].clone()
+    };
+    let s = st(&io);
+    assert_eq!(s["state"], "synced", "{s}");
+    assert_eq!(s["appliedHeight"], 1, "{s}");
+    // CV-3: the applied tip's header-committed blue score, the unit of
+    // net_peerInfo[].headBlueScore, next to its height.
+    assert_eq!(s["appliedBlueScore"], 1, "{s}");
+    assert!(s["forkDepth"].is_null(), "{s}");
+    highest.store(40, Ordering::Relaxed);
+    let s = st(&io);
+    assert_eq!(s["state"], "catching_up", "{s}");
+    assert_eq!(s["highestSeen"], 40, "{s}");
+    citrate_storage::chain::wedge::write(
+        &storage.db,
+        &citrate_storage::chain::wedge::WedgeRecord {
+            dead_tip: tip,
+            dead_tip_height: 1,
+            fork_point: g,
+            fork_height: 0,
+            head: Hash::new([0x02; 32]),
+            head_height: 40,
+            reason: "refused".into(),
+            since_unix: 9,
+        },
+    )
+    .expect("marker");
+    let s = st(&io);
+    assert_eq!(s["state"], "wedged", "{s}");
+    assert_eq!(s["forkDepth"], 1, "{s}");
+    assert_eq!(s["reason"], "refused", "{s}");
+    assert_eq!(s["networkHead"]["height"], 40, "{s}");
+    assert_eq!(s["since"], 9, "{s}");
+    // Without a sync signal wired the highest seen height is unknown, not 0.
+    citrate_storage::chain::wedge::clear(&storage.db).expect("clear");
+    let s = st(&node_io(storage, None));
+    assert_eq!(s["state"], "synced", "{s}");
+    assert!(s["highestSeen"].is_null(), "{s}");
+}
+
 #[test]
 fn node_identity_is_null_where_unknown() {
     // No genesis stored and no identity supplied: nothing is invented.
@@ -166,6 +225,9 @@ fn node_identity_is_null_where_unknown() {
 
 #[test]
 fn dag_stats_does_not_estimate_blue_red_or_total_counts() {
+    // S3-7 (chain#317): `totalBlocks` is now the maintained stored-block
+    // counter (genesis + 20), and the store-wide blue/red tallies, which the
+    // node cannot know, are gone rather than null.
     let (storage, _tmp, g) = storage_with_genesis();
     let mut parent = g;
     for h in 1..=20u64 {
@@ -176,9 +238,15 @@ fn dag_stats_does_not_estimate_blue_red_or_total_counts() {
     let io = node_io(storage, None);
     let v = call(&io, "citrate_getDagStats", "[]");
     let r = &v["result"];
-    assert!(r["totalBlocks"].is_null(), "no block counter is kept: {v}");
-    assert!(r["blueBlocks"].is_null(), "no blue tally is kept: {v}");
-    assert!(r["redBlocks"].is_null(), "no red tally is kept: {v}");
+    assert_eq!(r["totalBlocks"], 21, "the maintained block counter: {v}");
+    assert!(
+        r.get("blueBlocks").is_none(),
+        "no blue tally is reported: {v}"
+    );
+    assert!(
+        r.get("redBlocks").is_none(),
+        "no red tally is reported: {v}"
+    );
     assert_eq!(r["height"], 20, "{v}");
     assert!(
         r["ghostdagParams"].is_null(),

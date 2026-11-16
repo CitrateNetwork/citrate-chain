@@ -214,6 +214,7 @@ fn staticcall_gas_at(
         coinbase: [0x42; 20],
         prevrandao: [0u8; 32],
         block_hashes: HashMap::new(),
+        gas_limit: None,
     };
     let (output, gas, _logs) = execute_contract_call_with_context(
         state_db,

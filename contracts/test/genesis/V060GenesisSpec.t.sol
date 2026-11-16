@@ -16,6 +16,7 @@ import {UsageReceipts} from "../../src/amc/UsageReceipts.sol";
 import {OrgBudgets, IOrganizationSBT} from "../../src/amc/OrgBudgets.sol";
 import {WorkAttestations, IAgentSBT} from "../../src/amc/WorkAttestations.sol";
 import {WorkMarket} from "../../src/work/WorkMarket.sol";
+import {Governable} from "../../src/lib/Governable.sol";
 import {FLRoundVerifier, IFederatedRoundLedgerReads} from "../../src/work/FLRoundVerifier.sol";
 import {TaskVerifier} from "../../src/work/TaskVerifier.sol";
 import {DatasetRegistry} from "../../src/data/DatasetRegistry.sol";
@@ -51,6 +52,7 @@ contract V060WithNode is DeployV060Genesis, RecordedRoleHistory, NodeStub {
 // tokenomics decision, and the builder refuses to run without them being given explicitly.
 uint128 constant TEST_MIN_BOND = 3 ether;
 uint128 constant TEST_DEFAULT_BOND = 7 ether;
+uint128 constant TEST_MIN_JOIN_BOND = 2 ether;
 
 /// @title V060GenesisSpec.t: the 0.6.0 ceremony genesis spec
 /// @notice Builds the ceremony the way the 0.6.0 genesis does on chain 40204 (genesis profile):
@@ -179,6 +181,7 @@ contract V060GenesisSpecTest is Test {
         i.agentSbt = address(agentSbt);
         i.minCoordinatorBond = TEST_MIN_BOND;
         i.defaultCoordinatorBond = TEST_DEFAULT_BOND;
+        i.minJoinBond = TEST_MIN_JOIN_BOND;
     }
 
     function _build() internal returns (DeployV060Genesis s, DeployV060Genesis.Deployed memory d) {
@@ -247,10 +250,10 @@ contract V060GenesisSpecTest is Test {
                 "Genesis.WorkMarket",
                 abi.encodePacked(
                     type(WorkMarket).creationCode,
-                    abi.encode(gt, rt, gt, TEST_DEFAULT_BOND, TEST_MIN_BOND, _verifiers(flv, tv))
+                    abi.encode(gt, rt, gt, TEST_DEFAULT_BOND, TEST_MIN_BOND, TEST_MIN_JOIN_BOND, _verifiers(flv, tv))
                 )
             ),
-            address(new WorkMarket(gt, rt, gt, TEST_DEFAULT_BOND, TEST_MIN_BOND, _verifiers(flv, tv))).codehash
+            address(new WorkMarket(gt, rt, gt, TEST_DEFAULT_BOND, TEST_MIN_BOND, TEST_MIN_JOIN_BOND, _verifiers(flv, tv))).codehash
         );
 
         _assertAt(
@@ -300,6 +303,30 @@ contract V060GenesisSpecTest is Test {
         assertEq(abi.encode(p), abi.encode(d));
     }
 
+    // ------------------------------------------------------------------ bond floors after genesis
+
+    /// The genesis floors are only a starting point: the GOVERNANCE timelock, and nobody else (not
+    /// the guardian council, not the deployer), sets them afterwards.
+    function test_after_genesis_only_the_governance_timelock_sets_the_bond_floors() public {
+        (, DeployV060Genesis.Deployed memory d) = _build();
+        WorkMarket m = WorkMarket(payable(d.workMarket));
+        address[2] memory others = [gov.guardianTimelock, SENDER];
+        for (uint256 k = 0; k < others.length; k++) {
+            vm.startPrank(others[k]);
+            vm.expectRevert(Governable.Governable_NotGovernance.selector);
+            m.setMinCoordinatorBond(200 ether);
+            vm.expectRevert(Governable.Governable_NotGovernance.selector);
+            m.setMinJoinBond(20 ether);
+            vm.stopPrank();
+        }
+        vm.startPrank(gov.governanceTimelock);
+        m.setMinCoordinatorBond(200 ether);
+        m.setMinJoinBond(20 ether);
+        vm.stopPrank();
+        assertEq(m.minCoordinatorBond(), 200 ether);
+        assertEq(m.minJoinBond(), 20 ether);
+    }
+
     // ------------------------------------------------------------------ constructor arguments
 
     function test_constructor_arguments_read_back() public {
@@ -326,6 +353,7 @@ contract V060GenesisSpecTest is Test {
         assertEq(m.slashSink(), gt, "slashSink is the GOVERNANCE timelock (treasury)");
         assertEq(m.minCoordinatorBond(), TEST_MIN_BOND);
         assertEq(m.defaultCoordinatorBond(), TEST_DEFAULT_BOND);
+        assertEq(m.minJoinBond(), TEST_MIN_JOIN_BOND);
         assertTrue(m.verifierAllowed(d.flRoundVerifier));
         assertTrue(m.verifierAllowed(d.taskVerifier));
 
@@ -445,6 +473,19 @@ contract V060GenesisSpecTest is Test {
         s.deployWith(SENDER, i);
         i = _inputs();
         i.defaultCoordinatorBond = TEST_MIN_BOND - 1;
+        vm.expectRevert(bytes(V060GenesisSpec.PENDING_COORDINATOR_BONDS));
+        s.deployWith(SENDER, i);
+        i = _inputs();
+        i.minJoinBond = 0;
+        vm.expectRevert(bytes(V060GenesisSpec.PENDING_COORDINATOR_BONDS));
+        s.deployWith(SENDER, i);
+        i = _inputs();
+        i.minJoinBond = 1 ether - 1; // below WorkMarket's 1 SALT bound
+        vm.expectRevert(bytes(V060GenesisSpec.PENDING_COORDINATOR_BONDS));
+        s.deployWith(SENDER, i);
+        i = _inputs();
+        i.minCoordinatorBond = 100_001 ether; // above the 100,000 SALT bound
+        i.defaultCoordinatorBond = 100_001 ether;
         vm.expectRevert(bytes(V060GenesisSpec.PENDING_COORDINATOR_BONDS));
         s.deployWith(SENDER, i);
         assertEq(vm.getNonce(SENDER), nonceBefore, "nothing broadcast");

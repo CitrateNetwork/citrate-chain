@@ -63,10 +63,14 @@ pub const PBA_HARDENING_ENV: &str = "CITRATE_PBA_HARDENING_HEIGHT";
 pub const MAX_BLOCK_TIMESTAMP_ADVANCE_SECS: u64 = 3_600;
 
 /// Wall-clock future-drift tolerance applied at every block ingress (gossip,
-/// sync). The same value gossip has always used. This one is local policy
-/// (it depends on the local clock), so it is NOT height-gated: a block
-/// rejected for it now is accepted once its time arrives.
-pub const MAX_FUTURE_BLOCK_DRIFT_SECS: u64 = 900;
+/// sync). This one is local policy (it depends on the local clock), so it is
+/// NOT height-gated: a block rejected for it now is accepted once its time
+/// arrives (a later child names it, and sync fetches it).
+///
+/// r1007 G9: the spec's 15 s ([`crate::slots::MAX_FUTURE_SLOT_DRIFT_SECS`]),
+/// down from 900 s. With one block per proposer per slot, this window is how
+/// far ahead of the honest clock a lone proposer can run a chain.
+pub const MAX_FUTURE_BLOCK_DRIFT_SECS: u64 = crate::slots::MAX_FUTURE_SLOT_DRIFT_SECS;
 
 const UNSET: u64 = u64::MAX;
 
@@ -180,6 +184,8 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
     ),
     // r1006 (profile `r1006`: genesis from ceremony state)
     (40204, R1006_GENESIS),
+    // r1007 (profile `r1007`: the r1006 ceremony state, its own note, MPT root from 0)
+    (40204, R1007_GENESIS),
     // mainnet
     (
         40204,
@@ -192,6 +198,20 @@ pub const RELEASE_GENESIS: &[(u64, [u8; 32])] = &[
 /// the compiled profile; any change to the allocation moves it, on purpose.
 pub const R1006_GENESIS: [u8; 32] =
     hex32("a3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4");
+
+/// The r1007 genesis block (profile `r1007`, ADR-2026-11-03 CV-2, planset S3-6): the
+/// r1006 ceremony state (same contracts, same producer set, owner Q-3) with its own
+/// genesis note, rooted under the MPT state root rule from block 0 (CV-14).
+/// Pinned by `r1007_genesis_hash_is_pinned_and_reproducible_under_the_mpt_rule` in
+/// citrate-economics, which rebuilds it from the compiled layout. Any change to the
+/// allocation, the genesis block encoding or the root rule moves it, on purpose
+/// (docs/consensus/R1007_GENESIS.md).
+///
+/// D-K3 done (2026-11-11): the hash of the r1007 profile built from the fresh-keys alloc
+/// (`core/economics/assets/r1007/alloc.json`), at the canonical genesis timestamp. It is
+/// still a candidate: the ceremony stamps block 0 with its own timestamp, which moves it.
+pub const R1007_GENESIS: [u8; 32] =
+    hex32("cf68634502b4fca1e977ac8dd35aa006bb40c04208d5cd55f1c2b508bba96631");
 
 /// Activation heights compiled into this release for ONE genesis, keyed by its block-0
 /// hash rather than by chain id. r1005 and r1006 share chain id 40204, so a per-chain pin
@@ -220,18 +240,23 @@ pub struct GenesisActivations {
     /// one height (`citrate_execution::supply_hardening`, resolved through its
     /// `pin_for_genesis`).
     pub supply_hardening: Option<u64>,
+    /// The standard, incremental MPT state root (`citrate_execution::mpt_state_root`,
+    /// ADR-2026-11-03 CV-14 (a)+(b)): an r1007 genesis rule. It changes every root
+    /// value, so a running chain never gets it; r1006 keeps it unset.
+    pub mpt_state_root: Option<u64>,
 }
 
 impl GenesisActivations {
     /// Every rule, by name, with its height, in a fixed order (for logs and the
     /// consensus fingerprint).
-    pub fn entries(&self) -> [(&'static str, Option<u64>); 5] {
+    pub fn entries(&self) -> [(&'static str, Option<u64>); 6] {
         [
             ("pba_hardening", self.pba_hardening),
             ("exact_create_code", self.exact_create_code),
             ("vrf_canonical_encoding", self.vrf_canonical_encoding),
             ("storage_root_hardening", self.storage_root_hardening),
             ("supply_hardening", self.supply_hardening),
+            ("mpt_state_root", self.mpt_state_root),
         ]
     }
 
@@ -243,25 +268,54 @@ impl GenesisActivations {
         "vrf_canonical_encoding",
         "storage_root_hardening",
         "supply_hardening",
+        "mpt_state_root",
     ];
 }
 
 /// r1006's rules: the owner's decision (2026-10-26) is EVERY new hardening rule active
 /// from the first block after genesis. ONE place: changing a rule's schedule for r1006 is
 /// a one-line change here (and moves the consensus fingerprint).
+///
+/// `mpt_state_root` is the exception: it is a genesis rule for r1007 (CV-14, owner
+/// 2026-11-07) and would change every root of the running r1006 chain, so r1006 keeps
+/// it unset.
 pub const R1006_ACTIVATIONS: GenesisActivations = GenesisActivations {
     pba_hardening: Some(0),
     exact_create_code: Some(0),
     vrf_canonical_encoding: Some(0),
     storage_root_hardening: Some(0),
     supply_hardening: Some(0),
+    mpt_state_root: None,
+};
+
+/// r1007's rules (S3-6; docs/consensus/R1007_GENESIS.md): every genesis-keyed rule from
+/// 0, so the chain runs one rule set from its first block and none of the legacy
+/// behaviours is reachable.
+///
+/// * `mpt_state_root: Some(0)`: CV-14 (a)+(b), owner 2026-11-07. Activation 0 includes
+///   block 0 itself (lead decision 2026-11-09, docs/consensus/STATE_ROOT_MPT.md §1).
+/// * `supply_hardening` and `exact_create_code` at 0: owner decision 2026-11-09 (the
+///   mergeset lane's recommendation). Block 0 carries no transactions, so they govern
+///   every executed transaction: no deployment bonus for a failed deployment, a
+///   deployment's `value` is transferred, and created code is stored exactly, not
+///   zero-padded.
+/// * `pba_hardening`, `vrf_canonical_encoding`, `storage_root_hardening` at 0, as r1006.
+pub const R1007_ACTIVATIONS: GenesisActivations = GenesisActivations {
+    pba_hardening: Some(0),
+    exact_create_code: Some(0),
+    vrf_canonical_encoding: Some(0),
+    storage_root_hardening: Some(0),
+    supply_hardening: Some(0),
+    mpt_state_root: Some(0),
 };
 
 /// Per-genesis activations compiled into this release, keyed by (chain id, block-0 hash),
 /// beside [`RELEASE_GENESIS`]. The ONLY place a new rule gets a height: r1005's genesis has
 /// no entry, so every new rule stays unset there (replay-identical).
-pub const GENESIS_ACTIVATIONS: &[(u64, [u8; 32], GenesisActivations)] =
-    &[(40204, R1006_GENESIS, R1006_ACTIVATIONS)];
+pub const GENESIS_ACTIVATIONS: &[(u64, [u8; 32], GenesisActivations)] = &[
+    (40204, R1006_GENESIS, R1006_ACTIVATIONS),
+    (40204, R1007_GENESIS, R1007_ACTIVATIONS),
+];
 
 /// The genesis-keyed rules for a node on `chain_id` whose loaded block 0 is `genesis`:
 ///
@@ -750,8 +804,10 @@ mod tests {
 
     #[test]
     fn future_drift_window() {
-        assert!(within_future_drift(1_900, 1_000));
-        assert!(!within_future_drift(1_901, 1_000));
+        // r1007 G9: the window is MAX_FUTURE_BLOCK_DRIFT_SECS (15 s, was 900 s).
+        let edge = 1_000 + MAX_FUTURE_BLOCK_DRIFT_SECS;
+        assert!(within_future_drift(edge, 1_000));
+        assert!(!within_future_drift(edge + 1, 1_000));
         assert!(!within_future_drift(u64::MAX, 1_000));
         assert!(within_future_drift(u64::MAX, u64::MAX));
     }
@@ -1023,10 +1079,16 @@ mod tests {
         );
         assert!(RELEASE_GENESIS.contains(&(40204, R1006_GENESIS)));
         for (name, h) in R1006_ACTIVATIONS.entries() {
+            // CV-14 (owner 2026-11-07): the MPT state root is an r1007 genesis rule and
+            // would move every r1006 root, so it is the one rule r1006 leaves unset.
+            let want = if name == "mpt_state_root" {
+                None
+            } else {
+                Some(0)
+            };
             assert_eq!(
-                h,
-                Some(0),
-                "{name}: the owner set every new rule to 0 on r1006"
+                h, want,
+                "{name}: the owner set every new rule to 0 on r1006 (except the r1007 genesis rule)"
             );
         }
         let names: Vec<&str> = R1006_ACTIVATIONS.entries().iter().map(|e| e.0).collect();
@@ -1037,7 +1099,8 @@ mod tests {
                 "exact_create_code",
                 "vrf_canonical_encoding",
                 "storage_root_hardening",
-                "supply_hardening"
+                "supply_hardening",
+                "mpt_state_root"
             ]
         );
         for w in GenesisActivations::WIRED {
@@ -1048,6 +1111,49 @@ mod tests {
         }
     }
 
+    /// r1007 (ADR-2026-11-03 CV-2, S3-6): its own block 0 on chain 40204, with every
+    /// genesis-keyed rule from 0, the MPT state root (CV-14) included, and nothing of it
+    /// reaching r1005 or r1006, which share the chain id.
+    #[test]
+    fn r1007_is_its_own_release_genesis_with_every_rule_from_zero() {
+        let r1005 = RELEASE_GENESIS[0].1;
+        assert_ne!(R1007_GENESIS, r1005);
+        assert_ne!(R1007_GENESIS, R1006_GENESIS);
+        assert!(RELEASE_GENESIS.contains(&(40204, R1007_GENESIS)));
+        assert!(check_genesis_chain(40204, &R1007_GENESIS).is_ok());
+        assert!(
+            check_genesis_chain(1337, &R1007_GENESIS).is_err(),
+            "r1007's block 0 runs only on 40204"
+        );
+        assert_eq!(
+            rules_for_genesis(40204, &R1007_GENESIS),
+            Some(R1007_ACTIVATIONS)
+        );
+        assert_eq!(rules_for_genesis(1337, &R1007_GENESIS), None);
+        for (name, h) in R1007_ACTIVATIONS.entries() {
+            assert_eq!(h, Some(0), "{name}: every r1007 rule is on from block 0");
+        }
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&R1007_GENESIS), |a| a.mpt_state_root),
+            Some(Some(0)),
+            "the r1007 block 0 is built and rebuilt under the MPT state root"
+        );
+        assert_eq!(
+            genesis_rule_pin(40204, Some(&R1006_GENESIS), |a| a.mpt_state_root),
+            Some(None),
+            "r1006 never gets the MPT rule"
+        );
+        assert!(canonical_checkpoints(&R1007_GENESIS).is_empty());
+        assert_eq!(
+            GENESIS_ACTIVATIONS
+                .iter()
+                .filter(|(_, g, _)| *g == R1007_GENESIS)
+                .count(),
+            1,
+            "one entry per genesis"
+        );
+    }
+
     /// r1005's genesis on the new binary: no genesis-keyed rule, so every module keeps its
     /// per-chain pin (the new rules stay unset: replay-identical). r1006's genesis: every
     /// rule at 0. An unknown genesis on 40204: `None`, explicitly.
@@ -1055,11 +1161,19 @@ mod tests {
     fn genesis_keyed_rules_r1005_none_r1006_zero_unknown_none() {
         let r1005 = RELEASE_GENESIS[0].1;
         assert_eq!(rules_for_genesis(40204, &r1005), None);
-        for (_, g) in RELEASE_GENESIS.iter().filter(|(_, g)| *g != R1006_GENESIS) {
+        for (_, g) in RELEASE_GENESIS
+            .iter()
+            .filter(|(_, g)| *g != R1006_GENESIS && *g != R1007_GENESIS)
+        {
             assert_eq!(rules_for_genesis(40204, g), None, "{}", hex::encode(g));
         }
         let r = rules_for_genesis(40204, &R1006_GENESIS).expect("r1006 has rules");
-        assert!(r.entries().iter().all(|(_, h)| *h == Some(0)), "{r:?}");
+        assert!(
+            r.entries()
+                .iter()
+                .all(|(n, h)| *h == Some(0) || (*n == "mpt_state_root" && h.is_none())),
+            "{r:?}"
+        );
         assert_eq!(
             rules_for_genesis(40204, &[0x42; 32]),
             None,

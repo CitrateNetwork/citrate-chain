@@ -75,7 +75,7 @@ use citrate_consensus::types::{Block, Hash};
 use citrate_storage::StorageManager;
 use tracing::{debug, info, warn};
 
-use crate::canonical_apply::{ApplyOutcome, CanonicalApplicator};
+use crate::canonical_apply::CanonicalApplicator;
 
 /// PBA-R2: verify a block's body against its header under the hardened
 /// validity rules. A no-op below the activation height (legacy validity is
@@ -111,6 +111,14 @@ pub(crate) fn verify_block_body(
             return Err(format!("body: tx #{i} ({}): {e} (PBA-L1b-001)", tx.hash));
         }
     }
+    // r1007 S3-3b (spec 06 §3.4 class A, §3.6): the stateless list rules. The
+    // block's own list is executed later, by its accepting block, where a
+    // stateful failure is a skip; these make a block invalid outright.
+    citrate_consensus::acceptance::class_a_violation(
+        &block.transactions,
+        block.header.base_fee_per_gas,
+    )
+    .map_err(|e| format!("body: {e} (class A)"))?;
     Ok(())
 }
 
@@ -628,31 +636,18 @@ impl BlockAdmission {
             }
         }
 
-        // ---- execute-on-receive ----
-        // Only for a genuinely new admission. A repaired partial admission is
-        // handed to the periodic drain instead: the repair may have filled a
-        // hole well BELOW the stored head, in which case the whole contiguous
-        // suffix above it should drain in one pass, which is precisely what
-        // `drive_drain` does and what a single `apply_received` would not.
-        if !completed_partial {
-            if let Some(app) = &self.applicator {
-                match app.apply_received(block).await {
-                    ApplyOutcome::Applied { root, height } => {
-                        debug!(
-                            "admission: execute-on-receive applied {} @ {} (root {})",
-                            hash, height, root
-                        );
-                    }
-                    ApplyOutcome::Rejected(why) => {
-                        warn!(
-                            "admission: execute-on-receive REJECTED {} @ {}: {}",
-                            hash, block.header.height, why
-                        );
-                    }
-                    // Deferred / AlreadyApplied: gap, fork, or echo. No-op.
-                    _ => {}
-                }
-            }
+        // ---- execute-on-receive: handed to the drain task ----
+        // Admission never executes. It runs on the P2P message loop, and
+        // execution there (once per admitted block, once per block of a
+        // 32-block `Blocks` answer, each waiting for the state-advance lock the
+        // producer and the drain hold while they execute) held that loop for
+        // the whole apply: at ~1.2 s per block a handler outlived the 60 s
+        // stall watchdog, NewBlock was shed and the node killed itself (r1007
+        // devnet, cand-236247b6, 2026-11-08). The drain task applies the
+        // stored block, and a repaired partial admission's suffix, in one pass
+        // toward fork choice's head (`CanonicalApplicator::drive_drain`).
+        if let Some(app) = &self.applicator {
+            app.request_drain();
         }
 
         AdmitOutcome::Admitted { completed_partial }
@@ -962,7 +957,8 @@ mod tests {
             .height(height)
             .parent(parent)
             .coinbase(CB)
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + height)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new(vrf),
@@ -972,6 +968,10 @@ mod tests {
             .blue_score(blue_score)
             .blue_work(citrate_consensus::types::blue_work_for_score(blue_score))
             .build_unhashed();
+        // r1007 G10: a proposer of its own (from its content), so honest siblings
+        // in one slot are not equivocation.
+        b.header.proposer_pubkey =
+            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
         b.header.block_hash = b.compute_hash();
         b
     }
@@ -1003,6 +1003,72 @@ mod tests {
 
     fn fully_admitted(storage: &StorageManager, dag_has: bool, b: &Block) -> bool {
         storage.blocks.has_block(&b.header.block_hash).unwrap() && dag_has
+    }
+
+    /// Admission with the node's applicator wired (execute-on-receive).
+    fn harness_with_applicator() -> (
+        BlockAdmission,
+        Arc<CanonicalApplicator>,
+        Arc<StorageManager>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage =
+            Arc::new(StorageManager::new(dir.path(), PruningConfig::default()).expect("storage"));
+        let dag = Arc::new(DagStore::with_permissive_vrf_for_testing());
+        let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
+        let exec = Arc::new(citrate_execution::Executor::new(Arc::new(
+            citrate_execution::StateDB::new(),
+        )));
+        let app = Arc::new(
+            CanonicalApplicator::new(exec, storage.clone()).with_fork_choice(ghostdag.clone()),
+        );
+        let adm = BlockAdmission::new(storage.clone(), dag, ghostdag, Some(app.clone()));
+        (adm, app, storage, dir)
+    }
+
+    /// RED (r1007 devnet, cand-236247b6 K1/R3/P1/P2, 2026-11-08): block
+    /// execution ran inside admission, i.e. on the single P2P message loop,
+    /// once per admitted block (and once per block of a 32-block `Blocks`
+    /// answer), waiting for the state-advance lock the producer and the
+    /// periodic drain hold while THEY execute. At an apply cost of ~1.2 s per
+    /// block one handler ran past the 60 s stall watchdog: NewBlock was shed
+    /// (`inbound queue full`, 18-183 per run) and the node killed itself
+    /// (`STALLED`, up to 25 per run), then could not reseal or catch up.
+    ///
+    /// Admission stores; it must never wait for, or do, execution. The drain
+    /// task applies (it is woken, so nothing waits for its 1 s tick).
+    #[tokio::test]
+    async fn admit_never_waits_for_the_state_advance_lock() {
+        let (adm, app, storage, _d) = harness_with_applicator();
+        let g = root();
+        adm.admit(&g).await;
+        let b1 = mk(1, g.header.block_hash, 1, [0x61; 32]);
+
+        // The producer (or the drain) is executing a block: it holds the lock.
+        let lock = app.advance_lock();
+        let held = lock.lock().await;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), adm.admit(&b1)).await;
+        assert_eq!(
+            out.expect(
+                "admission waited on the state-advance lock: execution runs on the P2P \
+                 message loop, so one slow apply stalls every inbound message"
+            ),
+            AdmitOutcome::Admitted {
+                completed_partial: false
+            }
+        );
+        assert!(
+            storage.blocks.has_block(&b1.header.block_hash).unwrap(),
+            "the block is stored for the drain to apply"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            app.drain_wake().notified(),
+        )
+        .await
+        .expect("admission wakes the drain task, which applies the block");
+        drop(held);
     }
 
     #[tokio::test]
@@ -1548,7 +1614,8 @@ mod tests {
             .parent(canonical[2].header.block_hash)
             .merge_parents(vec![sibling.header.block_hash])
             .coinbase(CB)
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + 4)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new([0x44; 32]),
@@ -1558,6 +1625,10 @@ mod tests {
             .blue_score(5)
             .blue_work(citrate_consensus::types::blue_work_for_score(5))
             .build_unhashed();
+        // r1007 G10: a proposer of its own (from its content), so honest siblings
+        // in one slot are not equivocation.
+        merge.header.proposer_pubkey =
+            citrate_consensus::types::PublicKey::new(*merge.compute_hash().as_bytes());
         merge.header.block_hash = merge.compute_hash();
         assert!(
             !admitted(&adm.admit(&merge).await),
@@ -1680,7 +1751,8 @@ mod pba_r2_admission {
             .height(height)
             .parent(parent)
             .coinbase([0x33; 20])
-            .timestamp(1000)
+            // r1007 G9: one slot per height (a timestamp shared with the parent is invalid).
+            .timestamp(1000 + height)
             .vrf_reveal(VrfProof {
                 proof: vec![],
                 output: Hash::new([0x5A; 32]),
@@ -1691,6 +1763,10 @@ mod pba_r2_admission {
             .blue_work(citrate_consensus::types::blue_work_for_score(height))
             .build_unhashed();
         b.tx_root = tx_root_for_height(hardening, height, &b.transactions);
+        // r1007 G10: a proposer of its own (from its content), so honest siblings
+        // in one slot are not equivocation.
+        b.header.proposer_pubkey =
+            citrate_consensus::types::PublicKey::new(*b.compute_hash().as_bytes());
         b.header.block_hash = b.compute_hash();
         b
     }

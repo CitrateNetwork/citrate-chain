@@ -80,6 +80,7 @@ fn put(storage: &StorageManager, tag: u8, height: u64, parent: Hash, base_fee: u
         eth_tx_type: 0,
         effective_gas_price: 0,
         revert_reason: None,
+        acceptance: None,
     };
     storage
         .transactions

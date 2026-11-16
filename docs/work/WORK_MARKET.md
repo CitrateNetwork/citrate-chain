@@ -2,7 +2,7 @@
 created: 2026-11-08T22:00:00Z
 branch: feat/v060-genesis-workmarket
 author: Larry Klosowski + Claude Opus 5.5 (MAC lane, V60-GEN)
-status: draft (ceremony-genesis candidate; owner decisions of 2026-11-09 (incl. the Q4 revision) and the #451 review fixes (rounds 1-4) applied; not deployed; internal audit GEN-AUDIT pending)
+status: draft (ceremony-genesis candidate; owner decisions of 2026-11-09 (incl. the Q4 revision), the #451 review fixes (rounds 1-4), the 2026-11-15 payouts hardening and the governance-set bond floors (owner 2026-11-14) applied; not deployed; internal audit GEN-AUDIT pending)
 spec: citrate-federation .agentile/planset/2026-11-07-v060/06_CONTRACTS.md §2-§4, §6-§8
 ---
 
@@ -21,10 +21,10 @@ Sources: `contracts/src/work/{IVerifier,WorkMarket,FLRoundVerifier,TaskVerifier}
 
 | Role | Who at genesis | What it can do | What it cannot do |
 |---|---|---|---|
-| Governance (`Governable`, two-step transfer) | the governance timelock (3-of-5 / 48 h) | allow or deny verifiers for **new** offers; pause and unpause **new** offers; set the guardian | touch any escrow, bond or pull balance; change an offer's price, verifier or terms; block `join`, `postPayout`, `dispute`, `settle`, `refund`, `claimBond`, `withdraw` |
+| Governance (`Governable`, two-step transfer) | the governance timelock (3-of-5 / 48 h) | allow or deny verifiers for **new** offers; pause and unpause **new** offers; set the guardian; set the bond floors for **new** offers (`setMinCoordinatorBond`, `setMinJoinBond`, each 1 to 100,000 SALT, events `MinCoordinatorBondSet` / `MinJoinBondSet`) | touch any escrow, bond or pull balance; change an offer's price, verifier or terms; block `join`, `postPayout`, `dispute`, `settle`, `refund`, `claimBond`, `withdraw` |
 | Guardian | the guardian council (2-of-3); required at construction (`InitialAdmin.check`), governance may later clear it | pause new offers | unpause; anything else |
 | Poster | any account | open (escrows the budget); dispute; refund what no root can claim; accept a TASK result (TaskVerifier) | take escrow a posted, undisputed root reserves |
-| Coordinator | named by the poster at `open` (FL: the round's coordinator; TASK: the selected worker, who must have joined) | post the payout root (with the poster-set bond) once the verifier accepts; claim its bond after an undisputed window | post after the deadline; post more units than the budget buys; post a tree deeper than `maxWorkers` needs |
+| Coordinator | named by the poster at `open` (FL: the round's coordinator, which must be the FRL cluster coordinator and a key with no code at `open`; TASK: the selected worker, who must have joined) | post the payout root (with the poster-set bond) once the verifier accepts; claim its bond after an undisputed window | post after the deadline; post more units than the budget buys; post a tree deeper than `maxWorkers` needs |
 | Dispute admin | named at `open`; required on group TASK offers, refused everywhere else | uphold or reject a subjective dispute (upholding waits for open challenges) | anything on FL offers or open tasks |
 | Worker | any account meeting the price floor and allowlist | join; dispute; settle its leaf (anyone can call `settle` for it); claim its join bond; withdraw | be paid twice; be paid without joining |
 | FLRoundVerifier | none (no owner) | — | — |
@@ -71,8 +71,8 @@ budget refunded as before; an uncommitted `dispute()`, or a disputer who is the 
 3. **`settle` takes `cumBefore` and `index`** for the same reason, and verifies them with the
    same opening rule as disputes (depth and index range).
 4. **Objective disputes** (upheld automatically): `MISSING_LEAF` (coordinator-signed receipt
-   plus a bracketing pair, a first or last leaf, or an empty tree), `LOW_UNITS` (more distinct
-   signed leases than the leaf's units), `ORDER` (neighbours unsorted, prefix sums that do not
+   plus a bracketing pair, a first or last leaf, or an empty tree), `LOW_UNITS` (one
+   coordinator-signed receipt whose `ordinal` is above the leaf's units), `ORDER` (neighbours unsorted, prefix sums that do not
    abut, or padding before a real leaf; `ORDER` takes **any two** openable leaves `i < j`, not
    only neighbours, and is proven by `worker_i >= worker_j` or `cumBefore_i + units_i > cumBefore_j`,
    or padding at `i` before a real leaf at `j`; neighbours must still abut exactly),
@@ -97,17 +97,25 @@ budget refunded as before; an uncommitted `dispute()`, or a disputer who is the 
    (`dispute`, `revealDispute`, `resolveChallenge`, `resolveIndexChallenge`) goes through this
    one rule; the subjective path never slashes (the worker's bond is returned, point 6).
    Receipt digest: `keccak256(abi.encode(RECEIPT_TAG, chainid, market, offerId, worker, leaseId,
-   deltaHash, true))`, EIP-191-signed by the coordinator (EIP-1271 for contract coordinators).
-   The coordinator software (citrate-compute-pool) must sign this exact digest.
+   deltaHash, ordinal, true))` (`RECEIPT_TAG` = `"citrate-workmarket-lease-receipt/2"`),
+   EIP-191-signed by the coordinator's key and checked with ECDSA only (no EIP-1271), so a
+   signed receipt stays valid for the life of the offer whatever code the coordinator's address
+   later carries; an FL offer whose coordinator has code at `open` is refused. `ordinal` is the
+   worker's verified-lease count on the offer including that lease (1 for its first, n for its
+   n-th; 0 is never valid), so the receipt for a worker's latest lease proves it is owed at least
+   that many units, at any unit count. The coordinator must not sign more ordinals across all
+   workers than the offer's `maxUnits` (no root could pay them all). The coordinator software
+   (citrate-compute-pool) must sign this exact digest, and a worker keeps the receipt for its
+   latest lease.
 5. **Inclusion challenge (Q11).** A leaf whose payload is not a valid `(worker, units,
    cumBefore)` preimage cannot be opened, so it could hide an absent worker from a
-   `MISSING_LEAF` proof. `challengeInclusion(id, receipts)`: inside the window a joined worker or
-   the poster presents coordinator-signed receipts for one joined worker. `answerChallenge(id,
+   `MISSING_LEAF` proof. `challengeInclusion(id, receipt)`: inside the window a joined worker or
+   the poster presents one coordinator-signed receipt for a joined worker. `answerChallenge(id,
    leaf)`: anyone, until `answerBy` (+24 h, `CHALLENGE_RESPONSE_WINDOW`), opens that worker's leaf
-   with at least the receipted units. Otherwise `resolveChallenge(id, worker)` upholds it like an
+   with at least the receipt's `ordinal` units. Otherwise `resolveChallenge(id, worker)` upholds it like an
    objective dispute (`DISPUTE_UNANSWERED_CHALLENGE`). Settle, the coordinator bond and the
    poster's refund wait while a challenge is open. The answer records the opened leaf's units, and
-   a worker is re-challenged under the same root only with more receipts than that, so a spurious
+   a worker is re-challenged under the same root only with a receipt ordinal above that, so a spurious
    challenge costs one answer (a claim above the leaf's units is a `LOW_UNITS` dispute anyway).
 5a. **Index challenge (#451 review).** A worker challenge only forces open the challenged
    worker's own leaf, so an unopenable leaf elsewhere could still separate two leaves whose
@@ -173,10 +181,15 @@ budget refunded as before; an uncommitted `dispute()`, or a disputer who is the 
    Upholding bumps `resultEpochOf(id)`; TaskVerifier keeps the epoch with each result and stops
    counting an older one, so the rejected result cannot be posted again, and the worker may
    submit a corrected result even if the requester had accepted the old one. Open tasks: no
-   admin, so the poster refunds after `deadline + disputeWindow` and the worker's bond is
-   returned. Upholding, and the refund of a Disputed offer, wait while a challenge is open, so
+   admin, so the offer is refunded to the poster after `deadline + disputeWindow` and the
+   worker's bond is returned. Anyone may call `refund` on a Disputed offer (the amount still
+   goes to the poster), so the bonds it holds do not wait on the poster. Upholding, and the refund of a Disputed offer, wait while a challenge is open, so
    the challenger's share of the slash is not lost; resolving the challenge first pays it.
-7. **Refund after a posted root** returns `budget − payoutUnits × price`, not `budget − paid`.
+7. **Refund after a posted root** returns `budget − paid − (payoutUnits − settledUnits) × price`:
+   what no root has paid, minus what the live root still reserves for its unsettled leaves (not
+   `budget − paid`). `sweepReserve` later returns that reserve, `(payoutUnits − settledUnits) ×
+   price`, and `postPayout` refuses a root whose `units × price` plus what is already paid
+   exceeds the budget, so the reserve is always backed whatever earlier roots paid.
    06 §2.1 allows `budget − paid` after `deadline + disputeWindow`, but a root posted near the
    deadline only opens for settling at about the same time, so `budget − paid` would let the
    poster take what the root owes unsettled workers (RT-11). The reserve stays settleable until
@@ -193,7 +206,13 @@ budget refunded as before; an uncommitted `dispute()`, or a disputer who is the 
     coordinator bond once the window has passed undisputed.
 12. **FLRoundVerifier `bindRef` = the FRL round id** `roundIdOf(clusterId, ordinal)`. 06 §3
     decodes `(clusterId, ordinal)` from `bindRef`, which a hash does not allow. FRL keys rounds
-    by that id, so no registration step is needed.
+    by that id, so no registration step is needed. The verifier reads the asking market's offer
+    (`msg.sender`, as TaskVerifier does; `acceptedFor(market, ...)` for off-chain readers) and
+    accepts only when the offer names it, is an FL round and binds this round id, the round's
+    FRL cluster coordinator is the offer's coordinator (the party that commits the round is the
+    party bonded for the payout), and the cluster's FRL challenge window is at least
+    `MIN_CHALLENGE_WINDOW` = 1800 blocks (about an hour at the 2 s producer cadence; FRL counts
+    `block.number`, which merged DAG blocks can repeat, so it is a floor on the count).
 13. **TaskVerifier keys results by market and result epoch** (`submit(market, offerId, hash)`,
     `accept(market, offerId, hash)`; `accepted` uses `msg.sender`). WorkMarket's block-0
     allowlist names TaskVerifier, so TaskVerifier's init code cannot name WorkMarket without a
@@ -201,8 +220,8 @@ budget refunded as before; an uncommitted `dispute()`, or a disputer who is the 
     payout in WorkMarket (point 6); an upheld one moves the market's `resultEpochOf` and so
     rejects the result here.
 14. **Known trade-offs (documented, not fixed in v1).**
-    - *Slot squatting.* With `joinBond = 0` and no allowlist, anyone can join until `maxWorkers`
-      is reached and so keep honest workers out; joined accounts may also raise challenges. A
+    - *Slot squatting.* With a join bond at the floor and no allowlist, anyone can join until
+      `maxWorkers` is reached and so keep honest workers out; joined accounts may also raise challenges. A
       poster who expects that sets a join bond (returned to the worker in every case, Q5) or an
       `allowlistRoot`.
     - *Poster as coordinator (#451 reviews 2-4).* `open` does not forbid `coordinator == poster`:
@@ -234,6 +253,82 @@ budget refunded as before; an uncommitted `dispute()`, or a disputer who is the 
     - *Challenge cost is visible before joining.* The poster sets `coordinatorBond` at `open` (at
       least `minCoordinatorBond`), and the challenge bond is 10 % of it, so a worker knows what a
       challenge will cost on an offer before it joins (`challengeBondOf(id)`).
+    - *Reveal pre-emption (accepted, 2026-11-15 review).* A poster or joined worker that sees a
+      reveal pending can land the same evidence through `dispute()` first. The root is withdrawn
+      and the bond slashed either way, so workers are protected the same; the only difference is
+      that the whole slash goes to `slashSink` and the committer earns no share. The party that
+      pre-empts gains nothing (an uncommitted dispute earns no share and the poster never
+      receives a slash), so this is griefing of the watcher reward at the griefer's gas cost.
+      Honouring the earlier commitment would mean keeping each withdrawn root's tree to check a
+      late reveal against, which v1 does not do. Watchers that want the share should reveal
+      promptly after the delay.
+    - *Coordinator liveness.* The coordinator bond is taken at `postPayout`, so a coordinator
+      that never posts loses nothing and the poster refunds after the deadline; workers are paid
+      only if the coordinator posts. No liveness bond in v1.
+
+## Lease receipts: the format a receipt issuer must produce
+
+For whoever builds the off-chain half: the coordinator's receipt issuer, the tree publisher and
+the worker-side watcher. No issuer exists yet. This section is the contract's side of the
+interface; the code is `WorkMarket.receiptDigest`, `_receiptValid`, `_provesLowUnits`,
+`_provesMissingLeaf` and `challengeInclusion`.
+
+**When to issue.** The coordinator issues one receipt each time it verifies a worker's lease
+(the worker's delta for that lease is accepted into the round). Sign only verified leases.
+
+**Fields** (`WorkMarket.Receipt`, in this order):
+
+| Field | Type | Value |
+|---|---|---|
+| `worker` | `address` | the joined worker the lease belongs to |
+| `leaseId` | `bytes32` | the coordinator's id for the lease; unique per lease |
+| `deltaHash` | `bytes32` | the hash of the delta the lease verified |
+| `ordinal` | `uint64` | the worker's count of verified leases on this offer, **including this one**: 1 for its first, n for its n-th. Never 0 (a receipt with ordinal 0 is invalid). |
+| `signature` | `bytes` | 65 bytes, `r ‖ s ‖ v`, low-s (OpenZeppelin `ECDSA.tryRecover`) |
+
+**Ordinal rules.**
+- Count per (offer, worker), from 1, by one per verified lease, never reused or skipped. Each
+  worker has its own count.
+- Count over the whole offer, not per root. A root that is withdrawn and re-posted does not reset
+  the count, because the work it counts is the same.
+- The units a root pays a worker must be at least the worker's highest ordinal. If the root pays
+  less, the worker's latest receipt proves the shortfall (`LOW_UNITS`), whatever the number.
+- Across all workers, the ordinals signed must not exceed the offer's `maxUnits` (`budget /
+  pricePerUnit`). No root could pay them all, so every root the coordinator posts would be
+  disputable. Stop verifying leases once the offer's units are used up.
+
+**Digest and signature.**
+```
+RECEIPT_TAG = keccak256("citrate-workmarket-lease-receipt/2")
+digest      = keccak256(abi.encode(RECEIPT_TAG, uint256 chainid, address market, uint256 offerId,
+                                   address worker, bytes32 leaseId, bytes32 deltaHash,
+                                   uint64 ordinal, bool true))
+signed      = keccak256("\x19Ethereum Signed Message:\n32" ‖ digest)   // EIP-191, personal_sign
+signature   = ECDSA(coordinator key, signed)
+```
+`abi.encode` pads every field to 32 bytes. `receiptDigest(offerId, worker, leaseId, deltaHash,
+ordinal)` on the deployed market returns `digest`; check the issuer against it.
+
+The signature must come from the coordinator's own key. The market checks it with ECDSA only;
+EIP-1271 is never consulted, so a contract or smart-account signature does not count. An FL
+offer whose coordinator address has code at `open` is refused. Once signed, a receipt stays
+valid for the life of the offer, whatever code the coordinator's address later carries.
+
+**What a worker keeps.** Its latest receipt on each offer (the highest ordinal). One receipt
+is enough for every remedy:
+- `dispute` (or `commitDispute`, then `revealDispute` to earn the share) with evidence
+  `abi.encode(uint8 tag, bytes body)`:
+  - `LOW_UNITS` (tag 2): `body = abi.encode(LeafOpening leaf, Receipt r)`, where `leaf` is the
+    worker's own leaf and `r.ordinal > leaf.units`.
+  - `MISSING_LEAF` (tag 1): `body = abi.encode(Receipt r, uint8 mode, LeafOpening lo,
+    LeafOpening hi)`, with the bracketing leaves for the `ABSENT_*` mode (point 4).
+- `challengeInclusion(offerId, Receipt r)`, with the challenge bond, when the tree is not
+  published. The root must then open the worker's leaf with at least `r.ordinal` units.
+
+**What the watcher does.** On `PayoutPosted`, open the worker's own leaf from the published
+tree and compare its units with the latest ordinal. If they fall short, or the leaf is missing,
+act inside the dispute window: commit-reveal a dispute when the tree is published, or raise an
+inclusion challenge when it is not.
 
 ## GEN-PARAMS (constructor parameters for the ceremony genesis spec)
 
@@ -248,12 +343,15 @@ their addresses are known before the ceremony.
 | WorkMarket | `governance_` | the governance timelock | two-step transfer; may not be the CREATE2 factory (Governable) |
 | WorkMarket | `guardian_` | the guardian council 2-of-3 | not zero and not the CREATE2 factory (`InitialAdmin.check`); governance may rotate or clear it later |
 | WorkMarket | `slashSink_` | the governance treasury: the governance timelock (#451 review 3) | immutable; not zero and not the CREATE2 factory (`InitialAdmin.check`); receives every slash not paid to a rewarded disputer (owner 2026-11-09, Q4 revised) and withdraws it like any pull balance. The governance timelock is used, not a burn, so slashed SALT stays under governance instead of being lost |
-| WorkMarket | `defaultCoordinatorBond_` | SALT wei, above zero (Q1), at least `minCoordinatorBond_` | immutable; the amount is a genesis-spec value tied to the tokenomics decision |
-| WorkMarket | `minCoordinatorBond_` | SALT wei, above zero (#451 review 3) | immutable; the least bond an offer may set, so a dust bond cannot neuter the slash or the challenge bond (10 % of it) |
+| WorkMarket | `defaultCoordinatorBond_` | SALT wei, at least `minCoordinatorBond_` and at most 100,000 SALT (Q1); 1,000 SALT (owner 2026-11-11, rehearsal value) | immutable; an offer opened with 0 carries it, or the coordinator floor if governance has since raised the floor above it |
+| WorkMarket | `minCoordinatorBond_` | the genesis coordinator-bond floor, 1 to 100,000 SALT; 100 SALT (owner 2026-11-11, rehearsal value) | governance-set afterwards (`setMinCoordinatorBond`, owner 2026-11-14); the least bond a new offer may set, so a dust bond cannot neuter the slash or the challenge bond (10 % of it) |
+| WorkMarket | `minJoinBond_` | the genesis join-bond floor, 1 to 100,000 SALT; 10 SALT (owner 2026-11-14) | governance-set afterwards (`setMinJoinBond`); the least join bond a new offer may set |
 | WorkMarket | `initialVerifiers_` | `[FLRoundVerifier, TaskVerifier]` | the CREATE2-predicted addresses above; deploy order: FRL, the two verifiers, then WorkMarket |
 
 Fixed in code (not parameters): `MIN_DISPUTE_WINDOW` = 24 h, `MAX_WORKERS_CAP` = 1024,
-`SLASH_DISPUTER_BPS` = 5000 (Q4, revised by the owner 2026-11-09: the rest goes to `slashSink`), `MAX_RECEIPTS_PER_DISPUTE` = 256,
+`SLASH_DISPUTER_BPS` = 5000 (Q4, revised by the owner 2026-11-09: the rest goes to `slashSink`),
+`MIN_BOND_FLOOR` = 1 SALT and `MAX_BOND_FLOOR` = 100,000 SALT (the bond-floor bounds), FLRoundVerifier
+`MIN_CHALLENGE_WINDOW` = 1800 blocks,
 `CHALLENGE_RESPONSE_WINDOW` = 24 h, `POST_ANSWER_DISPUTE_WINDOW` = 24 h, `RESERVE_CLAIM_PERIOD` = 180 days,
 `DISPUTE_REVEAL_DELAY` = 60 s, `CHALLENGE_BOND_BPS` = 1000 (10 % of the coordinator bond).
 The payout tree depth is per payout, bounded by `maxWorkers` (at most 10 for 1024 workers). Native SALT only; the market

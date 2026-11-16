@@ -121,7 +121,8 @@ fn refuse(detail: String, data: Value) -> jsonrpc_core::Error {
         code: jsonrpc_core::ErrorCode::ServerError(HISTORICAL_STATE_CODE),
         message: format!(
             "{HISTORICAL_STATE_MESSAGE}: {detail}; this node serves account state at its \
-             executed head only (use \"latest\")"
+             executed head, and at past blocks of its applied chain only while their undo \
+             records are kept (S3-7; use \"latest\")"
         ),
         data: Some(data),
     }

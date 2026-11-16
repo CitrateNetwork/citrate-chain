@@ -12,7 +12,8 @@ source; this package is its typed, versioned distribution.
 
 | Version | Network | Block-0 hash |
 |---------|---------|--------------|
-| 0.2.0 | r1006 (live) | `0xa3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4` |
+| 0.3.0 | r1007 (live since 2026-11-12T14:00Z; **not published yet**) | `0xcf68634502b4fca1e977ac8dd35aa006bb40c04208d5cd55f1c2b508bba96631` |
+| 0.2.0 | r1006 (retired; root book archived as `contracts/addresses/r1006/40204.root.json`) | `0xa3651a272fe411948cbb4cf7cca4cee44be4248d32ab4376cea7636821c6cdd4` |
 | 0.1.0 | r1005 (retired; book archived in `contracts/addresses/r1005/`) | state root `0x1dcfc490…` |
 
 0.2.0 is a breaking release (a new network generation): most addresses moved, the r1005-only
@@ -21,6 +22,11 @@ throws for them), the post-genesis registries are added under their own keys (fo
 `Quorum.AnchorRegistry`), addresses are lowercase, and `governance` carries only `GOVERNANCE` and
 `GUARDIAN`. New export: `genesisHash`. Check it against `eth_getBlockByNumber(0x0).hash` before
 trusting any address.
+
+0.3.0 is a new network generation. The block-0 contracts keep their addresses (CREATE2). The 28
+post-genesis contracts all moved: the r1007 post-genesis deployer is new. Names are unchanged. New
+export: `accounts`, the operator EOAs (for example `Bundler` and `Faucet`), which `getAddress` does
+not resolve.
 
 ## Why
 

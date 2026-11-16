@@ -173,9 +173,15 @@ proptest! {
             let (ghostdag, dag_store, hashes) = build_chain(n, seed).await;
             let genesis_hash = hashes[0];
 
+            // r1007 G7: a block's blue set is its blue past, so genesis is in
+            // every block's blue set except its own (which is empty).
             for hash in &hashes {
                 let block = dag_store.get_block(hash).await.unwrap();
                 let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
+                if *hash == genesis_hash {
+                    prop_assert!(blue_set.blocks.is_empty());
+                    continue;
+                }
                 prop_assert!(
                     blue_set.contains(&genesis_hash),
                     "Genesis must be in the blue set of block {:?} (chain len={})",
@@ -393,9 +399,10 @@ proptest! {
     }
 
     // -----------------------------------------------------------------------
-    // 14. Blue set always contains the block itself.
-    //     For any block in a random linear chain, its own hash must be
-    //     in its blue set.
+    // 14. A block's blue set is its blue past (r1007 G7): it never contains
+    //     the block itself, it has exactly blue_score members, and that score
+    //     is the committed header value. (Pre-r1007 the block counted itself,
+    //     the genesis = 1 convention.)
     // -----------------------------------------------------------------------
     #[test]
     fn proptest_blue_set_contains_self(n in 1..12usize, seed in 1..1000u64) {
@@ -406,10 +413,12 @@ proptest! {
                 let block = dag_store.get_block(hash).await.unwrap();
                 let blue_set = ghostdag.calculate_blue_set(&block).await.unwrap();
                 prop_assert!(
-                    blue_set.contains(hash),
-                    "Block {:?} must be in its own blue set",
+                    !blue_set.contains(hash),
+                    "Block {:?} must not be in its own blue set",
                     hash
                 );
+                prop_assert_eq!(blue_set.blocks.len() as u64, blue_set.score);
+                prop_assert_eq!(blue_set.score, block.header.blue_score);
             }
             Ok(())
         })?;

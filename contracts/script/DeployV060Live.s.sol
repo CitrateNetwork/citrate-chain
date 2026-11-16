@@ -23,7 +23,7 @@ import {V060GovernanceSpec} from "./lib/V060GovernanceSpec.sol";
 ///                                  FederatedRoundLedger, OrganizationSBT, AgentSBT;
 ///                                  GuardianRecoveryModule under contracts or aaStack)
 ///           V060_GENESIS_OUT       book-shaped output (under ./genesis)
-///           WORKMARKET_MIN_COORDINATOR_BOND, WORKMARKET_DEFAULT_COORDINATOR_BOND
+///           WORKMARKET_MIN_COORDINATOR_BOND, WORKMARKET_DEFAULT_COORDINATOR_BOND, WORKMARKET_MIN_JOIN_BOND
 ///           GENESIS_KEY_INVENTORY  (with the deployer tagged V060_DEPLOYER), GENESIS_RETIRED_KEYS,
 ///           GENESIS_GUARDIAN_VETO_MARGIN
 ///           R1006_GOV_OWNERS, R1006_GRD_OWNERS  the councils' constructor owners, in order
@@ -38,10 +38,10 @@ contract DeployV060Live is DeployV060Genesis {
     /// @notice Live mode from the environment: as `run`, with the r1007 block-0 book as
     ///         V060_INPUT_BOOK and a deployer the inventory tags V060_DEPLOYER.
     function run() external override returns (Deployed memory d) {
-        (uint128 minBond, uint128 defaultBond) = _bondsFromEnv();
+        (uint128 minBond, uint128 defaultBond, uint128 joinBond) = _bondsFromEnv();
         V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
         address deployer = deployerAddress();
-        Inputs memory i = _inputsFromBook(vm.readFile(vm.envString("V060_INPUT_BOOK")), minBond, defaultBond, k);
+        Inputs memory i = _inputsFromBook(vm.readFile(vm.envString("V060_INPUT_BOOK")), minBond, defaultBond, joinBond, k);
         require(bytes(vm.envString("V060_GENESIS_OUT")).length != 0, "V060_GENESIS_OUT must name an output path");
         Rotation memory rot = Rotation({
             fromGov: vm.envAddress("R1006_GOV_OWNERS", ","),
@@ -57,9 +57,9 @@ contract DeployV060Live is DeployV060Genesis {
     /// @notice The canceller-swap proposal for the inputs in the environment (read-only): the
     ///         GovernanceMultisig `propose` payloads, printed only once v2 has code (fed #561).
     function swapProposalFromBook() external {
-        (uint128 minBond, uint128 defaultBond) = _bondsFromEnv();
+        (uint128 minBond, uint128 defaultBond, uint128 joinBond) = _bondsFromEnv();
         V060GovernanceSpec.KeyParams memory k = _keysFromEnv();
-        Inputs memory i = _inputsFromBook(vm.readFile(vm.envString("V060_INPUT_BOOK")), minBond, defaultBond, k);
+        Inputs memory i = _inputsFromBook(vm.readFile(vm.envString("V060_INPUT_BOOK")), minBond, defaultBond, joinBond, k);
         (bytes memory scheduleData, bytes memory executeData, bytes32 opId) = swapProposal(i);
         console.log("operation id:");
         console.logBytes32(opId);

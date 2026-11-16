@@ -91,23 +91,46 @@ async fn pba_l1b_003_far_future_block_rejected_by_consensus_after_activation() {
     assert!(gd.validate_block_consistency(&past_bound).await.is_err());
 }
 
-/// Before activation the legacy rule stands (history must not be re-judged),
-/// but the sync ingress still refuses a far-future block and the producer can
-/// always build a valid child, so there is no halt either way.
+/// Before activation (or with the height unset) the sync ingress still refuses
+/// a far-future block and the producer can always build a valid child, so
+/// there is no halt either way.
+///
+/// r1007 G9 (#184): this test used to admit the u64::MAX block under the
+/// legacy rule (no upper bound) and build its child at the same timestamp. G9
+/// requires every child to be in a later slot, which no child of a u64::MAX
+/// block can be, so the parent-relative bound now holds at every height: the
+/// poison is invalid, and the furthest a valid tip can run ahead is the bound,
+/// whose child is valid one slot later.
 #[tokio::test]
-async fn pba_l1b_003_before_activation_legacy_rule_but_no_halt() {
+async fn pba_l1b_003_before_activation_bound_holds_and_no_halt() {
+    use citrate_consensus::slots::SLOT_DURATION_SECS;
     let (dag, gd, genesis) = dag_with_genesis(PbaHardening::off()).await;
     let poison = mk_linked(1, genesis.header.block_hash, u64::MAX);
-    gd.validate_block_consistency(&poison)
-        .await
-        .expect("pre-activation: legacy validity (no upper bound) is unchanged");
-    dag.store_block(poison.clone()).await.unwrap();
-    gd.add_block(&poison).await.unwrap();
-    assert_eq!(gd.select_tip().await.unwrap(), poison.header.block_hash);
+    assert!(
+        gd.validate_block_consistency(&poison).await.is_err(),
+        "r1007 G9: a block with no possible child is invalid at every height"
+    );
 
-    // Producer: stamps max(now, parent.ts) — the child is valid.
-    let child_ts = producer_timestamp(now(), poison.header.timestamp);
-    let child = mk_linked(2, poison.header.block_hash, child_ts);
+    // The furthest-ahead valid tip sits at the bound.
+    let tip = mk_linked(
+        1,
+        genesis.header.block_hash,
+        genesis.header.timestamp + MAX_BLOCK_TIMESTAMP_ADVANCE_SECS,
+    );
+    gd.validate_block_consistency(&tip)
+        .await
+        .expect("parent.ts + MAX is valid");
+    dag.store_block(tip.clone()).await.unwrap();
+    gd.add_block(&tip).await.unwrap();
+    assert_eq!(gd.select_tip().await.unwrap(), tip.header.block_hash);
+
+    // Producer: once its clock is in the slot after the tip, its stamp
+    // (max(now, parent.ts), clamped) is valid.
+    let child_ts = producer_timestamp(
+        tip.header.timestamp + SLOT_DURATION_SECS,
+        tip.header.timestamp,
+    );
+    let child = mk_linked(2, tip.header.block_hash, child_ts);
     gd.validate_block_consistency(&child)
         .await
         .expect("PBA-L1b-003: the honest child of a future-dated tip must be valid");

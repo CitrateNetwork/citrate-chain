@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "./ScriptEnv.sol";
 import "./lib/GovernanceOps.sol";
 import "../src/defense_prime/AuditBundleRegistry.sol";
+import {EnvSigner} from "./lib/EnvSigner.sol";
 
 /// @title DeployDpf10Assistant — Stage 8 broadcast
 /// @notice Deploys the DPF-10 NEW contract (AuditBundleRegistry) to
@@ -21,7 +22,7 @@ import "../src/defense_prime/AuditBundleRegistry.sol";
 ///       --rpc-url https://rpc.citrate.ai \
 ///       --private-key $DEPLOYER_PRIVATE_KEY \
 ///       --broadcast --slow
-contract DeployDpf10Assistant is ScriptEnv, GovernanceOps {
+contract DeployDpf10Assistant is ScriptEnv, GovernanceOps, EnvSigner {
     function run() external returns (address auditBundleRegistry) {
         address deployer = deployerAddress();
         address governance = requiredGovernance("GOVERNANCE", deployer);
@@ -31,7 +32,7 @@ contract DeployDpf10Assistant is ScriptEnv, GovernanceOps {
         console.log("Governance:      ", governance);
         console.log("Chain ID:        ", block.chainid);
 
-        vm.startBroadcast();
+        _startBroadcastEnv(deployer);
 
         AuditBundleRegistry abr = new AuditBundleRegistry(governance);
         console.log("AuditBundleRegistry:  ", address(abr));

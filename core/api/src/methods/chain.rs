@@ -4,7 +4,7 @@ use crate::types::{
     request::{BlockId, BlockTag},
     response::{BlockResponse, TransactionResponse},
 };
-use citrate_consensus::types::{BlockHeader, Hash};
+use citrate_consensus::types::{Block, BlockHeader, Hash};
 use citrate_execution::types::TransactionReceipt;
 use citrate_storage::StorageManager;
 use std::sync::Arc;
@@ -71,7 +71,17 @@ impl ChainApi {
             }
         };
 
-        Ok(block.into())
+        Ok(accepting_view(&self.storage, block))
+    }
+
+    /// r1007 S3-3b (spec 06 §5.1): whether `hash` is the applied chain's block
+    /// at `height` (the canonical height index, which tip writes keep at the
+    /// applied chain).
+    pub fn is_on_applied_chain(&self, hash: &Hash, height: u64) -> bool {
+        matches!(
+            self.storage.blocks.get_canonical_block_by_height(height),
+            Ok(Some(h)) if h == *hash
+        )
     }
 
     /// Get block header by ID
@@ -180,10 +190,37 @@ impl ChainApi {
     }
 
     // Helper method
+    /// r1007 S3-3b (spec 06 §5.1): `eth_blockNumber` / `latest` is the APPLIED
+    /// tip (the block whose post-state the node serves and whose executed
+    /// list is indexed), not the highest stored block, which can be admitted
+    /// but not yet executed. A store with no applied tip (no block executed
+    /// yet, or a pre-tip store) falls back to the stored head.
     async fn get_latest_height(&self) -> Result<u64, ApiError> {
+        if let Ok(Some((_, h))) = self.storage.blocks.get_applied_tip() {
+            return Ok(h);
+        }
         self.storage
             .blocks
             .get_latest_height()
             .map_err(|e| ApiError::InternalError(e.to_string()))
     }
+}
+
+/// r1007 S3-3b (spec 06 §5.2): the RPC view of `block`. A block that accepted
+/// a mergeset (`accepted_root` set) lists the transactions it EXECUTED, in
+/// execution order (`canonical_logs::executed_transactions`: the receipt index
+/// and stored bodies); its own list stays in `included_transactions`. A
+/// pre-r1007 block executed its own list and is served as stored.
+pub fn accepting_view(storage: &StorageManager, block: Block) -> BlockResponse {
+    let accepting = block.accepted_root != Hash::default();
+    let executed = if accepting {
+        crate::canonical_logs::executed_transactions(storage, &block).ok()
+    } else {
+        None
+    };
+    let mut resp: BlockResponse = block.into();
+    if let Some(list) = executed {
+        resp.transactions = list.into_iter().map(|(t, _)| t.into()).collect();
+    }
+    resp
 }
