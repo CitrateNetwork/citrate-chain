@@ -3093,6 +3093,54 @@ mod tests {
         assert!(pl.stats().buffered_blocks <= 300);
     }
 
+    /// A split: our applied tip is on a lighter branch, and the only peer
+    /// serves the heavier one, whose blocks never connect to our tip. That
+    /// peer is never struck or excluded, and the pipeline steps aside so the
+    /// fork-point search (the tick's rejoin path) can heal the node.
+    #[test]
+    fn a_peer_serving_the_heavier_branch_is_never_excluded_and_the_pipeline_steps_aside() {
+        let t0 = Instant::now();
+        let config = PipelineConfig {
+            engage_gap: 0,
+            ..PipelineConfig::default()
+        };
+        let mut pl = BlockPipeline::new(config, t0);
+        // Our tip: height 10 of branch "50" (the network's is branch "0").
+        pl.observe_applied((hash(10, 50), 10), t0);
+        let target = 400;
+        pl.set_target(target);
+        let peers = [peer("h", target)];
+        let mut now = t0;
+        let mut stepped_aside = false;
+        for _ in 0..2_000 {
+            now += Duration::from_millis(50);
+            let reqs = pl.plan(now, &peers, true);
+            feed_headers(&mut pl, &reqs, target, now);
+            for (p, lo, hi) in pl.fifo_windows() {
+                let answer = groups(lo - 1, hi);
+                let _ = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+            }
+            let _ = pl.poll(now);
+            let h = pl.peers.get(&pid("h")).expect("h");
+            assert_eq!(
+                h.strikes,
+                0,
+                "the heavier branch's peer struck: {:?}",
+                pl.stats()
+            );
+            assert!(!h.excluded(now), "the heavier branch's peer excluded");
+            if !pl.active() {
+                stepped_aside = true;
+                break;
+            }
+        }
+        assert!(
+            stepped_aside,
+            "the pipeline kept the node off the rejoin path: {:?}",
+            pl.stats()
+        );
+    }
+
     /// A peer that turns inadmissible loses the windows it held.
     #[test]
     fn a_peer_that_turns_inadmissible_loses_its_windows() {
