@@ -272,6 +272,8 @@ pub struct PipelineStats {
     pub unconnected: u64,
     /// Blocks not held because the reorder buffer was at its caps.
     pub held_cap_drops: u64,
+    /// Heights asked for again because an answer left a block of them out.
+    pub refills: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,7 +324,19 @@ struct Link {
     accepted: usize,
     /// Blocks in the window's range that did not chain from the anchor.
     unlinked: usize,
+    /// It brought blocks while the reorder buffer was at its caps.
+    over_cap: bool,
+    /// Blocks taken in whose selected parent this answer left out.
+    gaps: usize,
 }
+
+/// Blocks per answer whose selected parent the answer left out.
+const MAX_GAPS: usize = 8;
+
+/// Heights of verified history kept below the applied tip, so a height an
+/// answer left incomplete can still be asked for again after the tip passed
+/// it (the tip can move a whole lookahead between two answers).
+const REFILL_DEPTH: u64 = 512;
 
 /// Anchor-height siblings kept per answer while their children arrive.
 const MAX_ANCHOR_GROUP: usize = 64;
@@ -374,6 +388,8 @@ struct PeerSlot {
     capacity_heights: Option<u64>,
     strikes: u32,
     excluded_until: Option<Instant>,
+    /// Times it has been excluded: each exclusion lasts twice the last.
+    exclusions: u32,
     header_backoff_until: Option<Instant>,
 }
 
@@ -391,6 +407,7 @@ impl PeerSlot {
             capacity_heights: None,
             strikes: 0,
             excluded_until: None,
+            exclusions: 0,
             header_backoff_until: None,
         }
     }
@@ -432,6 +449,9 @@ struct Window {
     failed: Vec<PeerId>,
     attempts: u32,
     retry_at: Option<Instant>,
+    /// Asks again for a height that is already received but incomplete (a
+    /// block above references a block of it that never came).
+    refill: bool,
 }
 
 /// The pipelined downloader. Pure state: no I/O, no clock of its own (every
@@ -459,6 +479,12 @@ pub struct BlockPipeline {
     buffer: BTreeMap<u64, Vec<Held>>,
     buffered_bytes: usize,
     buffered_count: usize,
+    /// Heights asked for again (once each) because a block above references
+    /// a block of them that was never delivered.
+    refilled: HashSet<u64>,
+    /// Who delivered the released blocks of each height above the applied
+    /// tip: charged if the node then cannot apply that height.
+    released_by: BTreeMap<u64, Vec<PeerId>>,
     /// Most blocks seen at one height (sizes `count`).
     max_siblings: u64,
     last_progress: Instant,
@@ -485,6 +511,8 @@ impl BlockPipeline {
             buffer: BTreeMap::new(),
             buffered_bytes: 0,
             buffered_count: 0,
+            refilled: HashSet::new(),
+            released_by: BTreeMap::new(),
             max_siblings: 0,
             last_progress: now,
             stats: PipelineStats::default(),
@@ -515,7 +543,9 @@ impl BlockPipeline {
         // Prune what is below the tip; the tip's own height stays, seeded
         // with the tip, as the root every verified chain connects to.
         let keep_above = height.saturating_add(1);
-        self.received = self.received.split_off(&height);
+        self.received = self
+            .received
+            .split_off(&height.saturating_sub(REFILL_DEPTH));
         self.received.entry(height).or_default().insert(applied.0);
         self.verified = self.received.values().flatten().copied().collect();
         let below: Vec<u64> = self.buffer.range(..keep_above).map(|(h, _)| *h).collect();
@@ -527,10 +557,17 @@ impl BlockPipeline {
         for slot in self.peers.values_mut() {
             slot.headers = slot.headers.split_off(&keep_above);
         }
+        self.released_by = self.released_by.split_off(&keep_above);
+        let floor = height.saturating_sub(REFILL_DEPTH);
+        self.refilled.retain(|h| *h > floor);
         // Windows wholly at or below the tip are done; an unowned window that
         // straddles it starts above it.
         let mut adjusted: BTreeMap<u64, Window> = BTreeMap::new();
         for (lo, w) in std::mem::take(&mut self.windows) {
+            if w.refill && w.hi > height.saturating_sub(REFILL_DEPTH) {
+                adjusted.insert(lo, w);
+                continue;
+            }
             if w.hi <= height {
                 continue;
             }
@@ -587,6 +624,25 @@ impl BlockPipeline {
         out
     }
 
+    /// Each peer's outstanding window requests in the order they were sent,
+    /// which is the order a server answers them in (tests).
+    #[cfg(test)]
+    fn fifo_windows(&self) -> Vec<(PeerId, u64, u64)> {
+        let mut ids: Vec<&PeerId> = self.peers.keys().collect();
+        ids.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(slot) = self.peers.get(id) {
+                for e in &slot.fifo {
+                    if let EntryKind::Window { lo, hi, .. } = e.kind {
+                        out.push((id.clone(), lo, hi));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Every height `lo..=hi` that some in-flight window covers (tests).
     pub fn in_flight_windows(&self) -> Vec<(PeerId, u64, u64)> {
         let mut out = Vec::new();
@@ -634,7 +690,10 @@ impl BlockPipeline {
 
     fn restart_plan(&mut self) {
         self.windows.clear();
-        self.received = self.received.split_off(&self.applied.1);
+        self.released_by.clear();
+        self.refilled.clear();
+        // Nothing above the tip stays verified: it is all asked again.
+        let _above = self.received.split_off(&self.applied.1.saturating_add(1));
         self.received
             .entry(self.applied.1)
             .or_default()
@@ -644,13 +703,9 @@ impl BlockPipeline {
         self.frontier = self.applied.1;
         for slot in self.peers.values_mut() {
             slot.headers.clear();
-            // Outstanding window answers are now answers to nothing: keep the
-            // entries (order) but stop crediting them to windows.
-            for e in slot.fifo.iter_mut() {
-                if let EntryKind::Window { anchor_height, .. } = e.kind {
-                    e.kind = EntryKind::Other { anchor_height };
-                }
-            }
+            // Outstanding window answers stay window answers: what they bring
+            // is still checked (range, anchor, verification) and held, never
+            // passed on unchecked; their windows are simply gone.
         }
     }
 
@@ -749,7 +804,7 @@ impl BlockPipeline {
         if at == self.applied.1 {
             return Some((self.applied.0, at));
         }
-        if at < self.applied.1 {
+        if at < self.applied.1.saturating_sub(REFILL_DEPTH) {
             return None;
         }
         if let Some(h) = slot.headers.get(&at) {
@@ -787,8 +842,13 @@ impl BlockPipeline {
         }
         for p in peers {
             let slot = self.peers.entry(p.id.clone()).or_insert_with(PeerSlot::new);
+            let turned = slot.admissible && !p.admissible;
             slot.head_height = p.head_height;
             slot.admissible = p.admissible;
+            if turned {
+                // No longer to be asked: what it holds goes back to the pool.
+                self.drop_outstanding(&p.id, false, now);
+            }
         }
         let mut out = Vec::new();
         if !self.active() {
@@ -822,6 +882,7 @@ impl BlockPipeline {
                     failed: Vec::new(),
                     attempts: 0,
                     retry_at: None,
+                    refill: false,
                 },
             );
             self.planned_to = hi;
@@ -863,8 +924,13 @@ impl BlockPipeline {
             if over_budget && lo > self.frontier.saturating_add(1) {
                 break;
             }
-            // Drop what other answers already delivered.
-            let start = match self.first_missing(lo, w.hi) {
+            // Drop what other answers already delivered (a refill asks again
+            // for a height that is received but incomplete).
+            let start = match if w.refill {
+                Some(lo)
+            } else {
+                self.first_missing(lo, w.hi)
+            } {
                 Some(s) => s,
                 None => {
                     self.windows.remove(&lo);
@@ -892,6 +958,7 @@ impl BlockPipeline {
                         failed: w.failed.clone(),
                         attempts: w.attempts,
                         retry_at: None,
+                        refill: false,
                     };
                     self.windows.insert(cut.saturating_add(1), rest);
                     hi = cut;
@@ -1114,14 +1181,15 @@ impl BlockPipeline {
         // The deliverer's own consistency: blocks in its window that did not
         // chain from its anchor, or its own headers missing from what it
         // delivered, are charged to it.
-        let top = e.last_height.min(hi);
+        // Only complete groups: the answer's last height may have been cut.
+        let top = e.last_height.min(hi).saturating_sub(1);
         let own_mismatch = top >= lo
             && self.peers.get(peer).is_some_and(|slot| {
                 slot.headers
                     .range(lo..=top)
                     .any(|(_, x)| !e.link.chain.contains(x))
             });
-        if e.link.unlinked > 0 || own_mismatch {
+        if e.link.unlinked > 0 || own_mismatch || e.link.over_cap {
             self.strike(peer, now);
         }
         // The window: done, or its remainder goes back to the pool.
@@ -1299,9 +1367,9 @@ impl BlockPipeline {
         }
     }
 
-    /// Held blocks at or below the frontier, height-ascending. Only verified
-    /// ones go to admission; anything else held at those heights is not on our
-    /// chain and is dropped (`settle` has already charged its deliverer).
+    /// Verified held blocks at or below the frontier, height-ascending.
+    /// Unverified ones stay held until their parent comes or `settle` drops
+    /// them.
     fn take_releasable(&mut self) -> Vec<Block> {
         let Some(above) = self.frontier.checked_add(1) else {
             return Vec::new();
@@ -1309,84 +1377,178 @@ impl BlockPipeline {
         let rest = self.buffer.split_off(&above);
         let ready = std::mem::replace(&mut self.buffer, rest);
         let mut out = Vec::new();
-        for (_, bs) in ready {
-            self.forget_held(&bs);
-            out.extend(bs.into_iter().filter(|h| h.verified).map(|h| h.block));
+        for (h, bs) in ready {
+            let (go, stay): (Vec<Held>, Vec<Held>) = bs.into_iter().partition(|x| x.verified);
+            self.forget_held(&go);
+            for x in go {
+                let by = self.released_by.entry(h).or_default();
+                if !by.contains(&x.peer) {
+                    by.push(x.peer.clone());
+                }
+                out.push(x.block);
+            }
+            if !stay.is_empty() {
+                self.buffer.insert(h, stay);
+            }
         }
         out
     }
 
-    /// Mark held blocks whose parent is verified as verified, lowest height
-    /// first (a parent is always lower than its child), then advance the
-    /// frontier over verified heights.
+    /// Mark held blocks verified, lowest height first: a block is verified
+    /// when its selected parent is a verified block one height below (the
+    /// applied tip is verified). A verified block whose merge parent is
+    /// neither verified nor held asks for its parent's height again
+    /// ([`Self::refill`]): the answer that carried that height left a block
+    /// out. Then advance the frontier over verified heights.
     fn verify_held(&mut self) {
-        for (h, held) in self.buffer.iter_mut() {
-            for x in held.iter_mut().filter(|x| !x.verified) {
-                let hdr = &x.block.header;
-                let linked = self.verified.contains(&hdr.selected_parent_hash)
-                    || hdr
-                        .merge_parent_hashes
-                        .iter()
-                        .any(|p| self.verified.contains(p));
-                if linked {
-                    x.verified = true;
-                    self.verified.insert(hdr.block_hash);
-                    self.received.entry(*h).or_default().insert(hdr.block_hash);
+        let mut want: Vec<u64> = Vec::new();
+        let heights: Vec<u64> = self.buffer.keys().copied().collect();
+        for h in heights {
+            let Some(below) = h.checked_sub(1) else {
+                continue;
+            };
+            let mut newly: Vec<Hash> = Vec::new();
+            if let Some(held) = self.buffer.get_mut(&h) {
+                for x in held.iter_mut().filter(|x| !x.verified) {
+                    let hdr = &x.block.header;
+                    let linked = self
+                        .received
+                        .get(&below)
+                        .is_some_and(|set| set.contains(&hdr.selected_parent_hash));
+                    if linked {
+                        x.verified = true;
+                        newly.push(hdr.block_hash);
+                        for m in &hdr.merge_parent_hashes {
+                            if !self.verified.contains(m) {
+                                want.push(below);
+                            }
+                        }
+                    }
                 }
             }
+            for x in newly {
+                self.verified.insert(x);
+                self.received.entry(h).or_default().insert(x);
+            }
+        }
+        // A merge parent may be held unverified (it is checked in its own
+        // height's pass); only heights none of whose held blocks match count.
+        want.sort_unstable();
+        want.dedup();
+        for h in want {
+            self.refill(h);
         }
         self.advance_frontier();
     }
 
-    /// Held blocks that can no longer connect to our chain: at a height the
-    /// frontier has passed but not verified, or at the height just above the
-    /// frontier once nothing in flight can still deliver the frontier's
-    /// group. They are dropped, the peer that delivered them is charged a
-    /// strike, and a window they left uncovered goes back to the pool.
-    fn settle(&mut self, now: Instant) {
+    /// Ask once more for height `h` (received but incomplete), unless it was
+    /// asked for again already or is at or below the applied tip.
+    fn refill(&mut self, h: u64) {
+        if h <= self.applied.1.saturating_sub(REFILL_DEPTH) || self.refilled.contains(&h) {
+            return;
+        }
+        // A window not yet asked, or an answer not yet past `h`, may still
+        // deliver it: ask later.
+        let unasked = self
+            .windows
+            .iter()
+            .any(|(lo, w)| *lo <= h && h <= w.hi && w.owner.is_none());
+        let pending = self.peers.values().flat_map(|s| s.fifo.iter()).any(|e| {
+            matches!(e.kind, EntryKind::Window { lo, hi, .. } if lo <= h && h <= hi)
+                && (!e.started || e.last_height <= h)
+        });
+        if unasked || pending {
+            return;
+        }
+        self.refilled.insert(h);
+        self.stats.refills = self.stats.refills.saturating_add(1);
+        self.windows.insert(
+            h,
+            Window {
+                hi: h,
+                owner: None,
+                failed: Vec::new(),
+                attempts: 0,
+                retry_at: None,
+                refill: true,
+            },
+        );
+    }
+
+    /// Is a refill of `h` asked for and not yet answered?
+    fn refill_pending(&self, h: u64) -> bool {
+        self.refilled.contains(&h) && self.windows.get(&h).is_some_and(|w| w.refill)
+    }
+
+    /// Held blocks whose selected parent is missing, at or just above the
+    /// frontier once nothing in flight can still deliver it. The first time,
+    /// the parent's height is asked for again (an answer cut mid-group, or a
+    /// sibling left out). If that does not bring it, the blocks cannot connect
+    /// to our chain: they are dropped and their window goes back to the pool,
+    /// with that peer tried last. No one is charged here: which side is wrong
+    /// is not known from this alone (the stall valve charges a delivery the
+    /// node then cannot apply).
+    fn settle(&mut self) {
         let Some(next) = self.frontier.checked_add(1) else {
             return;
         };
-        let frontier = self.frontier;
-        let frontier_final = !self
+        let in_flight: Vec<(u64, u64)> = self
             .peers
             .values()
             .flat_map(|s| s.fifo.iter())
-            .any(|e| matches!(e.kind, EntryKind::Window { lo, hi, .. } if lo <= frontier && frontier <= hi));
-        let next_unconnected = frontier_final
-            && !self.received.contains_key(&next)
-            && self
-                .buffer
-                .get(&next)
-                .is_some_and(|v| v.iter().any(|x| !x.verified));
-        // The deliveries to drop: (peer, window) of every unverified block at
-        // or below the frontier, and of those at `next` if it cannot connect.
-        let mut bad: Vec<(PeerId, u64, u64)> = Vec::new();
+            .filter_map(|e| match e.kind {
+                // An answer already past a height has delivered all of it it
+                // will.
+                EntryKind::Window { lo, hi, .. } if !e.started || e.last_height <= hi => {
+                    Some((lo.max(if e.started { e.last_height } else { lo }), hi))
+                }
+                _ => None,
+            })
+            .collect();
+        let covered_in_flight = |h: u64| in_flight.iter().any(|(lo, hi)| *lo <= h && h <= *hi);
+        let mut stuck: Vec<(u64, PeerId, u64, u64)> = Vec::new();
         for (h, held) in self.buffer.range(..=next) {
-            if *h == next && !next_unconnected {
+            let Some(below) = h.checked_sub(1) else {
+                continue;
+            };
+            if *h == next && covered_in_flight(below) {
                 continue;
             }
+            let held_below: HashSet<Hash> = self
+                .buffer
+                .get(&below)
+                .map(|v| v.iter().map(|y| y.block.header.block_hash).collect())
+                .unwrap_or_default();
             for x in held.iter().filter(|x| !x.verified) {
-                let key = (x.peer.clone(), x.win_lo, x.win_hi);
-                if !bad.contains(&key) {
-                    bad.push(key);
+                // Waiting on a held parent that is itself waiting: only the
+                // lowest missing block is asked for.
+                if held_below.contains(&x.block.header.selected_parent_hash) {
+                    continue;
+                }
+                stuck.push((below, x.peer.clone(), x.win_lo, x.win_hi));
+            }
+        }
+        let mut drop: Vec<(PeerId, u64, u64)> = Vec::new();
+        for (below, peer, win_lo, win_hi) in stuck {
+            if !self.refilled.contains(&below) {
+                self.refill(below);
+            } else if !self.refill_pending(below) && !covered_in_flight(below) {
+                let key = (peer, win_lo, win_hi);
+                if !drop.contains(&key) {
+                    drop.push(key);
                 }
             }
         }
-        if bad.is_empty() {
-            return;
-        }
-        for (peer, win_lo, win_hi) in &bad {
-            // Everything unverified this delivery brought in goes.
+        for (peer, win_lo, win_hi) in drop {
             let mut emptied: Vec<u64> = Vec::new();
-            for (h, held) in self.buffer.range_mut(*win_lo..=*win_hi) {
-                let (drop, keep): (Vec<Held>, Vec<Held>) = std::mem::take(held)
+            for (h, held) in self.buffer.range_mut(win_lo..=win_hi) {
+                let (gone, keep): (Vec<Held>, Vec<Held>) = std::mem::take(held)
                     .into_iter()
-                    .partition(|x| !x.verified && x.peer == *peer && x.win_lo == *win_lo);
+                    .partition(|x| !x.verified && x.peer == peer && x.win_lo == win_lo);
                 self.buffered_bytes = self
                     .buffered_bytes
-                    .saturating_sub(drop.iter().map(|x| x.bytes).sum());
-                self.buffered_count = self.buffered_count.saturating_sub(drop.len());
+                    .saturating_sub(gone.iter().map(|x| x.bytes).sum());
+                self.buffered_count = self.buffered_count.saturating_sub(gone.len());
                 *held = keep;
                 if held.is_empty() {
                     emptied.push(*h);
@@ -1396,9 +1558,7 @@ impl BlockPipeline {
                 self.buffer.remove(&h);
             }
             self.stats.unconnected = self.stats.unconnected.saturating_add(1);
-            self.strike(peer, now);
-            // Re-plan what is now uncovered (one window per gap start).
-            if let Some(start) = self.first_missing((*win_lo).max(next), *win_hi) {
+            if let Some(start) = self.first_missing(win_lo.max(next), win_hi) {
                 let covered = self
                     .windows
                     .iter()
@@ -1407,11 +1567,12 @@ impl BlockPipeline {
                     self.windows.insert(
                         start,
                         Window {
-                            hi: *win_hi,
+                            hi: win_hi,
                             owner: None,
                             failed: vec![peer.clone()],
                             attempts: 1,
                             retry_at: None,
+                            refill: false,
                         },
                     );
                 }
@@ -1427,7 +1588,13 @@ impl BlockPipeline {
                 slot.strikes = slot.strikes.saturating_add(1);
                 if slot.strikes >= self.config.max_strikes {
                     slot.strikes = 0;
-                    slot.excluded_until = now.checked_add(self.config.exclusion);
+                    // 1, 2, 4, ... 32 x `exclusion` (a lookup, no shift).
+                    const FACTOR: [u32; 6] = [1, 2, 4, 8, 16, 32];
+                    let idx = usize::try_from(slot.exclusions).unwrap_or(usize::MAX);
+                    let factor = FACTOR.get(idx).copied().unwrap_or(32);
+                    slot.exclusions = slot.exclusions.saturating_add(1);
+                    slot.excluded_until =
+                        now.checked_add(self.config.exclusion.saturating_mul(factor));
                     true
                 } else {
                     false
@@ -1443,8 +1610,8 @@ impl BlockPipeline {
     /// Take in one block of a window answer from `peer`, if it belongs: in
     /// `[anchor height, hi]`, chaining from the anchor (or referencing an
     /// anchor-height sibling, which is then taken in too), within the
-    /// request's allowance and the buffer's caps. Returns blocks to hand to
-    /// admission now (only the anchor group at the applied tip).
+    /// request's allowance and the buffer's caps. Returns how many blocks
+    /// were new.
     fn take_in(&mut self, peer: &PeerId, b: Block, out_now: &mut Vec<Block>) -> usize {
         let Some(slot) = self.peers.get_mut(peer) else {
             return 0;
@@ -1476,6 +1643,7 @@ impl BlockPipeline {
             return 0;
         }
         let mut take: Vec<Block> = Vec::new();
+        let mut gap: Option<u64> = None;
         if h == anchor_height {
             if b.header.block_hash == anchor {
                 take.push(b);
@@ -1499,6 +1667,14 @@ impl BlockPipeline {
             }
             if linked {
                 take.push(b);
+            } else if e.link.gaps < MAX_GAPS {
+                // Its selected parent, one height below inside this answer,
+                // was left out (an answer cut mid-group, or a sibling
+                // omitted): taken in, unverified, and that height is asked
+                // for again. A few per answer; more is not an honest answer.
+                e.link.gaps = e.link.gaps.saturating_add(1);
+                gap = h.checked_sub(1);
+                take.push(b);
             } else {
                 e.link.unlinked = e.link.unlinked.saturating_add(1);
             }
@@ -1513,7 +1689,19 @@ impl BlockPipeline {
             e.link.accepted = e.link.accepted.saturating_add(1);
             let bh = b.header.height;
             if bh <= applied {
-                out_now.push(b);
+                // At or below the tip (a refill, or the anchor group): only a
+                // block on our verified chain goes to admission, at once.
+                let hdr = &b.header;
+                let on_chain = bh.checked_sub(1).is_some_and(|below| {
+                    self.received
+                        .get(&below)
+                        .is_some_and(|set| set.contains(&hdr.selected_parent_hash))
+                });
+                if on_chain && self.verified.insert(hdr.block_hash) {
+                    self.received.entry(bh).or_default().insert(hdr.block_hash);
+                    fresh = fresh.saturating_add(1);
+                    out_now.push(b);
+                }
                 continue;
             }
             let hash = b.header.block_hash;
@@ -1530,6 +1718,9 @@ impl BlockPipeline {
                 || self.buffered_bytes.saturating_add(bytes) > self.config.max_held_bytes
             {
                 self.stats.held_cap_drops = self.stats.held_cap_drops.saturating_add(1);
+                if let Some(e) = self.peers.get_mut(peer).and_then(|s| s.fifo.front_mut()) {
+                    e.link.over_cap = true;
+                }
                 continue;
             }
             self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
@@ -1546,6 +1737,9 @@ impl BlockPipeline {
             let per_height = u64::try_from(siblings.len()).unwrap_or(u64::MAX);
             self.max_siblings = self.max_siblings.max(per_height);
             fresh = fresh.saturating_add(1);
+        }
+        if let Some(below) = gap {
+            self.refill(below);
         }
         fresh
     }
@@ -1577,8 +1771,8 @@ impl BlockPipeline {
             };
         };
         let mut new_blocks = 0usize;
-        let mut immediate = Vec::new();
         let total = validated.len();
+        let mut immediate = Vec::new();
         for b in validated {
             new_blocks = new_blocks.saturating_add(self.take_in(peer, b, &mut immediate));
         }
@@ -1594,7 +1788,7 @@ impl BlockPipeline {
             self.complete_front(peer, now);
         }
         self.verify_held();
-        self.settle(now);
+        self.settle();
         immediate.extend(self.take_releasable());
         BlocksOutcome {
             attribution: Some(attribution),
@@ -1684,6 +1878,11 @@ impl BlockPipeline {
     /// Timeouts and the stall valve.
     pub fn poll(&mut self, now: Instant) -> PollOutcome {
         let mut out = PollOutcome::default();
+        // Settle what is held even when no answer is arriving (a refill or a
+        // re-plan may be all that is left to do).
+        self.verify_held();
+        self.settle();
+        out.flushed.extend(self.take_releasable());
         let ids: Vec<PeerId> = self.peers.keys().cloned().collect();
         for id in ids {
             while let Some(slot) = self.peers.get(&id) {
@@ -1724,11 +1923,16 @@ impl BlockPipeline {
                 break;
             }
         }
-        // Stall valve.
-        if !self.buffer.is_empty()
+        // Stall valve: the pipeline runs and the applied tip has not moved
+        // for `stall_timeout`, whether or not anything is held. What was
+        // released at the next height did not apply: its deliverers are
+        // charged and tried last, and the plan restarts from the tip.
+        if self.active()
             && now.saturating_duration_since(self.last_progress) > self.config.stall_timeout
         {
             self.stats.stall_flushes = self.stats.stall_flushes.saturating_add(1);
+            let next = self.applied.1.saturating_add(1);
+            let suspects = self.released_by.get(&next).cloned().unwrap_or_default();
             let all = std::mem::take(&mut self.buffer);
             self.buffered_bytes = 0;
             self.buffered_count = 0;
@@ -1737,6 +1941,13 @@ impl BlockPipeline {
                     .extend(bs.into_iter().filter(|h| h.verified).map(|h| h.block));
             }
             self.restart_plan();
+            for p in &suspects {
+                self.strike(p, now);
+            }
+            self.extend_windows();
+            if let Some(w) = self.windows.get_mut(&next) {
+                w.failed = suspects;
+            }
             self.last_progress = now;
         }
         out
@@ -2347,7 +2558,7 @@ mod tests {
         };
         let mut now = t0;
         let mut applied = 0u64;
-        for _ in 0..2_000 {
+        for _ in 0..8_000 {
             now += Duration::from_millis(50);
             let reqs = pl.plan(now, &peers, true);
             for r in &reqs {
@@ -2365,18 +2576,25 @@ mod tests {
                     pl.on_headers(peer, &hs, now);
                 }
             }
-            for (p, lo, hi) in pl.in_flight_windows() {
+            for (p, lo, hi) in pl.fifo_windows() {
                 let answer = if p.0 == "m" {
                     fake(lo - 1, hi)
                 } else {
                     groups(lo - 1, hi)
                 };
                 let o = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+                // Messages that answer nothing the pipeline asked (a peer's
+                // late answers after it was dropped) go the legacy way.
+                if !o.is_pipeline() {
+                    continue;
+                }
                 for b in &o.release {
                     assert!(
                         b.header.block_hash.as_bytes()[8..16] < 90u64.to_be_bytes()[..],
-                        "a block off our chain was released at {}",
-                        b.header.height
+                        "a block off our chain was released at {} (from {}, window {lo}..{hi}, parent {:?})",
+                        b.header.height,
+                        p.0,
+                        &b.header.selected_parent_hash.as_bytes()[..16]
                     );
                 }
             }
@@ -2455,17 +2673,29 @@ mod tests {
             now += Duration::from_millis(50);
             let reqs = pl.plan(now, peers, true);
             feed_headers(pl, &reqs, target, now);
-            for (p, lo, hi) in pl.in_flight_windows() {
+            for (p, lo, hi) in pl.fifo_windows() {
                 let answer = serve(&p, lo, hi);
                 let o = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+                if !o.is_pipeline() {
+                    continue;
+                }
                 for b in o.release {
                     if applies(&b) {
-                        by_height.entry(b.header.height).or_insert(b.header.block_hash);
+                        by_height
+                            .entry(b.header.height)
+                            .or_insert(b.header.block_hash);
                     }
                     released.insert(b.header.block_hash);
                 }
             }
-            let _ = pl.poll(now);
+            for b in pl.poll(now).flushed {
+                if applies(&b) {
+                    by_height
+                        .entry(b.header.height)
+                        .or_insert(b.header.block_hash);
+                }
+                released.insert(b.header.block_hash);
+            }
             while by_height.contains_key(&(applied + 1)) {
                 applied += 1;
             }
@@ -2507,7 +2737,11 @@ mod tests {
                 if p.0 == "f" {
                     let mut v = groups(lo - 1, lo - 1);
                     v.extend((lo..=hi).map(|h| {
-                        let parent = if h == lo { hash(lo - 1, 0) } else { hash(h - 1, 50) };
+                        let parent = if h == lo {
+                            hash(lo - 1, 0)
+                        } else {
+                            hash(h - 1, 50)
+                        };
                         block_on(h, 50, parent)
                     }));
                     v
@@ -2525,7 +2759,7 @@ mod tests {
     /// missing blocks are asked for again, and every block is released.
     #[test]
     fn a_cut_group_and_an_omitted_sibling_are_asked_for_again() {
-        let target = 200;
+        let target = 1_200;
         for skip in [
             // The rest of the group at 64, the top of the first window.
             vec![(64, 4), (64, 5), (64, 6)],
@@ -2546,7 +2780,9 @@ mod tests {
                     let cut: Vec<(u64, u64)> = skip
                         .iter()
                         .copied()
-                        .filter(|(h, _)| lo <= *h + 1 && *h <= hi && !served_once.contains(&(*h, 0)))
+                        .filter(|(h, _)| {
+                            lo <= *h + 1 && *h <= hi && !served_once.contains(&(*h, 0))
+                        })
                         .collect();
                     for (h, _) in &cut {
                         served_once.insert((*h, 0));
@@ -2582,7 +2818,38 @@ mod tests {
         let _ = pl.poll(t0 + Duration::from_secs(31));
         assert_eq!(pl.stats().stall_flushes, 1);
         let again = blocks_of(&pl.plan(t0 + Duration::from_secs(31), &peers, true));
-        assert!(again.iter().any(|(_, a, l, _)| *a == 0 && *l == 1), "{again:?}");
+        assert!(
+            again.iter().any(|(_, a, l, _)| *a == 0 && *l == 1),
+            "{again:?}"
+        );
+    }
+
+    /// At its caps the reorder buffer takes nothing more, and the answer that
+    /// brought the excess is counted.
+    #[test]
+    fn the_reorder_buffer_takes_nothing_past_its_caps() {
+        let now = Instant::now();
+        let config = PipelineConfig {
+            max_held_blocks: 50,
+            ..PipelineConfig::default()
+        };
+        let mut pl = BlockPipeline::new(config, now);
+        pl.observe_applied((hash(0, 0), 0), now);
+        pl.set_target(10_000);
+        let peers = [peer("a", 10_000), peer("b", 10_000)];
+        let reqs = pl.plan(now, &peers, true);
+        feed_headers(&mut pl, &reqs, 600, now);
+        let _ = pl.plan(now, &peers, true);
+        // Answer every window but the first: all of it waits, unverified.
+        for (p, lo, hi) in pl.fifo_windows() {
+            if lo == 1 {
+                continue;
+            }
+            let a = groups(lo - 1, hi);
+            let _ = pl.on_blocks(&p, raw_of(&a), a.clone(), now);
+        }
+        assert!(pl.stats().buffered_blocks <= 50, "{:?}", pl.stats());
+        assert!(pl.stats().held_cap_drops > 0);
     }
 
     /// A peer that turns inadmissible loses the windows it held.
