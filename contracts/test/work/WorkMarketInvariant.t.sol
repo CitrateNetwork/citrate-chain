@@ -1039,7 +1039,7 @@ contract WorkMarketInvariantTest is Test {
         );
     }
 
-    /// Receipts (GHSA-gh3c): a root that short-pays a worker holding the coordinator's receipt for
+    /// Receipts: a root that short-pays a worker holding the coordinator's receipt for
     /// more leases than its leaf pays (at any unit count, past 256 included), or that leaves out a
     /// receipted worker, never pays anyone, given that worker acts on its receipt at once (dispute,
     /// commit-reveal or inclusion challenge), even when the coordinator's address gains code

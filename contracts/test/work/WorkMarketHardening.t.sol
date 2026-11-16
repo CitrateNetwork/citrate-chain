@@ -16,7 +16,7 @@ contract SignsNothing {
     receive() external payable {}
 }
 
-/// @notice GHSA-gh3c hardening: receipts, refunds and the Disputed refund path.
+/// @notice WorkMarket hardening: receipts, refunds and the Disputed refund path.
 contract WorkMarketHardeningTest is WorkMarketTestBase {
     address internal w0 = address(0x0F00); // sorts before w1
     address internal w9 = address(0x5B11); // sorts after w3
