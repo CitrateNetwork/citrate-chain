@@ -2852,6 +2852,75 @@ mod tests {
         assert!(pl.stats().held_cap_drops > 0);
     }
 
+    /// A peer fills the reorder buffer with blocks that never connect; the
+    /// honest peer answering the frontier windows is never charged for it,
+    /// is never excluded, and its answers keep the node moving.
+    #[test]
+    fn a_full_buffer_is_charged_to_the_peer_that_filled_it() {
+        let t0 = Instant::now();
+        let config = PipelineConfig {
+            engage_gap: 0,
+            window_heights: 8,
+            lookahead_heights: 256,
+            max_held_blocks: 150,
+            ..PipelineConfig::default()
+        };
+        let mut pl = BlockPipeline::new(config, t0);
+        pl.observe_applied((hash(0, 0), 0), t0);
+        let target = 200;
+        pl.set_target(target);
+        let peers = [peer("b", target), peer("z", target)];
+        let mut now = t0;
+        let mut applied = 0u64;
+        for _ in 0..4_000 {
+            now += Duration::from_millis(50);
+            let reqs = pl.plan(now, &peers, true);
+            for r in &reqs {
+                if let PipelineRequest::Headers {
+                    peer, from_height, ..
+                } = r
+                {
+                    let hs: Vec<(u64, Hash)> = if peer.0 == "z" {
+                        (from_height + 1..=target)
+                            .map(|h| (h, hash(h, 90)))
+                            .collect()
+                    } else {
+                        headers(from_height + 1, target)
+                    };
+                    pl.on_headers(peer, &hs, now);
+                }
+            }
+            for (p, lo, hi) in pl.fifo_windows() {
+                let answer: Vec<Block> = if p.0 == "z" {
+                    (lo - 1..=hi)
+                        .flat_map(|h| {
+                            (0..7).map(move |i| block_on(h, 90 + i, hash(h.saturating_sub(1), 90)))
+                        })
+                        .collect()
+                } else {
+                    groups(lo - 1, hi)
+                };
+                let o = pl.on_blocks(&p, raw_of(&answer), answer.clone(), now);
+                if p.0 == "b" {
+                    let strikes = pl.peers.get(&p).map(|s| s.strikes).unwrap_or(0);
+                    assert_eq!(strikes, 0, "honest b charged: {:?}", pl.stats());
+                }
+                let _ = o;
+            }
+            let _ = pl.poll(now);
+            let b = pl.peers.get(&pid("b")).expect("b");
+            assert!(!b.excluded(now), "honest b excluded: {:?}", pl.stats());
+            if pl.frontier() > applied {
+                applied = pl.frontier();
+                pl.observe_applied((hash(applied, 0), applied), now);
+            }
+            if applied >= target {
+                break;
+            }
+        }
+        assert_eq!(applied, target, "{:?}", pl.stats());
+    }
+
     /// A peer that turns inadmissible loses the windows it held.
     #[test]
     fn a_peer_that_turns_inadmissible_loses_its_windows() {
