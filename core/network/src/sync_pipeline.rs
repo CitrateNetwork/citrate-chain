@@ -75,9 +75,10 @@
 // buffer and the missing-parent walk take over) and the plan restarts from the
 // applied tip.
 //
-// SECURITY HOOK. Which peers may be asked at all is the caller's decision
-// (`PipelinePeer::admissible`): the node's `sync_peer::pipeline_peer_admissible`,
-// which also refuses a peer that its own report puts far behind us.
+// PEER ELIGIBILITY. Which peers may be asked at all is the caller's
+// decision (`PipelinePeer::admissible`, from
+// `sync_peer::pipeline_peer_admissible`); the pipeline only ranks the peers
+// it is given.
 //
 // NOTHING HERE DECIDES VALIDITY. The pipeline only decides what to ask for,
 // from whom, and when blocks go to admission. Every block still passes
@@ -172,7 +173,7 @@ pub struct PipelinePeer {
     /// above it is never assigned to it).
     pub head_height: u64,
     /// The caller's verdict that this peer may be asked at all
-    /// (`sync_peer::pipeline_peer_admissible` in the node).
+    /// (`sync_peer::pipeline_peer_admissible`).
     pub admissible: bool,
 }
 

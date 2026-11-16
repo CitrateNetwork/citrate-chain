@@ -654,12 +654,13 @@ pub const FAR_BEHIND_BAND: u64 = ANCESTRY_RECOVERY_WINDOW;
 
 /// #477: may the pipelined downloader ask this peer for windows at all?
 ///
-/// The sync-peer eligibility rule for the pipeline (never ask a peer far
-/// behind us). The pipeline also never assigns a window starting above a
-/// peer's advertised head, and drops a peer whose header chain the delivered
-/// blocks contradict (`sync_pipeline`).
+/// The one place the pipeline's peer-eligibility rule lives. A peer that does
+/// not claim a head above our applied tip has nothing the pipeline could ask
+/// it for. The pipeline also never assigns a window starting above a peer's
+/// advertised head, and drops a peer whose header chain the delivered blocks
+/// contradict (`sync_pipeline`).
 ///
-/// NOTE: `head_height` is the peer's advertised head, which relayed gossip can
+/// `head_height` is the peer's advertised head, which relayed gossip can
 /// inflate (I4), so it is a necessary condition only. The peer must also not be
 /// far behind by its own report ([`SyncPeerSelector::is_far_behind`]): such a
 /// peer holds none of the windows above our tip however high gossip has pushed
