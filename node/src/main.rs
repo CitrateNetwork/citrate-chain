@@ -68,6 +68,7 @@ compile_error!(
      network. Enabling it requires a scheduled fleet-wide activation, not a build flag \
      (PBA-L1a-003)."
 );
+mod ancestor_sync;
 mod contribution_recorder;
 mod dag_prune;
 #[cfg(test)]
@@ -3209,6 +3210,16 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // the message handler, which judges the answers.
         let rejoin = Arc::new(parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()));
         let rejoin_for_rx = rejoin.clone();
+        // ancestor_sync.rs: header-first ancestor sync (protocol 1.3). Shared
+        // with the message handler, which feeds it `Ancestor` replies, body
+        // answers and deferred-block evidence.
+        let ancestor = Arc::new(parking_lot::Mutex::new(ancestor_sync::AncestorSync::new()));
+        let ancestor_for_rx = ancestor.clone();
+        // The reorg floor (finalized checkpoint) the episodes never fetch below.
+        let finalized_for_sync: Option<Arc<std::sync::atomic::AtomicU64>> = canonical_applicator
+            .as_ref()
+            .map(|a| a.finalized_height_handle());
+        let finalized_for_rx = finalized_for_sync.clone();
         // sync_recovery.rs: hold back re-asking the applied-tip anchor while
         // admission is ahead of apply (its last answer held nothing new).
         let tip_reask = Arc::new(parking_lot::Mutex::new(sync_recovery::TipReask::new()));
@@ -3221,6 +3232,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let max_seen_for_sync = max_seen_height.clone();
         let sync_peers_for_loop = sync_peers.clone();
         let rejoin_for_loop = rejoin.clone();
+        let ancestor_for_loop = ancestor.clone();
         let tip_reask_for_loop = tip_reask.clone();
         let initial_sync_for_sync = initial_sync_done.clone();
         let attested_for_sync = attested_network_head.clone();
@@ -3480,7 +3492,37 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         )
                     })
                     .collect();
-                let following_tip = rejoin_for_loop.lock().is_following_tip();
+                // ancestor_sync.rs: header-first ancestor sync. On evidence of a
+                // branch this node lacks (a deferred block, or a target above
+                // the applied tip), find the common ancestor with a 1.3 peer
+                // whose head we do not hold, verify that branch's headers and
+                // claimed work, and fetch its bodies from the fork point up.
+                // While an episode is fetching a branch below our tip, the
+                // pipeline and the tick's own request stand aside.
+                let ancestor_owns = {
+                    let handles: Vec<Arc<citrate_network::peer::Peer>> =
+                        connected_peers.iter().map(|(_, p)| p.clone()).collect();
+                    let cands = ancestor_sync::candidates(&handles, |h| {
+                        storage_for_sync.blocks.has_block(h).unwrap_or(true)
+                    })
+                    .await;
+                    let finalized = finalized_for_sync
+                        .as_ref()
+                        .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                        .unwrap_or(0);
+                    let _ = ancestor_sync::run_tick(
+                        &ancestor_for_loop,
+                        &storage_for_sync,
+                        &sync_for_loop,
+                        &cands,
+                        finalized,
+                        applied_height < target,
+                        std::time::Instant::now(),
+                    )
+                    .await;
+                    ancestor_for_loop.lock().owns_sync()
+                };
+                let following_tip = rejoin_for_loop.lock().is_following_tip() && !ancestor_owns;
                 let pipeline_round = sync_for_loop
                     .pipeline_tick(applied_tip_now, pipeline_peers, following_tip)
                     .await;
@@ -3523,32 +3565,35 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     pipe_log_delivered = st.delivered_blocks;
                     pipe_log_at = std::time::Instant::now();
                 }
-                let request_peer: Option<Arc<citrate_network::peer::Peer>> =
-                    if let Some(id) = chosen_id {
-                        connected_peers
-                            .iter()
-                            .find(|(c, _)| c.id == id)
-                            .map(|(_, p)| p.clone())
-                    } else if applied_height < target {
-                        // We have EVIDENCE we are behind (a gossiped block, a Hello,
-                        // a rejected far-ahead block) but no connected peer admits to
-                        // a head above ours — their advertisements are stale or were
-                        // never updated. Rotate across all connected peers so we keep
-                        // asking rather than parking idle; rotation (not a fixed pick)
-                        // so we don't spin forever on one that only serves a side
-                        // branch.
-                        if connected_peers.is_empty() {
-                            None
-                        } else {
-                            let i = (rotate_idx as usize)
-                                .checked_rem(connected_peers.len())
-                                .unwrap_or(0);
-                            rotate_idx = rotate_idx.wrapping_add(1);
-                            connected_peers.get(i).map(|p| p.1.clone())
-                        }
-                    } else {
+                // ancestor_sync.rs: while an episode fetches a branch below our
+                // tip, the tick asks nothing itself.
+                let request_peer: Option<Arc<citrate_network::peer::Peer>> = if ancestor_owns {
+                    None
+                } else if let Some(id) = chosen_id {
+                    connected_peers
+                        .iter()
+                        .find(|(c, _)| c.id == id)
+                        .map(|(_, p)| p.clone())
+                } else if applied_height < target {
+                    // We have EVIDENCE we are behind (a gossiped block, a Hello,
+                    // a rejected far-ahead block) but no connected peer admits to
+                    // a head above ours — their advertisements are stale or were
+                    // never updated. Rotate across all connected peers so we keep
+                    // asking rather than parking idle; rotation (not a fixed pick)
+                    // so we don't spin forever on one that only serves a side
+                    // branch.
+                    if connected_peers.is_empty() {
                         None
-                    };
+                    } else {
+                        let i = (rotate_idx as usize)
+                            .checked_rem(connected_peers.len())
+                            .unwrap_or(0);
+                        rotate_idx = rotate_idx.wrapping_add(1);
+                        connected_peers.get(i).map(|p| p.1.clone())
+                    }
+                } else {
+                    None
+                };
                 if let Some(peer) = request_peer {
                     let _ = best_hash; // anchor uses the applied tip, not best_hash
                                        // Anchor every request on our current PERSISTED tip so sync
@@ -3855,6 +3900,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 std::time::Instant::now(),
                 sync_for_rx.request_timeout(),
             );
+            // sync_peer.rs: deferred-gossip height claims per delivering peer;
+            // only corroborated heights are network-height evidence.
+            let mut deferred_heights = sync_peer::DeferredHeights::new();
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -3951,6 +3999,31 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             }
                         }
                     }
+                    // ancestor_sync.rs: the answer to this node's GetAncestor.
+                    // (GetAncestor itself is a serve request: `forward_incoming`
+                    // routes it to the serving plane, ADR CV-6.)
+                    NetworkMessage::Ancestor {
+                        common,
+                        tip,
+                        tip_blue_work,
+                        headers,
+                    } => {
+                        let finalized = finalized_for_rx
+                            .as_ref()
+                            .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+                            .unwrap_or(0);
+                        let _ = ancestor_sync::on_reply(
+                            &ancestor_for_rx,
+                            &storage_for_handler,
+                            finalized,
+                            &pid.0,
+                            common,
+                            tip,
+                            tip_blue_work,
+                            &headers,
+                            std::time::Instant::now(),
+                        );
+                    }
                     NetworkMessage::GetTransactions { hashes } => {
                         let mut txs = Vec::new();
                         for h in hashes {
@@ -4014,19 +4087,21 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // the serve-quality classifier (gap = target - applied).
                         // Keep this peer's advertised head FRESH from its gossip.
                         // PeerInfo.head_height is seeded once at the transport
-                        // handshake and never refreshed afterward, so the sync target
-                        // (driven from the best peer's head in the 2s tick) froze at
-                        // the handshake value — a follower then stopped one
-                        // growth-window short of a still-producing tip and never
-                        // closed the gap. A gossiped block proves the peer is at least
-                        // at that height, so bump it.
-                        if let Some(p) = pm_for_rx.get_peer(&pid) {
-                            let mut info = p.info.write().await;
-                            info.observe_gossiped_head(
-                                block.header.height,
-                                block.header.block_hash,
-                                block.header.blue_score,
-                            );
+                        // handshake, so the sync target (driven from the best
+                        // peer's head in the 2s tick) froze at the handshake value
+                        // and a follower stopped one growth-window short of a
+                        // still-producing tip. A gossiped block raises the head, but
+                        // (r1007 fleet split, 2026-11-17) only once it is VERIFIED
+                        // (this node admitted or already holds it) or, for a block
+                        // that defers, up to the height other peers corroborate
+                        // (`sync_peer::gossip_raises_head`). It used to run here,
+                        // on the raw block before any validation, so one packet
+                        // inflated a peer's head and steered peer selection.
+                        let held_already = admission_for_net
+                            .is_fully_admitted(&block.header.block_hash)
+                            .await;
+                        if held_already {
+                            sync_peer::raise_gossip_head(pm_for_rx.get_peer(&pid), &block).await;
                         }
                         // SYNC-S1 / D2: gossip runs its own validation (structure,
                         // signature, peer scoring, relay) and then hands the block to the
@@ -4038,10 +4113,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // interrupted earlier attempt looked complete and its missing DAG
                         // write was never made. Duplicate-suppression now requires
                         // presence in BOTH stores (see admission.rs, rule R1).
-                        if !admission_for_net
-                            .is_fully_admitted(&block.header.block_hash)
-                            .await
-                        {
+                        if !held_already {
                             match gossip_for_rx.handle_new_block(block.clone(), &pid).await {
                                 // r1007 G9 ingress: an early block is held by
                                 // gossip, not admitted; `gossip_hold` re-delivers
@@ -4066,6 +4138,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                                 &max_seen_for_rx,
                                                 block.header.height,
                                             );
+                                            sync_peer::raise_gossip_head(
+                                                pm_for_rx.get_peer(&pid),
+                                                &block,
+                                            )
+                                            .await;
                                             // F2: an admitted block is signed + genesis-linked;
                                             // record it as an attested candidate (re-checks
                                             // signature + parent ancestry itself). The producer
@@ -4082,29 +4159,60 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             );
                                             }
                                         }
-                                        admission::AdmitOutcome::AlreadyAdmitted => {}
+                                        admission::AdmitOutcome::AlreadyAdmitted => {
+                                            sync_peer::raise_gossip_head(
+                                                pm_for_rx.get_peer(&pid),
+                                                &block,
+                                            )
+                                            .await;
+                                        }
                                         admission::AdmitOutcome::Deferred { missing_parent } => {
                                             // Heard-but-unadmitted signed block: "behind"
                                             // evidence for the producer gate (counted only
                                             // from known proposers, see observe_deferred).
                                             attested_for_rx.observe_deferred(&block);
                                             // A block we can't admit because its parent is
-                                            // missing is still PROOF the network is at least
-                                            // at block.height. Rejecting it is correct, but
-                                            // dropping that height signal is what stalled a
-                                            // far-behind follower — record it so the sync tick
-                                            // pulls the gap forward instead of parking.
-                                            sync_peer::record_unverified_height(
-                                                &max_seen_for_rx,
+                                            // missing says the network MAY be at least at
+                                            // block.height: dropping that signal stalled a
+                                            // far-behind follower, so it is recorded. But a
+                                            // self-signed header proves nothing (any key signs
+                                            // any height): r1007 fleet split, it counts once
+                                            // DEFERRED_HEIGHT_CORROBORATION distinct peers
+                                            // reach it (`sync_peer::DeferredHeights`), clamped.
+                                            let corroborated = deferred_heights.record(
+                                                &pid.0,
                                                 block.header.height,
-                                                storage_for_handler
-                                                    .blocks
-                                                    .get_applied_tip()
-                                                    .ok()
-                                                    .flatten()
-                                                    .map(|(_, h)| h)
-                                                    .unwrap_or(0),
+                                                pm_for_rx.get_all_peers().len(),
                                             );
+                                            if let Some(h) = corroborated {
+                                                sync_peer::record_unverified_height(
+                                                    &max_seen_for_rx,
+                                                    h,
+                                                    storage_for_handler
+                                                        .blocks
+                                                        .get_applied_tip()
+                                                        .ok()
+                                                        .flatten()
+                                                        .map(|(_, h)| h)
+                                                        .unwrap_or(0),
+                                                );
+                                            }
+                                            if sync_peer::gossip_raises_head(
+                                                false,
+                                                block.header.height,
+                                                corroborated,
+                                            ) {
+                                                sync_peer::raise_gossip_head(
+                                                    pm_for_rx.get_peer(&pid),
+                                                    &block,
+                                                )
+                                                .await;
+                                            }
+                                            // ancestor_sync.rs: evidence of a branch this
+                                            // node lacks.
+                                            ancestor_for_rx
+                                                .lock()
+                                                .note_deferred(std::time::Instant::now());
                                             tracing::debug!(
                                             "Deferred gossiped block {} @ {} from {}: missing parent {}",
                                             hex::encode(&block.header.block_hash.as_bytes()[..8]),
@@ -4347,6 +4455,20 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .iter()
                             .filter(|b| verified_hashes.contains(&b.header.block_hash))
                             .count();
+                        // ancestor_sync.rs: a deferred block is evidence of a branch
+                        // this node lacks; a body answer moves the running episode.
+                        {
+                            let now = std::time::Instant::now();
+                            let mut anc = ancestor_for_rx.lock();
+                            if deferred_from_answer > 0 {
+                                anc.note_deferred(now);
+                            }
+                            if let Some(o) = anc.on_blocks(&pid.0, &answer_hashes, now, |h| {
+                                storage_for_handler.blocks.has_block(h).unwrap_or(false)
+                            }) {
+                                ancestor_sync::log_outcome(&pid.0, &o);
+                            }
+                        }
                         // sync_recovery.rs: the lowest block of THIS answer still
                         // deferred, followed down the buffered orphans, and the
                         // parent it lacks (the walk's next step).

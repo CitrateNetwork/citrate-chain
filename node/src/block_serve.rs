@@ -440,6 +440,120 @@ pub fn serve_blocks_within(
     out
 }
 
+/// The reply to a `GetAncestor` request (ADR-2026-11-17, ancestor sync).
+#[derive(Debug, Clone)]
+pub struct AncestorReply {
+    /// The highest locator entry on this node's executed chain.
+    pub common: Option<(Hash, u64)>,
+    /// This node's applied tip (the dead branch's fork point when the applied
+    /// tip is held on a dead branch, CV-7b).
+    pub tip: (Hash, u64),
+    /// `blue_work` of the tip's header (0 when unreadable).
+    pub tip_blue_work: u128,
+    /// Headers of the executed chain directly above `common`, ascending.
+    pub headers: Vec<BlockHeader>,
+}
+
+impl AncestorReply {
+    pub fn into_message(self) -> citrate_network::NetworkMessage {
+        citrate_network::NetworkMessage::Ancestor {
+            common: self.common,
+            tip: self.tip,
+            tip_blue_work: self.tip_blue_work,
+            headers: self.headers,
+        }
+    }
+}
+
+/// Serve a `GetAncestor { locator }` request, fully bounded.
+///
+/// Data source: this node's chain store, read through the canonical height
+/// index (`BlockStore::get_canonical_block_by_height`, the executed chain) and
+/// `BlockStore::get_header`. Cost: at most `MAX_LOCATOR_HASHES` header reads
+/// and index reads to find the common block, then at most
+/// `MAX_ANCESTOR_HEADERS` index and header reads, stopping at the applied tip
+/// (or a dead branch's fork point), at the first gap, and before the reply
+/// would exceed [`MAX_UNSPLIT_RESPONSE_BYTES`] (it is one Noise message).
+///
+/// The common block is the highest locator entry that this node holds AT ITS
+/// HEIGHT ON ITS EXECUTED CHAIN: a block it merely stores (a side block) is not
+/// a point from which its own chain continues. Entries are read in any order;
+/// the highest wins, so a requester cannot make the server walk further by
+/// reordering them.
+pub fn serve_ancestor(storage: &StorageManager, locator: &[Hash]) -> AncestorReply {
+    use citrate_network::protocol::{MAX_ANCESTOR_HEADERS, MAX_LOCATOR_HASHES};
+    let applied = storage
+        .blocks
+        .get_applied_tip()
+        .ok()
+        .flatten()
+        .unwrap_or((Hash::default(), 0));
+    // CV-7b: above a dead branch's fork point the executed chain is that
+    // branch; it is not served as this node's chain.
+    let (tip, top) = match dead_branch(storage) {
+        Some(w) if w.fork_height < applied.1 => ((w.fork_point, w.fork_height), w.fork_height),
+        _ => (applied, applied.1),
+    };
+    let tip_blue_work = storage
+        .blocks
+        .get_header(&tip.0)
+        .ok()
+        .flatten()
+        .map(|h| h.blue_work)
+        .unwrap_or(0);
+    let on_chain = |hash: &Hash| -> Option<u64> {
+        let header = storage.blocks.get_header(hash).ok().flatten()?;
+        let height = header.height;
+        if height > top {
+            return None;
+        }
+        let canonical = storage
+            .blocks
+            .get_canonical_block_by_height(height)
+            .ok()
+            .flatten()?;
+        (canonical == *hash).then_some(height)
+    };
+    let common = locator
+        .iter()
+        .take(MAX_LOCATOR_HASHES)
+        .filter_map(|h| on_chain(h).map(|height| (*h, height)))
+        .max_by_key(|(_, height)| *height);
+    let mut headers: Vec<BlockHeader> = Vec::new();
+    if let Some((_, from)) = common {
+        let mut budget = MAX_UNSPLIT_RESPONSE_BYTES;
+        let mut h = from;
+        while (headers.len() as u32) < MAX_ANCESTOR_HEADERS {
+            let Some(next) = h.checked_add(1) else {
+                break;
+            };
+            if next > top {
+                break;
+            }
+            h = next;
+            let Ok(Some(hash)) = storage.blocks.get_canonical_block_by_height(h) else {
+                break;
+            };
+            let Ok(Some(header)) = storage.blocks.get_header(&hash) else {
+                break;
+            };
+            match bincode::serialized_size(&header) {
+                Ok(size) if size <= budget => {
+                    budget = budget.saturating_sub(size);
+                    headers.push(header);
+                }
+                _ => break,
+            }
+        }
+    }
+    AncestorReply {
+        common,
+        tip,
+        tip_blue_work,
+        headers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,5 +1287,108 @@ mod tests {
         let g = Hash::new([1; 32]);
         let huge = fat_dag_block(0x50, 1, g, vec![], 70_000);
         assert_eq!(lens(chunk_for_noise(vec![huge])), vec![0]);
+    }
+
+    // ---- serve_ancestor (ancestor sync, ADR-2026-11-17) ----
+
+    /// `chain_of(n)` with its tip applied, so the canonical index describes
+    /// heights 0..n-1.
+    fn applied_chain_of(n: u64) -> (TempDir, Arc<StorageManager>) {
+        let (dir, storage) = chain_of(n);
+        storage
+            .blocks
+            .put_applied_tip(&height_hash(n - 1), n - 1)
+            .expect("applied tip");
+        (dir, storage)
+    }
+
+    fn unknown(k: u8) -> Hash {
+        Hash::new([0xE0 ^ k; 32])
+    }
+
+    #[test]
+    fn serve_ancestor_finds_the_highest_locator_entry_on_the_executed_chain() {
+        let (_dir, storage) = applied_chain_of(300);
+        // Newest first, as a requester on a branch forked at 50 sends it: its
+        // own blocks (unknown here), then shared ones. Order is not trusted:
+        // the highest held entry wins wherever it sits.
+        let locator = vec![
+            unknown(1),
+            unknown(2),
+            height_hash(10),
+            height_hash(50),
+            height_hash(0),
+        ];
+        let r = serve_ancestor(&storage, &locator);
+        assert_eq!(r.common, Some((height_hash(50), 50)));
+        assert_eq!(r.tip, (height_hash(299), 299));
+        assert_eq!(r.tip_blue_work, 299 * 100);
+        let heights: Vec<u64> = r.headers.iter().map(|h| h.height).collect();
+        let want: Vec<u64> =
+            (51..51 + u64::from(citrate_network::protocol::MAX_ANCESTOR_HEADERS)).collect();
+        assert_eq!(
+            heights, want,
+            "the executed chain above the common block, capped"
+        );
+        for w in r.headers.windows(2) {
+            assert_eq!(w[1].selected_parent_hash, w[0].block_hash, "one chain");
+        }
+    }
+
+    #[test]
+    fn serve_ancestor_stops_at_the_applied_tip_and_answers_an_unknown_locator_with_none() {
+        let (_dir, storage) = applied_chain_of(20);
+        let r = serve_ancestor(&storage, &[height_hash(15)]);
+        assert_eq!(r.common, Some((height_hash(15), 15)));
+        let heights: Vec<u64> = r.headers.iter().map(|h| h.height).collect();
+        assert_eq!(heights, vec![16, 17, 18, 19]);
+        let r = serve_ancestor(&storage, &[height_hash(19)]);
+        assert!(r.headers.is_empty(), "nothing above our own tip");
+        let r = serve_ancestor(&storage, &[unknown(1), unknown(2)]);
+        assert_eq!(r.common, None);
+        assert!(r.headers.is_empty());
+        assert_eq!(serve_ancestor(&storage, &[]).common, None);
+    }
+
+    /// A block this node merely stores (a side block at a height whose
+    /// executed block is another) is not a point its chain continues from.
+    #[test]
+    fn serve_ancestor_ignores_held_side_blocks() {
+        let (_dir, storage) = applied_chain_of(100);
+        let mut side = test_block(60, height_hash(59));
+        side.header.block_hash = unknown(9);
+        storage.blocks.put_block(&side).expect("side block");
+        // Re-assert the applied tip so the canonical index describes it.
+        storage
+            .blocks
+            .put_applied_tip(&height_hash(99), 99)
+            .expect("applied tip");
+        let r = serve_ancestor(&storage, &[unknown(9), height_hash(40)]);
+        assert_eq!(r.common, Some((height_hash(40), 40)));
+    }
+
+    /// DoS cap: entries past `MAX_LOCATOR_HASHES` are never read.
+    #[test]
+    fn serve_ancestor_reads_at_most_the_locator_cap() {
+        let (_dir, storage) = applied_chain_of(30);
+        let cap = citrate_network::protocol::MAX_LOCATOR_HASHES;
+        let mut locator: Vec<Hash> = (0..cap).map(|k| unknown(k as u8)).collect();
+        locator.push(height_hash(5));
+        assert_eq!(serve_ancestor(&storage, &locator).common, None);
+        locator.insert(0, height_hash(5));
+        assert_eq!(
+            serve_ancestor(&storage, &locator).common,
+            Some((height_hash(5), 5))
+        );
+    }
+
+    /// The reply is one message on the wire: it fits the Noise budget.
+    #[test]
+    fn serve_ancestor_reply_fits_one_noise_message() {
+        let (_dir, storage) = applied_chain_of(400);
+        let r = serve_ancestor(&storage, &[height_hash(1)]);
+        assert!(!r.headers.is_empty());
+        let size = bincode::serialized_size(&r.into_message()).expect("size");
+        assert!(size <= MAX_UNSPLIT_RESPONSE_BYTES + 256, "{size}");
     }
 }
