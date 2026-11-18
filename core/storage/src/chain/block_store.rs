@@ -515,13 +515,29 @@ impl BlockStore {
     /// each height; this returns them so the serve path can deliver complete
     /// height-groups in topological (height-ascending) order.
     ///
-    /// Cost: O(total stored headers) per call (no per-height multi-hash index
-    /// exists yet). Acceptable because only a late-joining peer triggers it and
-    /// the result is bounded downstream; a height→[hashes] index is the future
-    /// optimization if sync-serve load ever warrants it.
+    /// Cost: a bounded range (at most [`INDEXED_RANGE_MAX_HEIGHTS`] heights)
+    /// reads the sibling height index (`hsib:` ‖ height ‖ hash, see
+    /// [`Self::get_blocks_at_height`]) one height prefix at a time, so it costs
+    /// about the blocks in the range. r1007 fleet split (2026-11-17): every
+    /// `GetBlocks` a node serves reads one such range, and the old full header
+    /// scan made each answer cost every stored header (about a million per
+    /// node), which is how the serving plane fell behind and recovery requests
+    /// went unanswered. A wider or open-ended range (start-up purges, the
+    /// rollback planner), or a store whose index could not be built on open,
+    /// still scans every header.
     pub fn hashes_in_height_range(&self, start: u64, end: u64) -> Result<Vec<(u64, Hash)>> {
         let mut out: Vec<(u64, Hash)> = Vec::new();
         if start > end {
+            return Ok(out);
+        }
+        if self.height_indexed.load(AtomicOrdering::SeqCst)
+            && end.saturating_sub(start) < INDEXED_RANGE_MAX_HEIGHTS
+        {
+            for height in start..=end {
+                for hash in self.get_blocks_at_height(height)? {
+                    out.push((height, hash));
+                }
+            }
             return Ok(out);
         }
         for (key, value) in self.db.iter_cf(CF_HEADERS)? {
@@ -1164,6 +1180,10 @@ const BLOCK_COUNT_KEY: &[u8] = b"block_count_v1";
 /// S3-7: the latest height at which the sibling index and the count were known
 /// to describe the store (as [`TIPS_INDEX_MARKER_KEY`] for the tips index).
 const HEIGHT_INDEX_MARKER_KEY: &[u8] = b"hsib_idx_v1";
+
+/// Widest range [`BlockStore::hashes_in_height_range`] reads through the
+/// sibling height index (a `GetBlocks` answer covers at most 512 heights).
+pub const INDEXED_RANGE_MAX_HEIGHTS: u64 = 4_096;
 
 fn sibling_prefix(height: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(HEIGHT_SIBLINGS_PREFIX.len().saturating_add(8));
