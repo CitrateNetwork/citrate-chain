@@ -51,6 +51,7 @@ pub fn reserved_lane(message: &NetworkMessage) -> bool {
         NetworkMessage::NewBlock { .. }
             | NetworkMessage::Blocks { .. }
             | NetworkMessage::Headers { .. }
+            | NetworkMessage::Ancestor { .. }
     )
 }
 
@@ -59,7 +60,9 @@ pub fn reserved_lane(message: &NetworkMessage) -> bool {
 pub fn serve_request(message: &NetworkMessage) -> bool {
     matches!(
         message,
-        NetworkMessage::GetBlocks { .. } | NetworkMessage::GetHeaders { .. }
+        NetworkMessage::GetBlocks { .. }
+            | NetworkMessage::GetHeaders { .. }
+            | NetworkMessage::GetAncestor { .. }
     )
 }
 

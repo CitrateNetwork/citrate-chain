@@ -28,10 +28,11 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    /// 1.2: understands checkpoint certificate sync (see
+    /// 1.3: answers ancestor sync (see [`Self::ANCESTOR_SYNC`]); 1.2 and
+    /// later understand checkpoint certificate sync (see
     /// [`Self::CHECKPOINT_CERT_SYNC`]); 1.1 and later also verify chain-bound
     /// (V2) native transaction signatures (see [`Self::NATIVE_TX_V2`]).
-    pub const CURRENT: Self = Self::CHECKPOINT_CERT_SYNC;
+    pub const CURRENT: Self = Self::ANCESTOR_SYNC;
 
     pub fn is_compatible(&self, other: &Self) -> bool {
         // Major version must match, minor/patch can differ
@@ -73,7 +74,34 @@ impl ProtocolVersion {
         self.major == Self::CHECKPOINT_CERT_SYNC.major
             && self.minor >= Self::CHECKPOINT_CERT_SYNC.minor
     }
+
+    /// The first version whose nodes decode and answer
+    /// [`NetworkMessage::GetAncestor`] / [`NetworkMessage::Ancestor`]
+    /// (header-first ancestor sync, ADR-2026-11-17). An older node fails to
+    /// decode an unknown variant and drops the connection, so those two
+    /// messages are only ever sent to peers at or above it (`Peer::send`).
+    /// A minor bump: older nodes still accept this version's handshake, and
+    /// toward them a node keeps using the `GetBlocks` fork-point search.
+    pub const ANCESTOR_SYNC: Self = Self {
+        major: 1,
+        minor: 3,
+        patch: 0,
+    };
+
+    /// Whether a peer that advertised this version answers ancestor sync.
+    pub fn understands_ancestor_sync(&self) -> bool {
+        self.major == Self::ANCESTOR_SYNC.major && self.minor >= Self::ANCESTOR_SYNC.minor
+    }
 }
+
+/// Most hashes a [`NetworkMessage::GetAncestor`] locator carries; a server
+/// reads no more than this many (34 cover a fork 120,000 heights deep).
+pub const MAX_LOCATOR_HASHES: usize = 64;
+
+/// Most headers one [`NetworkMessage::Ancestor`] reply carries. The reply is
+/// one message on the wire, so it also stays under the Noise message budget
+/// (the server stops earlier when the headers would not fit).
+pub const MAX_ANCESTOR_HEADERS: u32 = 128;
 
 impl fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -357,6 +385,29 @@ pub enum NetworkMessage {
         binding: citrate_consensus::checkpoint::VoteBinding,
         signatures: Vec<CheckpointSignature>,
     },
+
+    // Header-first ancestor sync (ADR-2026-11-17). Appended LAST so every
+    // existing variant keeps its wire discriminant. Sent only to peers that
+    // advertised [`ProtocolVersion::ANCESTOR_SYNC`] (`Peer::send`).
+    /// Find the most recent common ancestor: `locator` lists hashes of the
+    /// requester's executed chain, newest first, exponentially spaced below
+    /// the tip, ending with its finalized checkpoint and genesis. At most
+    /// [`MAX_LOCATOR_HASHES`] are read.
+    GetAncestor {
+        locator: Vec<Hash>,
+    },
+
+    /// The answer to [`Self::GetAncestor`]: `common` is the highest locator
+    /// entry on the server's executed chain (`None`: none is), `tip` the
+    /// server's applied tip and `tip_blue_work` its header's blue work (claims,
+    /// never trusted), and `headers` up to [`MAX_ANCESTOR_HEADERS`] headers of
+    /// the server's executed chain directly above `common`, ascending.
+    Ancestor {
+        common: Option<(Hash, u64)>,
+        tip: (Hash, u64),
+        tip_blue_work: u128,
+        headers: Vec<BlockHeader>,
+    },
 }
 
 /// One committee member's signature in a [`NetworkMessage::CheckpointCertificate`]:
@@ -461,6 +512,8 @@ impl NetworkMessage {
             Self::LearningGossip { .. } => "LearningGossip",
             Self::GetCheckpoint { .. } => "GetCheckpoint",
             Self::CheckpointCertificate { .. } => "CheckpointCertificate",
+            Self::GetAncestor { .. } => "GetAncestor",
+            Self::Ancestor { .. } => "Ancestor",
         }
     }
 
@@ -469,7 +522,9 @@ impl NetworkMessage {
         match self {
             // Critical priority for handshake and sync
             Self::Hello { .. } | Self::HelloAck { .. } => MessagePriority::Critical,
-            Self::GetBlocks { .. } | Self::GetHeaders { .. } => MessagePriority::Critical,
+            Self::GetBlocks { .. } | Self::GetHeaders { .. } | Self::GetAncestor { .. } => {
+                MessagePriority::Critical
+            }
 
             // High priority for new blocks
             Self::NewBlock { .. } => MessagePriority::High,
@@ -493,6 +548,7 @@ impl NetworkMessage {
             Self::Ping { .. }
                 | Self::GetBlocks { .. }
                 | Self::GetHeaders { .. }
+                | Self::GetAncestor { .. }
                 | Self::GetTransactions { .. }
                 | Self::GetMempool
                 | Self::GetPeers
@@ -510,6 +566,12 @@ impl NetworkMessage {
             self,
             Self::GetCheckpoint { .. } | Self::CheckpointCertificate { .. }
         )
+    }
+
+    /// Whether this is an ancestor sync message, which only peers at
+    /// [`ProtocolVersion::ANCESTOR_SYNC`] or above decode.
+    pub fn is_ancestor_sync(&self) -> bool {
+        matches!(self, Self::GetAncestor { .. } | Self::Ancestor { .. })
     }
 
     /// Strip peer-asserted trust from a message deserialized off the wire.
