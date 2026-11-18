@@ -120,6 +120,20 @@ pub const BODY_WINDOW: u32 = 32;
 /// A request without its answer for this long ends the episode.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The longest one episode may run, whatever its peer does. An honest deep
+/// fetch that needs longer ends with [`Outcome::Budget`] and the next episode
+/// resumes from what is held by then (PR #483 review, P1-1: a peer answering
+/// each request just inside [`REQUEST_TIMEOUT`] could otherwise hold an
+/// episode for the whole header cap).
+pub const EPISODE_MAX_DURATION: Duration = Duration::from_secs(120);
+
+/// Requests one episode may make, sent or not (a request the sync manager
+/// refused counts: InFlightCap must not hold an episode open).
+pub const EPISODE_MAX_ROUNDS: u32 = 512;
+
+/// Requests in a row the sync manager refused before the episode ends.
+pub const MAX_UNSENT_ROUNDS: u32 = 4;
+
 /// Body answers in a row that hold no new header-chain block before the
 /// episode ends.
 pub const MAX_STALLED_BODY_ANSWERS: u32 = 4;
@@ -136,6 +150,9 @@ pub const COOLDOWN_MAX: Duration = Duration::from_secs(1_800);
 /// A fork below the reorg floor does not go away: the peer is not asked again
 /// for this long.
 pub const TOO_DEEP_COOLDOWN: Duration = COOLDOWN_MAX;
+
+/// Deliverers of deferred blocks remembered, at most; the oldest is dropped.
+pub const MAX_DELIVERERS: usize = 256;
 
 /// Peers with a cooldown recorded, at most; the soonest to expire is dropped.
 pub const MAX_COOLDOWN_PEERS: usize = 256;
@@ -169,6 +186,10 @@ pub enum Outcome {
     Stalled,
     /// The peer's executed chain no longer holds our last header (it reorged).
     PeerMoved,
+    /// The episode's time, round or header budget ran out. Resumable: what
+    /// was fetched stays stored, so the next episode's locator meets the peer
+    /// higher up. Not held against the peer when it delivered bodies.
+    Budget { fetched: u64 },
     /// The peer disconnected.
     PeerLeft,
 }
@@ -178,7 +199,11 @@ impl Outcome {
     fn is_failure(&self) -> bool {
         matches!(
             self,
-            Outcome::Faulty(_) | Outcome::Timeout | Outcome::Stalled | Outcome::NoCommon
+            Outcome::Faulty(_)
+                | Outcome::Timeout
+                | Outcome::Stalled
+                | Outcome::NoCommon
+                | Outcome::Budget { fetched: 0 }
         )
     }
 }
@@ -373,6 +398,14 @@ struct Episode {
     work_ok: bool,
     verified: u64,
     stalled: u32,
+    /// When the episode started (its [`EPISODE_MAX_DURATION`] clock).
+    started: Instant,
+    /// Requests made, sent or not ([`EPISODE_MAX_ROUNDS`]).
+    rounds: u32,
+    /// Requests in a row the sync manager refused ([`MAX_UNSENT_ROUNDS`]).
+    unsent: u32,
+    /// Heights the body cursor moved.
+    fetched: u64,
 }
 
 /// The episode driver described at the top of this file.
@@ -383,8 +416,16 @@ pub struct AncestorSync {
     cooldown: HashMap<String, (Instant, u32)>,
     /// When a block last deferred on a missing parent.
     evidence_at: Option<Instant>,
+    /// Peers that delivered a block that deferred on a missing parent, and
+    /// when they last did ([`MAX_DELIVERERS`] at most): the peers most likely
+    /// to hold the branch this node lacks. An advertised head says less: a
+    /// relayed block raises the relaying peer's head whether or not it holds
+    /// that block's branch.
+    deliverers: HashMap<String, Instant>,
     /// The peer of the last episode that ended (for its log line).
     last_peer: Option<String>,
+    /// Episodes ended, by outcome kind (diagnostics).
+    ended: HashMap<&'static str, u64>,
 }
 
 impl AncestorSync {
@@ -392,16 +433,40 @@ impl AncestorSync {
         Self::default()
     }
 
-    /// A block deferred on a missing parent: evidence of a branch this node
-    /// lacks (only whether an episode may start; it moves nothing else).
-    pub fn note_deferred(&mut self, now: Instant) {
+    /// A block `peer` delivered deferred on a missing parent: evidence of a
+    /// branch this node lacks, and a candidate to ask (only whether and with
+    /// whom an episode may start; it moves nothing else).
+    pub fn note_deferred(&mut self, peer: &str, now: Instant) {
         self.evidence_at = Some(now);
+        if self.deliverers.len() >= MAX_DELIVERERS && !self.deliverers.contains_key(peer) {
+            if let Some(oldest) = self
+                .deliverers
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(p, _)| p.clone())
+            {
+                self.deliverers.remove(&oldest);
+            }
+        }
+        self.deliverers.insert(peer.to_string(), now);
     }
 
-    /// The episode found the fork below the applied tip and is fetching that
-    /// branch: the sync tick's own request and the pipeline stand aside.
+    fn delivered_recently(&self, peer: &str, now: Instant) -> Option<Instant> {
+        self.deliverers
+            .get(peer)
+            .copied()
+            .filter(|at| now.saturating_duration_since(*at) < EVIDENCE_TTL)
+    }
+
+    /// The episode is in its body phase: the fork is below the applied tip
+    /// and a verified header claims more work than ours. Only then do the
+    /// sync tick's own request and the pipeline stand aside; locating and
+    /// header paging never do (PR #483 review, P1-1), and the body phase is
+    /// bounded by [`EPISODE_MAX_DURATION`] and [`EPISODE_MAX_ROUNDS`].
     pub fn owns_sync(&self) -> bool {
-        self.episode.as_ref().is_some_and(|e| e.fork.is_some())
+        self.episode
+            .as_ref()
+            .is_some_and(|e| e.fork.is_some() && e.work_ok)
     }
 
     /// Move the body cursor past every buffered header whose block this node
@@ -421,9 +486,57 @@ impl AncestorSync {
             if !holds(&hash) {
                 break;
             }
+            let from = e.held.map(|h| h.1).unwrap_or(height);
+            e.fetched = e.fetched.saturating_add(height.saturating_sub(from));
             e.held = Some((hash, height));
             e.headers.pop_front();
             e.stalled = 0;
+        }
+    }
+
+    /// The request to send right after an answer, if the running episode has
+    /// one and nothing is in flight: an episode does not wait for the next
+    /// sync tick between rounds. Bounded by the same round and time budgets
+    /// as the tick (which ends an episode that ran out).
+    pub fn next(&mut self, now: Instant) -> Option<Request> {
+        let e = self.episode.as_mut()?;
+        if e.asked.is_some()
+            || e.rounds >= EPISODE_MAX_ROUNDS
+            || now.saturating_duration_since(e.started) >= EPISODE_MAX_DURATION
+            || (e.fork.is_some() && e.tip_reached && e.headers.is_empty())
+        {
+            return None;
+        }
+        Self::next_request(e, now)
+    }
+
+    /// The next `limit` buffered header hashes the body cursor waits on.
+    pub fn front_headers(&self, limit: usize) -> Vec<Hash> {
+        self.episode
+            .as_ref()
+            .map(|e| e.headers.iter().take(limit).map(|(h, _)| *h).collect())
+            .unwrap_or_default()
+    }
+
+    /// A one-line state summary (diagnostics, harness failure output).
+    pub fn summary(&self) -> String {
+        let mut ended: Vec<String> = self.ended.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        ended.sort();
+        match &self.episode {
+            Some(e) => format!(
+                "episode(peer={} asked={} fork={:?} held={:?} headers={} work_ok={} tip_reached={} rounds={} fetched={}) ended[{}]",
+                e.peer,
+                e.asked.is_some(),
+                e.fork.map(|f| f.1),
+                e.held.map(|h| h.1),
+                e.headers.len(),
+                e.work_ok,
+                e.tip_reached,
+                e.rounds,
+                e.fetched,
+                ended.join(" ")
+            ),
+            None => format!("idle ended[{}]", ended.join(" ")),
         }
     }
 
@@ -448,6 +561,8 @@ impl AncestorSync {
         let (wait, failures) = match &outcome {
             Outcome::TooDeep { .. } => (TOO_DEEP_COOLDOWN, failures),
             Outcome::PeerLeft => (Duration::ZERO, failures),
+            // Resumable, and the peer delivered: ask it again at once.
+            Outcome::Budget { fetched } if *fetched > 0 => (Duration::ZERO, 0),
             o if o.is_failure() => {
                 let shift = failures.min(6);
                 (
@@ -471,6 +586,24 @@ impl AncestorSync {
             }
         }
         self.last_peer = Some(episode.peer.clone());
+        let kind = match &outcome {
+            Outcome::Extends => "extends",
+            Outcome::NotHeavier { .. } => "not_heavier",
+            Outcome::Fetched { .. } => "fetched",
+            Outcome::TooDeep { .. } => "too_deep",
+            Outcome::NoCommon => "no_common",
+            Outcome::Faulty(_) => "faulty",
+            Outcome::Timeout => "timeout",
+            Outcome::Stalled => "stalled",
+            Outcome::PeerMoved => "peer_moved",
+            Outcome::PeerLeft => "peer_left",
+            Outcome::Budget { .. } => "budget",
+        };
+        let count = self.ended.entry(kind).or_insert(0);
+        *count = count.saturating_add(1);
+        if let Outcome::Faulty(why) = &outcome {
+            tracing::debug!("ancestor episode faulty: {why}");
+        }
         self.cooldown.insert(
             episode.peer,
             (now.checked_add(wait).unwrap_or(now), failures),
@@ -501,6 +634,11 @@ impl AncestorSync {
                 };
                 if timed_out {
                     ended = self.end(Outcome::Timeout, now);
+                } else if e.rounds >= EPISODE_MAX_ROUNDS
+                    || now.saturating_duration_since(e.started) >= EPISODE_MAX_DURATION
+                {
+                    let fetched = e.fetched;
+                    ended = self.end(Outcome::Budget { fetched }, now);
                 }
             }
         }
@@ -527,17 +665,22 @@ impl AncestorSync {
         if !evidence {
             return (None, ended);
         }
+        // Peers that delivered a deferred block first (most recent first),
+        // then peers whose advertised head this node does not hold (highest
+        // first).
         let Some(pick) = candidates
             .iter()
             .filter(|c| {
                 c.speaks
-                    && !c.head_held
-                    && c.head_hash != view.applied.0
                     && !self.cooling(&c.id, now)
+                    && (self.delivered_recently(&c.id, now).is_some()
+                        || (!c.head_held && c.head_hash != view.applied.0))
             })
             .max_by(|a, b| {
-                a.head_height
-                    .cmp(&b.head_height)
+                self.delivered_recently(&a.id, now)
+                    .cmp(&self.delivered_recently(&b.id, now))
+                    .then_with(|| (!a.head_held).cmp(&!b.head_held))
+                    .then_with(|| a.head_height.cmp(&b.head_height))
                     .then_with(|| b.id.cmp(&a.id))
             })
         else {
@@ -561,6 +704,10 @@ impl AncestorSync {
             work_ok: false,
             verified: 0,
             stalled: 0,
+            started: now,
+            rounds: 1,
+            unsent: 0,
+            fetched: 0,
         });
         (Some(Request::Locate { peer, locator }), ended)
     }
@@ -585,6 +732,7 @@ impl AncestorSync {
                 at: now,
                 locator: locator.clone(),
             });
+            e.rounds = e.rounds.saturating_add(1);
             return Some(Request::Locate {
                 peer: e.peer.clone(),
                 locator,
@@ -595,6 +743,7 @@ impl AncestorSync {
                 at: now,
                 anchor: held.0,
             });
+            e.rounds = e.rounds.saturating_add(1);
             return Some(Request::Bodies {
                 peer: e.peer.clone(),
                 from: held.0,
@@ -604,17 +753,24 @@ impl AncestorSync {
         None
     }
 
-    /// The tick could not send the request it was given (the sync manager
-    /// refused it, or the peer is gone): forget it, ask again next tick.
-    pub fn unsent(&mut self) {
-        if let Some(e) = self.episode.as_mut() {
-            e.asked = None;
+    /// The request could not be sent (the sync manager refused it, e.g. at
+    /// its in-flight cap, or the peer is gone): forget it and ask again next
+    /// round. It still counted against [`EPISODE_MAX_ROUNDS`], and
+    /// [`MAX_UNSENT_ROUNDS`] in a row end the episode, so a refusal can never
+    /// hold it open (PR #483 review, P1-1). Returns the outcome when it ends.
+    pub fn unsent(&mut self, now: Instant) -> Option<Outcome> {
+        let e = self.episode.as_mut()?;
+        e.asked = None;
+        e.unsent = e.unsent.saturating_add(1);
+        if e.unsent >= MAX_UNSENT_ROUNDS {
+            return self.end(Outcome::Stalled, now);
         }
+        None
     }
 
-    /// An `Ancestor` reply from `peer`. `holds(h)` says whether this node
-    /// stores block `h`; `own_header(h)` returns the header of a block this
-    /// node stores. Returns the outcome when the episode ends.
+    /// An `Ancestor` reply from `peer`. `ours(h, height)` says whether block
+    /// `h` is on this node's executed chain at `height`; `own_header(h)`
+    /// returns the header of a block this node stores. Returns the outcome when the episode ends.
     #[allow(clippy::too_many_arguments)]
     pub fn on_ancestor(
         &mut self,
@@ -626,7 +782,7 @@ impl AncestorSync {
         view: &View,
         now: Instant,
         now_secs: u64,
-        holds: impl Fn(&Hash) -> bool,
+        ours: impl Fn(&Hash, u64) -> bool,
         own_header: impl Fn(&Hash) -> Option<BlockHeader>,
     ) -> Option<Outcome> {
         let sent = match self.episode.as_ref() {
@@ -673,6 +829,7 @@ impl AncestorSync {
         }
         let e = self.episode.as_mut()?;
         e.asked = None;
+        e.unsent = 0;
         e.peer_tip = tip;
         // The link the headers continue from: our last verified header when
         // the peer still holds it, else (first reply) the common block, whose
@@ -702,20 +859,21 @@ impl AncestorSync {
         }
         e.verified = e.verified.saturating_add(headers.len() as u64);
         if e.verified > MAX_EPISODE_HEADERS {
-            return self.end(
-                Outcome::Faulty("branch longer than the episode cap".into()),
-                now,
-            );
+            let fetched = e.fetched;
+            return self.end(Outcome::Budget { fetched }, now);
         }
         for h in headers {
             let hash = h.block_hash;
             if e.fork.is_none() {
-                if holds(&hash) {
+                // The fork point is the last header ON OUR EXECUTED CHAIN: a
+                // side block this node merely stores (gossip, a walk) would
+                // make the fork look shallower than it is (PR #483 review).
+                if ours(&hash, h.height) {
                     e.held = Some((hash, h.height));
                     continue;
                 }
-                // The first header whose block this node lacks: the block
-                // before it is the fork point.
+                // The first header that is not ours: the block before it is
+                // the fork point.
                 let fork = e.held.unwrap_or((common_hash, common_height));
                 if fork.1 < floor {
                     let depth = view.applied.1.saturating_sub(fork.1);
@@ -766,6 +924,24 @@ impl AncestorSync {
             if fork.0 == view.applied.0 {
                 return self.end(Outcome::Extends, now);
             }
+            // Headers spanning the whole reorg window above the fork without
+            // claiming more work than ours: nothing further up is a branch
+            // this node should fetch now.
+            let above = e
+                .last
+                .map(|l| l.height)
+                .unwrap_or(fork.1)
+                .saturating_sub(fork.1);
+            if !e.work_ok && above >= crate::canonical_apply::MAX_REORG_DEPTH {
+                let peer_tip = tip.1;
+                return self.end(
+                    Outcome::NotHeavier {
+                        fork: fork.1,
+                        peer_tip,
+                    },
+                    now,
+                );
+            }
             if e.tip_reached && !e.work_ok {
                 let peer_tip = tip.1;
                 return self.end(
@@ -800,11 +976,14 @@ impl AncestorSync {
             return None;
         }
         e.asked = None;
+        e.unsent = 0;
         let mut moved = false;
         while let Some((hash, height)) = e.headers.front().copied() {
             if !holds(&hash) {
                 break;
             }
+            let from = e.held.map(|h| h.1).unwrap_or(height);
+            e.fetched = e.fetched.saturating_add(height.saturating_sub(from));
             e.held = Some((hash, height));
             e.headers.pop_front();
             moved = true;
@@ -869,11 +1048,14 @@ pub fn read_view(
     }
 }
 
-/// The connected peers as [`Candidate`]s, with their handles. `held(h)` says
-/// whether this node stores `h` (a read error must count as held).
+/// The connected peers as [`Candidate`]s, with their handles. A head counts
+/// as held only when it is fully admitted (chain store AND DAG,
+/// `BlockAdmission::is_fully_admitted`): a block that deferred on a missing
+/// parent is stored but not admitted, and is exactly the evidence of a branch
+/// this node lacks.
 pub async fn candidates(
     peers: &[std::sync::Arc<citrate_network::peer::Peer>],
-    held: impl Fn(&Hash) -> bool,
+    admission: &crate::admission::BlockAdmission,
 ) -> Vec<(Candidate, std::sync::Arc<citrate_network::peer::Peer>)> {
     let mut out = Vec::with_capacity(peers.len());
     for p in peers {
@@ -881,27 +1063,54 @@ pub async fn candidates(
         if info.state != citrate_network::peer::PeerState::Connected {
             continue;
         }
-        let c = Candidate {
-            id: info.id.0.clone(),
-            speaks: info.version.is_some_and(|v| v.understands_ancestor_sync()),
-            head_hash: info.head_hash,
-            head_height: info.head_height,
-            head_held: held(&info.head_hash),
-        };
+        let id = info.id.0.clone();
+        let speaks = info.version.is_some_and(|v| v.understands_ancestor_sync());
+        let head_hash = info.head_hash;
+        let head_height = info.head_height;
         drop(info);
+        let c = Candidate {
+            id,
+            speaks,
+            head_hash,
+            head_height,
+            head_held: admission.is_fully_admitted(&head_hash).await,
+        };
         out.push((c, p.clone()));
     }
     out
 }
+
+/// Of the running episode's next buffered headers, those whose blocks are
+/// fully admitted (`BlockAdmission::is_fully_admitted`: a stored block that
+/// deferred on a missing parent is not). What the body cursor may move past.
+pub async fn admitted_front(
+    driver: &parking_lot::Mutex<AncestorSync>,
+    admission: &crate::admission::BlockAdmission,
+) -> HashSet<Hash> {
+    let front = driver.lock().front_headers(ADMITTED_FRONT);
+    let mut out = HashSet::with_capacity(front.len());
+    for h in front {
+        if !admission.is_fully_admitted(&h).await {
+            break;
+        }
+        out.insert(h);
+    }
+    out
+}
+
+/// Buffered headers [`admitted_front`] checks per call: four body windows.
+pub const ADMITTED_FRONT: usize = (BODY_WINDOW as usize).saturating_mul(4);
 
 /// One sync tick's ancestor-sync step, as `start_node` runs it: the driver's
 /// request for this tick, sent. `GetAncestor` goes straight to the peer
 /// (`Peer::send` withholds it from a peer below 1.3); a body window goes
 /// through `SyncManager::request_blocks`, so its answer is validated, admitted
 /// and timed like any other. Returns the outcome of an episode that ended.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tick(
     driver: &parking_lot::Mutex<AncestorSync>,
     storage: &citrate_storage::StorageManager,
+    admission: &crate::admission::BlockAdmission,
     sync: &citrate_network::sync::SyncManager,
     peers: &[(Candidate, std::sync::Arc<citrate_network::peer::Peer>)],
     finalized_height: u64,
@@ -910,15 +1119,18 @@ pub async fn run_tick(
 ) -> Option<Outcome> {
     let view = read_view(storage, finalized_height, behind);
     let cands: Vec<Candidate> = peers.iter().map(|(c, _)| c.clone()).collect();
-    driver
-        .lock()
-        .advance(|h| storage.blocks.has_block(h).unwrap_or(false));
+    let admitted = admitted_front(driver, admission).await;
+    driver.lock().advance(|h| admitted.contains(h));
     let (request, ended) = driver.lock().tick(now, &view, &cands, |h| {
         crate::sync_rejoin::anchor_at_height(storage, h)
     });
     if let Some(o) = &ended {
-        let peer = driver.lock().last_peer().unwrap_or("-").to_string();
+        let (peer, summary) = {
+            let d = driver.lock();
+            (d.last_peer().unwrap_or("-").to_string(), d.summary())
+        };
         log_outcome(&peer, o);
+        tracing::debug!("SYNCANCESTOR {summary}");
     }
     let Some(request) = request else {
         return ended;
@@ -931,8 +1143,7 @@ pub async fn run_tick(
         .find(|(c, _)| c.id == target)
         .map(|(_, p)| p.clone())
     else {
-        driver.lock().unsent();
-        return ended;
+        return driver.lock().unsent(now).or(ended);
     };
     let sent = match request {
         Request::Locate { locator, .. } => {
@@ -960,9 +1171,53 @@ pub async fn run_tick(
         }
     };
     if !sent {
-        driver.lock().unsent();
+        if let Some(o) = driver.lock().unsent(now) {
+            log_outcome(&target, &o);
+        }
     }
     ended
+}
+
+/// Send the running episode's next request right after an answer from
+/// `peer` (see [`AncestorSync::next`]), so an episode does not wait a sync
+/// tick per round. The cursor first catches up with what is stored.
+pub async fn send_next(
+    driver: &parking_lot::Mutex<AncestorSync>,
+    admission: &crate::admission::BlockAdmission,
+    sync: &citrate_network::sync::SyncManager,
+    peer: Option<std::sync::Arc<citrate_network::peer::Peer>>,
+    now: Instant,
+) {
+    let Some(handle) = peer else {
+        return;
+    };
+    let id = handle.info.read().await.id.0.clone();
+    let admitted = admitted_front(driver, admission).await;
+    let request = {
+        let mut d = driver.lock();
+        if d.episode.as_ref().map(|e| e.peer.as_str()) != Some(id.as_str()) {
+            return;
+        }
+        d.advance(|h| admitted.contains(h));
+        d.next(now)
+    };
+    let Some(request) = request else {
+        return;
+    };
+    let sent = match request {
+        Request::Locate { locator, .. } => handle
+            .send(citrate_network::NetworkMessage::GetAncestor { locator })
+            .await
+            .is_ok(),
+        Request::Bodies { from, height, .. } => {
+            matches!(sync.request_blocks(&handle, from, height).await, Ok(true))
+        }
+    };
+    if !sent {
+        if let Some(o) = driver.lock().unsent(now) {
+            log_outcome(&id, &o);
+        }
+    }
 }
 
 /// An `Ancestor` reply from `peer`, judged against this node's store (see
@@ -985,6 +1240,7 @@ pub fn on_reply(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let applied_height = view.applied.1;
     let out = driver.lock().on_ancestor(
         peer,
         common,
@@ -994,7 +1250,17 @@ pub fn on_reply(
         &view,
         now,
         now_secs,
-        |h| storage.blocks.has_block(h).unwrap_or(false),
+        // On this node's executed chain: at or below the applied tip, the
+        // canonical height index names it.
+        |h, height| {
+            height <= applied_height
+                && storage
+                    .blocks
+                    .get_canonical_block_by_height(height)
+                    .ok()
+                    .flatten()
+                    == Some(*h)
+        },
         |h| storage.blocks.get_header(h).ok().flatten(),
     );
     if let Some(o) = &out {
@@ -1022,6 +1288,12 @@ pub fn log_outcome(peer: &str, outcome: &Outcome) {
             short,
             fork,
             top
+        ),
+        Outcome::Budget { fetched } => tracing::info!(
+            "SYNCANCESTOR episode with {} ran out of budget after {} height(s); the next one \
+             resumes from there",
+            short,
+            fetched
         ),
         Outcome::Faulty(why) => {
             tracing::info!(
@@ -1354,7 +1626,7 @@ mod tests {
     fn drive(me: &mut Me, peer: &Peer, admit: bool) -> (Option<Outcome>, usize, usize) {
         let mut a = AncestorSync::new();
         let t0 = Instant::now();
-        a.note_deferred(t0);
+        a.note_deferred("peer", t0);
         let mut locates = 0;
         let mut bodies = 0;
         for tick in 0..20_000u64 {
@@ -1380,7 +1652,7 @@ mod tests {
                         &view,
                         now,
                         NOW,
-                        |h| held.contains(h),
+                        |h, _| held.contains(h),
                         |h| me.header(h),
                     ) {
                         return (Some(o), locates, bodies);
@@ -1531,7 +1803,7 @@ mod tests {
         };
         let mut a = AncestorSync::new();
         let now = Instant::now();
-        a.note_deferred(now);
+        a.note_deferred("peer", now);
         let mut view = me.view();
         view.finalized = (me.hash_at(950), 950);
         let (req, _) = a.tick(now, &view, &[peer.candidate()], |h| Some(me.hash_at(h)));
@@ -1556,7 +1828,7 @@ mod tests {
             &view,
             now,
             NOW,
-            |h| held.contains(h),
+            |h, _| held.contains(h),
             |h| me.header(h),
         );
         assert!(
@@ -1591,7 +1863,7 @@ mod tests {
         };
         let mut a = AncestorSync::new();
         let now = Instant::now();
-        a.note_deferred(now);
+        a.note_deferred("peer", now);
         let view = me.view();
         let (req, _) = a.tick(now, &view, &[peer.candidate()], |h| Some(me.hash_at(h)));
         assert!(matches!(req, Some(Request::Locate { .. })));
@@ -1605,12 +1877,12 @@ mod tests {
             &view,
             now,
             NOW,
-            |h| held.contains(h),
+            |h, _| held.contains(h),
             |h| me.header(h),
         );
         assert!(matches!(out, Some(Outcome::Faulty(_))), "{out:?}");
         // Cooling: not asked again at once, even with fresh evidence.
-        a.note_deferred(now + Duration::from_secs(1));
+        a.note_deferred("peer", now + Duration::from_secs(1));
         let (req, _) = a.tick(
             now + Duration::from_secs(1),
             &view,
@@ -1618,7 +1890,7 @@ mod tests {
             |h| Some(me.hash_at(h)),
         );
         assert_eq!(req, None);
-        a.note_deferred(now + COOLDOWN_BASE);
+        a.note_deferred("peer", now + COOLDOWN_BASE);
         let (req, _) = a.tick(now + COOLDOWN_BASE, &view, &[peer.candidate()], |h| {
             Some(me.hash_at(h))
         });
@@ -1639,7 +1911,7 @@ mod tests {
         };
         let mut a = AncestorSync::new();
         let now = Instant::now();
-        a.note_deferred(now);
+        a.note_deferred("peer", now);
         let view = me.view();
         let (req, _) = a.tick(now, &view, &[peer.candidate()], |h| Some(me.hash_at(h)));
         let Some(Request::Locate { locator, .. }) = req else {
@@ -1659,7 +1931,7 @@ mod tests {
             &view,
             now,
             NOW,
-            |h| held.contains(h),
+            |h, _| held.contains(h),
             |h| me.header(h),
         );
         assert!(matches!(out, Some(Outcome::Faulty(_))), "{out:?}");
@@ -1679,7 +1951,7 @@ mod tests {
         };
         let mut a = AncestorSync::new();
         let t0 = Instant::now();
-        a.note_deferred(t0);
+        a.note_deferred("peer", t0);
         let mut anchors = Vec::new();
         for tick in 0..2_000u64 {
             let now = t0 + Duration::from_millis(tick);
@@ -1711,7 +1983,7 @@ mod tests {
                         &view,
                         now,
                         NOW,
-                        |h| held.contains(h),
+                        |h, _| held.contains(h),
                         |h| me.header(h),
                     );
                 }
@@ -1741,6 +2013,299 @@ mod tests {
         );
     }
 
+    /// Answer the outstanding locate of `a` with `peer`'s reply.
+    fn reply(
+        a: &mut AncestorSync,
+        me: &Me,
+        peer: &Peer,
+        locator: &[Hash],
+        now: Instant,
+    ) -> Option<Outcome> {
+        let (common, headers) = peer.answer(locator);
+        let held = me.held.clone();
+        a.on_ancestor(
+            "peer",
+            common,
+            peer.tip(),
+            peer.tip_work(),
+            &headers,
+            &me.view(),
+            now,
+            NOW,
+            |h, _| held.contains(h),
+            |h| me.header(h),
+        )
+    }
+
+    /// PR #483 review, P1-1: a peer that answers every locate just inside the
+    /// request timeout, with headers that never claim more work than ours,
+    /// must not hold the sync tick or the pipeline aside at all, and its
+    /// episode must end within the episode's time budget.
+    #[test]
+    fn a_slow_drip_header_peer_never_owns_sync_and_is_bounded() {
+        // Our branch is 8,000 deep at 4 blue per height; the peer's 30,000
+        // headers at 1 per height never reach our work, though its tip claims
+        // the most work there is.
+        let me = Me::new(1_000, 9_000, 4, 0);
+        let peer = Peer {
+            fork: 1_000,
+            len: 30_000,
+            per: 1,
+            claim: Some(u128::MAX),
+        };
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        a.note_deferred("peer", t0);
+        let drip = REQUEST_TIMEOUT - Duration::from_secs(1);
+        let mut pending: Option<(Instant, Vec<Hash>)> = None;
+        let mut ended = None;
+        for sec in 0..3_600u64 {
+            let now = t0 + Duration::from_secs(sec);
+            if let Some((due, locator)) = pending.clone() {
+                if now >= due {
+                    pending = None;
+                    if let Some(o) = reply(&mut a, &me, &peer, &locator, now) {
+                        ended = Some((sec, o));
+                        break;
+                    }
+                }
+            }
+            assert!(
+                !a.owns_sync(),
+                "a header-phase episode stood the sync tick aside at {sec} s"
+            );
+            let (req, out) = a.tick(now, &me.view(), &[peer.candidate()], |h| {
+                Some(me.hash_at(h))
+            });
+            if let Some(o) = out {
+                ended = Some((sec, o));
+                break;
+            }
+            if let Some(Request::Locate { locator, .. }) = req {
+                pending = Some((now + drip, locator));
+            }
+        }
+        let (sec, out) = ended.expect("the episode ended");
+        assert!(
+            sec <= EPISODE_MAX_DURATION.as_secs() + REQUEST_TIMEOUT.as_secs(),
+            "ended after {sec} s: {out:?}"
+        );
+        assert_eq!(out, Outcome::Budget { fetched: 0 });
+        // Delivered nothing: held against it (no immediate retry).
+        a.note_deferred("peer", t0 + Duration::from_secs(sec));
+        let (req, _) = a.tick(
+            t0 + Duration::from_secs(sec + 1),
+            &me.view(),
+            &[peer.candidate()],
+            |h| Some(me.hash_at(h)),
+        );
+        assert_eq!(req, None);
+    }
+
+    /// PR #483 review, P1-1: a request the sync manager refuses (InFlightCap)
+    /// clears nothing that would let the episode hang: four in a row end it.
+    #[test]
+    fn refused_requests_end_the_episode() {
+        let me = Me::new(1_000, 1_100, 3, 0);
+        let peer = Peer {
+            fork: 1_000,
+            len: 200,
+            per: 4,
+            claim: None,
+        };
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        a.note_deferred("peer", t0);
+        let mut ended = None;
+        let mut refused = 0;
+        for tick in 0..100u64 {
+            let now = t0 + Duration::from_millis(tick);
+            let (req, out) = a.tick(now, &me.view(), &[peer.candidate()], |h| {
+                Some(me.hash_at(h))
+            });
+            if out.is_some() {
+                ended = out;
+                break;
+            }
+            match req {
+                Some(Request::Locate { locator, .. }) => {
+                    let _ = reply(&mut a, &me, &peer, &locator, now);
+                }
+                Some(Request::Bodies { .. }) => {
+                    refused += 1;
+                    if let Some(o) = a.unsent(now) {
+                        ended = Some(o);
+                        break;
+                    }
+                }
+                None => {}
+            }
+        }
+        assert_eq!(ended, Some(Outcome::Stalled));
+        assert_eq!(refused, MAX_UNSENT_ROUNDS);
+    }
+
+    /// The common-block check (mutation guard): a reply naming a block this
+    /// node does hold, but that was not in the locator it sent, is faulty.
+    #[test]
+    fn a_held_common_block_not_in_the_locator_is_faulty() {
+        let me = Me::new(100, 120, 3, 0);
+        let peer = Peer {
+            fork: 100,
+            len: 50,
+            per: 4,
+            claim: None,
+        };
+        let mut a = AncestorSync::new();
+        let now = Instant::now();
+        a.note_deferred("peer", now);
+        let (req, _) = a.tick(now, &me.view(), &[peer.candidate()], |h| {
+            Some(me.hash_at(h))
+        });
+        let Some(Request::Locate { locator, .. }) = req else {
+            panic!("locate");
+        };
+        let ours = hb(0, 5);
+        assert!(
+            me.held.contains(&ours) && !locator.contains(&ours),
+            "fixture"
+        );
+        let held = me.held.clone();
+        let out = a.on_ancestor(
+            "peer",
+            Some((ours, 5)),
+            peer.tip(),
+            peer.tip_work(),
+            &[],
+            &me.view(),
+            now,
+            NOW,
+            |h, _| held.contains(h),
+            |h| me.header(h),
+        );
+        assert!(matches!(out, Some(Outcome::Faulty(_))), "{out:?}");
+    }
+
+    /// PR #483 review: side blocks this node stores (from gossip or a walk)
+    /// are not its chain. The fork depth is measured from the last header on
+    /// its executed chain, so stored side blocks cannot make a fork beyond
+    /// the undo window look shallow enough to fetch.
+    #[test]
+    fn stored_side_blocks_do_not_make_a_deep_fork_look_shallow() {
+        let mut me = Me::new(1_000, 11_500, 3, 0);
+        let peer = Peer {
+            fork: 1_000,
+            len: 12_000,
+            per: 4,
+            claim: None,
+        };
+        // The peer's branch up to 2,000 is stored here as side blocks.
+        for h in 1_001..=2_000 {
+            me.held.insert(peer.hash_at(h));
+        }
+        let fork_h = 1_000u64;
+        let mut a = AncestorSync::new();
+        let now = Instant::now();
+        a.note_deferred("peer", now);
+        let mut out = None;
+        for round in 0..200u64 {
+            let t = now + Duration::from_millis(round);
+            let (req, ended) = a.tick(t, &me.view(), &[peer.candidate()], |h| {
+                (h <= me.tip).then(|| me.hash_at(h))
+            });
+            if ended.is_some() {
+                out = ended;
+                break;
+            }
+            if let Some(Request::Locate { locator, .. }) = req {
+                let (common, headers) = peer.answer(&locator);
+                let mine = |h: &Hash, height: u64| *h == me.hash_at(height) && height <= me.tip;
+                if let Some(o) = a.on_ancestor(
+                    "peer",
+                    common,
+                    peer.tip(),
+                    peer.tip_work(),
+                    &headers,
+                    &me.view(),
+                    t,
+                    NOW,
+                    mine,
+                    |h| me.header(h),
+                ) {
+                    out = Some(o);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(out, Some(Outcome::TooDeep { fork, .. }) if fork == fork_h),
+            "{out:?}"
+        );
+    }
+
+    /// An honest deep fetch that outlasts the episode budget ends resumable:
+    /// no cooldown, so the next episode with the same peer starts at once
+    /// from what is held by then.
+    #[test]
+    fn an_honest_fetch_past_the_budget_resumes() {
+        let mut me = Me::new(1_000, 1_100, 3, 0);
+        let peer = Peer {
+            fork: 1_000,
+            len: 30_000,
+            per: 4,
+            claim: None,
+        };
+        let (out, _, bodies) = drive(&mut me, &peer, true);
+        assert!(
+            matches!(out, Some(Outcome::Budget { fetched }) if fetched > 0),
+            "{out:?}"
+        );
+        assert!(bodies > 0);
+        let mut a = AncestorSync::new();
+        let now = Instant::now();
+        a.note_deferred("peer", now);
+        let _ = a.tick(now, &me.view(), &[peer.candidate()], |h| {
+            Some(me.hash_at(h))
+        });
+        let _ = a.end(Outcome::Budget { fetched: 10 }, now);
+        let (req, _) = a.tick(now, &me.view(), &[peer.candidate()], |h| {
+            Some(me.hash_at(h))
+        });
+        assert!(
+            matches!(req, Some(Request::Locate { .. })),
+            "no cooldown: {req:?}"
+        );
+    }
+
+    /// An episode does not wait a sync tick between rounds: right after an
+    /// answer, `next` hands out the following request.
+    #[test]
+    fn the_next_round_follows_an_answer_at_once() {
+        let me = Me::new(1_000, 1_100, 3, 0);
+        let peer = Peer {
+            fork: 1_000,
+            len: 600,
+            per: 4,
+            claim: None,
+        };
+        let mut a = AncestorSync::new();
+        let now = Instant::now();
+        a.note_deferred("peer", now);
+        let (req, _) = a.tick(now, &me.view(), &[peer.candidate()], |h| {
+            Some(me.hash_at(h))
+        });
+        let Some(Request::Locate { locator, .. }) = req else {
+            panic!("locate");
+        };
+        assert_eq!(a.next(now), None, "one request in flight");
+        assert_eq!(reply(&mut a, &me, &peer, &locator, now), None);
+        assert!(
+            matches!(a.next(now), Some(Request::Locate { .. })),
+            "pages on at once"
+        );
+        assert_eq!(a.next(now), None, "and only one at a time");
+    }
+
     #[test]
     fn a_peer_that_never_delivers_bodies_stalls_out() {
         let mut me = Me::new(1_000, 1_100, 3, 0);
@@ -1766,7 +2331,7 @@ mod tests {
         };
         let mut a = AncestorSync::new();
         let now = Instant::now();
-        a.note_deferred(now);
+        a.note_deferred("peer", now);
         let view = me.view();
         let _ = a.tick(now, &view, &[peer.candidate()], |h| Some(me.hash_at(h)));
         let (req, ended) = a.tick(
@@ -1791,7 +2356,7 @@ mod tests {
         let me = Me::new(100, 120, 3, 0);
         let mut a = AncestorSync::new();
         let now = Instant::now();
-        a.note_deferred(now);
+        a.note_deferred("peer", now);
         let old = Candidate {
             id: "old".into(),
             speaks: false,
@@ -1838,7 +2403,7 @@ mod tests {
             Some(me.hash_at(h))
         });
         assert_eq!(req, None, "no evidence: no episode");
-        a.note_deferred(now);
+        a.note_deferred("peer", now);
         let (req, _) = a.tick(now, &me.view(), std::slice::from_ref(&held), |h| {
             Some(me.hash_at(h))
         });
@@ -1847,6 +2412,33 @@ mod tests {
             Some(me.hash_at(h))
         });
         assert_eq!(req, None, "evidence expires");
+    }
+
+    /// A peer whose advertised head is our own tip (it relayed our block)
+    /// but which delivered a block that deferred is still asked: the
+    /// deferral says it may hold a branch we lack; its head says nothing.
+    #[test]
+    fn a_deliverer_is_asked_whatever_its_advertised_head() {
+        let me = Me::new(100, 120, 3, 0);
+        let mut a = AncestorSync::new();
+        let now = Instant::now();
+        let relayed = Candidate {
+            id: "heavy".into(),
+            speaks: true,
+            head_hash: me.hash_at(120),
+            head_height: 120,
+            head_held: true,
+        };
+        let (req, _) = a.tick(now, &me.view(), std::slice::from_ref(&relayed), |h| {
+            Some(me.hash_at(h))
+        });
+        assert_eq!(req, None, "no evidence from it yet");
+        a.note_deferred("heavy", now);
+        let (req, _) = a.tick(now, &me.view(), &[relayed], |h| Some(me.hash_at(h)));
+        assert!(
+            matches!(req, Some(Request::Locate { ref peer, .. }) if peer == "heavy"),
+            "{req:?}"
+        );
     }
 
     #[test]
@@ -1860,7 +2452,7 @@ mod tests {
         };
         let mut a = AncestorSync::new();
         let now = Instant::now();
-        a.note_deferred(now);
+        a.note_deferred("peer", now);
         let _ = a.tick(now, &me.view(), &[peer.candidate()], |h| {
             Some(me.hash_at(h))
         });
@@ -1881,7 +2473,7 @@ mod tests {
         let mut a = AncestorSync::new();
         let now = Instant::now();
         for k in 0..(MAX_COOLDOWN_PEERS + 50) {
-            a.note_deferred(now);
+            a.note_deferred("peer", now);
             let c = Candidate {
                 id: format!("p{k}"),
                 speaks: true,

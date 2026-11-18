@@ -135,6 +135,22 @@ async fn run(
             let to = pid.clone();
             let handle = jobs.spawn(async move {
                 let kind = request.kind();
+                // A GetAncestor from a peer that did not advertise 1.3 could
+                // not be answered anyway (`Peer::send` withholds `Ancestor`
+                // from it): do not build the reply.
+                if request.is_ancestor_sync() {
+                    let speaks = match pm.get_peer(&to) {
+                        Some(p) => p.speaks_ancestor_sync().await,
+                        None => false,
+                    };
+                    if !speaks {
+                        debug!(
+                            "serve plane: {} from {} skipped (protocol below 1.3)",
+                            kind, to.0
+                        );
+                        return;
+                    }
+                }
                 let built = tokio::task::spawn_blocking(move || {
                     // the anchor of a peer's own sync request is
                     // its current self-report.
@@ -143,10 +159,6 @@ async fn run(
                         | NetworkMessage::GetHeaders { from, .. } => {
                             block_serve::anchor_height(&storage, from)
                         }
-                        // The locator starts at the requester's applied tip.
-                        NetworkMessage::GetAncestor { locator } => locator
-                            .first()
-                            .and_then(|h| block_serve::anchor_height(&storage, h)),
                         _ => None,
                     };
                     (answer_frames(&storage, &request), anchor)

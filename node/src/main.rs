@@ -3220,6 +3220,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             .as_ref()
             .map(|a| a.finalized_height_handle());
         let finalized_for_rx = finalized_for_sync.clone();
+        // sync_peer.rs: deferred-gossip height claims per delivering peer;
+        // only corroborated heights are network-height evidence. The tick
+        // keeps its connected set current.
+        let deferred_heights = Arc::new(parking_lot::Mutex::new(sync_peer::DeferredHeights::new()));
+        let deferred_for_rx = deferred_heights.clone();
         // sync_recovery.rs: hold back re-asking the applied-tip anchor while
         // admission is ahead of apply (its last answer held nothing new).
         let tip_reask = Arc::new(parking_lot::Mutex::new(sync_recovery::TipReask::new()));
@@ -3233,6 +3238,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let sync_peers_for_loop = sync_peers.clone();
         let rejoin_for_loop = rejoin.clone();
         let ancestor_for_loop = ancestor.clone();
+        let admission_for_loop = block_admission.clone();
+        let deferred_for_loop = deferred_heights.clone();
         let tip_reask_for_loop = tip_reask.clone();
         let initial_sync_for_sync = initial_sync_done.clone();
         let attested_for_sync = attested_network_head.clone();
@@ -3304,6 +3311,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         p.clone(),
                     ));
                 }
+                deferred_for_loop
+                    .lock()
+                    .set_connected(connected_peers.iter().map(|(c, _)| c.id.clone()));
                 {
                     let mut sel = sync_peers_for_loop.lock().await;
                     // 0: no report yet (a genesis peer says nothing either).
@@ -3502,10 +3512,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 let ancestor_owns = {
                     let handles: Vec<Arc<citrate_network::peer::Peer>> =
                         connected_peers.iter().map(|(_, p)| p.clone()).collect();
-                    let cands = ancestor_sync::candidates(&handles, |h| {
-                        storage_for_sync.blocks.has_block(h).unwrap_or(true)
-                    })
-                    .await;
+                    let cands = ancestor_sync::candidates(&handles, &admission_for_loop).await;
                     let finalized = finalized_for_sync
                         .as_ref()
                         .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
@@ -3513,6 +3520,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     let _ = ancestor_sync::run_tick(
                         &ancestor_for_loop,
                         &storage_for_sync,
+                        &admission_for_loop,
                         &sync_for_loop,
                         &cands,
                         finalized,
@@ -3900,9 +3908,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 std::time::Instant::now(),
                 sync_for_rx.request_timeout(),
             );
-            // sync_peer.rs: deferred-gossip height claims per delivering peer;
-            // only corroborated heights are network-height evidence.
-            let mut deferred_heights = sync_peer::DeferredHeights::new();
+
             while let Some((pid, msg)) = in_rx.recv().await {
                 // #149 liveness heartbeat. Bumped BEFORE the message is handled,
                 // so a loop that is stuck inside a handler stops advancing this
@@ -4023,6 +4029,15 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             &headers,
                             std::time::Instant::now(),
                         );
+                        // The episode's next round goes out now, not on the tick.
+                        ancestor_sync::send_next(
+                            &ancestor_for_rx,
+                            &admission_for_net,
+                            &sync_for_rx,
+                            pm_for_rx.get_peer(&pid),
+                            std::time::Instant::now(),
+                        )
+                        .await;
                     }
                     NetworkMessage::GetTransactions { hashes } => {
                         let mut txs = Vec::new();
@@ -4179,40 +4194,37 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                             // any height): r1007 fleet split, it counts once
                                             // DEFERRED_HEIGHT_CORROBORATION distinct peers
                                             // reach it (`sync_peer::DeferredHeights`), clamped.
-                                            let corroborated = deferred_heights.record(
+                                            let applied_for_claim = storage_for_handler
+                                                .blocks
+                                                .get_applied_tip()
+                                                .ok()
+                                                .flatten()
+                                                .map(|(_, h)| h)
+                                                .unwrap_or(0);
+                                            let corroborated = deferred_for_rx.lock().record(
                                                 &pid.0,
                                                 block.header.height,
-                                                pm_for_rx.get_all_peers().len(),
+                                                std::time::Instant::now(),
                                             );
                                             if let Some(h) = corroborated {
                                                 sync_peer::record_unverified_height(
                                                     &max_seen_for_rx,
                                                     h,
-                                                    storage_for_handler
-                                                        .blocks
-                                                        .get_applied_tip()
-                                                        .ok()
-                                                        .flatten()
-                                                        .map(|(_, h)| h)
-                                                        .unwrap_or(0),
+                                                    applied_for_claim,
                                                 );
                                             }
-                                            if sync_peer::gossip_raises_head(
-                                                false,
-                                                block.header.height,
+                                            sync_peer::raise_deferred_head(
+                                                pm_for_rx.get_peer(&pid),
+                                                &block,
                                                 corroborated,
-                                            ) {
-                                                sync_peer::raise_gossip_head(
-                                                    pm_for_rx.get_peer(&pid),
-                                                    &block,
-                                                )
-                                                .await;
-                                            }
+                                                applied_for_claim,
+                                            )
+                                            .await;
                                             // ancestor_sync.rs: evidence of a branch this
                                             // node lacks.
                                             ancestor_for_rx
                                                 .lock()
-                                                .note_deferred(std::time::Instant::now());
+                                                .note_deferred(&pid.0, std::time::Instant::now());
                                             tracing::debug!(
                                             "Deferred gossiped block {} @ {} from {}: missing parent {}",
                                             hex::encode(&block.header.block_hash.as_bytes()[..8]),
@@ -4458,17 +4470,28 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         // ancestor_sync.rs: a deferred block is evidence of a branch
                         // this node lacks; a body answer moves the running episode.
                         {
+                            let admitted =
+                                ancestor_sync::admitted_front(&ancestor_for_rx, &admission_for_net)
+                                    .await;
                             let now = std::time::Instant::now();
                             let mut anc = ancestor_for_rx.lock();
                             if deferred_from_answer > 0 {
-                                anc.note_deferred(now);
+                                anc.note_deferred(&pid.0, now);
                             }
-                            if let Some(o) = anc.on_blocks(&pid.0, &answer_hashes, now, |h| {
-                                storage_for_handler.blocks.has_block(h).unwrap_or(false)
-                            }) {
+                            if let Some(o) =
+                                anc.on_blocks(&pid.0, &answer_hashes, now, |h| admitted.contains(h))
+                            {
                                 ancestor_sync::log_outcome(&pid.0, &o);
                             }
                         }
+                        ancestor_sync::send_next(
+                            &ancestor_for_rx,
+                            &admission_for_net,
+                            &sync_for_rx,
+                            pm_for_rx.get_peer(&pid),
+                            std::time::Instant::now(),
+                        )
+                        .await;
                         // sync_recovery.rs: the lowest block of THIS answer still
                         // deferred, followed down the buffered orphans, and the
                         // parent it lacks (the walk's next step).
