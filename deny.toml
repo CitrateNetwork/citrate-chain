@@ -115,6 +115,12 @@ ignore = [
     "RUSTSEC-2024-0381",  # (transitive unmaintained — REM-21)
     "RUSTSEC-2026-0162",  # (transitive unmaintained — REM-21)
     "RUSTSEC-2025-0124",  # (transitive unmaintained — REM-21)
+    # chrono unmaintained (RUSTSEC-2026-0543, informational, published
+    # 2026-11). Added 2026-11-18 so cargo-deny matches main at f4a0e600, which
+    # fails on it the same way. A direct dependency (timestamps) with no
+    # security finding filed against it; replacing it (std::time / jiff / time) is a
+    # workspace-wide change, tracked with the other REM-21 replacements.
+    "RUSTSEC-2026-0543",
     # lru LruCache::pop use-after-free (RUSTSEC-2026-0253, CHAIN-B-E004) —
     # UNSOUND, NOT EXPLOITABLE here. The advisory requires a key whose `Drop`
     # panics while `pop` is unwinding under `catch_unwind`; citrate-chain

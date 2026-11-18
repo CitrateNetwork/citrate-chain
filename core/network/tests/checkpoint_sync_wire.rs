@@ -93,7 +93,7 @@ async fn sync_messages_reach_only_peers_that_decode_them() {
         ));
     }
     let got = drain(&mut new);
-    assert_eq!(got.len(), 3, "a 1.2 peer gets all three: {got:?}");
+    assert_eq!(got.len(), 3, "a peer at CURRENT gets all three: {got:?}");
     assert!(matches!(
         got.first(),
         Some(NetworkMessage::GetCheckpoint { .. })
@@ -107,7 +107,10 @@ async fn sync_messages_reach_only_peers_that_decode_them() {
 #[test]
 fn version_bump_is_backward_compatible() {
     let cur = ProtocolVersion::CURRENT;
-    assert_eq!(cur, ProtocolVersion::CHECKPOINT_CERT_SYNC);
+    // CURRENT moved on to 1.3 (ancestor sync); it must still be at or above
+    // the version that introduced checkpoint certificate sync.
+    assert_eq!(cur.major, ProtocolVersion::CHECKPOINT_CERT_SYNC.major);
+    assert!(cur.minor >= ProtocolVersion::CHECKPOINT_CERT_SYNC.minor);
     assert!(V1_0.is_compatible(&cur) && cur.is_compatible(&V1_0));
     assert!(V1_1.is_compatible(&cur) && cur.is_compatible(&V1_1));
     assert!(cur.understands_checkpoint_sync());

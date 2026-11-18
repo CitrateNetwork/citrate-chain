@@ -181,6 +181,10 @@ struct Node {
     mempool: Arc<Mempool>,
     sync: SyncManager,
     rejoin: parking_lot::Mutex<sync_rejoin::RejoinTracker>,
+    /// Header-first ancestor sync (`ancestor_sync`, protocol 1.3).
+    ancestor: parking_lot::Mutex<crate::ancestor_sync::AncestorSync>,
+    /// Deferred-gossip height claims per delivering peer (`sync_peer`).
+    deferred_heights: sync_peer::DeferredHeights,
     tip_reask: sync_recovery::TipReask,
     sel: sync_peer::SyncPeerSelector,
     walk: sync_recovery::ParentWalks,
@@ -248,6 +252,12 @@ pub(crate) struct Fleet {
     /// Nodes that serve `GetBlocks` as a server built before #477 does (a
     /// 60 KiB reply budget; replies split as since #476).
     legacy_serve: HashSet<usize>,
+    /// Nodes running a binary from before ancestor sync: they advertise
+    /// protocol 1.2 in their handshake and run no ancestor-sync episode
+    /// (a rolling upgrade's old half).
+    legacy_protocol: HashSet<usize>,
+    /// Nodes that relay no gossip (a peer that only serves).
+    no_relay: HashSet<usize>,
     /// Accounts the genesis state funds.
     alloc: Vec<(citrate_execution::types::Address, U256)>,
     genesis: Block,
@@ -417,10 +427,17 @@ impl Node {
             .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         let dag_handle = dag.clone();
+        // The pool is the applicator's too, as `start_node` wires it: a reorg
+        // gives the abandoned blocks' transactions back to it.
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
         let app = Arc::new(
             CanonicalApplicator::new(executor.clone(), storage.clone())
                 .with_fork_choice(ghostdag.clone())
-                .with_dag_prune_floor(dag.clone()),
+                .with_dag_prune_floor(dag.clone())
+                .with_mempool(mempool.clone()),
         );
         app.set_genesis(genesis_state(alloc), genesis.header.block_hash);
         let adm = Arc::new(BlockAdmission::new(
@@ -432,10 +449,6 @@ impl Node {
         adm.seed_genesis().await;
         let _ = adm.reconcile().await;
         ghostdag.reconcile_tips_from_dag_store().await;
-        let mempool = Arc::new(Mempool::new(MempoolConfig {
-            require_valid_signature: false,
-            ..Default::default()
-        }));
         // r1007 G9: the producers below stamp the harness's simulated time, so
         // the deferred-evidence check judges header timestamps against it too
         // (before G9 the producer stamped the real clock).
@@ -511,6 +524,8 @@ impl Node {
             mempool,
             sync,
             rejoin: parking_lot::Mutex::new(sync_rejoin::RejoinTracker::new()),
+            ancestor: parking_lot::Mutex::new(crate::ancestor_sync::AncestorSync::new()),
+            deferred_heights: sync_peer::DeferredHeights::new(),
             tip_reask: sync_recovery::TipReask::new(),
             sel: sync_peer::SyncPeerSelector::new(),
             walk: sync_recovery::ParentWalks::new(clock, SyncConfig::default().request_timeout),
@@ -622,6 +637,8 @@ impl Fleet {
                     Direction::Outbound,
                 );
                 info.state = PeerState::Connected;
+                // What the transport handshake records (`transport.rs`).
+                info.version = Some(citrate_network::ProtocolVersion::CURRENT);
                 row.push(Some((Arc::new(Peer::new(info, tx, in_rx)), rx)));
             }
             peers.push(row);
@@ -639,6 +656,8 @@ impl Fleet {
             prune_retain: None,
             restart_mode: RestartMode::Snapshot,
             legacy_serve: HashSet::new(),
+            legacy_protocol: HashSet::new(),
+            no_relay: HashSet::new(),
             alloc,
             genesis,
             epoch,
@@ -658,6 +677,18 @@ impl Fleet {
         // initial-sync condition counts only heard peers (R2 early seal).
         fleet.handshake().await;
         fleet
+    }
+
+    /// Node `j` runs a binary from before ancestor sync: every peer's handle
+    /// on it records the 1.2 handshake it sends, and it runs no episode.
+    pub(crate) async fn set_legacy_protocol(&mut self, j: usize) {
+        self.legacy_protocol.insert(j);
+        for i in 0..self.nodes.len() {
+            if let Some((p, _)) = self.peers[i][j].as_ref() {
+                p.info.write().await.version =
+                    Some(citrate_network::ProtocolVersion::CHECKPOINT_CERT_SYNC);
+            }
+        }
     }
 
     pub(crate) fn set_links(&mut self, up: impl Fn(usize, usize) -> bool) {
@@ -897,6 +928,13 @@ impl Fleet {
 
     /// One message, through the steps `start_node`'s receive loop runs for it.
     async fn receive(&mut self, at: usize, from: usize, msg: NetworkMessage) {
+        // A node on the 1.2 binary cannot decode the 1.3 messages and would
+        // drop the connection: none may ever reach it (`Peer::send` gates).
+        assert!(
+            !(self.legacy_protocol.contains(&at) && msg.is_ancestor_sync()),
+            "a 1.2 node (p{at}) was sent {} by p{from}",
+            msg.kind()
+        );
         let pid = PeerId::new(self.nodes[from].name.clone());
         // Production admission (`PeerManager::forward_incoming`): anything it
         // sheds never reaches the handlers, exactly as on a node.
@@ -955,7 +993,7 @@ impl Fleet {
                 // (`GossipProtocol::handle_new_block`), before admission.
                 let hash = block.header.block_hash;
                 let fresh = !node.adm.is_fully_admitted(&hash).await;
-                let relay = fresh && node.relayed.insert(hash);
+                let relay = fresh && node.relayed.insert(hash) && !self.no_relay.contains(&at);
                 let t = std::time::Instant::now();
                 node.on_new_block(&peer, &pid, block.clone()).await;
                 // Admission's cost plus the apply it hands the drain task.
@@ -979,6 +1017,34 @@ impl Fleet {
             NetworkMessage::Blocks { blocks } => {
                 node.on_blocks(&peer, &pid, blocks).await;
                 node.run_woken_drain().await;
+            }
+            // main.rs `NetworkMessage::Ancestor` arm.
+            NetworkMessage::Ancestor {
+                common,
+                tip,
+                tip_blue_work,
+                headers,
+            } => {
+                let finalized = node.app.finalized_height_handle().load(Ordering::SeqCst);
+                let _ = crate::ancestor_sync::on_reply(
+                    &node.ancestor,
+                    &node.storage,
+                    finalized,
+                    &pid.0,
+                    common,
+                    tip,
+                    tip_blue_work,
+                    &headers,
+                    node.clock,
+                );
+                crate::ancestor_sync::send_next(
+                    &node.ancestor,
+                    &node.adm,
+                    &node.sync,
+                    Some(peer.clone()),
+                    node.clock,
+                )
+                .await;
             }
             _ => {}
         }
@@ -1051,7 +1117,8 @@ impl Fleet {
             peers.extend(self.sybils[i].iter().map(|(p, _)| p.clone()));
             let since =
                 SLOT * u32::try_from(self.slot_no - self.nodes[i].started_slot).expect("slots");
-            self.nodes[i].tick(&peers, since).await;
+            let ancestor_on = !self.legacy_protocol.contains(&i);
+            self.nodes[i].tick(&peers, since, ancestor_on).await;
             self.pump().await;
         }
         for i in running {
@@ -1255,7 +1322,7 @@ impl Fleet {
         for n in &self.nodes {
             let t = n.app.applied_tip().await;
             s.push_str(&format!(
-                "{}: applied {}@{} orphans={} stored_tip={:?} initial_sync={} rejoin={:?}; ",
+                "{}: applied {}@{} orphans={} stored_tip={:?} initial_sync={} rejoin={:?} ancestor={}; ",
                 n.name,
                 short(&t.hash),
                 t.height,
@@ -1263,6 +1330,7 @@ impl Fleet {
                 n.storage.blocks.get_latest_height().ok(),
                 n.initial_sync.load(Ordering::Relaxed),
                 n.rejoin.lock().mode(),
+                n.ancestor.lock().summary(),
             ));
         }
         s
@@ -1282,31 +1350,38 @@ impl Node {
     /// main.rs `NetworkMessage::NewBlock` arm (gossip validation and relay
     /// aside: the harness is a full mesh and its blocks are honest).
     async fn on_new_block(&mut self, peer: &Arc<Peer>, pid: &PeerId, block: Block) {
-        {
-            let mut info = peer.info.write().await;
-            info.observe_gossiped_head(
-                block.header.height,
-                block.header.block_hash,
-                block.header.blue_score,
-            );
-        }
+        // main.rs: the head rises only for a block this node verified
+        // (`sync_peer::gossip_raises_head`).
         if self.adm.is_fully_admitted(&block.header.block_hash).await {
+            sync_peer::raise_gossip_head(Some(peer.clone()), &block).await;
             return;
         }
         match self.adm.admit(&block).await {
             AdmitOutcome::Admitted { .. } => {
                 sync_peer::record_verified_height(&self.max_seen, block.header.height);
+                sync_peer::raise_gossip_head(Some(peer.clone()), &block).await;
                 self.attested.observe(&self.storage, &block);
             }
-            AdmitOutcome::AlreadyAdmitted => {}
+            AdmitOutcome::AlreadyAdmitted => {
+                sync_peer::raise_gossip_head(Some(peer.clone()), &block).await;
+            }
             AdmitOutcome::Deferred { missing_parent } => {
                 self.attested.observe_deferred(&block);
                 let applied_now = self.applied().1;
-                sync_peer::record_unverified_height(
-                    &self.max_seen,
-                    block.header.height,
+                let corroborated =
+                    self.deferred_heights
+                        .record(&pid.0, block.header.height, self.clock);
+                if let Some(h) = corroborated {
+                    sync_peer::record_unverified_height(&self.max_seen, h, applied_now);
+                }
+                sync_peer::raise_deferred_head(
+                    Some(peer.clone()),
+                    &block,
+                    corroborated,
                     applied_now,
-                );
+                )
+                .await;
+                self.ancestor.lock().note_deferred(&pid.0, self.clock);
                 if sync_peer::should_attempt_ancestry_recovery(block.header.height, applied_now) {
                     let now = self.clock;
                     let step = self.walk.begin(
@@ -1318,7 +1393,6 @@ impl Node {
                     );
                     self.run_step(&pid.0, step, applied_now, now).await;
                 }
-                let _ = peer;
             }
             AdmitOutcome::Rejected(why) => {
                 panic!(
@@ -1409,6 +1483,22 @@ impl Node {
             .iter()
             .filter(|b| verified.contains(&b.header.block_hash))
             .count();
+        {
+            let admitted = crate::ancestor_sync::admitted_front(&self.ancestor, &self.adm).await;
+            let mut anc = self.ancestor.lock();
+            if deferred_from_answer > 0 {
+                anc.note_deferred(&pid.0, self.clock);
+            }
+            let _ = anc.on_blocks(&pid.0, &answer_hashes, self.clock, |h| admitted.contains(h));
+        }
+        crate::ancestor_sync::send_next(
+            &self.ancestor,
+            &self.adm,
+            &self.sync,
+            Some(peer.clone()),
+            self.clock,
+        )
+        .await;
         let lowest_deferred = {
             let from_answer: Vec<&Block> = fx
                 .deferred
@@ -1509,7 +1599,12 @@ impl Node {
 
     /// main.rs periodic sync tick, over the peers this node is connected to;
     /// `since_start` is how long this process has run.
-    async fn tick(&mut self, connected: &[Arc<Peer>], since_start: std::time::Duration) {
+    async fn tick(
+        &mut self,
+        connected: &[Arc<Peer>],
+        since_start: std::time::Duration,
+        ancestor_on: bool,
+    ) {
         let mut best_h = 0u64;
         let mut candidates = Vec::new();
         let mut split = Vec::new();
@@ -1539,6 +1634,9 @@ impl Node {
                 head_hash: info.head_hash,
             });
         }
+        // main.rs: the tick keeps the deferred-claim table's connected set.
+        self.deferred_heights
+            .set_connected(candidates.iter().map(|c| c.id.clone()));
         let seen = self.max_seen.load(Ordering::Relaxed);
         let applied_tip = self.applied();
         let applied_height = applied_tip.1;
@@ -1590,13 +1688,36 @@ impl Node {
                     )
                 })
                 .collect();
-        let following_tip = self.rejoin.lock().is_following_tip();
+        // main.rs: ancestor sync, then the pipeline and the tick's own request
+        // stand aside only while `AncestorSync::owns_sync` (a body request in
+        // flight after this episode already had a block admitted).
+        let ancestor_owns = if ancestor_on {
+            let cands = crate::ancestor_sync::candidates(connected, &self.adm).await;
+            let finalized = self.app.finalized_height_handle().load(Ordering::SeqCst);
+            let _ = crate::ancestor_sync::run_tick(
+                &self.ancestor,
+                &self.storage,
+                &self.adm,
+                &self.sync,
+                &cands,
+                finalized,
+                applied_height < target,
+                self.clock,
+            )
+            .await;
+            self.ancestor.lock().owns_sync()
+        } else {
+            false
+        };
+        let following_tip = self.rejoin.lock().is_following_tip() && !ancestor_owns;
         let pipeline_round = self
             .sync
             .pipeline_tick(applied_tip, pipeline_peers, following_tip)
             .await;
         let pipelined = self.sync.pipeline_active();
-        let request_peer = if let Some(id) = chosen {
+        let request_peer = if ancestor_owns {
+            None
+        } else if let Some(id) = chosen {
             connected
                 .iter()
                 .zip(candidates.iter())
@@ -2243,7 +2364,7 @@ impl Fleet {
                 let peers: Vec<Arc<Peer>> = servers.iter().map(|&s| self.peer(cold, s)).collect();
                 let t = std::time::Instant::now();
                 self.nodes[cold]
-                    .tick(&peers, std::time::Duration::from_secs(3600))
+                    .tick(&peers, std::time::Duration::from_secs(3600), true)
                     .await;
                 self.nodes[cold].app.drive_drain().await;
                 if spec.count_cpu {
@@ -3126,6 +3247,22 @@ mod tests {
             ".pipeline_tick(applied_tip_now, pipeline_peers, following_tip)",
             "sync_for_loop.pipeline_active()",
             "!pipelined && pb < sync_recovery::TICK_PENDING_GATE && !held_tip",
+            "if ancestor_owns {",
+            // Ancestor sync and the evidence rules (r1007 fleet split).
+            "ancestor_sync::candidates(&handles, &admission_for_loop)",
+            "ancestor_sync::admitted_front(&ancestor_for_rx, &admission_for_net)",
+            "ancestor_sync::run_tick(",
+            "ancestor_for_loop.lock().owns_sync()",
+            "rejoin_for_loop.lock().is_following_tip() && !ancestor_owns",
+            "ancestor_sync::on_reply(",
+            "anc.on_blocks(&pid.0, &answer_hashes, now, |h| admitted.contains(h))",
+            "ancestor_sync::send_next(",
+            "anc.note_deferred(&pid.0, now)",
+            "deferred_for_rx.lock().record(",
+            "sync_peer::raise_deferred_head(",
+            "deferred_for_loop",
+            ".set_connected(connected_peers.iter().map(|(c, _)| c.id.clone()))",
+            "sync_peer::raise_gossip_head(pm_for_rx.get_peer(&pid), &block)",
             "sync_for_rx.pipeline_on_answer(applied_tip)",
             "let answers_rejoin = if receipt.pipelined {",
             "receipt.new_blocks == 0 && receipt.received > 0",
@@ -3193,7 +3330,7 @@ mod tests {
         }
         // The main loop's sync tick, 1 s into the process, then a production round.
         fleet.nodes[late]
-            .tick(&peers, std::time::Duration::from_secs(1))
+            .tick(&peers, std::time::Duration::from_secs(1), true)
             .await;
         let sealed = fleet.nodes[late].producer.produce_block().await;
         assert!(
@@ -3558,5 +3695,630 @@ mod tests {
                 "{name}: {mutated:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Ancestor sync (r1007 fleet split, 2026-11-15, fork at 105,012).
+    //
+    // After checkpoint 105,000 finalized, the fleet split into partitions
+    // that each built only on their own blocks and never re-converged: a
+    // node on a lighter branch kept receiving the heavier branch's blocks,
+    // deferred every one (missing parent), and anchored every request at its
+    // own applied height, which on the other branch is above the fork point.
+    // The missing-parent walk gave up a few hundred heights down. These
+    // scenarios fork two producer groups above a finalized checkpoint, run
+    // the fork well past the walk's reach, reconnect them, and require the
+    // fleet to re-converge on the heavier branch by itself.
+    // ---------------------------------------------------------------------
+
+    /// What [`deep_split`] found.
+    struct DeepSplit {
+        /// Highest height both groups' selected chains agreed on before the heal.
+        fork: u64,
+        /// The lighter group's applied height minus `fork` at the heal.
+        light_depth: u64,
+        /// How far the heavy group's tip was above the light group's.
+        heavy_lead: u64,
+        /// The heavy group's tip minus `fork` at the heal.
+        heavy_depth: u64,
+        /// The light group's tip minus the heavy group's at the heal.
+        light_lead: u64,
+        /// Slots after the heal until every node selected the heavier group's
+        /// pre-heal chain (four below its tip) and every producer was sealing
+        /// again.
+        converged_at: Option<u64>,
+        /// The finalized checkpoint registered before the split.
+        checkpoint: u64,
+        /// Every node's reorg floor at the end (never below `checkpoint`).
+        floors: Vec<u64>,
+        /// A checkpoint above the fork, registered after the heal, and every
+        /// node's floor after it (empty: the nodes disagree at that height;
+        /// `None`: no convergence to register on).
+        finalized_after: Option<(u64, Vec<u64>)>,
+        /// Per transaction (light-only, heavy-only): executed on node 0's
+        /// converged chain, or waiting in some node's pool.
+        txs: Vec<(&'static str, bool, bool)>,
+        detail: String,
+    }
+
+    /// A 3v4 split above a finalized checkpoint, `partition` slots long, then
+    /// every link back (a reconnect: the handshake gives each side the
+    /// other's head), and up to `heal` slots to converge. One transaction is
+    /// submitted to each side during the partition. During the partition the
+    /// light group seals only every other slot, so the heavy branch is also
+    /// ahead in height when the links come back, as on r1007 (HEAVY was 363
+    /// heights above LIGHT): the light nodes are "behind", every peer's head
+    /// is raised to the heavy tip by relayed gossip, and the heavy tip blocks
+    /// they hear are too far above them for the missing-parent walk.
+    async fn deep_split(partition: u64, heal: u64) -> DeepSplit {
+        deep_split_with(partition, heal, &[]).await
+    }
+
+    /// [`deep_split`] with `legacy` nodes on the pre-1.3 binary (a rolling
+    /// upgrade's old half).
+    async fn deep_split_with(partition: u64, heal: u64, legacy: &[usize]) -> DeepSplit {
+        deep_split_shaped(partition, heal, legacy, AHEAD_IN_HEIGHT).await
+    }
+
+    /// Who seals when, in [`deep_split_shaped`].
+    #[derive(Clone, Copy, Debug)]
+    struct Shape {
+        /// The light group's producers (the rest of it follows).
+        light_sealers: &'static [usize],
+        /// The light producers seal every `light_every`-th slot.
+        light_every: u64,
+        /// The heavy producers seal every `heavy_every`-th slot.
+        heavy_every: u64,
+        /// The same cadence after the heal (else every producer, every slot).
+        keep_cadence: bool,
+    }
+
+    /// The r1007 shape: the heavy branch is ahead in height too.
+    const AHEAD_IN_HEIGHT: Shape = Shape {
+        light_sealers: &[0, 1, 2],
+        light_every: 2,
+        heavy_every: 1,
+        keep_cadence: false,
+    };
+
+    /// The heavier branch is BELOW the light node's height: four producers
+    /// every other slot (4 blue per height, half a height per slot) against
+    /// one producer every slot (1 blue per height, a height per slot).
+    const HEAVIER_BELOW: Shape = Shape {
+        light_sealers: &[0],
+        light_every: 1,
+        heavy_every: 2,
+        keep_cadence: true,
+    };
+
+    /// [`deep_split`] with the producers' cadence given by `shape`.
+    async fn deep_split_shaped(
+        partition: u64,
+        heal: u64,
+        legacy: &[usize],
+        shape: Shape,
+    ) -> DeepSplit {
+        let n = 7;
+        let light: Vec<usize> = vec![0, 1, 2];
+        let heavy: Vec<usize> = vec![3, 4, 5, 6];
+        let in_light = |i: usize| i < 3;
+        let alloc = (0..2u64)
+            .map(|i| {
+                let pk = PublicKey::new(fat_sender(i).verifying_key().to_bytes());
+                (
+                    citrate_execution::address_utils::normalize_address(&pk),
+                    U256::from(10u128.pow(21)),
+                )
+            })
+            .collect();
+        let mut fleet = Fleet::with_genesis(n, None, alloc).await;
+        for &j in legacy {
+            fleet.set_legacy_protocol(j).await;
+        }
+        let mut rng = Rng(0x5EED_A11C_E570_0001);
+        for _ in 0..ACT + 6 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // A finalized checkpoint every node agrees on, two below the lowest
+        // tip (r1007: 105,000, finalized 85 s before the split).
+        let low = *fleet.applied_heights().await.iter().min().expect("nodes");
+        let checkpoint = low - 2;
+        let cp_hash = fleet
+            .agree_at(checkpoint)
+            .await
+            .expect("fixture: the fleet agrees below its tips before the split");
+        for node in &fleet.nodes {
+            node.app.register_certified(checkpoint, cp_hash);
+            assert_eq!(
+                node.app.settle_registered_floor().await,
+                checkpoint,
+                "fixture: {} raises its reorg floor to the checkpoint",
+                node.name
+            );
+        }
+        fleet.set_links(|i, j| in_light(i) == in_light(j));
+        let light_tx = fat_tx(0);
+        let heavy_tx = fat_tx(1);
+        for k in 0..partition {
+            if k == 5 {
+                fleet.nodes[light[0]]
+                    .mempool
+                    .add_transaction(
+                        light_tx.clone(),
+                        citrate_sequencer::mempool::TxClass::Standard,
+                    )
+                    .await
+                    .expect("fixture: the light pool takes its transaction");
+                fleet.nodes[heavy[0]]
+                    .mempool
+                    .add_transaction(
+                        heavy_tx.clone(),
+                        citrate_sequencer::mempool::TxClass::Standard,
+                    )
+                    .await
+                    .expect("fixture: the heavy pool takes its transaction");
+            }
+            fleet.quiet = cadence(&shape, &light, &heavy, k);
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            fleet.quiet.clear();
+        }
+        let heights = fleet.applied_heights().await;
+        let light_chain = fleet.chain(light[0]).await;
+        let (heavy_top_node, heavy_top) = heavy
+            .iter()
+            .map(|i| (*i, heights[*i]))
+            .max_by_key(|(_, h)| *h)
+            .expect("heavy side");
+        let heavy_chain = fleet.chain(heavy_top_node).await;
+        // A few heights below the heavy group's tip: the block there is
+        // settled on every heavy node (the topmost siblings are not yet).
+        let heavy_mark = heavy_top - 4;
+        let heavy_tip = *heavy_chain.get(&heavy_mark).expect("heavy mark");
+        let light_top = light.iter().map(|i| heights[*i]).max().expect("light");
+        let fork = (0..=light_top)
+            .rev()
+            .find(|h| light_chain.contains_key(h) && light_chain.get(h) == heavy_chain.get(h))
+            .unwrap_or(0);
+        fleet.set_links(|_, _| true);
+        fleet.handshake().await;
+        let mut last_sealed: HashMap<usize, u64> = HashMap::new();
+        let mut converged_at = None;
+        let sealers: Vec<usize> = (0..n)
+            .filter(|i| {
+                !shape.keep_cadence || !light.contains(i) || shape.light_sealers.contains(i)
+            })
+            .collect();
+        for slot in 1..=heal {
+            if shape.keep_cadence {
+                fleet.quiet = cadence(&shape, &light, &heavy, partition + slot);
+            }
+            let o = rng.order(n);
+            for (i, _) in fleet.slot(&o).await {
+                last_sealed.insert(i, slot);
+            }
+            fleet.quiet.clear();
+            let mut all = true;
+            for i in 0..n {
+                if fleet.chain(i).await.get(&heavy_mark) != Some(&heavy_tip) {
+                    all = false;
+                    break;
+                }
+            }
+            let window = PRODUCING_WINDOW * shape.heavy_every.max(shape.light_every);
+            let producing = sealers
+                .iter()
+                .all(|i| last_sealed.get(i).is_some_and(|r| r + window > slot));
+            // One line per heal slot, shown only when the run fails.
+            println!(
+                "DEEPSLOT {slot} applied={:?} on_heavy={all} producing={producing}",
+                fleet.applied_heights().await
+            );
+            if all && producing {
+                converged_at = Some(slot);
+                break;
+            }
+        }
+        let mut floors = Vec::new();
+        for node in &fleet.nodes {
+            floors.push(node.app.finalized_height_handle().load(Ordering::SeqCst));
+        }
+        let finalized_after = if converged_at.is_some() {
+            // Every node on one chain: a checkpoint above the fork can gather
+            // every vote. Register it on every node; each floor must rise to it.
+            let min_h = *fleet.applied_heights().await.iter().min().expect("nodes");
+            let cp2 = min_h.saturating_sub(2).max(fork + 1);
+            match fleet.agree_at(cp2).await {
+                Some(h2) => {
+                    let mut out = Vec::new();
+                    for node in &fleet.nodes {
+                        node.app.register_certified(cp2, h2);
+                        out.push(node.app.settle_registered_floor().await);
+                    }
+                    Some((cp2, out))
+                }
+                None => Some((cp2, Vec::new())),
+            }
+        } else {
+            None
+        };
+        println!(
+            "DEEPSPLIT fork={fork} light_depth={} heavy_lead={} converged_at={converged_at:?} \
+             lost={} shed={}",
+            light_top.saturating_sub(fork),
+            heavy_top.saturating_sub(light_top),
+            fleet.lost,
+            fleet.shed
+        );
+        let past = fleet.past(0).await;
+        let mut txs = Vec::new();
+        for (name, tx) in [("light-only", &light_tx), ("heavy-only", &heavy_tx)] {
+            let executed = fleet.nodes[0]
+                .storage
+                .transactions
+                .get_receipt(&tx.hash)
+                .expect("read receipt")
+                .is_some_and(|r| {
+                    past.contains(&r.block_hash) || fleet_tip_is(&fleet, &r.block_hash)
+                });
+            let mut pooled = false;
+            for node in &fleet.nodes {
+                if node.mempool.contains(&tx.hash).await {
+                    pooled = true;
+                }
+            }
+            txs.push((name, executed, pooled));
+        }
+        DeepSplit {
+            fork,
+            light_depth: light_top.saturating_sub(fork),
+            heavy_lead: heavy_top.saturating_sub(light_top),
+            heavy_depth: heavy_top.saturating_sub(fork),
+            light_lead: light_top.saturating_sub(heavy_top),
+            converged_at,
+            checkpoint,
+            floors,
+            finalized_after,
+            txs,
+            detail: format!(
+                "fork {fork}, light at {light_top}, heavy at {heavy_top} ({}): {}",
+                short(&heavy_tip),
+                fleet.describe().await
+            ),
+        }
+    }
+
+    /// The producers that seal nothing in slot `k` under `shape`.
+    fn cadence(shape: &Shape, light: &[usize], heavy: &[usize], k: u64) -> HashSet<usize> {
+        let mut quiet = HashSet::new();
+        for &i in light {
+            if !shape.light_sealers.contains(&i) || !k.is_multiple_of(shape.light_every) {
+                quiet.insert(i);
+            }
+        }
+        if !k.is_multiple_of(shape.heavy_every) {
+            quiet.extend(heavy.iter().copied());
+        }
+        quiet
+    }
+
+    /// Whether `h` is node 0's applied tip (its past excludes it).
+    fn fleet_tip_is(fleet: &Fleet, h: &Hash) -> bool {
+        fleet.nodes[0].applied().0 == *h
+    }
+
+    /// The r1007 split at harness scale: two producer groups fork above a
+    /// finalized checkpoint and run 1,100 slots apart (the heavy branch one
+    /// height per slot, the light one every other slot: both are more than
+    /// the 512-height missing-parent walk above the fork, and the heavy tip is
+    /// more than that above the light one), then reconnect. Within 60 slots
+    /// (two minutes of chain time) every node must be on the heavier
+    /// (four-producer) branch and every producer sealing again, without
+    /// operator action; the
+    /// reorg must stay above the checkpoint; a checkpoint above the fork must
+    /// then finalize on every node; and neither side's transaction may be
+    /// lost (executed on the converged chain, or back in a pool).
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_groups_forked_past_the_walk_reconverge_on_the_heavier_branch() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::two_groups_forked_past_the_walk_reconverge_on_the_heavier_branch",
+            );
+        }
+        let r = deep_split(1_100, 60).await;
+        assert!(
+            r.light_depth > crate::sync_peer::ANCESTRY_RECOVERY_WINDOW
+                && r.heavy_lead > crate::sync_peer::ANCESTRY_RECOVERY_WINDOW,
+            "fixture: the lighter branch is {} deep and {} behind ({})",
+            r.light_depth,
+            r.heavy_lead,
+            r.detail
+        );
+        assert!(
+            r.fork > r.checkpoint,
+            "fixture: the fork is above the checkpoint ({})",
+            r.detail
+        );
+        assert!(
+            r.converged_at.is_some(),
+            "a {}-deep split did not re-converge on the heavier branch within 60 slots \
+             of the reconnect ({})",
+            r.light_depth,
+            r.detail
+        );
+        assert!(
+            r.floors.iter().all(|f| *f >= r.checkpoint),
+            "a reorg floor fell below the finalized checkpoint {}: {:?}",
+            r.checkpoint,
+            r.floors
+        );
+        let (cp2, floors) = r.finalized_after.clone().expect("converged");
+        assert!(
+            floors.len() == 7 && floors.iter().all(|f| *f == cp2),
+            "checkpoint {cp2} above the fork did not finalize on every node: {floors:?} ({})",
+            r.detail
+        );
+        for (name, executed, pooled) in &r.txs {
+            assert!(
+                *executed || *pooled,
+                "the {name} transaction was lost: not executed on the converged chain and \
+                 in no pool ({})",
+                r.detail
+            );
+        }
+    }
+
+    /// A block `key` signed at `height` on a parent nobody holds: what a
+    /// relay of another branch's tip, or a forger, gossips. It passes gossip
+    /// validation (self-consistent, self-signed) and defers on admission.
+    fn unconnected_block(key: &Ed25519SigningKey, height: u64, salt: u8) -> Block {
+        let mut parent = [0xD7u8; 32];
+        parent[0] = salt;
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(Hash::new(parent))
+            .coinbase([0xBC; 20])
+            .timestamp(chrono::Utc::now().timestamp().max(0) as u64)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5D; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(height)
+            .blue_work(citrate_consensus::types::blue_work_for_score(height))
+            .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            .build_unhashed();
+        b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+            citrate_consensus::hardening::PbaHardening::from_process(),
+            height,
+            &b.transactions,
+        );
+        b.header.block_hash = b.compute_hash();
+        b.signature = citrate_consensus::crypto::sign_block(&b.header.block_hash, key);
+        b
+    }
+
+    /// Evidence poisoning (r1007 fleet split): one peer gossips a signed block
+    /// a million heights above the network on a parent nobody holds. It
+    /// defers. Neither the node's network-height evidence (`max_seen_height`,
+    /// the sync target and `eth_syncing.highestBlock`) nor that peer's
+    /// advertised head may move: nothing verified it, and no second peer
+    /// corroborates it. Red at f4a0e600: the head was raised before
+    /// validation and the deferred path recorded the claim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lone_peers_far_ahead_gossip_moves_neither_the_target_nor_its_head() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::a_lone_peers_far_ahead_gossip_moves_neither_the_target_nor_its_head",
+            );
+        }
+        let n = 3;
+        let mut fleet = Fleet::new(n).await;
+        fleet.add_sybils(1).await;
+        let mut rng = Rng(0x0BAD_5EED_0000_0001);
+        for _ in 0..ACT + 4 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        let verified = *fleet.applied_heights().await.iter().max().expect("nodes");
+        let before = fleet.nodes[0].max_seen.load(Ordering::Relaxed);
+        assert!(before <= verified, "fixture: {before} > {verified}");
+        let key = Ed25519SigningKey::from_bytes(&[0xF1; 32]);
+        let claim = verified + 1_000_000;
+        let peer = fleet.sybils[0][0].0.clone();
+        let pid = PeerId::new("sybil0".to_string());
+        for k in 0..4u8 {
+            let b = unconnected_block(&key, claim + u64::from(k), k);
+            fleet.nodes[0].on_new_block(&peer, &pid, b).await;
+        }
+        fleet.pump().await;
+        let seen = fleet.nodes[0].max_seen.load(Ordering::Relaxed);
+        assert!(
+            seen <= verified,
+            "one peer's unverified claim of {claim} moved the network height to {seen} \
+             (verified {verified})"
+        );
+        let head = peer.info.read().await.head_height;
+        assert!(
+            head <= verified,
+            "the peer's advertised head was raised to {head} by a block nothing verified"
+        );
+    }
+
+    /// Rolling upgrade: the same deep split with two of the four heavy
+    /// producers still on the 1.2 binary. No message reaches them that they
+    /// cannot decode (nothing is lost on their links for that), the upgraded
+    /// light group re-converges through the upgraded heavy peers, and the
+    /// old nodes stay on the heavy branch they never left.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_mixed_version_fleet_reconverges_through_its_upgraded_peers() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::a_mixed_version_fleet_reconverges_through_its_upgraded_peers",
+            );
+        }
+        let r = deep_split_with(1_100, 60, &[5, 6]).await;
+        assert!(
+            r.light_depth > crate::sync_peer::ANCESTRY_RECOVERY_WINDOW,
+            "fixture: {} deep ({})",
+            r.light_depth,
+            r.detail
+        );
+        assert!(
+            r.converged_at.is_some(),
+            "a mixed fleet did not re-converge on the heavier branch ({})",
+            r.detail
+        );
+        for (name, executed, pooled) in &r.txs {
+            assert!(
+                *executed || *pooled,
+                "the {name} transaction was lost ({})",
+                r.detail
+            );
+        }
+    }
+
+    /// PR #483 review, P1-2: a split the existing recovery heals only slowly
+    /// (about 110 slots with the driver off, review round 2). The
+    /// heavier branch sits BELOW the light nodes' height: four producers
+    /// sealing every other slot (four blue blocks per height) against one
+    /// producer every slot, 4,000 slots apart. The light nodes are never
+    /// "behind" (no peer is ahead, and the corroborated heavy heights are
+    /// below their tip), no heavy peer is within the split-pull height band,
+    /// and the heavy branch is 2,000 heights deep, more than the
+    /// missing-parent walk's node-wide budget can descend in the 40 slots
+    /// allowed here. With ancestor sync the light followers rejoin by slot 2.
+    /// Driven by slots on the harness's simulated clock.
+    const HEAVIER_BELOW_SLOTS: u64 = 4_000;
+    const HEAVIER_BELOW_HEAL: u64 = 40;
+
+    fn assert_heavier_below_fixture(r: &DeepSplit) {
+        assert!(
+            r.light_lead > crate::sync_peer::SPLIT_PULL_HEIGHT_BAND * 100
+                && r.heavy_depth
+                    > u64::from(crate::sync_recovery::NODE_WALK_BURST) + HEAVIER_BELOW_HEAL * 16
+                && r.light_depth < crate::canonical_apply::MAX_REORG_DEPTH,
+            "fixture: light {} deep and {} above the heavy tip, heavy {} deep ({})",
+            r.light_depth,
+            r.light_lead,
+            r.heavy_depth,
+            r.detail
+        );
+    }
+
+    /// With ancestor sync the light nodes find the heavier branch below them
+    /// and switch to it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heavier_branch_below_our_height_is_rejoined() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::a_heavier_branch_below_our_height_is_rejoined",
+            );
+        }
+        let r =
+            deep_split_shaped(HEAVIER_BELOW_SLOTS, HEAVIER_BELOW_HEAL, &[], HEAVIER_BELOW).await;
+        assert_heavier_below_fixture(&r);
+        assert!(
+            r.converged_at.is_some(),
+            "the light nodes did not rejoin a heavier branch below their height within {} \
+             slots ({})",
+            HEAVIER_BELOW_HEAL,
+            r.detail
+        );
+        assert!(
+            r.floors.iter().all(|f| *f >= r.checkpoint),
+            "{:?}",
+            r.floors
+        );
+        let (cp2, floors) = r.finalized_after.clone().expect("converged");
+        assert!(
+            floors.len() == 7 && floors.iter().all(|f| *f == cp2),
+            "checkpoint {cp2} above the fork did not finalize on every node: {floors:?}"
+        );
+        for (name, executed, pooled) in &r.txs {
+            assert!(
+                *executed || *pooled,
+                "the {name} transaction was lost ({})",
+                r.detail
+            );
+        }
+    }
+
+    /// The same split with every node on the 1.2 binary (no ancestor sync):
+    /// the existing recovery does NOT rejoin it within the 40 slots the
+    /// driver needs only 2 of. It does heal eventually (review round 2: about
+    /// slot 110 with a 400-slot window, p0 at 79), so this pins the speed-up,
+    /// not that the driver is the only way back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn without_ancestor_sync_a_heavier_branch_below_our_height_heals_far_slower() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::without_ancestor_sync_a_heavier_branch_below_our_height_heals_far_slower",
+            );
+        }
+        let all: Vec<usize> = (0..7).collect();
+        let r =
+            deep_split_shaped(HEAVIER_BELOW_SLOTS, HEAVIER_BELOW_HEAL, &all, HEAVIER_BELOW).await;
+        assert_heavier_below_fixture(&r);
+        assert_eq!(
+            r.converged_at, None,
+            "the 1.2 recovery rejoined it within {} slots: the scenario no longer shows the \
+             driver's speed-up ({})",
+            HEAVIER_BELOW_HEAL, r.detail
+        );
+    }
+
+    /// PR #483 review, P2: a cold node with two connected peers, only one of
+    /// which relays gossip (the other only serves), and no head from the
+    /// handshake. Corroboration needs two peers, so the relaying peer's tip
+    /// blocks never become node-wide evidence; its own advertised head must
+    /// still rise from them (within the undo window of our tip), or the node
+    /// would never ask anyone for anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cold_node_with_one_relaying_peer_of_two_reaches_the_tip() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::a_cold_node_with_one_relaying_peer_of_two_reaches_the_tip",
+            );
+        }
+        let n = 3;
+        let mut fleet = Fleet::new(n).await;
+        let mut rng = Rng(0x0C01_D5EE_D000_0002);
+        for _ in 0..ACT + 40 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        fleet.replace_with_fresh(2).await;
+        fleet.quiet = [1, 2].into_iter().collect();
+        fleet.no_relay.insert(1);
+        // No handshake head: what the cold node knows of its peers comes
+        // from what they send it.
+        for j in 0..n {
+            if let Some((p, _)) = fleet.peers[2][j].as_ref() {
+                let mut info = p.info.write().await;
+                info.head_height = 0;
+                info.head_hash = Hash::default();
+                info.reported_head_height = 0;
+            }
+        }
+        let mut reached = None;
+        for slot in 1..=80u64 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            let h = fleet.applied_heights().await;
+            if h[2] + 2 >= h[0] && h[0] > ACT + 40 {
+                reached = Some(slot);
+                break;
+            }
+        }
+        assert!(
+            reached.is_some(),
+            "the cold node never caught up with its relaying peer: {:?} ({})",
+            fleet.applied_heights().await,
+            fleet.describe().await
+        );
     }
 }

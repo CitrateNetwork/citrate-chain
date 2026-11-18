@@ -66,9 +66,10 @@ pub const SERVE_WORKERS: usize = 2;
 
 /// The answer to one serve request, or `None` for a message that is not one.
 ///
-/// Source: `block_serve::serve_blocks` / `block_serve::serve_headers`, which
-/// read the node's `StorageManager` (CF_METADATA height index, CF_BLOCKS)
-/// under their NET-1/NET-2 clamps. Reads only; takes no consensus lock.
+/// Source: `block_serve::serve_blocks` / `block_serve::serve_headers` /
+/// `block_serve::serve_ancestor`, which read the node's `StorageManager`
+/// (CF_METADATA height and canonical indexes, CF_BLOCKS) under their
+/// NET-1/NET-2 and locator clamps. Reads only; takes no consensus lock.
 pub fn answer(storage: &StorageManager, request: &NetworkMessage) -> Option<NetworkMessage> {
     match request {
         NetworkMessage::GetBlocks { from, count, .. } => Some(NetworkMessage::Blocks {
@@ -77,6 +78,9 @@ pub fn answer(storage: &StorageManager, request: &NetworkMessage) -> Option<Netw
         NetworkMessage::GetHeaders { from, count } => Some(NetworkMessage::Headers {
             headers: block_serve::serve_headers(storage, from, *count),
         }),
+        NetworkMessage::GetAncestor { locator } => {
+            Some(block_serve::serve_ancestor(storage, locator).into_message())
+        }
         _ => None,
     }
 }
@@ -131,6 +135,22 @@ async fn run(
             let to = pid.clone();
             let handle = jobs.spawn(async move {
                 let kind = request.kind();
+                // A GetAncestor from a peer that did not advertise 1.3 could
+                // not be answered anyway (`Peer::send` withholds `Ancestor`
+                // from it): do not build the reply.
+                if request.is_ancestor_sync() {
+                    let speaks = match pm.get_peer(&to) {
+                        Some(p) => p.speaks_ancestor_sync().await,
+                        None => false,
+                    };
+                    if !speaks {
+                        debug!(
+                            "serve plane: {} from {} skipped (protocol below 1.3)",
+                            kind, to.0
+                        );
+                        return;
+                    }
+                }
                 let built = tokio::task::spawn_blocking(move || {
                     // the anchor of a peer's own sync request is
                     // its current self-report.

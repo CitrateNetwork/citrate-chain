@@ -225,6 +225,180 @@ pub fn record_unverified_height(seen: &std::sync::atomic::AtomicU64, claimed: u6
     seen.fetch_max(bounded, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Distinct connected peers whose deferred blocks must reach a height before
+/// that height counts as network-height evidence (r1007 fleet split).
+pub const DEFERRED_HEIGHT_CORROBORATION: usize = 2;
+
+/// Peers whose highest deferred claim is remembered, at most; the oldest
+/// claim is dropped first.
+pub const MAX_DEFERRED_CLAIM_PEERS: usize = 256;
+
+/// A deferred claim counts for this long after it was last renewed.
+pub const DEFERRED_CLAIM_TTL: Duration = Duration::from_secs(120);
+
+/// How far above the higher of this node's applied tip and the corroborated
+/// deferred height an uncorroborated deferred block may raise the advertised
+/// head of the peer that delivered it: the undo window. Measured from those
+/// two, never from the peer's own previous head, so repeated claims cannot
+/// ratchet it upward (review round 2, P3). The node-wide evidence
+/// (`max_seen_height`) never moves on an uncorroborated claim; a peer's own
+/// head is advertised and unverified by design (the selector and the timeout
+/// penalty box treat it so), and refreshing it from that peer's relays keeps
+/// a cold node with one relaying peer pulling toward the tip.
+pub const UNCORROBORATED_HEAD_LEAD: u64 = crate::canonical_apply::MAX_REORG_DEPTH;
+
+/// Deferred-gossip height claims, per delivering peer (r1007 fleet split).
+///
+/// A block that defers on a missing parent passed gossip validation, which
+/// proves only a self-consistent, self-signed header: any key can sign any
+/// height. Recording every such height as network-height evidence
+/// (`record_unverified_height`) let one peer pin the sync target, and with it
+/// `eth_syncing` and the "behind" verdict, at a height nothing verified.
+///
+/// A height counts only once at least [`DEFERRED_HEIGHT_CORROBORATION`]
+/// distinct CURRENTLY CONNECTED peers delivered deferred blocks at or above it
+/// within [`DEFERRED_CLAIM_TTL`] (each peer's own highest claim counts once):
+/// the second-highest live claim. A node with a single connected peer counts
+/// that peer's claim (it has nothing to corroborate with). Claims of peers
+/// that disconnected are dropped ([`Self::set_connected`]), so an attacker
+/// that reconnects under a fresh key is still one peer. No known-proposer
+/// filter: that set is filled only from admitted blocks
+/// (`AttestedNetworkHead::observe`) and would blind a cold node.
+#[derive(Debug, Default)]
+pub struct DeferredHeights {
+    /// peer -> (highest claimed height, when it was last renewed).
+    by_peer: HashMap<String, (u64, Instant)>,
+    /// The connected peers as of the last sync tick; `None` before the first.
+    connected: Option<std::collections::HashSet<String>>,
+}
+
+impl DeferredHeights {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The peers connected now (the sync tick's snapshot). Claims of every
+    /// other peer are dropped.
+    pub fn set_connected(&mut self, peers: impl IntoIterator<Item = String>) {
+        let set: std::collections::HashSet<String> = peers.into_iter().collect();
+        self.by_peer.retain(|p, _| set.contains(p));
+        self.connected = Some(set);
+    }
+
+    /// Record `peer`'s deferred block at `claimed`; the corroborated height
+    /// after it (see [`Self::corroborated`]).
+    pub fn record(&mut self, peer: &str, claimed: u64, now: Instant) -> Option<u64> {
+        if self.connected.as_ref().is_some_and(|c| !c.contains(peer)) {
+            return self.corroborated(now);
+        }
+        match self.by_peer.get_mut(peer) {
+            Some(entry) => {
+                if claimed >= entry.0 {
+                    *entry = (claimed, now);
+                }
+            }
+            None => {
+                if self.by_peer.len() >= MAX_DEFERRED_CLAIM_PEERS {
+                    if let Some(oldest) = self
+                        .by_peer
+                        .iter()
+                        .min_by_key(|(_, (_, at))| *at)
+                        .map(|(p, _)| p.clone())
+                    {
+                        self.by_peer.remove(&oldest);
+                    }
+                }
+                self.by_peer.insert(peer.to_string(), (claimed, now));
+            }
+        }
+        self.corroborated(now)
+    }
+
+    /// The highest height that the live deferred claims of at least
+    /// [`DEFERRED_HEIGHT_CORROBORATION`] distinct connected peers reach (one,
+    /// with a single connected peer); `None` until that many have claimed.
+    pub fn corroborated(&self, now: Instant) -> Option<u64> {
+        let need = match &self.connected {
+            Some(c) => DEFERRED_HEIGHT_CORROBORATION.min(c.len().max(1)),
+            None => DEFERRED_HEIGHT_CORROBORATION,
+        };
+        let mut claims: Vec<u64> = self
+            .by_peer
+            .values()
+            .filter(|(_, at)| now.saturating_duration_since(*at) < DEFERRED_CLAIM_TTL)
+            .map(|(h, _)| *h)
+            .collect();
+        claims.sort_unstable_by(|a, b| b.cmp(a));
+        claims.get(need.saturating_sub(1)).copied()
+    }
+
+    #[cfg(test)]
+    pub fn peers(&self) -> usize {
+        self.by_peer.len()
+    }
+}
+
+/// Whether a gossiped block may raise the advertised head of the peer that
+/// sent it (`PeerInfo::observe_gossiped_head`), judged AFTER gossip validation
+/// and admission (r1007 fleet split: it used to run on the raw block before
+/// either). A block this node admitted, or already holds, is verified. A
+/// deferred block raises it when the deferred claims of other peers
+/// corroborate its height, or when it is no more than
+/// [`UNCORROBORATED_HEAD_LEAD`] above the higher of this node's applied tip
+/// and the corroborated height: a lone peer's far-ahead claim never moves its
+/// head (not even step by step), and one relaying peer still keeps its head
+/// fresh during a cold sync.
+pub fn gossip_raises_head(
+    verified: bool,
+    height: u64,
+    corroborated: Option<u64>,
+    applied: u64,
+) -> bool {
+    verified
+        || corroborated.is_some_and(|c| height <= c)
+        || height
+            <= applied
+                .max(corroborated.unwrap_or(0))
+                .saturating_add(UNCORROBORATED_HEAD_LEAD)
+}
+
+/// Raise the advertised head of the peer that gossiped `block` (when
+/// [`gossip_raises_head`] allows it): height, hash and blue score together.
+pub async fn raise_gossip_head(
+    peer: Option<std::sync::Arc<citrate_network::peer::Peer>>,
+    block: &citrate_consensus::types::Block,
+) {
+    if let Some(p) = peer {
+        p.info.write().await.observe_gossiped_head(
+            block.header.height,
+            block.header.block_hash,
+            block.header.blue_score,
+        );
+    }
+}
+
+/// A deferred gossiped `block` from `peer`: raise that peer's advertised
+/// head when [`gossip_raises_head`] allows it (`corroborated` is the
+/// [`DeferredHeights`] verdict, `applied` this node's applied height).
+pub async fn raise_deferred_head(
+    peer: Option<std::sync::Arc<citrate_network::peer::Peer>>,
+    block: &citrate_consensus::types::Block,
+    corroborated: Option<u64>,
+    applied: u64,
+) {
+    let Some(p) = peer else {
+        return;
+    };
+    let mut info = p.info.write().await;
+    if gossip_raises_head(false, block.header.height, corroborated, applied) {
+        info.observe_gossiped_head(
+            block.header.height,
+            block.header.block_hash,
+            block.header.blue_score,
+        );
+    }
+}
+
 /// A connected peer considered as a block source for this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCandidate {
@@ -1692,5 +1866,154 @@ mod pba_l1b_006_network_height {
         );
         assert!(src.contains("sync_peer::record_verified_height(&max_seen_for_rx"));
         assert!(src.contains("sync_peer::record_unverified_height("));
+    }
+}
+
+#[cfg(test)]
+mod deferred_height_evidence {
+    use super::*;
+
+    fn connected(n: usize) -> Vec<String> {
+        (0..n).map(|k| format!("p{k}")).collect()
+    }
+
+    #[test]
+    fn a_lone_peers_claim_is_not_evidence() {
+        let mut d = DeferredHeights::new();
+        let now = Instant::now();
+        d.set_connected(connected(3));
+        assert_eq!(d.record("p0", 9_000_000, now), None);
+        assert_eq!(
+            d.record("p0", 9_000_001, now),
+            None,
+            "repeats do not corroborate"
+        );
+        assert_eq!(d.corroborated(now), None);
+        // Before the first tick nobody is known connected: two are needed.
+        let mut fresh = DeferredHeights::new();
+        assert_eq!(fresh.record("p0", 50, now), None);
+    }
+
+    #[test]
+    fn two_connected_peers_corroborate_the_lower_of_their_claims() {
+        let mut d = DeferredHeights::new();
+        let now = Instant::now();
+        d.set_connected(connected(5));
+        assert_eq!(d.record("p0", 1_000, now), None);
+        assert_eq!(d.record("p1", 900, now), Some(900));
+        assert_eq!(
+            d.record("p2", 5_000_000, now),
+            Some(1_000),
+            "the second-highest claim"
+        );
+        assert_eq!(d.record("p1", 2_000, now), Some(2_000));
+    }
+
+    /// PR #483 review, P2: a peer that reconnects under a fresh key is still
+    /// one peer: claims of disconnected peers are dropped, and claims of
+    /// peers that are not connected are never recorded.
+    #[test]
+    fn a_reconnecting_attacker_does_not_corroborate_itself() {
+        let mut d = DeferredHeights::new();
+        let now = Instant::now();
+        d.set_connected(vec!["honest".into(), "evil-1".into()]);
+        let _ = d.record("evil-1", 9_000_000, now);
+        // evil-1 drops and comes back as evil-2.
+        d.set_connected(vec!["honest".into(), "evil-2".into()]);
+        assert_eq!(d.record("evil-2", 9_000_000, now), None);
+        assert_eq!(
+            d.record("evil-1", 9_000_000, now),
+            None,
+            "not connected: ignored"
+        );
+        assert_eq!(d.peers(), 1);
+    }
+
+    #[test]
+    fn claims_expire() {
+        let mut d = DeferredHeights::new();
+        let now = Instant::now();
+        d.set_connected(connected(2));
+        let _ = d.record("p0", 100, now);
+        assert_eq!(d.record("p1", 100, now), Some(100));
+        assert_eq!(d.corroborated(now + DEFERRED_CLAIM_TTL), None);
+    }
+
+    /// Cold sync: a node with one peer has nothing to corroborate with and
+    /// keeps hearing where that peer's network is.
+    #[test]
+    fn a_single_connected_peer_still_counts() {
+        let mut d = DeferredHeights::new();
+        let now = Instant::now();
+        d.set_connected(connected(1));
+        assert_eq!(d.record("p0", 50_000, now), Some(50_000));
+        d.set_connected(connected(2));
+        assert_eq!(
+            d.corroborated(now),
+            None,
+            "with two connected, one is not enough"
+        );
+    }
+
+    #[test]
+    fn the_claim_table_is_bounded_and_drops_the_oldest() {
+        let mut d = DeferredHeights::new();
+        let t0 = Instant::now();
+        d.set_connected(connected(MAX_DEFERRED_CLAIM_PEERS + 100));
+        for k in 0..(MAX_DEFERRED_CLAIM_PEERS as u64 + 100) {
+            let at = t0 + Duration::from_millis(k);
+            let _ = d.record(&format!("p{k}"), 1_000_000 - k, at);
+        }
+        assert_eq!(d.peers(), MAX_DEFERRED_CLAIM_PEERS);
+        // The oldest (and highest) claims went first.
+        let now = t0 + Duration::from_millis(1_000);
+        assert_eq!(d.corroborated(now), Some(1_000_000 - 101));
+    }
+
+    /// Review round 2, P3: claims stepping up one lead at a time do not
+    /// ratchet a lone peer's head: the bound is our tip, not its last head.
+    #[test]
+    fn a_lone_peers_head_cannot_ratchet() {
+        let applied = 100;
+        let mut head = 0u64;
+        for step in 1..=10u64 {
+            let claim = applied + step * UNCORROBORATED_HEAD_LEAD;
+            if gossip_raises_head(false, claim, None, applied) {
+                head = head.max(claim);
+            }
+        }
+        assert_eq!(head, applied + UNCORROBORATED_HEAD_LEAD);
+    }
+
+    #[test]
+    fn the_head_rule_needs_verification_corroboration_or_a_bounded_lead() {
+        assert!(gossip_raises_head(true, u64::MAX, None, 0));
+        assert!(gossip_raises_head(false, 10, Some(10), 0));
+        assert!(gossip_raises_head(false, 900, None, 50), "within the lead");
+        let cap = 50 + UNCORROBORATED_HEAD_LEAD;
+        assert!(gossip_raises_head(false, cap, None, 50));
+        assert!(!gossip_raises_head(false, cap + 1, None, 50));
+        assert!(gossip_raises_head(
+            false,
+            70 + UNCORROBORATED_HEAD_LEAD,
+            Some(70),
+            50
+        ));
+        assert!(
+            !gossip_raises_head(false, 1_000_000, None, 11),
+            "a far-ahead lone claim"
+        );
+    }
+
+    /// Tripwire: the inbound loop raises a peer's head only through the rule,
+    /// never on the raw block (the call that ran before validation is gone).
+    #[test]
+    fn main_loop_raises_heads_only_through_the_rule() {
+        let src = include_str!("main.rs");
+        assert_eq!(src.matches("observe_gossiped_head(").count(), 0);
+        assert!(src.contains("sync_peer::raise_deferred_head("));
+        assert!(src.contains("sync_peer::raise_gossip_head("));
+        assert!(src.contains("deferred_for_rx.lock().record("));
+        assert!(src.contains(".set_connected("));
     }
 }
