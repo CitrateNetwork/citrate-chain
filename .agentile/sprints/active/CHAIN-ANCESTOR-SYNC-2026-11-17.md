@@ -140,6 +140,17 @@ two touch `main.rs`, `sync_peer.rs` and `split_heal_tests.rs` in different place
   serving-side range fix may be the decisive real-world fix.
 - [x] P3: `a_lone_peers_head_cannot_ratchet`.
 
+## WP-8 Review round 3 (PR #483, 2026-11-18)
+
+- [x] P1 (Sybil rotation): owns_sync needs `fetched > 0` in this episode.
+  `rotating_sybils_with_fabricated_headers_cannot_own_sync`: red 3,165 of
+  3,600 s, green 0. Heavier-below on/off unchanged (slot 2 / not within 40,
+  3 runs each). Workspace: 6,247 tests, 6,225 passed, 0 failed, 22 ignored;
+  clippy clean.
+- [x] P3: stale stand-aside comments fixed.
+- Follow-ups (not fixed here): citrate-chain#484 (idle-budget cooldown inert
+  on a live chain; `on_blocks` credits blocks from any route).
+
 ## Verification (cnv-build-2, Ubuntu 24.04, rustc 1.96.0; no cargo on the Mac)
 
 | What | Result |
