@@ -1849,3 +1849,96 @@ mod tests {
         assert_eq!(store.stored_block_count().expect("test store op"), Some(3));
     }
 }
+
+#[cfg(test)]
+mod height_range_tests {
+    use super::*;
+    use citrate_consensus::types::{BlockBuilder, PublicKey};
+    use tempfile::TempDir;
+
+    fn block(height: u64, sibling: u8, parent: Hash) -> Block {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&height.to_be_bytes());
+        h[8] = sibling;
+        h[31] = 0x5A;
+        BlockBuilder::new()
+            .hash(Hash::new(h))
+            .parent(parent)
+            .height(height)
+            .timestamp(1_000_000 + height)
+            .blue_score(height)
+            .blue_work(u128::from(height))
+            .proposer(PublicKey::new([1; 32]))
+            .build_unhashed()
+    }
+
+    /// A store of `heights` heights with `siblings` blocks at each.
+    fn store(heights: u64, siblings: u8) -> (TempDir, BlockStore) {
+        let dir = TempDir::new().expect("tempdir");
+        let db = Arc::new(RocksDB::open(dir.path()).expect("db"));
+        let store = BlockStore::new(db);
+        let mut parent = Hash::default();
+        for h in 1..=heights {
+            let mut first = None;
+            for s in 0..siblings {
+                let b = block(h, s, parent);
+                store.put_block(&b).expect("put");
+                first.get_or_insert(b.hash());
+            }
+            parent = first.expect("a block per height");
+        }
+        (dir, store)
+    }
+
+    fn sorted(mut v: Vec<(u64, Hash)>) -> Vec<(u64, Hash)> {
+        v.sort();
+        v
+    }
+
+    /// Every stored block in the range, siblings included, and nothing else:
+    /// the same answer as a scan of every header.
+    #[test]
+    fn a_bounded_range_holds_every_sibling_and_nothing_else() {
+        let (_d, s) = store(120, 3);
+        for (a, b) in [(1, 1), (5, 36), (100, 140), (0, 0), (119, 120), (40, 30)] {
+            let full: Vec<(u64, Hash)> = s
+                .hashes_in_height_range(0, u64::MAX)
+                .expect("full")
+                .into_iter()
+                .filter(|(h, _)| *h >= a && *h <= b)
+                .collect();
+            assert_eq!(
+                sorted(s.hashes_in_height_range(a, b).expect("range")),
+                sorted(full),
+                "range {a}..={b}"
+            );
+        }
+        assert_eq!(s.hashes_in_height_range(7, 7).expect("one").len(), 3);
+    }
+
+    /// Serving cost (r1007 fleet split, 2026-11-17): every `GetBlocks` a node
+    /// serves reads one 32-height range. Reading it scanned every header the
+    /// node stores (about a million on r1007), so each answer cost a full
+    /// header scan and the serving plane fell behind (`serve lane over
+    /// budget`, recovery `Unanswered`). A bounded range must cost about its own
+    /// size: 200 32-height ranges must take far less than 200 full scans.
+    #[test]
+    fn a_bounded_range_does_not_scan_every_header() {
+        let (_d, s) = store(6_000, 3);
+        let t = std::time::Instant::now();
+        let all = s.hashes_in_height_range(0, u64::MAX).expect("full");
+        let full_scan = t.elapsed();
+        assert_eq!(all.len(), 18_000);
+        let t = std::time::Instant::now();
+        for k in 0..200u64 {
+            let start = 1 + k * 29;
+            let got = s.hashes_in_height_range(start, start + 31).expect("range");
+            assert_eq!(got.len(), 96);
+        }
+        let ranges = t.elapsed();
+        assert!(
+            ranges < full_scan.saturating_mul(20),
+            "200 bounded ranges took {ranges:?}; one full scan takes {full_scan:?}"
+        );
+    }
+}
