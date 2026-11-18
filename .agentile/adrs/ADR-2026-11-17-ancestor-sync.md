@@ -114,10 +114,14 @@ request in flight:
    recomputed (G7 rejects a header that lied about its work). An answer that
    stores no new header-chain block is a stall; four end the episode.
 
-Only in the body phase (fork below the applied tip AND the work gate passed)
-do the tick's own applied-tip request and the #477 pipeline stand aside (they
-would only re-ask the anchor the peer does not hold). Locating and header
-paging never stand anything aside. Each round's next request goes out as soon
+Only while a body request of the episode is in flight do the tick's own
+applied-tip request and the #477 pipeline stand aside (they would only re-ask
+the anchor the peer does not hold). Locating and header paging never stand
+anything aside, however much work the headers claim: headers carry no
+signature, so a claimed work is only refuted once a body is admitted (review
+round 2: a peer dripping fabricated high-work headers on top of a side block
+we already held kept an episode in its "body phase" for 99% of the time
+without ever being asked for a body). Each round's next request goes out as soon
 as its answer is in (`AncestorSync::next`), not on the next 2 s tick.
 
 Every episode is bounded whatever its peer does (review of #483, P1-1): 120 s
@@ -125,8 +129,11 @@ and 512 requests (a request the sync manager refused counts; four refused in a
 row end the episode), and a header phase whose verified headers span the
 whole reorg window above the fork without beating our work ends `NotHeavier`.
 An episode that runs out of budget ends `Budget { fetched }`: resumable (what
-was fetched stays stored), with no cooldown when it delivered bodies, and the
-same doubling cooldown as a fault when it delivered nothing.
+was fetched stays stored). `fetched` counts only heights the cursor moved on
+this episode's own body answers, never blocks held before it. A budget ending
+with nothing fetched is a fault (doubling cooldown); one with bodies fetched
+restarts at once, except that two in a row with one peer that left the applied
+tip where it was get the doubling cooldown too.
 
 Claimed heights, claimed work and the peer's reported tip only decide what to
 fetch. Fork choice stays with GHOSTDAG over admitted blocks, and whether the
@@ -204,19 +211,28 @@ the canonical branch. Every r1007 branch is in this state today (fork about
 * The serving plane does not build an `Ancestor` reply for a peer below 1.3,
   and a `GetAncestor` does not refresh the requester's self-reported head.
 
-### D5b. A scenario the 1.2 recovery cannot heal
+### D5b. A scenario the 1.2 recovery heals only slowly
 
 `split_heal_tests::a_heavier_branch_below_our_height_is_rejoined` and
-`without_ancestor_sync_a_heavier_branch_below_our_height_is_not_rejoined`: the
+`without_ancestor_sync_a_heavier_branch_below_our_height_heals_far_slower`: the
 heavier branch is BELOW the light nodes' height (four producers every other
 slot, four blue blocks per height, against one producer every slot), 4,000
 slots apart: light 4,000 above the fork and 2,000 above the heavy tip, heavy
 2,000 deep. No peer is ahead, no heavy peer is inside the split-pull band, and
 the missing-parent walk's node-wide budget cannot descend 2,000 heights in the
-40 slots allowed. With every node on 1.2 the light followers never rejoin (3
-of 3 runs); with 1.3 they rejoin by slot 2 (3 of 3). The light producer itself
-rejoins either way through the producer gate's resync request; followers have
-no such gate.
+40 slots allowed. With every node on 1.2 the light followers have not rejoined
+by slot 40 (3 of 3 runs); with 1.3 they rejoin by slot 2 (3 of 3). The 1.2
+recovery does get there: with a 400-slot window the reviewer saw the fleet
+converge at slot 110 (p0 at 79). So the driver cuts this heal from about 110
+slots to 2; it is not the only way back. The test is named for that
+(`..._heals_far_slower`).
+
+For r1007 itself the serving-side fix (D6) may well be the decisive one: the
+split began with missing-parent fetches failing on `InFlightCap` and
+`Unanswered`, and every `GetBlocks` answer then cost a scan of every stored
+header (about a million), so serving lanes fell behind exactly when recovery
+needed answers. Ancestor sync shortens the heal; cheap serving lets every
+recovery path get its answers at all.
 
 ### D6. Serving a block window costs the window, not the store
 

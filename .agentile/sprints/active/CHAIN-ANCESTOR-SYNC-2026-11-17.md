@@ -99,10 +99,11 @@ two touch `main.rs`, `sync_peer.rs` and `split_heal_tests.rs` in different place
   Tests: `a_slow_drip_header_peer_never_owns_sync_and_is_bounded`,
   `refused_requests_end_the_episode`, `an_honest_fetch_past_the_budget_resumes`.
 - [x] P1-2: `a_heavier_branch_below_our_height_is_rejoined` and
-  `without_ancestor_sync_a_heavier_branch_below_our_height_is_not_rejoined`:
+  `without_ancestor_sync_a_heavier_branch_below_our_height_heals_far_slower`:
   the heavier branch is below the light nodes' height (four producers every
   other slot against one every slot, 4,000 slots); driver off, the light
-  followers never rejoin; driver on, they do. Getting there exposed two
+  followers have not rejoined by slot 40 (they do at about 110, round 2);
+  driver on, by slot 2. Getting there exposed two
   driver defects, now fixed: a head counted as held when its block was merely
   stored (deferred blocks are stored, not admitted), and candidates were
   chosen by advertised heads that relayed gossip had set to our own tip. The
@@ -122,6 +123,22 @@ two touch `main.rs`, `sync_peer.rs` and `split_heal_tests.rs` in different place
   `Budget` (not Faulty).
 - [x] CI: `deny.toml` ignore for RUSTSEC-2026-0543 (chrono unmaintained), own
   commit.
+
+## WP-7 Review round 2 (PR #483, 2026-11-18)
+
+- [x] P1-1 (still open after round 1): owns_sync only while a body request is
+  in flight; `fetched` counts only this episode's own body answers; two idle
+  resumable budgets in a row with one peer get the doubling cooldown. Red
+  first with the reviewer's PoC
+  (`ancestor_sync::tests::a_peer_serving_a_held_side_block_and_fake_work_cannot_own_sync`):
+  owned 10,710 of 10,800 s before, 0 after.
+- [x] Mutation gaps: `an_empty_budget_backs_off_like_a_fault`,
+  `a_fast_chaining_peer_is_bounded_by_the_episode_guards`; also
+  `idle_budgets_in_a_row_cool_the_peer`, `only_a_body_request_in_flight_owns_sync`.
+- [x] P2: the driver-off test is `..._heals_far_slower` (the 1.2 recovery
+  heals at about slot 110 against 2); ADR and PR body say so, and that the
+  serving-side range fix may be the decisive real-world fix.
+- [x] P3: `a_lone_peers_head_cannot_ratchet`.
 
 ## Verification (cnv-build-2, Ubuntu 24.04, rustc 1.96.0; no cargo on the Mac)
 
