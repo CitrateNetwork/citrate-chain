@@ -417,10 +417,17 @@ impl Node {
             .expect("r1007 G9: bind the slot origin from genesis, as start_node does");
         let ghostdag = Arc::new(GhostDag::new(GhostDagParams::default(), dag.clone()));
         let dag_handle = dag.clone();
+        // The pool is the applicator's too, as `start_node` wires it: a reorg
+        // gives the abandoned blocks' transactions back to it.
+        let mempool = Arc::new(Mempool::new(MempoolConfig {
+            require_valid_signature: false,
+            ..Default::default()
+        }));
         let app = Arc::new(
             CanonicalApplicator::new(executor.clone(), storage.clone())
                 .with_fork_choice(ghostdag.clone())
-                .with_dag_prune_floor(dag.clone()),
+                .with_dag_prune_floor(dag.clone())
+                .with_mempool(mempool.clone()),
         );
         app.set_genesis(genesis_state(alloc), genesis.header.block_hash);
         let adm = Arc::new(BlockAdmission::new(
@@ -432,10 +439,6 @@ impl Node {
         adm.seed_genesis().await;
         let _ = adm.reconcile().await;
         ghostdag.reconcile_tips_from_dag_store().await;
-        let mempool = Arc::new(Mempool::new(MempoolConfig {
-            require_valid_signature: false,
-            ..Default::default()
-        }));
         // r1007 G9: the producers below stamp the harness's simulated time, so
         // the deferred-evidence check judges header timestamps against it too
         // (before G9 the producer stamped the real clock).
@@ -3558,5 +3561,375 @@ mod tests {
                 "{name}: {mutated:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Ancestor sync (r1007 fleet split, 2026-11-15, fork at 105,012).
+    //
+    // After checkpoint 105,000 finalized, the fleet split into partitions
+    // that each built only on their own blocks and never re-converged: a
+    // node on a lighter branch kept receiving the heavier branch's blocks,
+    // deferred every one (missing parent), and anchored every request at its
+    // own applied height, which on the other branch is above the fork point.
+    // The missing-parent walk gave up a few hundred heights down. These
+    // scenarios fork two producer groups above a finalized checkpoint, run
+    // the fork well past the walk's reach, reconnect them, and require the
+    // fleet to re-converge on the heavier branch by itself.
+    // ---------------------------------------------------------------------
+
+    /// What [`deep_split`] found.
+    struct DeepSplit {
+        /// Highest height both groups' selected chains agreed on before the heal.
+        fork: u64,
+        /// The lighter group's applied height minus `fork` at the heal.
+        light_depth: u64,
+        /// How far the heavy group's tip was above the light group's.
+        heavy_lead: u64,
+        /// Slots after the heal until every node selected the heavier group's
+        /// pre-heal chain (four below its tip) and every producer was sealing
+        /// again.
+        converged_at: Option<u64>,
+        /// The finalized checkpoint registered before the split.
+        checkpoint: u64,
+        /// Every node's reorg floor at the end (never below `checkpoint`).
+        floors: Vec<u64>,
+        /// A checkpoint above the fork, registered after the heal, and every
+        /// node's floor after it (empty: the nodes disagree at that height;
+        /// `None`: no convergence to register on).
+        finalized_after: Option<(u64, Vec<u64>)>,
+        /// Per transaction (light-only, heavy-only): executed on node 0's
+        /// converged chain, or waiting in some node's pool.
+        txs: Vec<(&'static str, bool, bool)>,
+        detail: String,
+    }
+
+    /// A 3v4 split above a finalized checkpoint, `partition` slots long, then
+    /// every link back (a reconnect: the handshake gives each side the
+    /// other's head), and up to `heal` slots to converge. One transaction is
+    /// submitted to each side during the partition. During the partition the
+    /// light group seals only every other slot, so the heavy branch is also
+    /// ahead in height when the links come back, as on r1007 (HEAVY was 363
+    /// heights above LIGHT): the light nodes are "behind", every peer's head
+    /// is raised to the heavy tip by relayed gossip, and the heavy tip blocks
+    /// they hear are too far above them for the missing-parent walk.
+    async fn deep_split(partition: u64, heal: u64) -> DeepSplit {
+        let n = 7;
+        let light: Vec<usize> = vec![0, 1, 2];
+        let heavy: Vec<usize> = vec![3, 4, 5, 6];
+        let in_light = |i: usize| i < 3;
+        let alloc = (0..2u64)
+            .map(|i| {
+                let pk = PublicKey::new(fat_sender(i).verifying_key().to_bytes());
+                (
+                    citrate_execution::address_utils::normalize_address(&pk),
+                    U256::from(10u128.pow(21)),
+                )
+            })
+            .collect();
+        let mut fleet = Fleet::with_genesis(n, None, alloc).await;
+        let mut rng = Rng(0x5EED_A11C_E570_0001);
+        for _ in 0..ACT + 6 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // A finalized checkpoint every node agrees on, two below the lowest
+        // tip (r1007: 105,000, finalized 85 s before the split).
+        let low = *fleet.applied_heights().await.iter().min().expect("nodes");
+        let checkpoint = low - 2;
+        let cp_hash = fleet
+            .agree_at(checkpoint)
+            .await
+            .expect("fixture: the fleet agrees below its tips before the split");
+        for node in &fleet.nodes {
+            node.app.register_certified(checkpoint, cp_hash);
+            assert_eq!(
+                node.app.settle_registered_floor().await,
+                checkpoint,
+                "fixture: {} raises its reorg floor to the checkpoint",
+                node.name
+            );
+        }
+        fleet.set_links(|i, j| in_light(i) == in_light(j));
+        let light_tx = fat_tx(0);
+        let heavy_tx = fat_tx(1);
+        for k in 0..partition {
+            if k == 5 {
+                fleet.nodes[light[0]]
+                    .mempool
+                    .add_transaction(
+                        light_tx.clone(),
+                        citrate_sequencer::mempool::TxClass::Standard,
+                    )
+                    .await
+                    .expect("fixture: the light pool takes its transaction");
+                fleet.nodes[heavy[0]]
+                    .mempool
+                    .add_transaction(
+                        heavy_tx.clone(),
+                        citrate_sequencer::mempool::TxClass::Standard,
+                    )
+                    .await
+                    .expect("fixture: the heavy pool takes its transaction");
+            }
+            if k % 2 == 1 {
+                fleet.quiet.extend(light.iter().copied());
+            }
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            fleet.quiet.clear();
+        }
+        let heights = fleet.applied_heights().await;
+        let light_chain = fleet.chain(light[0]).await;
+        let (heavy_top_node, heavy_top) = heavy
+            .iter()
+            .map(|i| (*i, heights[*i]))
+            .max_by_key(|(_, h)| *h)
+            .expect("heavy side");
+        let heavy_chain = fleet.chain(heavy_top_node).await;
+        // A few heights below the heavy group's tip: the block there is
+        // settled on every heavy node (the topmost siblings are not yet).
+        let heavy_mark = heavy_top - 4;
+        let heavy_tip = *heavy_chain.get(&heavy_mark).expect("heavy mark");
+        let light_top = light.iter().map(|i| heights[*i]).max().expect("light");
+        let fork = (0..=light_top)
+            .rev()
+            .find(|h| light_chain.contains_key(h) && light_chain.get(h) == heavy_chain.get(h))
+            .unwrap_or(0);
+        fleet.set_links(|_, _| true);
+        fleet.handshake().await;
+        let mut last_sealed: HashMap<usize, u64> = HashMap::new();
+        let mut converged_at = None;
+        for slot in 1..=heal {
+            let o = rng.order(n);
+            for (i, _) in fleet.slot(&o).await {
+                last_sealed.insert(i, slot);
+            }
+            let mut all = true;
+            for i in 0..n {
+                if fleet.chain(i).await.get(&heavy_mark) != Some(&heavy_tip) {
+                    all = false;
+                    break;
+                }
+            }
+            let producing = (0..n).all(|i| {
+                last_sealed
+                    .get(&i)
+                    .is_some_and(|r| r + PRODUCING_WINDOW > slot)
+            });
+            if all && producing {
+                converged_at = Some(slot);
+                break;
+            }
+        }
+        let mut floors = Vec::new();
+        for node in &fleet.nodes {
+            floors.push(node.app.finalized_height_handle().load(Ordering::SeqCst));
+        }
+        let finalized_after = if converged_at.is_some() {
+            // Every node on one chain: a checkpoint above the fork can gather
+            // every vote. Register it on every node; each floor must rise to it.
+            let min_h = *fleet.applied_heights().await.iter().min().expect("nodes");
+            let cp2 = min_h.saturating_sub(2).max(fork + 1);
+            match fleet.agree_at(cp2).await {
+                Some(h2) => {
+                    let mut out = Vec::new();
+                    for node in &fleet.nodes {
+                        node.app.register_certified(cp2, h2);
+                        out.push(node.app.settle_registered_floor().await);
+                    }
+                    Some((cp2, out))
+                }
+                None => Some((cp2, Vec::new())),
+            }
+        } else {
+            None
+        };
+        println!(
+            "DEEPSPLIT fork={fork} light_depth={} heavy_lead={} converged_at={converged_at:?} \
+             lost={} shed={}",
+            light_top.saturating_sub(fork),
+            heavy_top.saturating_sub(light_top),
+            fleet.lost,
+            fleet.shed
+        );
+        let past = fleet.past(0).await;
+        let mut txs = Vec::new();
+        for (name, tx) in [("light-only", &light_tx), ("heavy-only", &heavy_tx)] {
+            let executed = fleet.nodes[0]
+                .storage
+                .transactions
+                .get_receipt(&tx.hash)
+                .expect("read receipt")
+                .is_some_and(|r| {
+                    past.contains(&r.block_hash) || fleet_tip_is(&fleet, &r.block_hash)
+                });
+            let mut pooled = false;
+            for node in &fleet.nodes {
+                if node.mempool.contains(&tx.hash).await {
+                    pooled = true;
+                }
+            }
+            txs.push((name, executed, pooled));
+        }
+        DeepSplit {
+            fork,
+            light_depth: light_top.saturating_sub(fork),
+            heavy_lead: heavy_top.saturating_sub(light_top),
+            converged_at,
+            checkpoint,
+            floors,
+            finalized_after,
+            txs,
+            detail: format!(
+                "fork {fork}, light at {light_top}, heavy at {heavy_top} ({}): {}",
+                short(&heavy_tip),
+                fleet.describe().await
+            ),
+        }
+    }
+
+    /// Whether `h` is node 0's applied tip (its past excludes it).
+    fn fleet_tip_is(fleet: &Fleet, h: &Hash) -> bool {
+        fleet.nodes[0].applied().0 == *h
+    }
+
+    /// The r1007 split at harness scale: two producer groups fork above a
+    /// finalized checkpoint and run 1,100 slots apart (the heavy branch one
+    /// height per slot, the light one every other slot: both are more than
+    /// the 512-height missing-parent walk above the fork, and the heavy tip is
+    /// more than that above the light one), then reconnect. Within 60 slots
+    /// (two minutes of chain time) every node must be on the heavier
+    /// (four-producer) branch and every producer sealing again, without
+    /// operator action; the
+    /// reorg must stay above the checkpoint; a checkpoint above the fork must
+    /// then finalize on every node; and neither side's transaction may be
+    /// lost (executed on the converged chain, or back in a pool).
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_groups_forked_past_the_walk_reconverge_on_the_heavier_branch() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::two_groups_forked_past_the_walk_reconverge_on_the_heavier_branch",
+            );
+        }
+        let r = deep_split(1_100, 60).await;
+        assert!(
+            r.light_depth > crate::sync_peer::ANCESTRY_RECOVERY_WINDOW
+                && r.heavy_lead > crate::sync_peer::ANCESTRY_RECOVERY_WINDOW,
+            "fixture: the lighter branch is {} deep and {} behind ({})",
+            r.light_depth,
+            r.heavy_lead,
+            r.detail
+        );
+        assert!(
+            r.fork > r.checkpoint,
+            "fixture: the fork is above the checkpoint ({})",
+            r.detail
+        );
+        assert!(
+            r.converged_at.is_some(),
+            "a {}-deep split did not re-converge on the heavier branch within 60 slots \
+             of the reconnect ({})",
+            r.light_depth,
+            r.detail
+        );
+        assert!(
+            r.floors.iter().all(|f| *f >= r.checkpoint),
+            "a reorg floor fell below the finalized checkpoint {}: {:?}",
+            r.checkpoint,
+            r.floors
+        );
+        let (cp2, floors) = r.finalized_after.clone().expect("converged");
+        assert!(
+            floors.len() == 7 && floors.iter().all(|f| *f == cp2),
+            "checkpoint {cp2} above the fork did not finalize on every node: {floors:?} ({})",
+            r.detail
+        );
+        for (name, executed, pooled) in &r.txs {
+            assert!(
+                *executed || *pooled,
+                "the {name} transaction was lost: not executed on the converged chain and \
+                 in no pool ({})",
+                r.detail
+            );
+        }
+    }
+
+    /// A block `key` signed at `height` on a parent nobody holds: what a
+    /// relay of another branch's tip, or a forger, gossips. It passes gossip
+    /// validation (self-consistent, self-signed) and defers on admission.
+    fn unconnected_block(key: &Ed25519SigningKey, height: u64, salt: u8) -> Block {
+        let mut parent = [0xD7u8; 32];
+        parent[0] = salt;
+        let mut b = BlockBuilder::new()
+            .version(2)
+            .height(height)
+            .parent(Hash::new(parent))
+            .coinbase([0xBC; 20])
+            .timestamp(chrono::Utc::now().timestamp().max(0) as u64)
+            .vrf_reveal(VrfProof {
+                proof: vec![],
+                output: Hash::new([0x5D; 32]),
+            })
+            .transactions(vec![])
+            .state_root(Hash::default())
+            .blue_score(height)
+            .blue_work(citrate_consensus::types::blue_work_for_score(height))
+            .proposer(PublicKey::new(key.verifying_key().to_bytes()))
+            .build_unhashed();
+        b.tx_root = citrate_consensus::tx_auth::tx_root_for_height(
+            citrate_consensus::hardening::PbaHardening::from_process(),
+            height,
+            &b.transactions,
+        );
+        b.header.block_hash = b.compute_hash();
+        b.signature = citrate_consensus::crypto::sign_block(&b.header.block_hash, key);
+        b
+    }
+
+    /// Evidence poisoning (r1007 fleet split): one peer gossips a signed block
+    /// a million heights above the network on a parent nobody holds. It
+    /// defers. Neither the node's network-height evidence (`max_seen_height`,
+    /// the sync target and `eth_syncing.highestBlock`) nor that peer's
+    /// advertised head may move: nothing verified it, and no second peer
+    /// corroborates it. Red at f4a0e600: the head was raised before
+    /// validation and the deferred path recorded the claim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lone_peers_far_ahead_gossip_moves_neither_the_target_nor_its_head() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::a_lone_peers_far_ahead_gossip_moves_neither_the_target_nor_its_head",
+            );
+        }
+        let n = 3;
+        let mut fleet = Fleet::new(n).await;
+        fleet.add_sybils(1).await;
+        let mut rng = Rng(0x0BAD_5EED_0000_0001);
+        for _ in 0..ACT + 4 {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        let verified = *fleet.applied_heights().await.iter().max().expect("nodes");
+        let before = fleet.nodes[0].max_seen.load(Ordering::Relaxed);
+        assert!(before <= verified, "fixture: {before} > {verified}");
+        let key = Ed25519SigningKey::from_bytes(&[0xF1; 32]);
+        let claim = verified + 1_000_000;
+        let peer = fleet.sybils[0][0].0.clone();
+        let pid = PeerId::new("sybil0".to_string());
+        for k in 0..4u8 {
+            let b = unconnected_block(&key, claim + u64::from(k), k);
+            fleet.nodes[0].on_new_block(&peer, &pid, b).await;
+        }
+        fleet.pump().await;
+        let seen = fleet.nodes[0].max_seen.load(Ordering::Relaxed);
+        assert!(
+            seen <= verified,
+            "one peer's unverified claim of {claim} moved the network height to {seen} \
+             (verified {verified})"
+        );
+        let head = peer.info.read().await.head_height;
+        assert!(
+            head <= verified,
+            "the peer's advertised head was raised to {head} by a block nothing verified"
+        );
     }
 }
