@@ -4180,7 +4180,8 @@ mod tests {
         }
     }
 
-    /// PR #483 review, P1-2: a split the existing recovery cannot heal. The
+    /// PR #483 review, P1-2: a split the existing recovery heals only slowly
+    /// (about 110 slots with the driver off, review round 2). The
     /// heavier branch sits BELOW the light nodes' height: four producers
     /// sealing every other slot (four blue blocks per height) against one
     /// producer every slot, 4,000 slots apart. The light nodes are never
@@ -4188,7 +4189,8 @@ mod tests {
     /// below their tip), no heavy peer is within the split-pull height band,
     /// and the heavy branch is 2,000 heights deep, more than the
     /// missing-parent walk's node-wide budget can descend in the 40 slots
-    /// allowed. Driven by slots on the harness's simulated clock.
+    /// allowed here. With ancestor sync the light followers rejoin by slot 2.
+    /// Driven by slots on the harness's simulated clock.
     const HEAVIER_BELOW_SLOTS: u64 = 4_000;
     const HEAVIER_BELOW_HEAL: u64 = 40;
 
@@ -4245,13 +4247,15 @@ mod tests {
     }
 
     /// The same split with every node on the 1.2 binary (no ancestor sync):
-    /// the existing recovery never rejoins it. Pins that the scenario above
-    /// needs the driver.
+    /// the existing recovery does NOT rejoin it within the 40 slots the
+    /// driver needs only 2 of. It does heal eventually (review round 2: about
+    /// slot 110 with a 400-slot window, p0 at 79), so this pins the speed-up,
+    /// not that the driver is the only way back.
     #[tokio::test(flavor = "current_thread")]
-    async fn without_ancestor_sync_a_heavier_branch_below_our_height_is_not_rejoined() {
+    async fn without_ancestor_sync_a_heavier_branch_below_our_height_heals_far_slower() {
         if !in_child() {
             return run_in_child(
-                "split_heal_tests::tests::without_ancestor_sync_a_heavier_branch_below_our_height_is_not_rejoined",
+                "split_heal_tests::tests::without_ancestor_sync_a_heavier_branch_below_our_height_heals_far_slower",
             );
         }
         let all: Vec<usize> = (0..7).collect();
@@ -4260,9 +4264,9 @@ mod tests {
         assert_heavier_below_fixture(&r);
         assert_eq!(
             r.converged_at, None,
-            "the 1.2 recovery rejoined it after all: the scenario no longer shows the driver is \
-             needed ({})",
-            r.detail
+            "the 1.2 recovery rejoined it within {} slots: the scenario no longer shows the \
+             driver's speed-up ({})",
+            HEAVIER_BELOW_HEAL, r.detail
         );
     }
 

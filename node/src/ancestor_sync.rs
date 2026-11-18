@@ -131,6 +131,11 @@ pub const EPISODE_MAX_DURATION: Duration = Duration::from_secs(120);
 /// refused counts: InFlightCap must not hold an episode open).
 pub const EPISODE_MAX_ROUNDS: u32 = 512;
 
+/// Resumable budget endings in a row with one peer that did not move the
+/// applied tip, before that peer gets the ordinary failure cooldown (review
+/// round 2: a peer must not restart episode after episode for free).
+pub const MAX_IDLE_BUDGETS: u32 = 2;
+
 /// Requests in a row the sync manager refused before the episode ends.
 pub const MAX_UNSENT_ROUNDS: u32 = 4;
 
@@ -404,8 +409,13 @@ struct Episode {
     rounds: u32,
     /// Requests in a row the sync manager refused ([`MAX_UNSENT_ROUNDS`]).
     unsent: u32,
-    /// Heights the body cursor moved.
+    /// Heights the body cursor moved on this episode's own body answers.
     fetched: u64,
+    /// The last answer this episode consumed was a body answer: the cursor
+    /// catch-up after it ([`AncestorSync::advance`]) counts as fetched.
+    body_answered: bool,
+    /// This node's applied tip when the episode started.
+    start_applied: Hash,
 }
 
 /// The episode driver described at the top of this file.
@@ -426,6 +436,11 @@ pub struct AncestorSync {
     last_peer: Option<String>,
     /// Episodes ended, by outcome kind (diagnostics).
     ended: HashMap<&'static str, u64>,
+    /// The applied tip as of the last tick.
+    applied_now: Hash,
+    /// peer -> resumable budget endings in a row that left the applied tip
+    /// where the episode found it ([`MAX_IDLE_BUDGETS`]).
+    idle_budgets: HashMap<String, u32>,
 }
 
 impl AncestorSync {
@@ -458,15 +473,16 @@ impl AncestorSync {
             .filter(|at| now.saturating_duration_since(*at) < EVIDENCE_TTL)
     }
 
-    /// The episode is in its body phase: the fork is below the applied tip
-    /// and a verified header claims more work than ours. Only then do the
+    /// A body request of the running episode is in flight. Only then do the
     /// sync tick's own request and the pipeline stand aside; locating and
-    /// header paging never do (PR #483 review, P1-1), and the body phase is
-    /// bounded by [`EPISODE_MAX_DURATION`] and [`EPISODE_MAX_ROUNDS`].
+    /// header paging never do, however much work the headers claim (PR #483
+    /// review rounds 1 and 2: a peer dripping fabricated high-work headers
+    /// held the tick aside for 99% of the time, because no body was ever
+    /// requested and so admission never got to reject the claim).
     pub fn owns_sync(&self) -> bool {
         self.episode
             .as_ref()
-            .is_some_and(|e| e.fork.is_some() && e.work_ok)
+            .is_some_and(|e| matches!(e.asked, Some(Asked::Bodies { .. })))
     }
 
     /// Move the body cursor past every buffered header whose block this node
@@ -486,11 +502,16 @@ impl AncestorSync {
             if !holds(&hash) {
                 break;
             }
-            let from = e.held.map(|h| h.1).unwrap_or(height);
-            e.fetched = e.fetched.saturating_add(height.saturating_sub(from));
+            // Only blocks this episode's own body answers brought in count as
+            // fetched: a block held before (a side block served as the first
+            // header) moves the cursor but is no progress (review round 2).
+            if e.body_answered {
+                let from = e.held.map(|h| h.1).unwrap_or(height);
+                e.fetched = e.fetched.saturating_add(height.saturating_sub(from));
+                e.stalled = 0;
+            }
             e.held = Some((hash, height));
             e.headers.pop_front();
-            e.stalled = 0;
         }
     }
 
@@ -558,11 +579,40 @@ impl AncestorSync {
             .get(&episode.peer)
             .map(|(_, f)| *f)
             .unwrap_or(0);
+        let idle = match &outcome {
+            Outcome::Budget { fetched } if *fetched > 0 => {
+                let streak = self.idle_budgets.entry(episode.peer.clone()).or_insert(0);
+                if self.applied_now == episode.start_applied {
+                    *streak = streak.saturating_add(1);
+                } else {
+                    *streak = 0;
+                }
+                *streak >= MAX_IDLE_BUDGETS
+            }
+            Outcome::PeerLeft => false,
+            _ => {
+                self.idle_budgets.remove(&episode.peer);
+                false
+            }
+        };
+        if self.idle_budgets.len() > MAX_COOLDOWN_PEERS {
+            self.idle_budgets.clear();
+        }
         let (wait, failures) = match &outcome {
             Outcome::TooDeep { .. } => (TOO_DEEP_COOLDOWN, failures),
             Outcome::PeerLeft => (Duration::ZERO, failures),
-            // Resumable, and the peer delivered: ask it again at once.
-            Outcome::Budget { fetched } if *fetched > 0 => (Duration::ZERO, 0),
+            // Resumable, and the peer delivered: ask it again at once, unless
+            // its last budgets in a row left the applied tip where it was.
+            Outcome::Budget { fetched } if *fetched > 0 && !idle => (Duration::ZERO, 0),
+            Outcome::Budget { fetched } if *fetched > 0 => {
+                let shift = failures.min(6);
+                (
+                    COOLDOWN_BASE
+                        .saturating_mul(2u32.saturating_pow(shift))
+                        .min(COOLDOWN_MAX),
+                    failures.saturating_add(1),
+                )
+            }
             o if o.is_failure() => {
                 let shift = failures.min(6);
                 (
@@ -621,6 +671,7 @@ impl AncestorSync {
         candidates: &[Candidate],
         lookup: impl Fn(u64) -> Option<Hash>,
     ) -> (Option<Request>, Option<Outcome>) {
+        self.applied_now = view.applied.0;
         let mut ended = None;
         if let Some(e) = &self.episode {
             if !candidates.iter().any(|c| c.id == e.peer) {
@@ -708,6 +759,8 @@ impl AncestorSync {
             rounds: 1,
             unsent: 0,
             fetched: 0,
+            body_answered: false,
+            start_applied: view.applied.0,
         });
         (Some(Request::Locate { peer, locator }), ended)
     }
@@ -733,6 +786,7 @@ impl AncestorSync {
                 locator: locator.clone(),
             });
             e.rounds = e.rounds.saturating_add(1);
+            e.body_answered = false;
             return Some(Request::Locate {
                 peer: e.peer.clone(),
                 locator,
@@ -744,6 +798,7 @@ impl AncestorSync {
                 anchor: held.0,
             });
             e.rounds = e.rounds.saturating_add(1);
+            e.body_answered = false;
             return Some(Request::Bodies {
                 peer: e.peer.clone(),
                 from: held.0,
@@ -977,6 +1032,7 @@ impl AncestorSync {
         }
         e.asked = None;
         e.unsent = 0;
+        e.body_answered = true;
         let mut moved = false;
         while let Some((hash, height)) = e.headers.front().copied() {
             if !holds(&hash) {
@@ -2557,7 +2613,7 @@ mod tests {
             }
             let held = me.held.clone();
             a.advance(|h| held.contains(h));
-            let (req, ended) = a.tick(now, &view, &[cand.clone()], |h| {
+            let (req, ended) = a.tick(now, &view, std::slice::from_ref(&cand), |h| {
                 (h <= me.tip).then(|| me.hash_at(h))
             });
             if let Some(o) = ended {
@@ -2593,5 +2649,244 @@ mod tests {
             owned * 2 < total,
             "one peer held the sync tick and pipeline aside for {owned} of {total} s: {outcomes:?}"
         );
+        // Nothing was fetched (S was held before the episode), so every
+        // ending is an empty budget and the cooldown doubles: few episodes.
+        assert!(
+            outcomes
+                .keys()
+                .all(|k| !k.starts_with("Budget") || k == "Budget { fetched: 0 }"),
+            "a held side block counted as fetched: {outcomes:?}"
+        );
+        let episodes: u64 = outcomes.values().sum();
+        assert!(episodes <= 16, "{episodes} episodes in 3 h: {outcomes:?}");
+    }
+
+    /// The PoC's peer: a held side block S on our block at 1,099, then one
+    /// fabricated high-work header per locate.
+    struct Dripper {
+        common: (Hash, u64),
+        s_hdr: BlockHeader,
+    }
+
+    impl Dripper {
+        fn new(me: &mut Me) -> Self {
+            let common = (me.hash_at(1_099), 1_099u64);
+            let s_hash = hb(9, 1_100);
+            let s_hdr = header(s_hash, common.0, 1_100, me.score_at(1_099) + 1);
+            me.held.insert(s_hash);
+            Self { common, s_hdr }
+        }
+        fn fake(&self, k: u64) -> BlockHeader {
+            let parent = if k == 1 {
+                self.s_hdr.block_hash
+            } else {
+                hb(8, 1_100 + k - 1)
+            };
+            header(hb(8, 1_100 + k), parent, 1_100 + k, 10_000_000 + k)
+        }
+        fn answer(&self, locator: &[Hash]) -> (Option<(Hash, u64)>, Vec<BlockHeader>) {
+            if let Some(k) = (1..100_000u64).find(|k| locator.first() == Some(&hb(8, 1_100 + k))) {
+                return (Some((hb(8, 1_100 + k), 1_100 + k)), vec![self.fake(k + 1)]);
+            }
+            (Some(self.common), vec![self.s_hdr.clone(), self.fake(1)])
+        }
+        fn tip(&self) -> (Hash, u64) {
+            (hb(8, 5_000_000), 5_000_000)
+        }
+        fn candidate(&self) -> Candidate {
+            Candidate {
+                id: "peer".into(),
+                speaks: true,
+                head_hash: self.tip().0,
+                head_height: self.tip().1,
+                head_held: false,
+            }
+        }
+    }
+
+    /// Review round 2, mutation M2: the round and time guards in `next`
+    /// bound a peer that answers every request at once (no tick runs between
+    /// rounds, so the tick's own budget check never fires).
+    #[test]
+    fn a_fast_chaining_peer_is_bounded_by_the_episode_guards() {
+        for step in [Duration::from_millis(1), Duration::from_secs(1)] {
+            let mut me = Me::new(1_000, 1_100, 3, 0);
+            let d = Dripper::new(&mut me);
+            let mut a = AncestorSync::new();
+            let t0 = Instant::now();
+            a.note_deferred("peer", t0);
+            let view = View {
+                behind: true,
+                ..me.view()
+            };
+            let (req, _) = a.tick(t0, &view, &[d.candidate()], |h| Some(me.hash_at(h)));
+            let Some(Request::Locate { mut locator, .. }) = req else {
+                panic!("locate");
+            };
+            let mut rounds = 1u64;
+            let ours = |h: &Hash, height: u64| height <= 1_100 && *h == me.hash_at(height);
+            for k in 0..100_000u64 {
+                let now = t0 + step * u32::try_from(k).expect("k");
+                let (c, hs) = d.answer(&locator);
+                let _ = a.on_ancestor(
+                    "peer",
+                    c,
+                    d.tip(),
+                    u128::MAX,
+                    &hs,
+                    &view,
+                    now,
+                    NOW,
+                    ours,
+                    |h| me.header(h),
+                );
+                match a.next(now) {
+                    Some(Request::Locate { locator: l, .. }) => {
+                        locator = l;
+                        rounds += 1;
+                    }
+                    _ => break,
+                }
+            }
+            let cap = u64::from(EPISODE_MAX_ROUNDS)
+                .min(EPISODE_MAX_DURATION.as_millis() as u64 / step.as_millis() as u64 + 1);
+            assert!(
+                rounds <= cap,
+                "{rounds} rounds at {step:?} a round (cap {cap})"
+            );
+        }
+    }
+
+    /// Review round 2, mutation M1: an episode that ran out of budget with
+    /// nothing fetched backs off like a fault: the cooldown doubles.
+    #[test]
+    fn an_empty_budget_backs_off_like_a_fault() {
+        let me = Me::new(100, 120, 3, 0);
+        let peer = Peer {
+            fork: 100,
+            len: 50,
+            per: 4,
+            claim: None,
+        };
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        let start = |a: &mut AncestorSync, t: Instant| {
+            a.note_deferred("peer", t);
+            a.tick(t, &me.view(), &[peer.candidate()], |h| Some(me.hash_at(h)))
+                .0
+        };
+        assert!(start(&mut a, t0).is_some());
+        assert_eq!(
+            a.end(Outcome::Budget { fetched: 0 }, t0),
+            Some(Outcome::Budget { fetched: 0 })
+        );
+        let t1 = t0 + COOLDOWN_BASE;
+        assert!(
+            start(&mut a, t1).is_some(),
+            "the first cooldown is the base"
+        );
+        let _ = a.end(Outcome::Budget { fetched: 0 }, t1);
+        assert_eq!(
+            start(&mut a, t1 + COOLDOWN_BASE),
+            None,
+            "the second empty budget doubles the cooldown"
+        );
+        assert!(start(&mut a, t1 + COOLDOWN_BASE * 2).is_some());
+    }
+
+    /// Review round 2, fix (c): resumable budget endings that leave the
+    /// applied tip where it was stop being free after MAX_IDLE_BUDGETS.
+    #[test]
+    fn idle_budgets_in_a_row_cool_the_peer() {
+        let me = Me::new(100, 120, 3, 0);
+        let peer = Peer {
+            fork: 100,
+            len: 50,
+            per: 4,
+            claim: None,
+        };
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        let start = |a: &mut AncestorSync, t: Instant, view: &View| {
+            a.note_deferred("peer", t);
+            a.tick(t, view, &[peer.candidate()], |h| Some(me.hash_at(h)))
+                .0
+        };
+        let view = me.view();
+        for k in 1..MAX_IDLE_BUDGETS {
+            assert!(
+                start(&mut a, t0, &view).is_some(),
+                "budget {k} restarts at once"
+            );
+            let _ = a.end(Outcome::Budget { fetched: 5 }, t0);
+        }
+        assert!(start(&mut a, t0, &view).is_some());
+        let _ = a.end(Outcome::Budget { fetched: 5 }, t0);
+        assert_eq!(
+            start(&mut a, t0, &view),
+            None,
+            "idle budgets cooled the peer"
+        );
+        // Progress resets it: the applied tip moved during the episode.
+        let t1 = t0 + COOLDOWN_BASE * 4;
+        assert!(start(&mut a, t1, &view).is_some());
+        let moved = View {
+            applied: (hb(7, 121), 121),
+            ..view
+        };
+        let _ = a.tick(t1, &moved, &[peer.candidate()], |h| Some(me.hash_at(h)));
+        let _ = a.end(Outcome::Budget { fetched: 5 }, t1);
+        assert!(
+            start(&mut a, t1, &moved).is_some(),
+            "a moving tip restarts at once"
+        );
+    }
+
+    /// Review round 2, fix (b): only an in-flight body request stands the
+    /// tick and pipeline aside; header paging never does.
+    #[test]
+    fn only_a_body_request_in_flight_owns_sync() {
+        let mut me = Me::new(1_000, 1_100, 3, 0);
+        let peer = Peer {
+            fork: 1_000,
+            len: 600,
+            per: 4,
+            claim: None,
+        };
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        a.note_deferred("peer", t0);
+        let mut saw_bodies = false;
+        for tick in 0..20_000u64 {
+            let now = t0 + Duration::from_millis(tick);
+            let view = me.view();
+            let (req, ended) = a.tick(now, &view, &[peer.candidate()], |h| {
+                (h <= me.tip).then(|| me.hash_at(h))
+            });
+            if ended.is_some() {
+                break;
+            }
+            match req {
+                Some(Request::Locate { locator, .. }) => {
+                    assert!(!a.owns_sync(), "a locate in flight");
+                    let _ = reply(&mut a, &me, &peer, &locator, now);
+                    assert!(!a.owns_sync(), "between header pages");
+                }
+                Some(Request::Bodies { from, height, .. }) => {
+                    saw_bodies = true;
+                    assert!(a.owns_sync(), "a body request in flight");
+                    for x in height..=height + u64::from(BODY_WINDOW) {
+                        if x <= peer.tip().1 {
+                            me.held.insert(peer.hash_at(x));
+                        }
+                    }
+                    let held = me.held.clone();
+                    let _ = a.on_blocks("peer", &[from], now, |h| held.contains(h));
+                    assert!(!a.owns_sync(), "the body answer is in");
+                }
+                None => {}
+            }
+        }
+        assert!(saw_bodies);
     }
 }

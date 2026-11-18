@@ -236,9 +236,11 @@ pub const MAX_DEFERRED_CLAIM_PEERS: usize = 256;
 /// A deferred claim counts for this long after it was last renewed.
 pub const DEFERRED_CLAIM_TTL: Duration = Duration::from_secs(120);
 
-/// How far above the higher of its current head and this node's applied tip
-/// one uncorroborated deferred block may raise the advertised head of the
-/// peer that delivered it: the undo window. The node-wide evidence
+/// How far above the higher of this node's applied tip and the corroborated
+/// deferred height an uncorroborated deferred block may raise the advertised
+/// head of the peer that delivered it: the undo window. Measured from those
+/// two, never from the peer's own previous head, so repeated claims cannot
+/// ratchet it upward (review round 2, P3). The node-wide evidence
 /// (`max_seen_height`) never moves on an uncorroborated claim; a peer's own
 /// head is advertised and unverified by design (the selector and the timeout
 /// penalty box treat it so), and refreshing it from that peer's relays keeps
@@ -342,21 +344,21 @@ impl DeferredHeights {
 /// either). A block this node admitted, or already holds, is verified. A
 /// deferred block raises it when the deferred claims of other peers
 /// corroborate its height, or when it is no more than
-/// [`UNCORROBORATED_HEAD_LEAD`] above the higher of the peer's current head
-/// and this node's applied tip: a lone peer's far-ahead claim never moves its
-/// head, and one relaying peer still keeps its head fresh during a cold sync.
+/// [`UNCORROBORATED_HEAD_LEAD`] above the higher of this node's applied tip
+/// and the corroborated height: a lone peer's far-ahead claim never moves its
+/// head (not even step by step), and one relaying peer still keeps its head
+/// fresh during a cold sync.
 pub fn gossip_raises_head(
     verified: bool,
     height: u64,
     corroborated: Option<u64>,
-    peer_head: u64,
     applied: u64,
 ) -> bool {
     verified
         || corroborated.is_some_and(|c| height <= c)
         || height
-            <= peer_head
-                .max(applied)
+            <= applied
+                .max(corroborated.unwrap_or(0))
                 .saturating_add(UNCORROBORATED_HEAD_LEAD)
 }
 
@@ -388,13 +390,7 @@ pub async fn raise_deferred_head(
         return;
     };
     let mut info = p.info.write().await;
-    if gossip_raises_head(
-        false,
-        block.header.height,
-        corroborated,
-        info.head_height,
-        applied,
-    ) {
+    if gossip_raises_head(false, block.header.height, corroborated, applied) {
         info.observe_gossiped_head(
             block.header.height,
             block.header.block_hash,
@@ -1974,19 +1970,37 @@ mod deferred_height_evidence {
         assert_eq!(d.corroborated(now), Some(1_000_000 - 101));
     }
 
+    /// Review round 2, P3: claims stepping up one lead at a time do not
+    /// ratchet a lone peer's head: the bound is our tip, not its last head.
+    #[test]
+    fn a_lone_peers_head_cannot_ratchet() {
+        let applied = 100;
+        let mut head = 0u64;
+        for step in 1..=10u64 {
+            let claim = applied + step * UNCORROBORATED_HEAD_LEAD;
+            if gossip_raises_head(false, claim, None, applied) {
+                head = head.max(claim);
+            }
+        }
+        assert_eq!(head, applied + UNCORROBORATED_HEAD_LEAD);
+    }
+
     #[test]
     fn the_head_rule_needs_verification_corroboration_or_a_bounded_lead() {
-        assert!(gossip_raises_head(true, u64::MAX, None, 0, 0));
-        assert!(gossip_raises_head(false, 10, Some(10), 0, 0));
+        assert!(gossip_raises_head(true, u64::MAX, None, 0));
+        assert!(gossip_raises_head(false, 10, Some(10), 0));
+        assert!(gossip_raises_head(false, 900, None, 50), "within the lead");
+        let cap = 50 + UNCORROBORATED_HEAD_LEAD;
+        assert!(gossip_raises_head(false, cap, None, 50));
+        assert!(!gossip_raises_head(false, cap + 1, None, 50));
+        assert!(gossip_raises_head(
+            false,
+            70 + UNCORROBORATED_HEAD_LEAD,
+            Some(70),
+            50
+        ));
         assert!(
-            gossip_raises_head(false, 900, None, 100, 50),
-            "within the lead"
-        );
-        let cap = 100 + UNCORROBORATED_HEAD_LEAD;
-        assert!(gossip_raises_head(false, cap, None, 100, 50));
-        assert!(!gossip_raises_head(false, cap + 1, None, 100, 50));
-        assert!(
-            !gossip_raises_head(false, 1_000_000, None, 0, 11),
+            !gossip_raises_head(false, 1_000_000, None, 11),
             "a far-ahead lone claim"
         );
     }
