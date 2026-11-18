@@ -2490,4 +2490,108 @@ mod tests {
         }
         assert!(a.cooldown.len() <= MAX_COOLDOWN_PEERS);
     }
+
+    /// PR #483 review round 2, P1-1 (the reviewer's PoC, adapted). One peer
+    /// must not be able to hold the sync tick and pipeline aside: it serves a real side block S this node already holds
+    /// (fully admitted, not on the executed chain) followed by fabricated,
+    /// structurally valid headers claiming huge work, dripping one header per
+    /// locate just inside REQUEST_TIMEOUT. `advance` pops S, so every episode
+    /// ends `Budget { fetched: 1 }`: zero cooldown, failures reset, and the
+    /// next episode with the same peer starts on the same tick.
+    #[test]
+    fn a_peer_serving_a_held_side_block_and_fake_work_cannot_own_sync() {
+        let mut me = Me::new(1_000, 1_100, 3, 0);
+        let common = (me.hash_at(1_099), 1_099u64);
+        let s_hash = hb(9, 1_100);
+        let s_hdr = header(s_hash, common.0, 1_100, me.score_at(1_099) + 1);
+        me.held.insert(s_hash);
+        let fake = |k: u64| -> BlockHeader {
+            let parent = if k == 1 { s_hash } else { hb(8, 1_100 + k - 1) };
+            header(hb(8, 1_100 + k), parent, 1_100 + k, 10_000_000 + k)
+        };
+        let tip = (hb(8, 5_000_000), 5_000_000u64);
+        let cand = Candidate {
+            id: "peer".into(),
+            speaks: true,
+            head_hash: tip.0,
+            head_height: tip.1,
+            head_held: false,
+        };
+        let answer = |locator: &[Hash]| -> (Option<(Hash, u64)>, Vec<BlockHeader>) {
+            if let Some(k) = (1..100_000u64).find(|k| locator.first() == Some(&hb(8, 1_100 + k))) {
+                return (Some((hb(8, 1_100 + k), 1_100 + k)), vec![fake(k + 1)]);
+            }
+            (Some(common), vec![s_hdr.clone(), fake(1)])
+        };
+        let ours = |h: &Hash, height: u64| height <= 1_100 && *h == me.hash_at(height);
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        let drip = REQUEST_TIMEOUT - Duration::from_secs(1);
+        let mut pending: Option<(Instant, Vec<Hash>)> = None;
+        let total = 3 * 3_600u64;
+        let mut owned = 0u64;
+        let mut outcomes: HashMap<String, u64> = HashMap::new();
+        for sec in 0..total {
+            let now = t0 + Duration::from_secs(sec);
+            let view = View {
+                behind: true,
+                ..me.view()
+            };
+            if let Some((due, locator)) = pending.clone() {
+                if now >= due {
+                    pending = None;
+                    let (c, hs) = answer(&locator);
+                    if let Some(o) =
+                        a.on_ancestor("peer", c, tip, u128::MAX, &hs, &view, now, NOW, ours, |h| {
+                            me.header(h)
+                        })
+                    {
+                        *outcomes.entry(format!("{o:?}")).or_insert(0) += 1;
+                    }
+                    let held = me.held.clone();
+                    a.advance(|h| held.contains(h));
+                    if let Some(Request::Locate { locator, .. }) = a.next(now) {
+                        pending = Some((now + drip, locator));
+                    }
+                }
+            }
+            let held = me.held.clone();
+            a.advance(|h| held.contains(h));
+            let (req, ended) = a.tick(now, &view, &[cand.clone()], |h| {
+                (h <= me.tip).then(|| me.hash_at(h))
+            });
+            if let Some(o) = ended {
+                *outcomes.entry(format!("{o:?}")).or_insert(0) += 1;
+                pending = None; // the attacker never answers a stale request
+            }
+            // main.rs samples owns_sync right after run_tick.
+            if a.owns_sync() {
+                owned += 1;
+            }
+            if let Some(Request::Locate { locator, .. }) = req {
+                // A new episode's first locate: answered at once.
+                let (c, hs) = answer(&locator);
+                if let Some(o) =
+                    a.on_ancestor("peer", c, tip, u128::MAX, &hs, &view, now, NOW, ours, |h| {
+                        me.header(h)
+                    })
+                {
+                    *outcomes.entry(format!("{o:?}")).or_insert(0) += 1;
+                }
+                let held = me.held.clone();
+                a.advance(|h| held.contains(h));
+                if let Some(Request::Locate { locator, .. }) = a.next(now) {
+                    pending = Some((now + drip, locator));
+                }
+            }
+        }
+        eprintln!(
+            "owned {owned}/{total} ticks; outcomes {outcomes:?}; {}",
+            a.summary()
+        );
+        assert!(
+            owned * 2 < total,
+            "one peer held the sync tick and pipeline aside for {owned} of {total} s: {outcomes:?}"
+        );
+    }
 }
