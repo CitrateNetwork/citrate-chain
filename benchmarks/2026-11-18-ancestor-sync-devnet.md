@@ -49,3 +49,25 @@ Ground truth matched in every run.
 - Expected: on a single node nothing defers and no peer exists, so the
   ancestor-sync driver never starts an episode; the hot path gains one
   version check in `Peer::send` and the per-tick driver call.
+
+## Re-run after review round 1 and the serving-cost fix (2026-11-18, later)
+
+The head now includes the storage change (`hashes_in_height_range` reads the
+sibling height index for bounded ranges) and the review-round-1 driver changes.
+Same host, harness and settings; both binaries rebuilt (`--locked`), runs
+sequential on an otherwise idle host.
+
+- **Head:** `a3965fb5` node code, sha256 `10c691d208e8b1c2…`.
+- **Base:** `f4a0e600`, sha256 `6d520ba0a4bc9abe…`.
+
+| Run | Signers | Attempted / included | Timeouts | Included tx/s | Avg inclusion latency |
+|---|---:|---:|---:|---:|---:|
+| base | 64 | 18,001 / 18,001 | 0 | 278.03 | 3,846 ms |
+| head | 64 | 18,000 / 18,000 | 0 | 276.88 | 3,926 ms |
+| base | 256 | 18,001 / 18,001 | 0 | 278.07 | 3,543 ms |
+| head | 256 | 18,001 / 18,001 | 0 | 285.36 | 3,878 ms |
+
+Ground truth matched in every run; nothing was rejected (the head-64 run's
+rate limiter attempted one transaction fewer inside its 60 s deadline).
+64 signers: −0.4% vs base. 256 signers: +2.6%. Inside the 10% bound; the
+latency differences are within one slot and within run-to-run spread.
