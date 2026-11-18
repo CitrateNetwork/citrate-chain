@@ -2889,4 +2889,77 @@ mod tests {
         }
         assert!(saw_bodies);
     }
+
+    /// PR #483 review round 3, P1: K peers taking turns. Each serves a valid
+    /// high-work header chain and then never delivers a body. Cooldowns are
+    /// per peer but standing the tick aside is node-wide, so a body request
+    /// in flight must not stand anything aside until this episode's own body
+    /// answer has had a block admitted.
+    #[test]
+    fn rotating_sybils_with_fabricated_headers_cannot_own_sync() {
+        let me = Me::new(1_000, 1_100, 3, 0);
+        let peer = Peer {
+            fork: 1_000,
+            len: 200,
+            per: 4,
+            claim: None,
+        };
+        let k = 32usize;
+        let ids: Vec<String> = (0..k).map(|i| format!("s{i}")).collect();
+        let cands: Vec<Candidate> = ids
+            .iter()
+            .map(|id| Candidate {
+                id: id.clone(),
+                ..peer.candidate()
+            })
+            .collect();
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        let total = 3_600u64;
+        let mut owned = 0u64;
+        let mut bodies = 0u64;
+        for sec in 0..total {
+            let now = t0 + Duration::from_secs(sec);
+            for id in &ids {
+                a.note_deferred(id, now);
+            }
+            let view = View {
+                behind: true,
+                ..me.view()
+            };
+            let (mut req, _) = a.tick(now, &view, &cands, |h| Some(me.hash_at(h)));
+            // Every locate is answered at once; no body ever is.
+            while let Some(Request::Locate { peer: who, locator }) = req.clone() {
+                let (common, headers) = peer.answer(&locator);
+                let held = me.held.clone();
+                let out = a.on_ancestor(
+                    &who,
+                    common,
+                    peer.tip(),
+                    peer.tip_work(),
+                    &headers,
+                    &view,
+                    now,
+                    NOW,
+                    |h, _| held.contains(h),
+                    |h| me.header(h),
+                );
+                if out.is_some() {
+                    break;
+                }
+                req = a.next(now);
+            }
+            if matches!(req, Some(Request::Bodies { .. })) {
+                bodies += 1;
+            }
+            if a.owns_sync() {
+                owned += 1;
+            }
+        }
+        assert!(bodies > 0, "fixture: the sybils got to the body phase");
+        assert!(
+            owned * 100 < total,
+            "{k} rotating peers held the sync tick aside for {owned} of {total} s ({bodies} body requests)"
+        );
+    }
 }
