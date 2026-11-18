@@ -3507,8 +3507,10 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                 // the applied tip), find the common ancestor with a 1.3 peer
                 // whose head we do not hold, verify that branch's headers and
                 // claimed work, and fetch its bodies from the fork point up.
-                // While an episode is fetching a branch below our tip, the
-                // pipeline and the tick's own request stand aside.
+                // The pipeline and the tick's own request stand aside only while
+                // a body request is in flight to a peer whose earlier body
+                // answer in the same episode had a block admitted
+                // (`AncestorSync::owns_sync`).
                 let ancestor_owns = {
                     let handles: Vec<Arc<citrate_network::peer::Peer>> =
                         connected_peers.iter().map(|(_, p)| p.clone()).collect();
@@ -3573,8 +3575,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     pipe_log_delivered = st.delivered_blocks;
                     pipe_log_at = std::time::Instant::now();
                 }
-                // ancestor_sync.rs: while an episode fetches a branch below our
-                // tip, the tick asks nothing itself.
+                // ancestor_sync.rs: while `owns_sync` (a body request in flight
+                // to a peer that already delivered an admitted block in this
+                // episode), the tick asks nothing itself.
                 let request_peer: Option<Arc<citrate_network::peer::Peer>> = if ancestor_owns {
                     None
                 } else if let Some(id) = chosen_id {

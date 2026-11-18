@@ -1689,7 +1689,8 @@ impl Node {
                 })
                 .collect();
         // main.rs: ancestor sync, then the pipeline and the tick's own request
-        // stand aside while an episode fetches a branch below our tip.
+        // stand aside only while `AncestorSync::owns_sync` (a body request in
+        // flight after this episode already had a block admitted).
         let ancestor_owns = if ancestor_on {
             let cands = crate::ancestor_sync::candidates(connected, &self.adm).await;
             let finalized = self.app.finalized_height_handle().load(Ordering::SeqCst);

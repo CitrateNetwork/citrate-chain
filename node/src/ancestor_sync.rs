@@ -473,16 +473,19 @@ impl AncestorSync {
             .filter(|at| now.saturating_duration_since(*at) < EVIDENCE_TTL)
     }
 
-    /// A body request of the running episode is in flight. Only then do the
-    /// sync tick's own request and the pipeline stand aside; locating and
-    /// header paging never do, however much work the headers claim (PR #483
-    /// review rounds 1 and 2: a peer dripping fabricated high-work headers
-    /// held the tick aside for 99% of the time, because no body was ever
-    /// requested and so admission never got to reject the claim).
+    /// A body request of the running episode is in flight AND an earlier
+    /// body answer of this same episode already had a block admitted. Only
+    /// then do the sync tick's own request and the pipeline stand aside.
+    /// Locating, header paging and an episode's first body request never do,
+    /// however much work the headers claim (PR #483 review rounds 1 to 3: a
+    /// peer dripping fabricated headers held the tick aside for 99% of the
+    /// time; then 32 peers taking turns, each asked for one body it never
+    /// delivered, held it aside for 88%). A peer earns the stand-aside only
+    /// by delivering a block admission accepted.
     pub fn owns_sync(&self) -> bool {
         self.episode
             .as_ref()
-            .is_some_and(|e| matches!(e.asked, Some(Asked::Bodies { .. })))
+            .is_some_and(|e| e.fetched > 0 && matches!(e.asked, Some(Asked::Bodies { .. })))
     }
 
     /// Move the body cursor past every buffered header whose block this node
@@ -2842,10 +2845,11 @@ mod tests {
         );
     }
 
-    /// Review round 2, fix (b): only an in-flight body request stands the
-    /// tick and pipeline aside; header paging never does.
+    /// Review rounds 2 and 3: only a body request in flight AFTER this
+    /// episode's own body answer had a block admitted stands the tick and
+    /// pipeline aside; header paging and the first body request never do.
     #[test]
-    fn only_a_body_request_in_flight_owns_sync() {
+    fn only_a_body_request_after_a_delivered_window_owns_sync() {
         let mut me = Me::new(1_000, 1_100, 3, 0);
         let peer = Peer {
             fork: 1_000,
@@ -2856,7 +2860,7 @@ mod tests {
         let mut a = AncestorSync::new();
         let t0 = Instant::now();
         a.note_deferred("peer", t0);
-        let mut saw_bodies = false;
+        let mut bodies = 0u32;
         for tick in 0..20_000u64 {
             let now = t0 + Duration::from_millis(tick);
             let view = me.view();
@@ -2873,8 +2877,18 @@ mod tests {
                     assert!(!a.owns_sync(), "between header pages");
                 }
                 Some(Request::Bodies { from, height, .. }) => {
-                    saw_bodies = true;
-                    assert!(a.owns_sync(), "a body request in flight");
+                    bodies += 1;
+                    if bodies == 1 {
+                        assert!(
+                            !a.owns_sync(),
+                            "the first body request: nothing delivered yet"
+                        );
+                    } else {
+                        assert!(
+                            a.owns_sync(),
+                            "a body request after a delivered, admitted window"
+                        );
+                    }
                     for x in height..=height + u64::from(BODY_WINDOW) {
                         if x <= peer.tip().1 {
                             me.held.insert(peer.hash_at(x));
@@ -2887,7 +2901,7 @@ mod tests {
                 None => {}
             }
         }
-        assert!(saw_bodies);
+        assert!(bodies > 1);
     }
 
     /// PR #483 review round 3, P1: K peers taking turns. Each serves a valid
@@ -2956,6 +2970,7 @@ mod tests {
                 owned += 1;
             }
         }
+        eprintln!("sybils: owned {owned}/{total} s, {bodies} body requests");
         assert!(bodies > 0, "fixture: the sybils got to the body phase");
         assert!(
             owned * 100 < total,

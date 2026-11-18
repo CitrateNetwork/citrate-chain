@@ -114,9 +114,12 @@ request in flight:
    recomputed (G7 rejects a header that lied about its work). An answer that
    stores no new header-chain block is a stall; four end the episode.
 
-Only while a body request of the episode is in flight do the tick's own
-applied-tip request and the #477 pipeline stand aside (they would only re-ask
-the anchor the peer does not hold). Locating and header paging never stand
+Only while a body request of the episode is in flight, and an earlier body
+answer of the same episode already had a block admitted, do the tick's own
+applied-tip request and the #477 pipeline stand aside (review round 3: per-peer
+cooldowns do not bound a node-wide stand-aside, so 32 peers taking turns, each
+asked for one body it never delivered, held it for 88% of the time). They would only re-ask the anchor the peer
+does not hold. Locating and header paging never stand
 anything aside, however much work the headers claim: headers carry no
 signature, so a claimed work is only refuted once a body is admitted (review
 round 2: a peer dripping fabricated high-work headers on top of a side block
