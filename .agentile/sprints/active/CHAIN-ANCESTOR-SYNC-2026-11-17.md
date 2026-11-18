@@ -78,6 +78,51 @@ two touch `main.rs`, `sync_peer.rs` and `split_heal_tests.rs` in different place
   calls `observe_gossiped_head` on the raw block.
 - Tests: `sync_peer::deferred_height_evidence` (6, incl. a tripwire on main.rs).
 
+## WP-5 Serving cost
+
+- [x] `BlockStore::hashes_in_height_range` reads the sibling height index for
+  ranges up to 4,096 heights (every `GetBlocks` answer) instead of scanning
+  every stored header. Found while profiling the slow deep-split runs: half
+  their CPU was `serve_blocks` -> `hashes_in_height_range` deserializing every
+  header.
+- Tests: `block_store::height_range_tests::a_bounded_range_holds_every_sibling_and_nothing_else`,
+  `a_bounded_range_does_not_scan_every_header` (red: "200 bounded ranges took
+  72.689574752s; one full scan takes 318.36695ms").
+
+## WP-6 Review round 1 (PR #483, 2026-11-18)
+
+- [x] P1-1: the pipeline and the tick stand aside only in the body phase
+  (fork found AND work gate passed); every episode is bounded by 120 s and 512
+  requests (refused requests count; four in a row end it); a header phase that
+  spans the reorg window without beating our work ends NotHeavier; a budget
+  end is resumable (`Budget`), with no cooldown when it delivered bodies.
+  Tests: `a_slow_drip_header_peer_never_owns_sync_and_is_bounded`,
+  `refused_requests_end_the_episode`, `an_honest_fetch_past_the_budget_resumes`.
+- [x] P1-2: `a_heavier_branch_below_our_height_is_rejoined` and
+  `without_ancestor_sync_a_heavier_branch_below_our_height_is_not_rejoined`:
+  the heavier branch is below the light nodes' height (four producers every
+  other slot against one every slot, 4,000 slots); driver off, the light
+  followers never rejoin; driver on, they do. Getting there exposed two
+  driver defects, now fixed: a head counted as held when its block was merely
+  stored (deferred blocks are stored, not admitted), and candidates were
+  chosen by advertised heads that relayed gossip had set to our own tip. The
+  driver now asks the peers that delivered deferred blocks first, and counts
+  a block held only when fully admitted. Rounds go out on the answer, not the
+  next tick.
+- [x] P2: `DeferredHeights` counts only connected peers (dropped on
+  disconnect), with a 120 s TTL and oldest-first eviction; a peer's own head
+  may rise from an uncorroborated deferred block up to the undo window above
+  max(its head, our tip). Tests: `a_reconnecting_attacker_does_not_corroborate_itself`,
+  `claims_expire`, `a_cold_node_with_one_relaying_peer_of_two_reaches_the_tip`.
+- [x] P3: `a_held_common_block_not_in_the_locator_is_faulty`;
+  `stored_side_blocks_do_not_make_a_deep_fork_look_shallow` (the fork point
+  is the last header on our executed chain); the serving plane skips
+  `GetAncestor` from peers below 1.3 and no longer refreshes the requester's
+  reported head from the locator; an honest catch-up past the header cap ends
+  `Budget` (not Faulty).
+- [x] CI: `deny.toml` ignore for RUSTSEC-2026-0543 (chrono unmaintained), own
+  commit.
+
 ## Verification (cnv-build-2, Ubuntu 24.04, rustc 1.96.0; no cargo on the Mac)
 
 | What | Result |

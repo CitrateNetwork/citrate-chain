@@ -85,16 +85,22 @@ request in flight:
 
 1. **Locate** when there is evidence of a branch this node lacks (a block that
    deferred on a missing parent in the last 30 s, or a sync target above the
-   applied tip), against a 1.3 peer whose advertised head this node does not
-   store, highest head first, with a per-peer cooldown (30 s, doubling per
-   failure to 30 min).
+   applied tip), against a 1.3 peer with a per-peer cooldown (30 s, doubling
+   per failure to 30 min). Peers that DELIVERED a deferred block are asked
+   first, most recent first; then peers whose advertised head is not fully
+   admitted here, highest first. An advertised head alone is weak evidence:
+   relayed gossip raises the relaying peer's head whether or not it holds the
+   block's branch (in the review's scenario every heavy peer's head was the
+   light node's own tip). "Held" always means fully admitted (chain store and
+   DAG): a block that deferred is stored but not admitted.
 2. **Headers.** Each reply must name a common block that was in the locator
    sent. Each header must link to the one before it by selected parent, be one
    height higher, have a strictly higher blue score, carry
    `blue_work == blue_work_for_score(blue_score)` (CV-3), and not be more than
    15 s in the future. The first header continues from the common block, whose
-   header this node holds. The true fork point is the last header whose block
-   this node already holds.
+   header this node holds. The true fork point is the last header that is on
+   this node's EXECUTED chain (the canonical index at its height): a side
+   block it merely stores never makes a fork look shallower.
 3. **Work gate.** Bodies are fetched only once a verified header claims more
    blue work than this node's applied tip. If the peer's reported tip work, or
    every header up to its tip, claims no more, the episode ends
@@ -108,9 +114,19 @@ request in flight:
    recomputed (G7 rejects a header that lied about its work). An answer that
    stores no new header-chain block is a stall; four end the episode.
 
-While an episode is fetching a branch below the applied tip, the tick's own
-applied-tip request and the #477 pipeline stand aside (they would only re-ask
-the anchor the peer does not hold).
+Only in the body phase (fork below the applied tip AND the work gate passed)
+do the tick's own applied-tip request and the #477 pipeline stand aside (they
+would only re-ask the anchor the peer does not hold). Locating and header
+paging never stand anything aside. Each round's next request goes out as soon
+as its answer is in (`AncestorSync::next`), not on the next 2 s tick.
+
+Every episode is bounded whatever its peer does (review of #483, P1-1): 120 s
+and 512 requests (a request the sync manager refused counts; four refused in a
+row end the episode), and a header phase whose verified headers span the
+whole reorg window above the fork without beating our work ends `NotHeavier`.
+An episode that runs out of budget ends `Budget { fetched }`: resumable (what
+was fetched stays stored), with no cooldown when it delivered bodies, and the
+same doubling cooldown as a fault when it delivered nothing.
 
 Claimed heights, claimed work and the peer's reported tip only decide what to
 fetch. Fork choice stays with GHOSTDAG over admitted blocks, and whether the
@@ -126,6 +142,7 @@ rules.
 | Headers verified per episode | 2 x `MAX_REORG_DEPTH` (20,000) |
 | Header hashes held per episode | the same 20,000 (40 bytes each, under 1 MB) |
 | Episodes / requests in flight | 1 / 1 |
+| Episode duration / requests | 120 s / 512 (refused ones count; 4 in a row end it) |
 | Body window | 32 heights (`SyncConfig` batch) |
 | Request timeout | 15 s |
 | Stalled body answers | 4 |
@@ -165,19 +182,56 @@ the canonical branch. Every r1007 branch is in this state today (fork about
 ### D5. Height evidence must be verified or corroborated
 
 * `max_seen_height` from a deferred block: `sync_peer::DeferredHeights` keeps
-  each delivering peer's highest deferred claim (256 peers at most). A height
-  counts once two distinct peers' claims reach it (the second-highest claim),
-  then goes through the existing clamp (`record_unverified_height`). A node with
-  a single connected peer counts that peer's claim (it has nothing to
-  corroborate with). A "known proposers only" filter was rejected: the known set
-  is filled only from admitted blocks (`AttestedNetworkHead::observe`), so a
-  cold node would never count the network head.
+  each delivering peer's highest deferred claim (256 peers at most, oldest
+  dropped first; 120 s TTL). Only peers in the sync tick's current connected
+  set count, and a peer's claims are dropped when it disconnects, so a peer
+  that reconnects under a fresh key is still one peer. A height counts once
+  two connected peers' live claims reach it (the second-highest claim), then
+  goes through the existing clamp (`record_unverified_height`). A node with a
+  single connected peer counts that peer's claim. A "known proposers only"
+  filter was rejected: the known set is filled only from admitted blocks
+  (`AttestedNetworkHead::observe`), so a cold node would never count the
+  network head.
 * A peer's advertised head (`PeerInfo::head_height`) rises from gossip only
-  after validation and admission: a block this node admitted or already holds,
-  or a deferred block up to the corroborated height
-  (`sync_peer::gossip_raises_head`). A relayed tip block from several peers still
-  keeps honest heads fresh during a cold sync; a lone peer's claim no longer
-  moves its own head, the sync target or peer selection.
+  after validation and admission: a block this node admitted or already holds;
+  a deferred block up to the corroborated height; or a deferred block no more
+  than the undo window (10,000) above the higher of that peer's head and this
+  node's applied tip (`sync_peer::gossip_raises_head`). So a lone peer's
+  far-ahead claim never moves its head or the node-wide evidence, while one
+  relaying peer among several still keeps its own head fresh for a cold node.
+  A peer's head is advertised and unverified by design; the selector's timeout
+  penalty box handles a peer that is not where it says.
+* The serving plane does not build an `Ancestor` reply for a peer below 1.3,
+  and a `GetAncestor` does not refresh the requester's self-reported head.
+
+### D5b. A scenario the 1.2 recovery cannot heal
+
+`split_heal_tests::a_heavier_branch_below_our_height_is_rejoined` and
+`without_ancestor_sync_a_heavier_branch_below_our_height_is_not_rejoined`: the
+heavier branch is BELOW the light nodes' height (four producers every other
+slot, four blue blocks per height, against one producer every slot), 4,000
+slots apart: light 4,000 above the fork and 2,000 above the heavy tip, heavy
+2,000 deep. No peer is ahead, no heavy peer is inside the split-pull band, and
+the missing-parent walk's node-wide budget cannot descend 2,000 heights in the
+40 slots allowed. With every node on 1.2 the light followers never rejoin (3
+of 3 runs); with 1.3 they rejoin by slot 2 (3 of 3). The light producer itself
+rejoins either way through the producer gate's resync request; followers have
+no such gate.
+
+### D6. Serving a block window costs the window, not the store
+
+Every `GetBlocks` answer (the tick's, the walk's, the pipeline's and an
+episode's body windows) reads one bounded height range through
+`BlockStore::hashes_in_height_range`, which scanned every header in
+`CF_HEADERS`. On r1007 that is about a million headers per node per answer,
+which matches the serving plane falling behind (`serve lane over budget
+GetBlocks=5717`) and recovery requests going `Unanswered` / `InFlightCap` at
+the split. A range of at most 4,096 heights now reads the S3-7 sibling height
+index (`hsib:` ‖ height ‖ hash, written and removed in the same batch as the
+block) one height at a time; wider or open-ended ranges (start-up purge,
+rollback planner) and stores without the index keep the full scan. Measured on
+cnv-build-2 (debug, 18,000 blocks): 200 32-height ranges took 72.7 s before
+(one full scan 318 ms each), now well under one full scan.
 
 ## P2P compatibility during a rolling upgrade
 
