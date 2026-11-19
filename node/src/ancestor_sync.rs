@@ -178,8 +178,21 @@ pub enum Outcome {
     Fetched { fork: u64, top: u64 },
     /// The fork point is below the reorg floor (the finalized checkpoint, or
     /// more than the undo window below the applied tip). No body was fetched.
-    /// An operator re-seed is the recovery for a node stranded on such a fork.
-    TooDeep { fork: u64, depth: u64, floor: u64 },
+    /// A node stranded on such a fork needs a resync (`dead_branch.rs` decides
+    /// when the evidence is strong enough to do it automatically).
+    ///
+    /// `fork_hash` is the fork point's block. `diverged` is the first header
+    /// of the peer's branch that is not on our executed chain, set only when
+    /// the episode located the fork exactly and that header verified as the
+    /// child of our block at the fork (`verify_headers`); `None` for a fork
+    /// below the finalized checkpoint (I4), where no header is checked.
+    TooDeep {
+        fork: u64,
+        depth: u64,
+        floor: u64,
+        fork_hash: Hash,
+        diverged: Option<Hash>,
+    },
     /// The peer holds none of our locator on its executed chain.
     NoCommon,
     /// The reply broke the protocol (a common block we never sent, headers
@@ -280,22 +293,37 @@ pub fn verify_headers(
 /// `floor` and genesis. `lookup(h)` names the executed chain's block at `h`
 /// (`sync_rejoin::anchor_at_height`); a height it cannot name is skipped. At
 /// most [`MAX_LOCATOR_HASHES`] hashes, no repeats, newest first.
+#[cfg(test)]
 pub fn build_locator(
     applied: (Hash, u64),
     floor: (Hash, u64),
     genesis: Hash,
     lookup: impl Fn(u64) -> Option<Hash>,
 ) -> Vec<Hash> {
+    build_locator_with_heights(applied, floor, genesis, lookup)
+        .into_iter()
+        .map(|(h, _)| h)
+        .collect()
+}
+
+/// The locator for this node's executed chain (see `build_locator`), with the
+/// height of each entry (genesis at 0).
+pub fn build_locator_with_heights(
+    applied: (Hash, u64),
+    floor: (Hash, u64),
+    genesis: Hash,
+    lookup: impl Fn(u64) -> Option<Hash>,
+) -> Vec<(Hash, u64)> {
     let budget = MAX_LOCATOR_HASHES.saturating_sub(2);
-    let mut out: Vec<Hash> = Vec::with_capacity(MAX_LOCATOR_HASHES);
+    let mut out: Vec<(Hash, u64)> = Vec::with_capacity(MAX_LOCATOR_HASHES);
     let mut seen: HashSet<Hash> = HashSet::new();
-    let mut push = |h: Hash, out: &mut Vec<Hash>| {
+    let mut push = |h: Hash, height: u64, out: &mut Vec<(Hash, u64)>| {
         if seen.insert(h) {
-            out.push(h);
+            out.push((h, height));
         }
     };
     if applied.1 > floor.1 {
-        push(applied.0, &mut out);
+        push(applied.0, applied.1, &mut out);
     }
     let mut height = applied.1;
     let mut step: u64 = 1;
@@ -309,15 +337,50 @@ pub fn build_locator(
         }
         height = next;
         if let Some(h) = lookup(height) {
-            push(h, &mut out);
+            push(h, height, &mut out);
         }
         listed = listed.saturating_add(1);
         if listed >= LOCATOR_DENSE {
             step = step.saturating_mul(2);
         }
     }
-    push(floor.0, &mut out);
-    push(genesis, &mut out);
+    push(floor.0, floor.1, &mut out);
+    push(genesis, 0, &mut out);
+    out
+}
+
+/// The locator that narrows a fork known to lie between our block `lo` (held
+/// on the peer's executed chain) and height `hi` (our block there is not):
+/// our executed chain's blocks at up to `MAX_LOCATOR_HASHES - 1` evenly
+/// spaced heights strictly between them, newest first, then `lo`. The peer's
+/// answer names the highest it holds, so each round shrinks the gap about
+/// 63-fold (a gap of 130,000 heights is closed in three rounds), and the
+/// headers above it then show the first block of its branch.
+pub fn refine_locator(
+    lo: (Hash, u64),
+    hi: u64,
+    lookup: impl Fn(u64) -> Option<Hash>,
+) -> Vec<(Hash, u64)> {
+    let gap = hi.saturating_sub(lo.1).saturating_sub(1);
+    let slots = (MAX_LOCATOR_HASHES.saturating_sub(1) as u64).min(gap);
+    let mut out: Vec<(Hash, u64)> = Vec::with_capacity(MAX_LOCATOR_HASHES);
+    let mut last = hi;
+    for i in (1..=slots).rev() {
+        // i * (gap + 1) / (slots + 1) is in 1..=gap and strictly increasing in i.
+        let off = i
+            .saturating_mul(gap.saturating_add(1))
+            .checked_div(slots.saturating_add(1))
+            .unwrap_or(0);
+        let height = lo.1.saturating_add(off);
+        if height <= lo.1 || height >= last {
+            continue;
+        }
+        last = height;
+        if let Some(h) = lookup(height) {
+            out.push((h, height));
+        }
+    }
+    out.push(lo);
     out
 }
 
@@ -383,8 +446,16 @@ enum Asked {
 struct Episode {
     peer: String,
     asked: Option<Asked>,
-    /// The base locator (our executed chain) of this episode.
-    locator: Vec<Hash>,
+    /// The base locator (our executed chain) of this episode, with heights.
+    base: Vec<(Hash, u64)>,
+    /// The locator of the request in flight, with heights.
+    sent: Vec<(Hash, u64)>,
+    /// The lowest height at which a locator entry we sent was NOT on the
+    /// peer's executed chain: the fork point is below it.
+    upper: Option<u64>,
+    /// A fork-point search is due: the fork lies between our block `.0`
+    /// (on the peer's chain) and height `.1` ([`refine_locator`]).
+    refine: Option<((Hash, u64), u64)>,
     /// The last verified header, the next reply continues from it.
     last: Option<Link>,
     /// The highest header-chain block this node holds: the fork point until
@@ -525,6 +596,7 @@ impl AncestorSync {
     pub fn next(&mut self, now: Instant) -> Option<Request> {
         let e = self.episode.as_mut()?;
         if e.asked.is_some()
+            || e.refine.is_some()
             || e.rounds >= EPISODE_MAX_ROUNDS
             || now.saturating_duration_since(e.started) >= EPISODE_MAX_DURATION
             || (e.fork.is_some() && e.tip_reached && e.headers.is_empty())
@@ -700,6 +772,23 @@ impl AncestorSync {
             if e.asked.is_some() {
                 return (None, ended);
             }
+            if let Some((lo, hi)) = e.refine.take() {
+                let sent = refine_locator(lo, hi, &lookup);
+                let locator: Vec<Hash> = sent.iter().map(|(h, _)| *h).collect();
+                e.sent = sent;
+                // The answer's common block is one of these: the headers
+                // continue from our own copy of it.
+                e.last = None;
+                e.held = None;
+                e.asked = Some(Asked::Locate {
+                    at: now,
+                    locator: locator.clone(),
+                });
+                e.rounds = e.rounds.saturating_add(1);
+                e.body_answered = false;
+                let peer = e.peer.clone();
+                return (Some(Request::Locate { peer, locator }), ended);
+            }
             if e.fork.is_some() && e.tip_reached && e.headers.is_empty() {
                 let fork = e.fork.map(|f| f.1).unwrap_or(0);
                 let top = e.held.map(|h| h.1).unwrap_or(0);
@@ -740,7 +829,8 @@ impl AncestorSync {
         else {
             return (None, ended);
         };
-        let locator = build_locator(view.applied, view.finalized, view.genesis, lookup);
+        let base = build_locator_with_heights(view.applied, view.finalized, view.genesis, lookup);
+        let locator: Vec<Hash> = base.iter().map(|(h, _)| *h).collect();
         let peer = pick.id.clone();
         self.episode = Some(Episode {
             peer: peer.clone(),
@@ -748,7 +838,10 @@ impl AncestorSync {
                 at: now,
                 locator: locator.clone(),
             }),
-            locator: locator.clone(),
+            sent: base.clone(),
+            base,
+            upper: None,
+            refine: None,
             last: None,
             held: None,
             fork: None,
@@ -776,14 +869,16 @@ impl AncestorSync {
         if want_headers && e.headers.len() < HEADER_BUFFER_CAP {
             // Resume from the last verified header; the rest of the base
             // locator lets the peer answer even if it reorged since.
-            let mut locator = vec![last.hash];
-            locator.extend(
-                e.locator
+            let mut sent = vec![(last.hash, last.height)];
+            sent.extend(
+                e.base
                     .iter()
                     .copied()
-                    .filter(|h| *h != last.hash)
+                    .filter(|(h, _)| *h != last.hash)
                     .take(MAX_LOCATOR_HASHES.saturating_sub(1)),
             );
+            let locator: Vec<Hash> = sent.iter().map(|(h, _)| *h).collect();
+            e.sent = sent;
             e.asked = Some(Asked::Locate {
                 at: now,
                 locator: locator.clone(),
@@ -869,6 +964,8 @@ impl AncestorSync {
                     fork: common_height,
                     depth: view.applied.1.saturating_sub(common_height),
                     floor,
+                    fork_hash: common_hash,
+                    diverged: None,
                 },
                 now,
             );
@@ -889,6 +986,17 @@ impl AncestorSync {
         e.asked = None;
         e.unsent = 0;
         e.peer_tip = tip;
+        // Every entry we sent above the common block is off the peer's
+        // executed chain (it answers with the highest one on it).
+        if let Some(above) = e
+            .sent
+            .iter()
+            .filter(|(_, h)| *h > common_height)
+            .map(|(_, h)| *h)
+            .min()
+        {
+            e.upper = Some(e.upper.map_or(above, |u| u.min(above)));
+        }
         // The link the headers continue from: our last verified header when
         // the peer still holds it, else (first reply) the common block, whose
         // header this node holds.
@@ -940,6 +1048,8 @@ impl AncestorSync {
                             fork: fork.1,
                             depth,
                             floor,
+                            fork_hash: fork.0,
+                            diverged: Some(hash),
                         },
                         now,
                     );
@@ -973,6 +1083,21 @@ impl AncestorSync {
         }
         let at_tip = e.last.is_some_and(|l| l.hash == tip.0) || headers.is_empty();
         e.tip_reached = at_tip;
+        // Every header so far is ours, and the fork lies below `upper`: if all
+        // of that range is below the reorg floor the fork is too deep, and
+        // paging up to it one window at a time would run out of budget (r1007:
+        // a common block ~12,600 against a fork at 105,024, with the floor
+        // ~265,000). Narrow the range instead; the headers above the fork
+        // point then name the first block of the peer's branch.
+        if e.fork.is_none() {
+            if let (Some(lo), Some(upper)) = (e.held, e.upper) {
+                if !at_tip && upper <= floor && upper > lo.1 {
+                    e.refine = Some((lo, upper));
+                    e.tip_reached = false;
+                    return None;
+                }
+            }
+        }
         if at_tip && e.fork.is_none() {
             // Nothing above what we hold. If what we hold ends at our applied
             // tip the peer's chain extends ours (or is ours).
@@ -1333,7 +1458,9 @@ pub fn on_reply(
 pub fn log_outcome(peer: &str, outcome: &Outcome) {
     let short = peer.get(..14).unwrap_or(peer);
     match outcome {
-        Outcome::TooDeep { fork, depth, floor } => tracing::warn!(
+        Outcome::TooDeep {
+            fork, depth, floor, ..
+        } => tracing::warn!(
             "SYNCANCESTOR peer {} is on a branch forked at height {} ({} below our applied tip), \
              below our reorg floor {}: not fetched. This node cannot switch to it in place; if \
              that branch is canonical, re-seed this node's data dir from a node on it",
@@ -1843,10 +1970,138 @@ mod tests {
                 fork: 105_012,
                 depth: 121_100,
                 floor: 226_112 - crate::canonical_apply::MAX_REORG_DEPTH,
+                fork_hash: hb(0, 105_012),
+                diverged: Some(hb(2, 105_013)),
             })
         );
         assert_eq!(bodies, 0);
         assert!(locates <= 2, "found in O(1) round trips: {locates}");
+    }
+
+    /// The r1007 member after the recovery: LIGHT applied at 274,810, forked
+    /// at 105,024, and NO finalized height in the sync view (Observed mode
+    /// never raises the applicator's floor, so the view's finalized height is
+    /// 0 on every r1007 node). The locator then reaches down to genesis, the
+    /// peer's common block is ~12,650, and paging up to the fork one
+    /// 128-header window at a time runs out of the 20,000-header budget
+    /// (`Budget { fetched: 0 }`, with a doubling cooldown) on every episode:
+    /// the node never learned that its fork is too deep. The fork search
+    /// narrows the range instead and locates the fork exactly, with the
+    /// first block of the peer's branch named and verified, and no body.
+    #[test]
+    fn a_fork_far_below_the_floor_is_located_exactly_without_a_finalized_height() {
+        let mut me = Me::new(105_024, 274_810, 3, 0);
+        let peer = Peer {
+            fork: 105_024,
+            len: 178_576,
+            per: 4,
+            claim: None,
+        };
+        let (out, locates, bodies) = drive(&mut me, &peer, true);
+        assert!(
+            matches!(
+                &out,
+                Some(Outcome::TooDeep {
+                    fork: 105_024,
+                    depth: 169_786,
+                    ..
+                })
+            ),
+            "{out:?}"
+        );
+        let text = format!("{out:?}");
+        assert!(
+            text.contains(&format!("{:?}", hb(2, 105_025))),
+            "the first block of the peer's branch is named: {text}"
+        );
+        assert_eq!(bodies, 0, "nothing is fetched");
+        assert!(
+            locates <= 6,
+            "located in a handful of round trips: {locates}"
+        );
+    }
+
+    /// A peer cannot steer the search below what it answered: a common block
+    /// that is not in the narrowing locator we sent ends the episode faulty,
+    /// with nothing recorded as a deep fork.
+    #[test]
+    fn a_narrowing_answer_outside_the_locator_is_faulty() {
+        let me = Me::new(105_024, 274_810, 3, 0);
+        let peer = Peer {
+            fork: 105_024,
+            len: 178_576,
+            per: 4,
+            claim: None,
+        };
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        a.note_deferred("peer", t0);
+        let lookup = |h: u64| (h <= me.tip).then(|| me.hash_at(h));
+        let view = me.view();
+        let (req, _) = a.tick(t0, &view, &[peer.candidate()], lookup);
+        let Some(Request::Locate { locator, .. }) = req else {
+            panic!("expected a locate");
+        };
+        let (common, headers) = peer.answer(&locator);
+        let held = me.held.clone();
+        assert_eq!(
+            a.on_ancestor(
+                "peer",
+                common,
+                peer.tip(),
+                peer.tip_work(),
+                &headers,
+                &view,
+                t0,
+                NOW,
+                |h, _| held.contains(h),
+                |h| me.header(h),
+            ),
+            None,
+            "the first answer starts the narrowing"
+        );
+        let (req, _) = a.tick(t0, &view, &[peer.candidate()], lookup);
+        let Some(Request::Locate { locator, .. }) = req else {
+            panic!("expected the narrowing locate");
+        };
+        assert!(locator.len() <= MAX_LOCATOR_HASHES);
+        // A lying answer: a common block of ours we did not send this round.
+        let bogus = (me.hash_at(50_000), 50_000);
+        assert!(!locator.contains(&bogus.0));
+        let out = a.on_ancestor(
+            "peer",
+            Some(bogus),
+            peer.tip(),
+            peer.tip_work(),
+            &[],
+            &view,
+            t0,
+            NOW,
+            |h, _| held.contains(h),
+            |h| me.header(h),
+        );
+        assert!(matches!(out, Some(Outcome::Faulty(_))), "{out:?}");
+    }
+
+    #[test]
+    fn the_narrowing_locator_spans_the_gap_and_ends_at_its_low_end() {
+        let lo = (hx(1_000), 1_000);
+        let loc = refine_locator(lo, 131_072, |h| Some(hx(h)));
+        assert_eq!(loc.len(), MAX_LOCATOR_HASHES);
+        assert_eq!(loc.last(), Some(&lo));
+        let hs: Vec<u64> = loc.iter().map(|(_, h)| *h).collect();
+        assert!(hs.windows(2).all(|w| w[0] > w[1]), "newest first: {hs:?}");
+        assert!(hs.iter().all(|h| *h >= 1_000 && *h < 131_072));
+        // The largest step is about 1/63 of the gap.
+        let step = hs.windows(2).map(|w| w[0] - w[1]).max().expect("steps");
+        assert!(step <= 130_072 / 63 + 2, "{step}");
+        // A small gap lists every height once; no gap lists only `lo`.
+        let small = refine_locator(lo, 1_005, |h| Some(hx(h)));
+        assert_eq!(
+            small.iter().map(|(_, h)| *h).collect::<Vec<_>>(),
+            vec![1_004, 1_003, 1_002, 1_001, 1_000]
+        );
+        assert_eq!(refine_locator(lo, 1_001, |h| Some(hx(h))), vec![lo]);
     }
 
     #[test]
