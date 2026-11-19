@@ -879,6 +879,51 @@ impl FinalityGadget {
         }
     }
 
+    /// The committee a node that is BEHIND the governing epoch expects for a
+    /// checkpoint at `height`, for judging a certificate it cannot install
+    /// (dead-branch evidence, `node/src/dead_branch.rs`). Never used to sign,
+    /// finalize, install or raise a floor.
+    ///
+    /// When [`Self::committee_for`] can derive the committee, it is that one.
+    /// Otherwise, when the selector's schedule names a governing snapshot S(E)
+    /// ABOVE every snapshot this node holds (it has not reached that epoch),
+    /// the committee is drawn exactly as [`Self::committee_for`] draws it, with
+    /// epoch S(E) and its seed, from the most recent validator set this node
+    /// holds (`latest_epoch_committee_set`), on the assumption that the set did
+    /// not change since. If it did, the real certificate's voters are not all
+    /// members (or do not reach the quorum) and verification fails closed. A
+    /// certificate that verifies against it carries signatures of validators
+    /// this node itself materialized, holding more than two thirds of that
+    /// committee's stake. `None`: no committee can be stood in (a governing
+    /// snapshot at or below the newest held one that is no longer held, or no
+    /// registry and no genesis set).
+    pub async fn committee_beyond_held_epochs(&self, height: u64) -> Option<Committee> {
+        if let Some(c) = self.committee_for(height).await {
+            return Some(c);
+        }
+        let source = self.committee_source.as_ref()?;
+        let snapshot = source.governing_snapshot(height)?;
+        let (held, set) = source.latest_epoch_committee_set().await?;
+        if held >= snapshot {
+            return None;
+        }
+        let seed = committee_epoch_seed(&self.manager.config().genesis_hash, snapshot);
+        let members = CommitteeSelector::select_weighted(
+            &set,
+            height,
+            &seed,
+            self.manager.config().committee_size,
+        );
+        if members.is_empty() {
+            None
+        } else {
+            Some(Committee {
+                epoch: snapshot,
+                members,
+            })
+        }
+    }
+
     /// §4.2–4.3: the canonical block at boundary `height` is now buried
     /// `vote_depth` deep on this node. Propose `(height, block_hash)` (idempotent),
     /// replay buffered early votes for it, and — if `signer` is in the committee
@@ -1926,6 +1971,74 @@ mod tests {
         assert!(gb.committee_for(20).await.is_none());
         // Same inputs => same committee; no candidate block is an input.
         assert_eq!(ga.committee_for(12).await, Some(ca));
+    }
+
+    /// Dead-branch evidence: a node behind an epoch boundary (the r1007 member
+    /// at 274,810 holds snapshots up to 274,800; checkpoint 283,600 is governed
+    /// by 282,800) stands in its newest held set with the governing epoch and
+    /// its seed. With an unchanged set that is exactly the committee a node in
+    /// that epoch derives; a changed set gives a committee the real voters do
+    /// not match; a snapshot below the newest held one that is gone stands in
+    /// nothing; and a held epoch is never stood in for.
+    #[tokio::test]
+    async fn a_node_behind_the_epoch_stands_in_its_newest_set_with_that_epochs_seed() {
+        let ks: Vec<SigningKey> = (0u8..12).map(key).collect();
+        let others: Vec<SigningKey> = (80u8..92).map(key).collect();
+        let set = |ks: &[SigningKey]| -> Vec<(PublicKey, u128)> {
+            ks.iter()
+                .enumerate()
+                .map(|(i, k)| (pk(k), 1000u128.saturating_add(i as u128)))
+                .collect()
+        };
+        let mut cfg = config();
+        cfg.committee_size = 5;
+        // EPOCH 10, LAG 2: S(1) = 8, S(2) = 18, S(3) = 28 (governs 29..=38).
+        let ahead = Arc::new(VrfProposerSelector::new().with_snapshot_schedule(10, 2));
+        ahead.sync_active_set_at(8, set(&ks), 1).await;
+        ahead.sync_active_set_at(28, set(&ks), 1).await;
+        let behind = Arc::new(VrfProposerSelector::new().with_snapshot_schedule(10, 2));
+        behind.sync_active_set_at(8, set(&ks), 1).await;
+        let changed = Arc::new(VrfProposerSelector::new().with_snapshot_schedule(10, 2));
+        changed.sync_active_set_at(8, set(&others), 1).await;
+        let gadget = |sel: Arc<VrfProposerSelector>, cfg: CheckpointConfig| async move {
+            FinalityGadget::with_switch(
+                Arc::new(CheckpointManager::new(cfg, dag_with(40).await)),
+                Some(sel),
+                true,
+            )
+        };
+        let ga = gadget(ahead, cfg.clone()).await;
+        let gb = gadget(behind.clone(), cfg.clone()).await;
+        let gc = gadget(changed, cfg.clone()).await;
+        let real = ga.committee_for(30).await.expect("a node in epoch 3");
+        assert_eq!(real.epoch, 28);
+        assert_eq!(gb.committee_for(30).await, None, "not materialized behind");
+        assert_eq!(
+            gb.committee_beyond_held_epochs(30).await,
+            Some(real.clone()),
+            "same set, same epoch seed: the same committee"
+        );
+        let stood = gc
+            .committee_beyond_held_epochs(30)
+            .await
+            .expect("a stand-in from the changed set");
+        assert_eq!(stood.epoch, 28);
+        assert!(
+            stood.pubkeys().iter().all(|m| !real.pubkeys().contains(m)),
+            "a changed set never yields the real committee's members"
+        );
+        // Held epoch: committee_for's answer, unchanged.
+        assert_eq!(
+            gb.committee_beyond_held_epochs(12).await,
+            gb.committee_for(12).await
+        );
+        // A governing snapshot at or below the newest held one that is not
+        // held (history pruned) stands in nothing.
+        let gapped = Arc::new(VrfProposerSelector::new().with_snapshot_schedule(10, 2));
+        gapped.sync_active_set_at(28, set(&ks), 1).await;
+        let gd = gadget(gapped, cfg).await;
+        assert_eq!(gd.committee_for(20).await, None);
+        assert_eq!(gd.committee_beyond_held_epochs(20).await, None);
     }
 
     /// S1 across siblings (lead decision 2, 2026-11-09): with more validators

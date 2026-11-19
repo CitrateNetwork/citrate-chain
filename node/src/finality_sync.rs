@@ -569,6 +569,103 @@ impl CertificateSync {
     }
 }
 
+/// What a finalized certificate this node does NOT install says about this
+/// node's chain (dead-branch evidence, `dead_branch.rs`). Judged by
+/// [`judge_foreign_certificate`]; nothing here touches finality state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignCertificate {
+    /// It verifies, and certifies a block above this node's applied tip: the
+    /// committee finalized past a height this node has not reached.
+    AboveTip { height: u64, hash: Hash },
+    /// It verifies, and certifies a block at or below this node's applied tip
+    /// that is NOT this node's block at that height (`ours`: what is there,
+    /// `None` if the applied chain steps over the height).
+    Conflicts {
+        height: u64,
+        hash: Hash,
+        ours: Option<Hash>,
+    },
+    /// The certified block is on this node's applied chain: no evidence of a
+    /// dead branch (the ordinary certificate sync installs such certificates).
+    OnOurChain { height: u64 },
+    /// Not used: why (size, boundary, no committee, quorum or signatures).
+    Refused(String),
+}
+
+/// Judge a peer's finalized certificate as dead-branch evidence. Every check
+/// the ordinary sync makes before trusting a certificate is made here, but
+/// the certified block need not be held:
+///
+/// 1. size: at most [`MAX_CERTIFICATE_SIGNATURES`] signatures and
+///    [`MAX_CERTIFICATE_RESPONSE_BYTES`] encoded, before any other work;
+/// 2. a checkpoint boundary height;
+/// 3. where it stands against this node's applied chain
+///    (`CanonicalApplicator::verify_certified_floor`, read-only);
+/// 4. the committee derived HERE (`FinalityGadget::committee_beyond_held_epochs`:
+///    the governing epoch's snapshot, or, when this node has not reached that
+///    epoch, its newest held validator set with that epoch's seed). Never the
+///    peer's: the message carries none;
+/// 5. `CheckpointManager::verify_synced_certificate` against that committee:
+///    boundary, committee >= 4, distinct members holding more than two thirds
+///    of its stake, the binding's epoch equal to the committee's, and every
+///    ed25519 signature valid over the v2 vote message for this chain and
+///    genesis. The binding is the certificate's own (this node holds no copy of
+///    the block); every signature covers it.
+///
+/// The result is never installed and never raises a floor.
+pub async fn judge_foreign_certificate(
+    gadget: &FinalityGadget,
+    applicator: &CanonicalApplicator,
+    height: u64,
+    block_hash: Hash,
+    binding: VoteBinding,
+    signatures: &[CheckpointSignature],
+) -> ForeignCertificate {
+    let count = signatures.len();
+    let bytes = bincode::serialized_size(&(height, block_hash, signatures)).unwrap_or(u64::MAX);
+    if count > MAX_CERTIFICATE_SIGNATURES || bytes > MAX_CERTIFICATE_RESPONSE_BYTES {
+        return ForeignCertificate::Refused(format!("oversize: {count} signatures, {bytes} bytes"));
+    }
+    let manager = gadget.manager();
+    if !manager.config().is_checkpoint_height(height) {
+        return ForeignCertificate::Refused("not a checkpoint boundary".to_string());
+    }
+    let ours = match applicator
+        .verify_certified_floor(height, block_hash, false)
+        .await
+    {
+        FloorCheck::Match => return ForeignCertificate::OnOurChain { height },
+        FloorCheck::Mismatch { canonical } => Some(canonical),
+        FloorCheck::NotYetApplied { .. } => None,
+        FloorCheck::Unverifiable(why) => {
+            return ForeignCertificate::Refused(format!("chain check: {why}"))
+        }
+    };
+    let Some(committee) = gadget.committee_beyond_held_epochs(height).await else {
+        return ForeignCertificate::Refused(
+            "no committee can be derived for the height here".to_string(),
+        );
+    };
+    let sigs: Vec<(PublicKey, Signature)> =
+        signatures.iter().map(|s| (s.voter, s.signature)).collect();
+    if let Err(e) =
+        manager.verify_synced_certificate(height, block_hash, binding, &sigs, &committee, &binding)
+    {
+        return ForeignCertificate::Refused(e.to_string());
+    }
+    match ours {
+        Some(ours) => ForeignCertificate::Conflicts {
+            height,
+            hash: block_hash,
+            ours,
+        },
+        None => ForeignCertificate::AboveTip {
+            height,
+            hash: block_hash,
+        },
+    }
+}
+
 /// Connected peers that advertised certificate sync support, by id.
 async fn sync_capable_peers(peers: &PeerManager) -> Vec<String> {
     let mut out = Vec::new();
@@ -833,6 +930,166 @@ mod tests {
             !n.gadget.halted(),
             "a peer's certificate never halts finality"
         );
+    }
+
+    /// Signatures by keys `ids` over (height, hash) with an explicit binding.
+    fn signed_with(
+        ids: &[u8],
+        height: u64,
+        hash: Hash,
+        binding: &VoteBinding,
+    ) -> Vec<CheckpointSignature> {
+        ids.iter()
+            .map(|&i| {
+                let v =
+                    sign_checkpoint_vote(CHAIN, &Hash::default(), height, hash, binding, &key(i));
+                CheckpointSignature {
+                    voter: v.voter,
+                    signature: v.signature,
+                }
+            })
+            .collect()
+    }
+
+    async fn judge(
+        n: &Node,
+        height: u64,
+        hash: Hash,
+        b: VoteBinding,
+        sigs: &[CheckpointSignature],
+    ) -> ForeignCertificate {
+        judge_foreign_certificate(&n.gadget, &n.app, height, hash, b, sigs).await
+    }
+
+    /// Dead-branch evidence: a certificate for a block this node does not
+    /// hold, above its applied tip, verifies against the committee derived
+    /// here and is reported, not installed; one at the tip's height for a
+    /// sibling is a conflict; one for our own block is no evidence.
+    #[tokio::test]
+    async fn a_foreign_certificate_is_judged_against_our_committee_and_never_installed() {
+        let (n, (_a1, a2, b2, _b3)) = node(FloorMode::Observed).await;
+        let above = Hash::new([0xF4; 32]);
+        assert_eq!(
+            judge(&n, 4, above, tb(4), &signed(&[0, 1, 2], 4, above)).await,
+            ForeignCertificate::AboveTip {
+                height: 4,
+                hash: above
+            }
+        );
+        let b2h = b2.header.block_hash;
+        assert_eq!(
+            judge(&n, 2, b2h, tb(2), &signed(&[0, 1, 2], 2, b2h)).await,
+            ForeignCertificate::Conflicts {
+                height: 2,
+                hash: b2h,
+                ours: Some(a2.header.block_hash)
+            }
+        );
+        let a2h = a2.header.block_hash;
+        assert_eq!(
+            judge(&n, 2, a2h, tb(2), &signed(&[0, 1, 2], 2, a2h)).await,
+            ForeignCertificate::OnOurChain { height: 2 }
+        );
+        assert_eq!(n.latest().await, 0, "nothing was installed");
+        assert_untouched(&n);
+    }
+
+    /// The mutations: keys outside our committee, too few of its members, a
+    /// changed block, binding or chain, an off-boundary height, a voter listed
+    /// twice, or an oversize message: never evidence.
+    #[tokio::test]
+    async fn a_forged_foreign_certificate_is_refused() {
+        let (n, _) = node(FloorMode::Observed).await;
+        let h = Hash::new([0xF4; 32]);
+        let refused = |c: &ForeignCertificate| matches!(c, ForeignCertificate::Refused(_));
+        // Keys this node never materialized.
+        let c = judge(&n, 4, h, tb(4), &signed(&[20, 21, 22, 23], 4, h)).await;
+        assert!(refused(&c), "{c:?}");
+        // Two of four members: not more than two thirds.
+        let c = judge(&n, 4, h, tb(4), &signed(&[0, 1], 4, h)).await;
+        assert!(refused(&c), "{c:?}");
+        // Three members plus a stranger: a non-member voter.
+        let mut sigs = signed(&[0, 1, 2], 4, h);
+        sigs.extend(signed(&[20], 4, h));
+        let c = judge(&n, 4, h, tb(4), &sigs).await;
+        assert!(refused(&c), "{c:?}");
+        // Signatures over another block.
+        let c = judge(&n, 4, h, tb(4), &signed(&[0, 1, 2], 4, Hash::new([1; 32]))).await;
+        assert!(refused(&c), "{c:?}");
+        // A binding the signatures do not cover, and a binding of another epoch.
+        let mut other = tb(4);
+        other.state_root = Hash::new([9; 32]);
+        let c = judge(&n, 4, h, other, &signed(&[0, 1, 2], 4, h)).await;
+        assert!(refused(&c), "{c:?}");
+        let mut epoch = tb(4);
+        epoch.epoch = 7;
+        let c = judge(&n, 4, h, epoch, &signed_with(&[0, 1, 2], 4, h, &epoch)).await;
+        assert!(refused(&c), "{c:?}");
+        // Off the boundary (interval 2).
+        let c = judge(&n, 5, h, tb(5), &signed(&[0, 1, 2], 5, h)).await;
+        assert!(refused(&c), "{c:?}");
+        // A voter twice.
+        let mut twice = signed(&[0, 1], 4, h);
+        twice.extend(signed(&[1], 4, h));
+        let c = judge(&n, 4, h, tb(4), &twice).await;
+        assert!(refused(&c), "{c:?}");
+        // Oversize.
+        let many: Vec<CheckpointSignature> = (0..=MAX_CERTIFICATE_SIGNATURES)
+            .map(|_| signed(&[0], 4, h).remove(0))
+            .collect();
+        let c = judge(&n, 4, h, tb(4), &many).await;
+        assert!(refused(&c), "{c:?}");
+        assert_untouched(&n);
+    }
+
+    /// The r1007 member is behind the epoch boundary of the certificate it is
+    /// shown (snapshot S(2) = 1001 governs 1002; it holds only S(1) = 1): the
+    /// committee is drawn from its newest held set with epoch 1001's seed, and
+    /// the certificate must bind epoch 1001.
+    #[tokio::test]
+    async fn a_certificate_beyond_our_held_epochs_verifies_against_our_newest_set() {
+        let (n, _) = node(FloorMode::Observed).await;
+        let h = Hash::new([0xF5; 32]);
+        let binding = VoteBinding {
+            epoch: 1001,
+            ..tb(4)
+        };
+        assert_eq!(
+            judge(
+                &n,
+                1002,
+                h,
+                binding,
+                &signed_with(&[0, 1, 2], 1002, h, &binding)
+            )
+            .await,
+            ForeignCertificate::AboveTip {
+                height: 1002,
+                hash: h
+            }
+        );
+        // The held epoch's binding is not the governing epoch's.
+        let stale = tb(4);
+        let c = judge(
+            &n,
+            1002,
+            h,
+            stale,
+            &signed_with(&[0, 1, 2], 1002, h, &stale),
+        )
+        .await;
+        assert!(matches!(c, ForeignCertificate::Refused(_)), "{c:?}");
+        // Validators this node does not hold in its newest set.
+        let c = judge(
+            &n,
+            1002,
+            h,
+            binding,
+            &signed_with(&[30, 31, 32], 1002, h, &binding),
+        )
+        .await;
+        assert!(matches!(c, ForeignCertificate::Refused(_)), "{c:?}");
+        assert_untouched(&n);
     }
 
     #[tokio::test]

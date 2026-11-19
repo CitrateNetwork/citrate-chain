@@ -45,6 +45,7 @@ mod cold_resync;
 mod commands;
 mod config;
 mod consensus_manifest;
+mod dead_branch;
 
 // PBA-L1a-003: consensus-affecting cargo features are fixed to the crate's
 // DEFAULT feature set on every node build.
@@ -3215,6 +3216,14 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // answers and deferred-block evidence.
         let ancestor = Arc::new(parking_lot::Mutex::new(ancestor_sync::AncestorSync::new()));
         let ancestor_for_rx = ancestor.clone();
+        // dead_branch.rs: evidence that this node's applied branch is dead
+        // (header-verified TooDeeps from several peers, a finalized
+        // certificate for a block not on our chain, our branch stopped). When
+        // it all holds the dead-branch marker is recorded and the guarded
+        // cold resync (cold_resync.rs) recovers the node.
+        let dead_branch = Arc::new(parking_lot::Mutex::new(dead_branch::DeadBranch::new()));
+        let dead_branch_for_rx = dead_branch.clone();
+        let app_for_dead_branch_rx = canonical_applicator.clone();
         // The reorg floor (finalized checkpoint) the episodes never fetch below.
         let finalized_for_sync: Option<Arc<std::sync::atomic::AtomicU64>> = canonical_applicator
             .as_ref()
@@ -3239,6 +3248,11 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let rejoin_for_loop = rejoin.clone();
         let ancestor_for_loop = ancestor.clone();
         let admission_for_loop = block_admission.clone();
+        let dead_branch_for_loop = dead_branch.clone();
+        let app_for_dead_branch = canonical_applicator.clone();
+        let manager_for_dead_branch = checkpoint_manager.clone();
+        let own_coinbase = dead_branch::own_coinbase(&config.mining.coinbase);
+        let dead_branch_enabled = recovery_policy.enabled;
         let deferred_for_loop = deferred_heights.clone();
         let tip_reask_for_loop = tip_reask.clone();
         let initial_sync_for_sync = initial_sync_done.clone();
@@ -3258,6 +3272,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
             // #477: the SYNCPIPE progress line, at most once per window.
             let mut pipe_log_at = std::time::Instant::now();
             let mut pipe_log_delivered: u64 = 0;
+            // dead_branch.rs: the last incomplete-evidence state logged.
+            let dead_branch_logged: parking_lot::Mutex<Option<dead_branch::Missing>> =
+                parking_lot::Mutex::new(None);
             // #310: Skip — a slow sync round must not be followed by a burst
             // of back-to-back block requests to peers.
             let mut interval = timing::cadence_interval(std::time::Duration::from_secs(2));
@@ -3519,7 +3536,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         .as_ref()
                         .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
                         .unwrap_or(0);
-                    let _ = ancestor_sync::run_tick(
+                    let ended = ancestor_sync::run_tick(
                         &ancestor_for_loop,
                         &storage_for_sync,
                         &admission_for_loop,
@@ -3530,6 +3547,32 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         std::time::Instant::now(),
                     )
                     .await;
+                    if let Some(o) = &ended {
+                        let peer = ancestor_for_loop.lock().last_peer().map(str::to_string);
+                        if let Some(peer) = peer {
+                            dead_branch_for_loop.lock().note_outcome(
+                                &peer,
+                                o,
+                                std::time::Instant::now(),
+                            );
+                        }
+                    }
+                    if let Some(app) = &app_for_dead_branch {
+                        let _ = dead_branch::run_tick(
+                            &dead_branch_for_loop,
+                            app,
+                            &storage_for_sync,
+                            &manager_for_dead_branch,
+                            &handles,
+                            finalized,
+                            own_coinbase.as_ref(),
+                            dead_branch_enabled,
+                            &dead_branch_logged,
+                            std::time::Instant::now(),
+                            dead_branch::wall_secs(),
+                        )
+                        .await;
+                    }
                     ancestor_for_loop.lock().owns_sync()
                 };
                 let following_tip = rejoin_for_loop.lock().is_following_tip() && !ancestor_owns;
@@ -4021,7 +4064,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             .as_ref()
                             .map(|f| f.load(std::sync::atomic::Ordering::SeqCst))
                             .unwrap_or(0);
-                        let _ = ancestor_sync::on_reply(
+                        let ended = ancestor_sync::on_reply(
                             &ancestor_for_rx,
                             &storage_for_handler,
                             finalized,
@@ -4032,6 +4075,13 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             &headers,
                             std::time::Instant::now(),
                         );
+                        if let Some(o) = &ended {
+                            dead_branch_for_rx.lock().note_outcome(
+                                &pid.0,
+                                o,
+                                std::time::Instant::now(),
+                            );
+                        }
                         // The episode's next round goes out now, not on the tick.
                         ancestor_sync::send_next(
                             &ancestor_for_rx,
@@ -4485,6 +4535,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                                 anc.on_blocks(&pid.0, &answer_hashes, now, |h| admitted.contains(h))
                             {
                                 ancestor_sync::log_outcome(&pid.0, &o);
+                                dead_branch_for_rx.lock().note_outcome(&pid.0, &o, now);
                             }
                         }
                         ancestor_sync::send_next(
@@ -4896,26 +4947,78 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                     // Stage 1b: only the answer to this node's outstanding request
                     // is used; it is verified (epoch committee, quorum, signatures,
                     // (height, hash) on this node's chain) off the message loop.
+                    // dead_branch.rs: the answer to this node's request for a
+                    // TooDeep peer's latest certificate (any height above ours)
+                    // is judged as evidence and never installed. An answer above
+                    // our applied tip cannot be the late-joiner sync's (it asks
+                    // at or below the tip).
                     NetworkMessage::CheckpointCertificate {
                         height,
                         block_hash,
                         binding,
                         signatures,
-                    } => match &certificate_sync_for_net {
-                        Some(cs) if cs.accept_response(&pid.0).await => {
-                            let cs = cs.clone();
+                    } => {
+                        let now = std::time::Instant::now();
+                        let applied_now = app_for_dead_branch_rx
+                            .as_ref()
+                            .map(|a| {
+                                a.applied_height_handle()
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                            })
+                            .unwrap_or(u64::MAX);
+                        let probe = height > applied_now
+                            && dead_branch_for_rx.lock().accept_probe_answer(&pid.0, now);
+                        let synced = !probe
+                            && match &certificate_sync_for_net {
+                                Some(cs) => cs.accept_response(&pid.0).await,
+                                None => false,
+                            };
+                        let probe = probe
+                            || (!synced
+                                && dead_branch_for_rx.lock().accept_probe_answer(&pid.0, now));
+                        if synced {
+                            if let Some(cs) = certificate_sync_for_net.clone() {
+                                let peer = pid.0.clone();
+                                tokio::spawn(async move {
+                                    let _ = cs
+                                        .process(&peer, height, block_hash, binding, signatures)
+                                        .await;
+                                });
+                            }
+                        } else if let (true, Some(app)) = (probe, app_for_dead_branch_rx.clone()) {
+                            let gadget = finality_gadget_for_net.clone();
+                            let evidence = dead_branch_for_rx.clone();
                             let peer = pid.0.clone();
                             tokio::spawn(async move {
-                                let _ = cs
-                                    .process(&peer, height, block_hash, binding, signatures)
-                                    .await;
+                                let judged = finality_sync::judge_foreign_certificate(
+                                    &gadget,
+                                    &app,
+                                    height,
+                                    block_hash,
+                                    binding,
+                                    &signatures,
+                                )
+                                .await;
+                                tracing::info!(
+                                    "DEADBRANCH certificate {} @ {} from {}: {:?}",
+                                    block_hash,
+                                    height,
+                                    peer,
+                                    judged
+                                );
+                                evidence.lock().note_certificate(
+                                    &peer,
+                                    &judged,
+                                    std::time::Instant::now(),
+                                );
                             });
+                        } else {
+                            tracing::debug!(
+                                "Checkpoint certificate from peer {} not requested; ignored",
+                                pid.0
+                            );
                         }
-                        _ => tracing::debug!(
-                            "Checkpoint certificate from peer {} not requested; ignored",
-                            pid.0
-                        ),
-                    },
+                    }
                     _ => {
                         tracing::debug!("Unhandled message variant from peer {}", pid.0);
                     }

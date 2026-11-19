@@ -1864,6 +1864,82 @@ impl CanonicalApplicator {
             Ok(Some(b)) => b.header.height,
             _ => 0,
         };
+        self.record_dead_branch_at(state, head, head_height, fork, why);
+    }
+
+    /// Dead-branch evidence (`dead_branch.rs`): record the marker for the
+    /// applied branch above `fork`, toward the certified block `head` @
+    /// `head_height` (which this node need not hold), if and only if the
+    /// applied tip is still `expected_tip` (the tip the evidence was judged
+    /// against) and `fork` is still on the applied chain. Under the advance
+    /// lock, so no block can be applied between the check and the write.
+    /// Returns whether the marker is recorded.
+    pub async fn record_dead_branch_on_evidence(
+        &self,
+        expected_tip: Hash,
+        fork: AppliedTip,
+        head: Hash,
+        head_height: u64,
+        why: &str,
+    ) -> bool {
+        let state = self.lock.lock().await;
+        if state.tip.hash != expected_tip || fork.height >= state.tip.height {
+            return false;
+        }
+        // On the applied chain: the canonical height index (one read; the
+        // executed chain's block at that height, as ancestor sync judges it).
+        match self
+            .storage
+            .blocks
+            .get_canonical_block_by_height(fork.height)
+        {
+            Ok(Some(h)) if h == fork.hash => {}
+            _ => return false,
+        }
+        self.record_dead_branch_at(&state, head, head_height, fork, why);
+        self.dead_branch.load(Ordering::SeqCst)
+    }
+
+    /// Dead-branch evidence: clear a marker that evidence recorded (its reason
+    /// starts with `prefix`) once the applied tip is no longer its dead tip:
+    /// the branch it called dead was extended after all (a wedged node seals
+    /// nothing, so any move is another producer's block). A marker the
+    /// applicator recorded itself (`RefusePruned`) is left alone. Returns
+    /// whether a marker was cleared.
+    pub async fn clear_evidence_dead_branch(&self, prefix: &str) -> bool {
+        let state = self.lock.lock().await;
+        let record = match citrate_storage::chain::wedge::read(&self.storage.db) {
+            Ok(Some(r)) => r,
+            _ => return false,
+        };
+        if !record.reason.starts_with(prefix) || state.tip.hash == record.dead_tip {
+            return false;
+        }
+        match citrate_storage::chain::wedge::clear(&self.storage.db) {
+            Ok(()) => {
+                self.dead_branch.store(false, Ordering::SeqCst);
+                info!(
+                    "SYNCSTATE: the applied tip moved to {} @ {} after the dead-branch evidence \
+                     marked {} @ {}; its branch is not dead, marker cleared",
+                    state.tip.hash, state.tip.height, record.dead_tip, record.dead_tip_height
+                );
+                true
+            }
+            Err(e) => {
+                warn!("SYNCSTATE: could not clear the dead-branch marker: {e}");
+                false
+            }
+        }
+    }
+
+    fn record_dead_branch_at(
+        &self,
+        state: &AppliedState,
+        head: Hash,
+        head_height: u64,
+        fork: AppliedTip,
+        why: &str,
+    ) {
         let previous = citrate_storage::chain::wedge::read(&self.storage.db)
             .ok()
             .flatten();
