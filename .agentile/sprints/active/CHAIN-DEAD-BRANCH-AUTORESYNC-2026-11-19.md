@@ -70,8 +70,16 @@ so member nodes stuck on the dead r1007 branch recover by themselves.
   clean, and `cargo fmt --all --check` clean. `--all-features` fails in the
   untouched `core/execution` halo2 code (unused imports and an unknown
   `circuit-params` cfg), which predates this change.
-- [ ] Test count against base 5fbcbd37 (clean target dir): pending
-- [ ] Rule 6 benchmark, base vs head: pending
+- [x] Test count (`cargo test --workspace -- --list`, clean target dirs): base
+  5fbcbd37 has 6,247 and head has 6,271 (+24, the tests this sprint adds;
+  none removed).
+- [x] Rule 6 benchmark, base vs head. Recipe as in #483: one loopback devnet
+  node, `citrate-bench`, target 300 TPS for 60 s, release binaries.
+  - 64 signers: base 277.75 TPS (inclusion 3,909 ms), head 277.78 TPS
+    (3,888 ms).
+  - 256 signers: base 277.91 TPS (3,846 ms), head 278.30 TPS (3,873 ms).
+  - No regression. Another lane's build shared the host during the head arms,
+    which could only have slowed head down.
 
 ## Core integration (read-only, citrate-core origin/main f8e60b84)
 
@@ -97,4 +105,5 @@ so member nodes stuck on the dead r1007 branch recover by themselves.
 - 2026-11-19: design settled and reported to the lead (approved). The owner
   decided no compiled r1007 checkpoint. Red reproduced. WP-2 to WP-4
   implemented, with the armed-member check added at the lead's request.
-  chain-aside accumulation is filed as #485.
+  chain-aside accumulation is filed as #485. PR #486 opened at ae3d32d1. The
+  gates, the test count and the benchmark are recorded above.
