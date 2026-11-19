@@ -904,4 +904,171 @@ mod tests {
         // A clock behind the chain never reads as stalled.
         assert_eq!(stall_age_secs(&s, None, 10), 0);
     }
+    // ---- Review round 1 of #486: a node that is catching up --------------
+
+    /// The cheapest attack on a node that is catching up (a fresh install, or
+    /// any node just after a cold resync): two Sybil peer ids answer TooDeep,
+    /// one relays a GENUINE certificate from the honest chain above our tip,
+    /// and our applied tip is old. An honest peer ahead of us on our own
+    /// chain (an `Extends`) vetoes it: the attack then needs a full eclipse.
+    #[test]
+    fn an_honest_peer_ahead_on_our_chain_vetoes_a_sybil_verdict() {
+        let now = Instant::now();
+        let mut d = DeadBranch::new();
+        d.note_outcome("sybil-1", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_outcome("sybil-2", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_certificate("sybil-1", &cert(283_600, h(0xC0)), now);
+        d.note_outcome("honest", &Outcome::Extends, now);
+        let connected = peers(&["sybil-1", "sybil-2", "honest"]);
+        assert!(
+            d.verdict(&member(), &connected, ours, now).is_err(),
+            "a catching-up node with an honest peer ahead of it was marked"
+        );
+        // The veto lasts while that peer is connected and its answer fresh.
+        assert!(d
+            .verdict(&member(), &peers(&["sybil-1", "sybil-2"]), ours, now)
+            .is_ok());
+        assert!(
+            d.verdict(&member(), &connected, ours, now + EVIDENCE_TTL)
+                .is_err(),
+            "stale TooDeeps do not count either"
+        );
+    }
+
+    /// E3 re-check: a certificate that was above our tip when it was judged,
+    /// and whose block our own chain has since applied, is no evidence.
+    #[test]
+    fn a_certificate_our_chain_has_since_applied_is_no_evidence() {
+        let now = Instant::now();
+        let d = full(now);
+        let local = Local {
+            applied: (h(0xAB), 290_000),
+            floor: 280_000,
+            ..member()
+        };
+        let on = |hash: &Hash, height: u64| {
+            (height == 105_024 && *hash == h(0x24)) || (height == 283_600 && *hash == h(0xC0))
+        };
+        assert_eq!(
+            d.verdict(&local, &peers(&["boot-1", "boot-2"]), on, now),
+            Err(Missing::Certificate)
+        );
+    }
+
+    /// The applicator's guards on an evidence marker: it is recorded only
+    /// against the tip and fork the verdict was judged on, kept while the tip
+    /// stays, and withdrawn once the tip moves; the cold resync's decision
+    /// re-checks the tip itself, so a marker whose tip moved never resyncs.
+    #[tokio::test]
+    async fn an_evidence_marker_is_withdrawn_when_the_tip_moves_and_never_resyncs() {
+        use crate::canonical_apply::tests::{fresh, mk_block, persist, roots, setup_fork};
+        use crate::canonical_apply::{AppliedTip, ApplyOutcome, CanonicalApplicator};
+        let (exec, storage, dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let (a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let fork = AppliedTip {
+            hash: a1.header.block_hash,
+            height: 1,
+        };
+        let tip = a2.header.block_hash;
+        let reason = format!("{REASON_PREFIX} test");
+        assert!(
+            !app.record_dead_branch_on_evidence(h(0x99), fork, h(0xC0), 400, &reason)
+                .await,
+            "recorded against a tip that is not the applied tip"
+        );
+        let off_chain = AppliedTip {
+            hash: h(0x98),
+            height: 1,
+        };
+        assert!(
+            !app.record_dead_branch_on_evidence(tip, off_chain, h(0xC0), 400, &reason)
+                .await,
+            "recorded with a fork block not on the applied chain"
+        );
+        assert_eq!(app.wedge().expect("read"), None);
+        assert!(
+            app.record_dead_branch_on_evidence(tip, fork, h(0xC0), 400, &reason)
+                .await
+        );
+        let w = app.wedge().expect("read").expect("marked");
+        assert_eq!((w.dead_tip, w.fork_height), (tip, 1));
+        assert!(
+            !app.clear_evidence_dead_branch(REASON_PREFIX).await,
+            "kept while the tip stays"
+        );
+        // A block is applied: the branch was not dead.
+        let a3 = mk_block(3, tip, roots(3)[2]);
+        persist(&storage, &a3);
+        assert!(matches!(
+            app.apply_received(&a3).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        let policy = crate::cold_resync::Policy::from(&crate::config::RecoveryConfig::default());
+        let decision = crate::cold_resync::evaluate(
+            &app,
+            &storage,
+            None,
+            dir.path(),
+            policy,
+            false,
+            &citrate_storage::signed_votes::Binding::default(),
+            w.since_unix.saturating_add(policy.after_secs),
+        )
+        .await
+        .expect("evaluate");
+        assert_eq!(decision, crate::cold_resync::Decision::NotWedged);
+        assert!(!dir.path().join(crate::cold_resync::REQUEST_FILE).exists());
+        assert_eq!(app.wedge().expect("read"), None);
+    }
+
+    /// `clear_evidence_dead_branch` clears an evidence marker whose tip moved
+    /// and nothing else: not while the tip stays, and never a marker the
+    /// applicator recorded itself (`RefusePruned`).
+    #[tokio::test]
+    async fn only_an_evidence_marker_whose_tip_moved_is_cleared() {
+        use crate::canonical_apply::tests::{fresh, mk_block, persist, roots, setup_fork};
+        use crate::canonical_apply::{AppliedTip, ApplyOutcome, CanonicalApplicator};
+        let (exec, storage, _dir) = fresh();
+        let app = CanonicalApplicator::new(exec, storage.clone());
+        let (a1, a2, _b2, _b3) = setup_fork(&app, &storage).await;
+        let fork = AppliedTip {
+            hash: a1.header.block_hash,
+            height: 1,
+        };
+        let tip = a2.header.block_hash;
+        let reason = format!("{REASON_PREFIX} test");
+        assert!(
+            app.record_dead_branch_on_evidence(tip, fork, h(0xC0), 400, &reason)
+                .await
+        );
+        assert!(app
+            .dead_branch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let a3 = mk_block(3, tip, roots(3)[2]);
+        persist(&storage, &a3);
+        assert!(matches!(
+            app.apply_received(&a3).await,
+            ApplyOutcome::Applied { .. }
+        ));
+        assert!(app.clear_evidence_dead_branch(REASON_PREFIX).await);
+        assert_eq!(app.wedge().expect("read"), None);
+        assert!(!app
+            .dead_branch_handle()
+            .load(std::sync::atomic::Ordering::SeqCst));
+        // An applicator marker on an old tip is left alone.
+        let own = citrate_storage::chain::wedge::WedgeRecord {
+            dead_tip: tip,
+            dead_tip_height: 2,
+            fork_point: fork.hash,
+            fork_height: 1,
+            head: h(0xC0),
+            head_height: 400,
+            reason: "RefusePruned".into(),
+            since_unix: 1,
+        };
+        citrate_storage::chain::wedge::write(&storage.db, &own).expect("write");
+        assert!(!app.clear_evidence_dead_branch(REASON_PREFIX).await);
+        assert_eq!(app.wedge().expect("read"), Some(own));
+    }
 }

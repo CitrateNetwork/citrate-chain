@@ -168,9 +168,15 @@ pub const MAX_HEADER_FUTURE_SECS: u64 = 15;
 /// Why an episode ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The peer's executed chain extends ours (the fork point is our applied
-    /// tip): ordinary sync owns that gap.
+    /// The peer's executed chain extends ours ABOVE our applied tip (the fork
+    /// point is our applied tip): ordinary sync owns that gap. Only a peer
+    /// that holds our tip and more ends an episode this way, so it is the
+    /// sign of a live branch that `dead_branch.rs` vetoes a verdict on.
     Extends,
+    /// The peer's executed chain holds ours up to its own tip, which is not
+    /// above our applied tip (a peer level with us, or behind us, on our
+    /// branch). Nothing to fetch; says nothing about our branch being alive.
+    Holds,
     /// Every header up to the peer's tip verified and none claims more blue
     /// work than our applied tip: no body was fetched.
     NotHeavier { fork: u64, peer_tip: u64 },
@@ -713,6 +719,7 @@ impl AncestorSync {
         self.last_peer = Some(episode.peer.clone());
         let kind = match &outcome {
             Outcome::Extends => "extends",
+            Outcome::Holds => "holds",
             Outcome::NotHeavier { .. } => "not_heavier",
             Outcome::Fetched { .. } => "fetched",
             Outcome::TooDeep { .. } => "too_deep",
@@ -1099,9 +1106,10 @@ impl AncestorSync {
             }
         }
         if at_tip && e.fork.is_none() {
-            // Nothing above what we hold. If what we hold ends at our applied
-            // tip the peer's chain extends ours (or is ours).
-            return self.end(Outcome::Extends, now);
+            // Nothing above what we hold: every header up to the peer's tip
+            // is on our executed chain (at or below our applied tip), so the
+            // peer is level with us or behind us on our branch.
+            return self.end(Outcome::Holds, now);
         }
         if let Some(fork) = e.fork {
             if fork.0 == view.applied.0 {
@@ -2164,6 +2172,24 @@ mod tests {
         let (out, locates, bodies) = drive(&mut me, &peer, true);
         assert_eq!(out, Some(Outcome::Extends));
         assert_eq!((locates, bodies), (1, 0));
+    }
+
+    /// A peer level with us on our branch (whatever work it claims) holds
+    /// our chain but is not ahead on it: `Holds`, never `Extends`, so it is
+    /// no sign that our branch is alive (`dead_branch.rs` E7). Stranded r1007
+    /// members are level with each other at 274,810.
+    #[test]
+    fn a_peer_level_with_us_holds_our_chain_but_does_not_extend_it() {
+        let mut me = Me::new(500, 500, 4, 0);
+        let peer = Peer {
+            fork: 500,
+            len: 0,
+            per: 4,
+            claim: Some(u128::MAX),
+        };
+        let (out, _, bodies) = drive(&mut me, &peer, true);
+        assert_eq!(out, Some(Outcome::Holds));
+        assert_eq!(bodies, 0);
     }
 
     #[test]
