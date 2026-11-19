@@ -82,8 +82,9 @@ holds (`dead_branch::DeadBranch::verdict`):
 | E2 | At least 2 distinct peers that are connected now gave such a TooDeep within the last hour, agreeing on the fork block and on the first block of the other branch. A later conclusive episode with a peer (Extends, NotHeavier, Fetched, Faulty) withdraws its TooDeep and any certificate it served. | One lying or buggy peer is never enough. A peer that disconnects stops counting. Agreement on `(fork, diverged)` means both describe the same branch. Peer ids are Noise keys, so this is not Sybil-proof by itself. E3 is what costs an attacker something real. |
 | E3 | One of the agreeing peers serves a finalized checkpoint certificate that verifies against the committee this node derives itself, for a block not on our executed chain (above our applied tip, or at or below it with another block there) and above the fork. It is fetched with the existing `GetCheckpoint { above: our finalized, at_or_below: u64::MAX }`, so the server returns its latest. It is judged by `judge_foreign_certificate`: size bounds, boundary height, committee >= 4, distinct members holding more than 2/3 of the committee stake, the binding's epoch equal to the committee's, and every ed25519 signature valid over the v2 vote message for this chain and genesis. It is never installed and never raises a floor. | This is the part that cannot be forged. It needs the signing keys of validators this node materialized from its own chain's ValidatorRegistry, holding more than 2/3 of the committee's stake. That is the finality assumption itself. It also answers "is the heavier claim real?": the committee finalized past the height we are stuck at. |
 | E4 | The fork is at or above this node's latest finalized checkpoint (any certificate it holds, Observed or Enforced). | A branch that leaves out a block this node holds a finalized certificate for is conflicting finality, a safety alarm, never a resync target. |
-| E5 | The newest block of our applied selected chain that this node did not seal is more than 30 minutes old by its own header timestamp (`stall_age_secs`, walking at most 4,096 headers). Own blocks are found by the coinbase the v2 header commits to. | Our branch has stopped, or only this node extends it. It is read from the chain store, so Core's restarts (its stall watchdog restarts a frozen node up to three times) do not reset it. A live branch keeps fresh timestamps from other producers. |
+| E5 | Our branch has stopped, by BOTH clocks: (i) the applied tip has not moved to a block another node sealed for 30 minutes of this node's own wall clock (`tip_unmoved_secs`; the tip and the time it was first seen are a synced record in `CF_METADATA`), and (ii) the newest block of our applied selected chain that this node did not seal is more than 30 minutes old by its header timestamp (`stall_age_secs`, walking at most 4,096 headers). Own blocks are found by the coinbase the v2 header commits to. | (i) is the rule that matters for a node that is catching up: replaying history, its blocks are always hours old by their timestamps, so (ii) alone held for every such node (review round 1). Its tip moves, so (i) does not. The record is durable, so Core's restarts (its stall watchdog restarts a frozen node up to three times) do not reset the clock; a database without it (a fresh install, or right after a cold resync) starts it, so such a node waits the full window. (ii) is kept as well: it is the stronger statement for the stranded case (no producer has extended the branch in 30 minutes), and it costs nothing. |
 | E6 | `[recovery] cold_resync` is on. When it is off, nothing is recorded and the verdict is logged at WARN. | The existing off switch covers this path too. |
+| E7 | The catch-up veto: no currently connected peer ended an ancestor episode with `Extends` in the last hour. `Extends` now means only that the peer's executed chain holds our applied tip AND goes above it; a peer level with us or behind us on our chain answers the new `Holds`. | The main defense (review round 1). A node that is catching up has an honest peer ahead of it on its own chain, which `Extends`; that peer is picked by the episode driver (its head is not held here) once the TooDeep peers are cooling (30 min). A stranded member has none: HEAVY peers answer TooDeep, and other stranded members are level with it (`Holds`). An attacker's `Extends` can only veto, never mark. With E7, marking a catching-up node needs a full eclipse of it. |
 
 Then the existing guarded path runs unchanged: the monitor waits
 `[recovery] cold_resync_after_secs` (default 900 s) from the marker, applies
@@ -95,7 +96,10 @@ advance lock, only if the applied tip is still the one the verdict was judged
 against and the fork block is still canonical. Its reason starts with
 `dead-branch evidence:`. If the applied tip moves before the resync fires,
 the branch was not dead, and that marker (never an applicator-recorded one)
-is cleared.
+is cleared. `cold_resync::evaluate` re-checks it at decision time too: an
+evidence marker whose dead tip is no longer the applied tip never resyncs
+(and is cleared there), so a tip that moved between evidence ticks, or an
+evidence tick that stopped running, cannot fire it.
 
 ### D3. The committee for an epoch this node has not reached
 
@@ -119,13 +123,28 @@ full blocks back from it (8,790 sequential requests for the member today,
 growing about 47,000 a day). That is not done. The tie between the certificate
 and the branch is the serving peers' claim, backed by E2 and E5.
 
-Residual risk: an eclipsed node whose branch has stopped, and which sits behind
-a genuine certificate on the honest chain, can be made to resync needlessly by
-two colluding peers. The damage is liveness only. The database is moved aside,
-not deleted, at most once per 6 h, and the node resyncs toward the chain the
-committee finalized. An eclipsed node is already at its peers' mercy for
-liveness. A former validator set holding more than 2/3 of a stale snapshot
-(the long-range case) has the same bound.
+Residual risk, as corrected by review round 1. Before E7 and the wall-clock
+half of E5, the risk was much wider than "an eclipsed node": ANY node that is
+catching up and whose tip stalls for 15 minutes qualified, cheaply. E1 and E2
+cost two peer ids (Noise keys from one host) answering with one of our own
+locator hashes and one fabricated header (`verify_headers` does not recompute
+the block hash). E3 held with a genuine certificate relayed from any honest
+node, because it is above the victim's tip. E4 held because a node that far
+behind holds no recent certificate (servers keep 256 in memory, and r1007 has
+no certificate between 105,000 and 283,600). E5 held because historical blocks
+are old by timestamp. The first resync on a fresh install is not rate limited.
+
+The defense is E7 together with E5(i) and the decision-time re-check: a node
+catching up has a moving tip and an honest peer ahead of it, either of which
+vetoes. What is left is a node that is fully eclipsed AND whose tip is frozen
+for 30 minutes while it is behind a genuine certificate. Such a node can be
+made to resync needlessly. The damage is liveness only: the database is moved
+aside, not deleted, at most once per 6 h after the first, and the node
+resyncs toward the chain the committee finalized. An eclipsed node is already
+at its peers' mercy for liveness. A former validator set holding more than 2/3
+of a stale snapshot (the long-range case) has the same bound. `chain-aside/`
+accumulation, which this path makes reachable from peers, is #485 (acceptance:
+a free-disk check and a cap of 2 asides).
 
 ## Tests (mutations included)
 
@@ -145,7 +164,15 @@ liveness. A former validator set holding more than 2/3 of a stale snapshot
   - disconnected, stale or withdrawn evidence lapses;
   - certificate requests go one at a time to TooDeep peers;
   - the peer table is bounded;
-  - the stall clock is computed as described.
+  - the stall clock is computed as described;
+  - review round 1: an honest peer ahead on our chain vetoes a Sybil verdict
+    (red on 7b5d58a7); a catching-up node whose tip moves is never marked;
+    only `Extends`, not `Holds`, vetoes; the wall clock is durable across a
+    restart and restarts only on another node's block; a certificate our
+    chain has since applied is no evidence.
+- Applicator guards and the decision-time re-check
+  (`an_evidence_marker_is_withdrawn_when_the_tip_moves_and_never_resyncs`,
+  red on 7b5d58a7; `only_an_evidence_marker_whose_tip_moved_is_cleared`).
 - Certificate (`finality_sync::tests`):
   - a foreign certificate is judged and never installed (above the tip, conflict, our own block);
   - a forged one is refused: foreign keys, too few members, a non-member voter, another block, another binding, another epoch, off-boundary, a voter twice, oversize;

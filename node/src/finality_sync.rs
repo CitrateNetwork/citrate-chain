@@ -1004,41 +1004,65 @@ mod tests {
         let refused = |c: &ForeignCertificate| matches!(c, ForeignCertificate::Refused(_));
         // Keys this node never materialized.
         let c = judge(&n, 4, h, tb(4), &signed(&[20, 21, 22, 23], 4, h)).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: keys this node never materialized"
+        );
         // Two of four members: not more than two thirds.
         let c = judge(&n, 4, h, tb(4), &signed(&[0, 1], 4, h)).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: two of four members"
+        );
         // Three members plus a stranger: a non-member voter.
         let mut sigs = signed(&[0, 1, 2], 4, h);
         sigs.extend(signed(&[20], 4, h));
         let c = judge(&n, 4, h, tb(4), &sigs).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: a non-member voter"
+        );
         // Signatures over another block.
         let c = judge(&n, 4, h, tb(4), &signed(&[0, 1, 2], 4, Hash::new([1; 32]))).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: signatures over another block"
+        );
         // A binding the signatures do not cover, and a binding of another epoch.
         let mut other = tb(4);
         other.state_root = Hash::new([9; 32]);
         let c = judge(&n, 4, h, other, &signed(&[0, 1, 2], 4, h)).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: a binding the signatures do not cover"
+        );
         let mut epoch = tb(4);
         epoch.epoch = 7;
         let c = judge(&n, 4, h, epoch, &signed_with(&[0, 1, 2], 4, h, &epoch)).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: a binding of another epoch"
+        );
         // Off the boundary (interval 2).
         let c = judge(&n, 5, h, tb(5), &signed(&[0, 1, 2], 5, h)).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: off the checkpoint boundary"
+        );
         // A voter twice.
         let mut twice = signed(&[0, 1], 4, h);
         twice.extend(signed(&[1], 4, h));
         let c = judge(&n, 4, h, tb(4), &twice).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(
+            refused(&c),
+            "forged certificate accepted: a voter listed twice"
+        );
         // Oversize.
         let many: Vec<CheckpointSignature> = (0..=MAX_CERTIFICATE_SIGNATURES)
             .map(|_| signed(&[0], 4, h).remove(0))
             .collect();
         let c = judge(&n, 4, h, tb(4), &many).await;
-        assert!(refused(&c), "{c:?}");
+        assert!(refused(&c), "forged certificate accepted: oversize");
         assert_untouched(&n);
     }
 
@@ -1078,7 +1102,10 @@ mod tests {
             &signed_with(&[0, 1, 2], 1002, h, &stale),
         )
         .await;
-        assert!(matches!(c, ForeignCertificate::Refused(_)), "{c:?}");
+        assert!(
+            matches!(c, ForeignCertificate::Refused(_)),
+            "forged certificate accepted: the held epoch's binding"
+        );
         // Validators this node does not hold in its newest set.
         let c = judge(
             &n,
@@ -1088,7 +1115,10 @@ mod tests {
             &signed_with(&[30, 31, 32], 1002, h, &binding),
         )
         .await;
-        assert!(matches!(c, ForeignCertificate::Refused(_)), "{c:?}");
+        assert!(
+            matches!(c, ForeignCertificate::Refused(_)),
+            "forged certificate accepted: validators not in our newest set"
+        );
         assert_untouched(&n);
     }
 

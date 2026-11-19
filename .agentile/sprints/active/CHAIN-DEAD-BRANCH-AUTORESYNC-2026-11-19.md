@@ -81,6 +81,43 @@ so member nodes stuck on the dead r1007 branch recover by themselves.
   - No regression. Another lane's build shared the host during the head arms,
     which could only have slowed head down.
 
+## WP-6 Review round 1 (#486, CHANGES, no P1): a node that is catching up
+
+Finding: any node that is catching up and whose tip stalls for 15 minutes could be
+marked cheaply. Two Sybil TooDeeps plus a genuine certificate relayed from above
+its tip are enough, because E4 and E5 (header age) held for every such node.
+
+- [x] Red on 7b5d58a7 (commit 72be9a64):
+  - `an_honest_peer_ahead_on_our_chain_vetoes_a_sybil_verdict`
+  - `an_evidence_marker_is_withdrawn_when_the_tip_moves_and_never_resyncs`
+- [x] P2-1: applicator guard tests
+  (`only_an_evidence_marker_whose_tip_moved_is_cleared`, and the withdrawn test).
+- [x] P2-2: `cold_resync::evaluate` re-checks an evidence marker's dead tip at
+  decision time.
+- [x] P2-3: E7 catch-up veto (a connected peer that answered `Extends` within 1 h).
+  `Outcome::Holds` is the reply for a peer level with us. E5(i) is a durable
+  local wall clock since the tip last moved (`tip_unmoved_secs`, `CF_METADATA`),
+  required together with the header age.
+- [x] P3-1: a certificate our chain has since applied is no evidence.
+- [x] P3-2: comment on #485 adding a free-disk check and a cap of 2 asides as
+  acceptance criteria. The PR body says this path makes it reachable from peers.
+- [x] P3-3: the 11 CodeQL cleartext-logging asserts in `finality_sync` tests now
+  print a case message, not the certificate.
+- [x] Mutants (cnv-build-2; one at a time; dead_branch, cold_resync and
+  ancestor_sync tests): 7 of 7 killed.
+  - From the review: `clear_evidence_dead_branch` never clearing, no tip check
+    in `record_dead_branch_on_evidence`, and no fork check there.
+  - P3-1: no E3 on-chain re-check.
+  - The new guards: no decision-time re-check, no E7 veto, no wall clock.
+- [x] `cargo test --workspace --no-fail-fast`: 6,256 passed, 0 failed, 23 ignored.
+  `-- --list` counts 6,279 tests, up from 6,271 at 7b5d58a7.
+- [x] Member end to end at twice the floor (`--include-ignored`): fork 60,
+  depth 20,200. Marked, resynced and on HEAVY; the armed node sealed nothing
+  before and 19 blocks on HEAVY after. 1,230 s.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean (after one
+  `manual_ok_err` fix), and `cargo fmt --all --check` clean.
+- [ ] CodeQL on the pushed head: see the PR.
+
 ## Core integration (read-only, citrate-core origin/main f8e60b84)
 
 1. The supervisor (`kit/src/supervisor.rs`) restarts the node on any exit.

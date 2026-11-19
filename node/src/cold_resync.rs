@@ -658,7 +658,22 @@ pub(crate) async fn evaluate(
     binding: &Binding,
     now: u64,
 ) -> anyhow::Result<Decision> {
-    let wedge = app.wedge()?;
+    let mut wedge = app.wedge()?;
+    // A marker the dead-branch evidence recorded (`dead_branch.rs`) holds only
+    // while the applied tip is the dead tip it was judged against: re-checked
+    // HERE, at decision time, so a tip that moved since the evidence tick (or
+    // an evidence tick that stopped running) never fires a resync. The
+    // applicator's own marker (`RefusePruned`) keeps its CV-7b rule.
+    if let Some(w) = &wedge {
+        if w.reason.starts_with(crate::dead_branch::REASON_PREFIX)
+            && app.applied_tip().await.hash != w.dead_tip
+        {
+            let _ = app
+                .clear_evidence_dead_branch(crate::dead_branch::REASON_PREFIX)
+                .await;
+            wedge = None;
+        }
+    }
     let state = read_state(data_dir)?;
     let decision = decide(policy, wedge.as_ref(), &state, finality_voting, now);
     if let Decision::Resync(req) = &decision {

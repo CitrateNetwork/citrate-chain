@@ -26,8 +26,8 @@
 // E2 Corroboration: at least [`MIN_PEERS`] distinct, currently connected
 //    peers gave such a TooDeep within [`EVIDENCE_TTL`], agreeing on the fork
 //    block and the first block of the other branch. A later conclusive
-//    episode with a peer (it extends our chain, is not heavier, or was
-//    fetched) withdraws its TooDeep.
+//    episode with a peer (it extends or holds our chain, is not heavier, or
+//    was fetched) withdraws its TooDeep.
 // E3 A finalized certificate from one of those peers that verifies against
 //    the committee THIS node derives (`finality_sync::judge_foreign_certificate`)
 //    and certifies a block not on our executed chain: above our applied tip,
@@ -37,11 +37,22 @@
 // E4 Never across finality: the fork is at or above this node's latest
 //    finalized checkpoint (a branch that leaves out a block this node holds a
 //    finalized certificate for is conflicting finality, never resynced to).
-// E5 Our branch has stopped: the newest block of our applied selected chain
-//    that this node did not seal is more than [`STALL_SECS`] old by its own
-//    timestamp ([`stall_age_secs`]). Read from the chain store, so a restart
-//    does not reset it.
+// E5 Our branch has stopped, by both clocks:
+//    - the applied tip has not moved to a block another node sealed for
+//      [`STALL_SECS`] of THIS node's wall clock ([`tip_unmoved_secs`], kept
+//      durably in the chain database, so a restart does not reset it and a
+//      node that is catching up, whose tip moves, never qualifies); and
+//    - the newest block of our applied selected chain that this node did not
+//      seal is more than [`STALL_SECS`] old by its own timestamp
+//      ([`stall_age_secs`]).
 // E6 `[recovery] cold_resync = false` records nothing (the verdict is logged).
+// E7 The catch-up veto: no currently connected peer ended an episode with
+//    `Outcome::Extends` (its executed chain holds our tip AND goes above it)
+//    within [`EVIDENCE_TTL`]. An honest peer ahead of us on our own chain
+//    always answers that way; a node stranded on a dead branch has none
+//    (peers level with it answer `Holds`). With this, the cheapest attack on a
+//    node that is catching up (two Sybil TooDeeps plus a genuine certificate
+//    relayed from the honest chain) needs a full eclipse.
 //
 // The marker's reason starts with [`REASON_PREFIX`]; if the applied tip moves
 // before the resync fires, the branch was not dead and the marker is cleared
@@ -91,6 +102,10 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const PROBE_COOLDOWN: Duration = Duration::from_secs(60);
 /// Peers whose TooDeep (or certificate request) is remembered, at most.
 pub const MAX_PEERS_TRACKED: usize = 256;
+/// `CF_METADATA` key of the durable E5 wall clock: the applied tip as last
+/// seen moved by another node's block, and when (unix seconds, this node's
+/// clock). In the chain database, so it goes away with it on a cold resync.
+const TIP_SINCE_KEY: &[u8] = b"dead_branch:tip_since";
 /// The marker reason of a marker this module recorded.
 pub const REASON_PREFIX: &str = "dead-branch evidence:";
 
@@ -123,6 +138,8 @@ pub struct Local {
     pub latest_finalized: u64,
     /// [`stall_age_secs`].
     pub stall_age_secs: u64,
+    /// [`tip_unmoved_secs`].
+    pub tip_unmoved_secs: u64,
 }
 
 /// All of E1 to E5 hold: the marker to record.
@@ -149,14 +166,21 @@ pub enum Missing {
     BelowFinality { fork: u64, finalized: u64 },
     /// E3: no verified certificate from an agreeing peer above the fork.
     Certificate,
-    /// E5: our branch was extended less than [`STALL_SECS`] ago.
-    NotStalled { age_secs: u64 },
+    /// E5: our branch was extended less than [`STALL_SECS`] ago, by its
+    /// blocks' timestamps (`age_secs`) or by this node's clock since the
+    /// applied tip last moved (`unmoved_secs`).
+    NotStalled { age_secs: u64, unmoved_secs: u64 },
+    /// E7: connected peers are ahead of us on our own chain: catching up.
+    CatchingUp { ahead: usize },
 }
 
 /// The evidence collected so far (see the module docs).
 #[derive(Debug, Default)]
 pub struct DeadBranch {
     deep: HashMap<String, DeepFork>,
+    /// E7: peers whose latest episode ended `Extends` (ahead of us on our
+    /// chain), and when.
+    ahead: HashMap<String, Instant>,
     cert: Option<Certified>,
     /// The certificate request in flight: (peer, sent at).
     probe: Option<(String, Instant)>,
@@ -198,14 +222,24 @@ impl DeadBranch {
                 );
             }
             // A conclusive answer that is not a deep fork withdraws the peer's
-            // TooDeep (and a certificate it served).
+            // TooDeep (and a certificate it served). `Extends` also says our
+            // branch is alive (E7).
             Outcome::Extends
+            | Outcome::Holds
             | Outcome::NotHeavier { .. }
             | Outcome::Fetched { .. }
             | Outcome::Faulty(_) => {
                 self.deep.remove(peer);
                 if self.cert.as_ref().is_some_and(|c| c.peer == peer) {
                     self.cert = None;
+                }
+                if matches!(outcome, Outcome::Extends) {
+                    if self.ahead.len() >= MAX_PEERS_TRACKED && !self.ahead.contains_key(peer) {
+                        self.ahead.retain(|_, at| fresh(*at, now));
+                    }
+                    if self.ahead.len() < MAX_PEERS_TRACKED || self.ahead.contains_key(peer) {
+                        self.ahead.insert(peer.to_string(), now);
+                    }
                 }
             }
             _ => {}
@@ -310,6 +344,15 @@ impl DeadBranch {
                 agreeing: peers.len(),
             });
         }
+        // E7: a connected peer ahead of us on our own chain.
+        let ahead = self
+            .ahead
+            .iter()
+            .filter(|(p, at)| fresh(**at, now) && connected.contains(p.as_str()))
+            .count();
+        if ahead > 0 {
+            return Err(Missing::CatchingUp { ahead });
+        }
         let fork = (*fork_hash, *fork_h);
         if fork.1 >= local.floor || !on_chain(&fork.0, fork.1) {
             return Err(Missing::NotDeep);
@@ -329,9 +372,10 @@ impl DeadBranch {
             .filter(|c| c.height > local.applied.1 || !on_chain(&c.hash, c.height))
             .ok_or(Missing::Certificate)?;
         // E5.
-        if local.stall_age_secs < STALL_SECS {
+        if local.stall_age_secs < STALL_SECS || local.tip_unmoved_secs < STALL_SECS {
             return Err(Missing::NotStalled {
                 age_secs: local.stall_age_secs,
+                unmoved_secs: local.tip_unmoved_secs,
             });
         }
         let mut peers: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
@@ -339,7 +383,8 @@ impl DeadBranch {
         let reason = format!(
             "{REASON_PREFIX} {} peers ({}) agree this branch forked at {} @ {} below the reorg \
              floor {}; the committee finalized {} @ {} on their branch (certificate from {}); \
-             this branch was last extended by another node {} s ago",
+             this branch was last extended by another node {} s ago (block time), \
+             the applied tip last moved {} s ago (local clock)",
             peers.len(),
             peers.join(", "),
             fork.0,
@@ -348,7 +393,8 @@ impl DeadBranch {
             cert.hash,
             cert.height,
             cert.peer,
-            local.stall_age_secs
+            local.stall_age_secs,
+            local.tip_unmoved_secs
         );
         Ok(Verdict {
             dead_tip: local.applied,
@@ -370,6 +416,54 @@ pub fn own_coinbase(coinbase: &str) -> Option<[u8; 20]> {
     let bytes = hex::decode(coinbase.trim_start_matches("0x")).ok()?;
     let out: [u8; 20] = bytes.try_into().ok()?;
     out.iter().any(|b| *b != 0).then_some(out)
+}
+
+/// E5, by this node's own clock: seconds since the applied tip last moved to
+/// a block another node sealed (`own`: this node's coinbase, as in
+/// [`stall_age_secs`]). The tip and the time it was first seen are kept in
+/// `CF_METADATA` ([`TIP_SINCE_KEY`], a synced write on change), so a restart
+/// does not reset the clock; a chain database without the record (a fresh
+/// install, or right after a cold resync) starts it now, so such a node
+/// waits the whole window. A tip this node sealed itself does not restart
+/// it. 0 on a read or write error (never "stalled" on an error). Data
+/// source: `BlockStore::get_applied_tip` and `get_header`, and the record.
+pub fn tip_unmoved_secs(
+    storage: &citrate_storage::StorageManager,
+    own: Option<&[u8; 20]>,
+    now_secs: u64,
+) -> u64 {
+    use citrate_storage::db::column_families::CF_METADATA;
+    let Ok(Some((tip, _))) = storage.blocks.get_applied_tip() else {
+        return 0;
+    };
+    let record: Option<(Hash, u64)> = match storage.db.get_cf(CF_METADATA, TIP_SINCE_KEY) {
+        Ok(Some(bytes)) => bincode::deserialize(&bytes).ok(),
+        Ok(None) => None,
+        Err(_) => return 0,
+    };
+    if let Some((seen, since)) = record {
+        if seen == tip {
+            return now_secs.saturating_sub(since);
+        }
+        let sealed_by_us = own.is_some()
+            && matches!(storage.blocks.get_header(&tip), Ok(Some(h)) if Some(&h.coinbase) == own);
+        if sealed_by_us {
+            return now_secs.saturating_sub(since);
+        }
+    }
+    let Ok(bytes) = bincode::serialize(&(tip, now_secs)) else {
+        return 0;
+    };
+    let mut batch = storage.db.batch();
+    if storage
+        .db
+        .batch_put_cf(&mut batch, CF_METADATA, TIP_SINCE_KEY, &bytes)
+        .is_err()
+        || storage.db.write_batch_sync(batch).is_err()
+    {
+        return 0;
+    }
+    0
 }
 
 /// The wall clock in unix seconds, for [`run_tick`].
@@ -478,6 +572,7 @@ pub async fn run_tick(
         floor: view.reorg_floor(),
         latest_finalized,
         stall_age_secs: stall_age_secs(storage, own, now_secs),
+        tip_unmoved_secs: tip_unmoved_secs(storage, own, now_secs),
     };
     let applied_height = view.applied.1;
     let verdict = evidence.lock().verdict(
@@ -565,6 +660,7 @@ mod tests {
             floor: 264_810,
             latest_finalized: 105_000,
             stall_age_secs: 3_600,
+            tip_unmoved_secs: 3_600,
         }
     }
 
@@ -729,9 +825,101 @@ mod tests {
         assert_eq!(
             full(now).verdict(&local, &peers(&["boot-1", "boot-2"]), ours, now),
             Err(Missing::NotStalled {
-                age_secs: STALL_SECS - 1
+                age_secs: STALL_SECS - 1,
+                unmoved_secs: 3_600
             })
         );
+    }
+
+    /// The node that is catching up: its blocks' timestamps are hours old
+    /// (it replays history), but its applied tip moves, so this node's own
+    /// clock since the tip last moved is short. Never marked, with every
+    /// other condition met (two Sybil TooDeeps, a genuine certificate).
+    #[test]
+    fn a_catching_up_node_whose_tip_moves_is_never_marked() {
+        let now = Instant::now();
+        let mut d = DeadBranch::new();
+        d.note_outcome("sybil-1", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_outcome("sybil-2", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_certificate("sybil-1", &cert(283_600, h(0xC0)), now);
+        let local = Local {
+            stall_age_secs: 50_000,
+            tip_unmoved_secs: 4,
+            ..member()
+        };
+        assert_eq!(
+            d.verdict(&local, &peers(&["sybil-1", "sybil-2"]), ours, now),
+            Err(Missing::NotStalled {
+                age_secs: 50_000,
+                unmoved_secs: 4
+            })
+        );
+    }
+
+    /// E7 is a veto only from a connected peer ahead of us (`Extends`); a
+    /// peer level with us (`Holds`, the other stranded members) is none.
+    #[test]
+    fn only_a_peer_ahead_of_us_vetoes() {
+        let now = Instant::now();
+        let mut d = full(now);
+        d.note_outcome("level", &Outcome::Holds, now);
+        assert!(d
+            .verdict(&member(), &peers(&["boot-1", "boot-2", "level"]), ours, now)
+            .is_ok());
+        d.note_outcome("ahead", &Outcome::Extends, now);
+        assert_eq!(
+            d.verdict(&member(), &peers(&["boot-1", "boot-2", "ahead"]), ours, now),
+            Err(Missing::CatchingUp { ahead: 1 })
+        );
+    }
+
+    /// The durable E5 clock: it starts when a tip is first seen, survives a
+    /// restart (a reopened store), restarts when another node's block moves
+    /// the tip, and does not restart for a block this node sealed.
+    #[test]
+    fn the_tip_clock_is_durable_and_restarts_only_on_another_nodes_block() {
+        use citrate_consensus::types::BlockBuilder;
+        use citrate_storage::pruning::PruningConfig;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let me = [7u8; 20];
+        let other = [8u8; 20];
+        let put = |s: &citrate_storage::StorageManager, height: u64, by: [u8; 20], parent: Hash| {
+            let mut hb = [0u8; 32];
+            hb[..8].copy_from_slice(&(height + 1).to_be_bytes());
+            let hash = Hash::new(hb);
+            let block = BlockBuilder::new()
+                .hash(hash)
+                .parent(parent)
+                .height(height)
+                .timestamp(1_000 + height)
+                .coinbase(by)
+                .build_unhashed();
+            s.blocks.put_block(&block).expect("put");
+            s.blocks.put_applied_tip(&hash, height).expect("tip");
+            hash
+        };
+        let t1 = {
+            let s = citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+                .expect("storage");
+            let t1 = put(&s, 1, other, Hash::default());
+            assert_eq!(tip_unmoved_secs(&s, Some(&me), 10_000), 0, "starts now");
+            assert_eq!(tip_unmoved_secs(&s, Some(&me), 10_500), 500);
+            t1
+        };
+        // A restart: the clock goes on.
+        let s = citrate_storage::StorageManager::new(dir.path(), PruningConfig::default())
+            .expect("reopen");
+        assert_eq!(tip_unmoved_secs(&s, Some(&me), 12_000), 2_000);
+        // Our own block on top: still running.
+        let t2 = put(&s, 2, me, t1);
+        assert_eq!(tip_unmoved_secs(&s, Some(&me), 12_100), 2_100);
+        // Another node's block: restarts.
+        put(&s, 3, other, t2);
+        assert_eq!(tip_unmoved_secs(&s, Some(&me), 12_200), 0);
+        assert_eq!(tip_unmoved_secs(&s, Some(&me), 12_260), 60);
+        // A follower (no coinbase): any move restarts it.
+        put(&s, 4, me, Hash::default());
+        assert_eq!(tip_unmoved_secs(&s, None, 12_300), 0);
     }
 
     #[test]
