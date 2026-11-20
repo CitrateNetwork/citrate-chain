@@ -5,3 +5,16 @@
 # them). CI must provide read access to CitrateNetwork/citrate-fed-types.
 [net]
 git-fetch-with-cli = true
+
+# Reproducible node builds: the vendored OpenSSL (openssl-src) compiles its
+# install prefix, an absolute path under the cargo target dir, into libcrypto
+# as ENGINESDIR / MODULESDIR. That ties the node's bytes to the directory it
+# was built in, and names a directory that does not exist where the node runs.
+# OpenSSL's Makefile appends $(CPPFLAGS) after its own -D flags, so these
+# defines replace them. They sit under OPENSSLDIR (/usr/local/ssl, the
+# openssl-src default), so the node trusts no directory it did not already.
+# No other C build in the tree reads CPPFLAGS (cc-rs reads CFLAGS/CXXFLAGS).
+# A builder that sets CPPFLAGS itself keeps its own value (force = false).
+# Pinned by node/tests/openssl_build_dirs.rs.
+[env]
+CPPFLAGS = '-UENGINESDIR -DENGINESDIR="\"/usr/local/ssl/lib/engines-3\"" -UMODULESDIR -DMODULESDIR="\"/usr/local/ssl/lib/ossl-modules\""'

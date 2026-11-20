@@ -786,14 +786,7 @@ impl AiApi {
 
         // Search for model in multiple locations
         let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let model_dirs = [
-            PathBuf::from("./models"),
-            PathBuf::from("../../../models"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models"),
-            home_dir.join("Models"),
-            home_dir.join(".citrate/models"),
-            home_dir.join(".ipfs/models"),
-        ];
+        let model_dirs = model_search_dirs(&home_dir);
 
         // First try exact filename match
         let mut model_path: Option<PathBuf> = model_dirs
@@ -971,10 +964,49 @@ impl AiApi {
     }
 }
 
+/// Where `chat_completions` looks for a GGUF model, in order.
+fn model_search_dirs(home_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    vec![
+        PathBuf::from("./models"),
+        PathBuf::from("../../../models"),
+        home_dir.join("Models"),
+        home_dir.join(".citrate/models"),
+        home_dir.join(".ipfs/models"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json;
+
+    /// A release binary must not carry the directory it was built in: that path means nothing on
+    /// the machine that runs the node, and it makes the binary's bytes depend on where it was built.
+    #[test]
+    fn model_search_dirs_do_not_name_the_build_tree() {
+        let home = std::path::Path::new("/home/someone");
+        let dirs = model_search_dirs(home);
+        let build_tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for d in &dirs {
+            assert!(
+                !d.starts_with(build_tree),
+                "model search dir {} is inside the build tree",
+                d.display()
+            );
+        }
+        // The runtime locations are all still searched, in order.
+        assert_eq!(
+            dirs,
+            vec![
+                std::path::PathBuf::from("./models"),
+                std::path::PathBuf::from("../../../models"),
+                home.join("Models"),
+                home.join(".citrate/models"),
+                home.join(".ipfs/models"),
+            ]
+        );
+    }
 
     #[test]
     fn test_chat_message_serialization() {
