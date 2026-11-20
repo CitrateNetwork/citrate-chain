@@ -1259,4 +1259,121 @@ mod tests {
         assert!(!app.clear_evidence_dead_branch(REASON_PREFIX).await);
         assert_eq!(app.wedge().expect("read"), Some(own));
     }
+    // ---- Review round 2 of #486: Sybils starve the catch-up veto ----------
+
+    /// The node as `start_node` runs it, for `secs` seconds: the ancestor
+    /// driver's tick every second over `cands`, and every peer answering a
+    /// locate after 14 s as a "hog" does (our tip as the common block, zero
+    /// work: NotHeavier), except "honest", which is ahead of us on our chain
+    /// (Extends). Returns how often "honest" was asked.
+    fn starve_run(
+        a: &mut crate::ancestor_sync::AncestorSync,
+        d: &mut DeadBranch,
+        cands: &[crate::ancestor_sync::Candidate],
+        t0: Instant,
+        secs: u64,
+    ) -> (usize, Instant) {
+        use crate::ancestor_sync::{Request, View};
+        let ch = |n: u64| {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&n.to_be_bytes());
+            b[31] = 1;
+            Hash::new(b)
+        };
+        let tip = 274_810u64;
+        let view = View {
+            applied: (ch(tip), tip),
+            applied_blue_work: 1_000,
+            finalized: (ch(0), 0),
+            genesis: ch(0),
+            behind: true,
+        };
+        let mut pending: Option<(String, Instant)> = None;
+        let mut honest = 0usize;
+        let mut now = t0;
+        for s in 0..secs {
+            now = t0 + Duration::from_secs(s);
+            if let Some((p, at)) = pending.clone() {
+                if now.saturating_duration_since(at) >= Duration::from_secs(14) {
+                    pending = None;
+                    if let Some(o) = a.on_ancestor(
+                        &p,
+                        Some((ch(tip), tip)),
+                        (ch(tip), tip),
+                        0,
+                        &[],
+                        &view,
+                        now,
+                        0,
+                        |_, _| true,
+                        |_| None,
+                    ) {
+                        d.note_outcome(&p, &o, now);
+                    }
+                }
+            }
+            let (req, ended) = a.tick(now, &view, cands, |x| Some(ch(x)));
+            if let Some(o) = &ended {
+                let p = a.last_peer().map(str::to_string).expect("peer");
+                d.note_outcome(&p, o, now);
+            }
+            if let Some(Request::Locate { peer, .. }) = req {
+                if peer == "honest" {
+                    honest += 1;
+                    // Its answer: ahead of us on our chain.
+                    let _ = a.unsent(now);
+                    d.note_outcome("honest", &Outcome::Extends, now);
+                } else {
+                    pending = Some((peer, now));
+                }
+            }
+        }
+        (honest, now)
+    }
+
+    fn starve_cands(hogs: usize) -> Vec<crate::ancestor_sync::Candidate> {
+        let mut cands = vec![crate::ancestor_sync::Candidate {
+            id: "honest".into(),
+            speaks: true,
+            head_hash: h(0xEE),
+            head_height: 274_810 + 5_000,
+            head_held: false,
+        }];
+        for i in 0..hogs {
+            cands.push(crate::ancestor_sync::Candidate {
+                id: format!("hog-{i}"),
+                speaks: true,
+                head_hash: h(0xF0 + i as u8),
+                head_height: u64::MAX / 2,
+                head_held: false,
+            });
+        }
+        cands
+    }
+
+    /// Round 2, P1-1 (adapted from the reviewer's PoC): five "hog" Sybils
+    /// advertise a huge head and answer each locate after 14 s with zero work
+    /// (NotHeavier: a 30 s cooldown, never a failure). They keep the driver's
+    /// one episode slot busy, so the honest peer ahead of us is never asked
+    /// and never vetoes. Together with two Sybil TooDeeps and a relayed
+    /// genuine certificate, the catching-up node must still never be marked.
+    #[test]
+    fn hog_sybils_cannot_starve_the_catch_up_veto() {
+        let t0 = Instant::now();
+        let cands = starve_cands(5);
+        let mut a = crate::ancestor_sync::AncestorSync::new();
+        let mut d = DeadBranch::new();
+        a.note_deferred("hog-0", t0);
+        let (_, now) = starve_run(&mut a, &mut d, &cands, t0, 4_000);
+        d.note_outcome("sybil-1", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_outcome("sybil-2", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_certificate("sybil-1", &cert(283_600, h(0xC0)), now);
+        let mut connected: Vec<String> = cands.iter().map(|c| c.id.clone()).collect();
+        connected.push("sybil-1".into());
+        connected.push("sybil-2".into());
+        assert!(
+            d.verdict(&member(), &connected, ours, now).is_err(),
+            "five hogs starved the honest peer and the node was marked"
+        );
+    }
 }
