@@ -217,7 +217,25 @@ struct Node {
     split_gate: sync_peer::SplitPullGate,
     /// Blocks this process has relayed (the gossip seen-cache).
     relayed: HashSet<Hash>,
+    /// This node's simulated wall clock in ms (the producer's slot clock).
+    wall: crate::producer::SlotClock,
+    /// Dead-branch evidence and checkpoint finality (`dead_branch.rs`,
+    /// `finality_sync.rs`), only in the scenarios that attach it
+    /// ([`Fleet::attach_dead_branch`]).
+    dead_branch: Option<DeadBranchRig>,
     dir: TempDir,
+}
+
+/// What `start_node` wires for dead-branch evidence: the checkpoint manager
+/// and gadget (committee: the genesis validator set), the certificate sync
+/// that serves `GetCheckpoint` (Observed mode, as on r1007), and the evidence.
+struct DeadBranchRig {
+    gadget: Arc<citrate_consensus::checkpoint_gadget::FinalityGadget>,
+    cert_sync: Arc<crate::finality_sync::CertificateSync>,
+    evidence: parking_lot::Mutex<crate::dead_branch::DeadBranch>,
+    logged: parking_lot::Mutex<Option<crate::dead_branch::Missing>>,
+    /// `[recovery] cold_resync`.
+    enabled: bool,
 }
 
 /// A node's handle on a peer, and the queue of what it sent that peer.
@@ -469,6 +487,7 @@ impl Node {
             })
         };
         let attested = AttestedNetworkHead::new().with_wall_clock_for_test(sim_wall.clone());
+        let wall = sim_wall.clone();
         let initial_sync = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let producer = BlockProducer::with_shared_dag(
             storage.clone(),
@@ -560,6 +579,8 @@ impl Node {
             rotate_idx: 0,
             split_gate: sync_peer::SplitPullGate::new(),
             relayed: HashSet::new(),
+            wall,
+            dead_branch: None,
             dir,
         }
     }
@@ -1043,7 +1064,7 @@ impl Fleet {
                 headers,
             } => {
                 let finalized = node.app.finalized_height_handle().load(Ordering::SeqCst);
-                let _ = crate::ancestor_sync::on_reply(
+                let ended = crate::ancestor_sync::on_reply(
                     &node.ancestor,
                     &node.storage,
                     finalized,
@@ -1054,6 +1075,9 @@ impl Fleet {
                     &headers,
                     node.clock,
                 );
+                if let (Some(rig), Some(o)) = (&node.dead_branch, &ended) {
+                    rig.evidence.lock().note_outcome(&pid.0, o, node.clock);
+                }
                 crate::ancestor_sync::send_next(
                     &node.ancestor,
                     &node.adm,
@@ -1062,6 +1086,52 @@ impl Fleet {
                     node.clock,
                 )
                 .await;
+            }
+            // main.rs `GetCheckpoint` arm (the serve rate limit is wall-clock
+            // based; the harness runs faster than it, so it is reset first).
+            NetworkMessage::GetCheckpoint { above, at_or_below } => {
+                if let Some(rig) = &node.dead_branch {
+                    rig.cert_sync.reset_rate_limits_for_tests().await;
+                    if let Some(resp) = rig.cert_sync.serve(&pid.0, above, at_or_below).await {
+                        let _ = peer.send(resp).await;
+                    }
+                }
+            }
+            // main.rs `CheckpointCertificate` arm: the answer to the evidence
+            // request is judged, never installed.
+            NetworkMessage::CheckpointCertificate {
+                height,
+                block_hash,
+                binding,
+                signatures,
+            } => {
+                if let Some(rig) = &node.dead_branch {
+                    let applied_now = node.applied().1;
+                    let probe = height > applied_now
+                        && rig.evidence.lock().accept_probe_answer(&pid.0, node.clock);
+                    let synced = !probe && rig.cert_sync.accept_response(&pid.0).await;
+                    let probe = probe
+                        || (!synced && rig.evidence.lock().accept_probe_answer(&pid.0, node.clock));
+                    if synced {
+                        let _ = rig
+                            .cert_sync
+                            .process(&pid.0, height, block_hash, binding, signatures)
+                            .await;
+                    } else if probe {
+                        let judged = crate::finality_sync::judge_foreign_certificate(
+                            &rig.gadget,
+                            &node.app,
+                            height,
+                            block_hash,
+                            binding,
+                            &signatures,
+                        )
+                        .await;
+                        rig.evidence
+                            .lock()
+                            .note_certificate(&pid.0, &judged, node.clock);
+                    }
+                }
             }
             _ => {}
         }
@@ -1711,7 +1781,7 @@ impl Node {
         let ancestor_owns = if ancestor_on {
             let cands = crate::ancestor_sync::candidates(connected, &self.adm).await;
             let finalized = self.app.finalized_height_handle().load(Ordering::SeqCst);
-            let _ = crate::ancestor_sync::run_tick(
+            let ended = crate::ancestor_sync::run_tick(
                 &self.ancestor,
                 &self.storage,
                 &self.adm,
@@ -1722,6 +1792,32 @@ impl Node {
                 self.clock,
             )
             .await;
+            // main.rs: the outcome feeds the dead-branch evidence, then the
+            // evidence tick runs.
+            if let Some(rig) = &self.dead_branch {
+                if let Some(o) = &ended {
+                    let peer = self.ancestor.lock().last_peer().map(str::to_string);
+                    if let Some(peer) = peer {
+                        rig.evidence.lock().note_outcome(&peer, o, self.clock);
+                    }
+                }
+                let wall_secs = (self.wall)() / 1_000;
+                let _ = crate::dead_branch::run_tick(
+                    &rig.evidence,
+                    &self.app,
+                    &self.storage,
+                    rig.gadget.manager(),
+                    &self.ancestor,
+                    connected,
+                    finalized,
+                    None,
+                    rig.enabled,
+                    &rig.logged,
+                    self.clock,
+                    wall_secs,
+                )
+                .await;
+            }
             self.ancestor.lock().owns_sync()
         } else {
             false
@@ -2176,6 +2272,163 @@ fn fat_tx(seq: u64) -> citrate_consensus::types::Transaction {
     citrate_consensus::crypto::sign_transaction_v2(&mut tx, &sk).expect("sign");
     tx.hash = citrate_consensus::tx_auth::native_tx_id(&tx);
     tx
+}
+
+/// The validator keys of the dead-branch scenarios' checkpoint committee:
+/// the genesis validator set (seven, as on r1007).
+fn committee_keys() -> Vec<Ed25519SigningKey> {
+    (0..7).map(key).collect()
+}
+
+impl Fleet {
+    /// Attach dead-branch evidence and checkpoint finality to node `i`, as
+    /// `start_node` wires them: a checkpoint manager on the node's store, a
+    /// gadget whose committee is the genesis validator set, the Observed-mode
+    /// floor verifier and certificate sync, and the evidence.
+    async fn attach_dead_branch(&mut self, i: usize, enabled: bool) {
+        use citrate_consensus::checkpoint::{CheckpointConfig, CheckpointManager};
+        use citrate_consensus::checkpoint_gadget::FinalityGadget;
+        let genesis = self.genesis.header.block_hash;
+        let node = &mut self.nodes[i];
+        let kv = Arc::new(crate::persistent_dag::RocksDbKvStore::new(
+            node.storage.db.clone(),
+        ));
+        let mgr = Arc::new(CheckpointManager::with_persistence(
+            CheckpointConfig {
+                chain_id: CHAIN_ID,
+                genesis_hash: genesis,
+                ..CheckpointConfig::default()
+            },
+            node.dag.clone(),
+            kv,
+        ));
+        let set = committee_keys()
+            .iter()
+            .map(|k| (PublicKey::new(k.verifying_key().to_bytes()), STAKE))
+            .collect();
+        let gadget = Arc::new(
+            FinalityGadget::with_switch(mgr.clone(), None, true).with_genesis_committee(set),
+        );
+        let floor = Arc::new(crate::finality_floor::FloorVerifier::new(
+            crate::finality_floor::FloorMode::Observed,
+            mgr,
+            node.app.clone(),
+            gadget.safety_stop(),
+            Arc::new(AtomicU64::new(0)),
+            crate::finality_floor::CertificateCommittees::new(gadget.clone(), node.storage.clone()),
+        ));
+        let cert_sync = Arc::new(
+            crate::finality_sync::CertificateSync::new(gadget.clone(), node.app.clone(), floor)
+                .expect("Observed mode runs certificate sync"),
+        );
+        node.dead_branch = Some(DeadBranchRig {
+            gadget,
+            cert_sync,
+            evidence: parking_lot::Mutex::new(crate::dead_branch::DeadBranch::new()),
+            logged: parking_lot::Mutex::new(None),
+            enabled,
+        });
+    }
+
+    /// Finalize node `i`'s canonical block at the checkpoint boundary
+    /// `height`: five of the seven committee keys sign it, and the certificate
+    /// is verified against the committee the node derives and installed as
+    /// a synced one (what a node that took part in the quorum holds).
+    async fn finalize_on(&self, i: usize, height: u64) -> Hash {
+        use citrate_consensus::checkpoint::sign_checkpoint_vote;
+        let node = &self.nodes[i];
+        let rig = node.dead_branch.as_ref().expect("fixture: rig attached");
+        let hash = node
+            .storage
+            .blocks
+            .get_canonical_block_by_height(height)
+            .expect("read")
+            .expect("fixture: a canonical block at the checkpoint");
+        let (committee, binding) = crate::finality_floor::CertificateCommittees::new(
+            rig.gadget.clone(),
+            node.storage.clone(),
+        )
+        .derive(height, hash)
+        .await
+        .expect("fixture: committee and binding");
+        let genesis = self.genesis.header.block_hash;
+        let sigs: Vec<(PublicKey, citrate_consensus::types::Signature)> = committee_keys()
+            .iter()
+            .take(5)
+            .map(|k| {
+                let v = sign_checkpoint_vote(CHAIN_ID, &genesis, height, hash, &binding, k);
+                (v.voter, v.signature)
+            })
+            .collect();
+        let mgr = rig.gadget.manager();
+        let verified = mgr
+            .verify_synced_certificate(height, hash, binding, &sigs, &committee, &binding)
+            .expect("fixture: a valid certificate");
+        mgr.install_synced_certificate(verified)
+            .await
+            .expect("fixture: installed");
+        hash
+    }
+
+    /// The guarded cold resync's restart, as on a node: the running process
+    /// exits (every handle on its store dropped), the supervisor starts it
+    /// again, and `start_node` carries out the request before it opens the
+    /// chain database (`cold_resync::apply_pending`), then starts on the empty
+    /// database with the same data dir. Returns where the database went.
+    async fn cold_resync_restart(&mut self, i: usize, now_unix: u64) -> std::path::PathBuf {
+        self.pump().await;
+        let n = self.nodes.len();
+        let old = self.nodes.remove(i);
+        let enabled = old.dead_branch.as_ref().is_some_and(|r| r.enabled);
+        let dir = old.stop();
+        let policy = crate::cold_resync::Policy::from(&crate::config::RecoveryConfig::default());
+        let aside = crate::cold_resync::apply_pending_with(
+            dir.path(),
+            policy,
+            &crate::cold_resync::Carry::default(),
+            now_unix,
+        )
+        .expect("apply_pending")
+        .expect("the chain database was moved aside");
+        let storage = Arc::new(
+            StorageManager::new(dir.path(), PruningConfig::default()).expect("the empty database"),
+        );
+        let node = Node::start(
+            i,
+            n,
+            &self.genesis,
+            storage,
+            dir,
+            Boot::Fresh,
+            self.slot_no,
+            self.now(),
+            self.clock_ms.clone(),
+            self.refuse_window,
+            &self.alloc,
+        )
+        .await;
+        self.nodes.insert(i, node);
+        self.attach_peers(i).await;
+        self.attach_dead_branch(i, enabled).await;
+        aside
+    }
+
+    /// The highest height at which nodes `a` and `b` hold the same canonical
+    /// block, searched down from `from`.
+    fn common_height(&self, a: usize, b: usize, from: u64) -> u64 {
+        let at = |i: usize, h: u64| {
+            self.nodes[i]
+                .storage
+                .blocks
+                .get_canonical_block_by_height(h)
+                .expect("read")
+        };
+        let mut h = from;
+        while h > 0 && (at(a, h).is_none() || at(a, h) != at(b, h)) {
+            h -= 1;
+        }
+        h
+    }
 }
 
 impl Fleet {
@@ -3283,6 +3536,13 @@ mod tests {
             "sync_for_rx.pipeline_on_answer(applied_tip)",
             "let answers_rejoin = if receipt.pipelined {",
             "receipt.new_blocks == 0 && receipt.received > 0",
+            // Dead-branch evidence (r1007 members after the 2026-11-19 recovery).
+            "dead_branch::run_tick(",
+            "dead_branch_for_loop.lock().note_outcome(",
+            "dead_branch_for_rx.lock().note_outcome(",
+            "dead_branch_for_rx.lock().accept_probe_answer(&pid.0, now)",
+            "finality_sync::judge_foreign_certificate(",
+            "evidence.lock().note_certificate(",
         ] {
             assert!(
                 main.contains(needle),
@@ -4336,6 +4596,350 @@ mod tests {
             "the cold node never caught up with its relaying peer: {:?} ({})",
             fleet.applied_heights().await,
             fleet.describe().await
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Dead-branch evidence (r1007 after the 2026-11-19 recovery).
+    //
+    // The fleet was recovered onto HEAVY, which then finalized checkpoint
+    // 283,600. Member nodes stayed on LIGHT at 274,810: forked at 105,024,
+    // about 170,000 heights below their tip, with no producer left on LIGHT.
+    // They report `catching_up` for ever, and ancestor sync only says the
+    // fork is below the reorg floor. Here: a light node forked more than
+    // twice the reorg floor below its tip, a heavy pair that finalized a
+    // checkpoint above it, and the guarded cold resync end to end.
+    // ---------------------------------------------------------------------
+
+    /// Up to `slots` slots, stopping once node `watch` holds a dead-branch
+    /// marker.
+    async fn run_until_marked(fleet: &mut Fleet, rng: &mut Rng, watch: usize, slots: u64) {
+        let n = fleet.nodes.len();
+        for _ in 0..slots {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+            if fleet.nodes[watch].app.wedge().expect("read").is_some() {
+                break;
+            }
+        }
+    }
+
+    /// The r1007 member, end to end, through the code a node runs: ancestor
+    /// sync locates the deep fork with each heavy peer, the evidence asks one
+    /// of them for its latest certificate and judges it against its own
+    /// committee, and only once every condition holds is the dead-branch
+    /// marker recorded; then the cold resync's own decision, request and
+    /// start-up move, a fresh start on the same data dir (identity kept), and
+    /// a sync from genesis onto the heavy branch. Along the way, each missing
+    /// condition holds it back: no certificate yet, a single connected heavy
+    /// peer, and `[recovery] cold_resync = false`.
+    ///
+    /// In the default suite with the fork just below the reorg floor (about
+    /// ten minutes on cnv-build-2); the next test runs the depth the r1007
+    /// case asks for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_stranded_on_a_dead_branch_resyncs_onto_the_finalized_branch() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::a_node_stranded_on_a_dead_branch_resyncs_onto_the_finalized_branch",
+            );
+        }
+        stranded_member(crate::canonical_apply::MAX_REORG_DEPTH + 300).await;
+    }
+
+    /// The same, with the fork more than twice the reorg floor below the light
+    /// node's tip (r1007: about 17 times). About 35 minutes on cnv-build-2.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "end to end at twice the reorg floor, ~35 min: run with --include-ignored"]
+    async fn a_member_forked_twice_the_reorg_floor_below_resyncs_onto_the_finalized_branch() {
+        if !in_child() {
+            let out = child_output_with(
+                "split_heal_tests::tests::a_member_forked_twice_the_reorg_floor_below_resyncs_onto_the_finalized_branch",
+                &["--include-ignored"],
+            );
+            for l in out.lines().filter(|l| l.starts_with("dead branch")) {
+                eprintln!("{l}");
+            }
+            return;
+        }
+        stranded_member(2 * crate::canonical_apply::MAX_REORG_DEPTH + 200).await;
+    }
+
+    /// The scenario of the two tests above: a light node whose branch forked
+    /// `split` slots (one height each) before it stopped.
+    async fn stranded_member(split: u64) {
+        use crate::dead_branch::{Missing, REASON_PREFIX, STALL_SECS};
+        let max = crate::canonical_apply::MAX_REORG_DEPTH;
+        assert!(
+            split > max + 100,
+            "fixture: the fork must be below the floor"
+        );
+        let n = 3;
+        let (heavy, light) = ([0usize, 1], 2usize);
+        let mut fleet = Fleet::new(n).await;
+        for i in 0..n {
+            fleet.attach_dead_branch(i, true).await;
+        }
+        let mut rng = Rng(0xDEAD_B4A9_C4E5_0001);
+        let t = std::time::Instant::now();
+        // Warm-up, then a checkpoint every node finalizes below the fork (as
+        // 105,000 on r1007): the fork is above it, so it is not crossed.
+        while fleet
+            .applied_heights()
+            .await
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(0)
+            < 60
+        {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        for i in 0..n {
+            fleet.finalize_on(i, 50).await;
+        }
+        let split_at = fleet.applied_heights().await[light];
+        fleet.set_links(|i, j| heavy.contains(&i) == heavy.contains(&j));
+        for _ in 0..split {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        // LIGHT's producers stop; HEAVY goes on for the stall window.
+        fleet.quiet.insert(light);
+        let stall_slots = STALL_SECS / 2 + 60;
+        for _ in 0..stall_slots {
+            let o = rng.order(n);
+            fleet.slot(&o).await;
+        }
+        let light_tip = fleet.nodes[light].applied();
+        let heavy_tip = fleet.nodes[heavy[0]].applied();
+        let fork = fleet.common_height(light, heavy[0], split_at + 10);
+        let depth = light_tip.1 - fork;
+        eprintln!(
+            "dead branch fixture: fork {fork}, light tip {}, heavy tip {}, depth {depth}, \
+             {:.0}s",
+            light_tip.1,
+            heavy_tip.1,
+            t.elapsed().as_secs_f64()
+        );
+        assert!(
+            fork >= 50,
+            "fixture: the fork is above the finalized checkpoint"
+        );
+        assert!(depth > max, "fixture: below the reorg floor ({depth})");
+        if split > 2 * max {
+            assert!(depth > 2 * max, "fixture: twice the reorg floor ({depth})");
+        }
+        assert!(
+            heavy_tip.1 > light_tip.1 + 100,
+            "fixture: HEAVY is above LIGHT"
+        );
+        let logged = |fleet: &Fleet| {
+            fleet.nodes[light]
+                .dead_branch
+                .as_ref()
+                .and_then(|r| r.logged.lock().clone())
+        };
+        let wedged = |fleet: &Fleet| fleet.nodes[light].app.wedge().expect("read");
+
+        // A. Both heavy peers, no certificate yet: TooDeep from both, no mark.
+        fleet.set_links(|_, _| true);
+        let _ = fleet.outbox();
+        fleet.handshake().await;
+        run_until_marked(&mut fleet, &mut rng, light, 120).await;
+        assert_eq!(wedged(&fleet), None, "no certificate: never marked");
+        assert_eq!(
+            logged(&fleet),
+            Some(Missing::Certificate),
+            "two heavy peers agree, the certificate is missing ({})",
+            fleet.nodes[light].ancestor.lock().summary()
+        );
+
+        // B. HEAVY finalizes above LIGHT's tip; only one heavy peer connected.
+        let cert_height = (heavy_tip.1 - 10) / 50 * 50;
+        assert!(cert_height > light_tip.1, "fixture: certified above LIGHT");
+        let certified = fleet.finalize_on(heavy[0], cert_height).await;
+        assert_eq!(fleet.finalize_on(heavy[1], cert_height).await, certified);
+        let cut =
+            |i: usize, j: usize| (i == heavy[1] && j == light) || (i == light && j == heavy[1]);
+        fleet.set_links(|i, j| !cut(i, j));
+        run_until_marked(&mut fleet, &mut rng, light, 120).await;
+        assert_eq!(wedged(&fleet), None, "one heavy peer: never marked");
+        assert!(
+            matches!(logged(&fleet), Some(Missing::Corroboration { agreeing: 1 })),
+            "{:?}",
+            logged(&fleet)
+        );
+
+        // C. Everything holds, but `[recovery] cold_resync = false`.
+        fleet.set_links(|_, _| true);
+        fleet.handshake().await;
+        fleet.nodes[light]
+            .dead_branch
+            .as_mut()
+            .expect("rig")
+            .enabled = false;
+        run_until_marked(&mut fleet, &mut rng, light, 120).await;
+        assert_eq!(wedged(&fleet), None, "the off switch records nothing");
+
+        // D. Switched on: marked.
+        fleet.nodes[light]
+            .dead_branch
+            .as_mut()
+            .expect("rig")
+            .enabled = true;
+        run_until_marked(&mut fleet, &mut rng, light, 120).await;
+        let w = wedged(&fleet).unwrap_or_else(|| {
+            panic!(
+                "never marked: {:?} ({})",
+                logged(&fleet),
+                fleet.nodes[light].ancestor.lock().summary()
+            )
+        });
+        assert_eq!((w.dead_tip, w.dead_tip_height), light_tip);
+        assert_eq!(w.fork_height, fork, "{w:?}");
+        assert_eq!((w.head, w.head_height), (certified, cert_height));
+        assert!(w.reason.starts_with(REASON_PREFIX), "{}", w.reason);
+        // A wedged node advertises the fork point, not the dead branch.
+        assert_eq!(
+            crate::cold_resync::advertised_head(&fleet.nodes[light].storage),
+            Some((w.fork_point, w.fork_height))
+        );
+
+        // The guarded cold resync, unchanged: it waits `cold_resync_after_secs`
+        // from the marker, then requests and the process exits; the restart
+        // moves the database aside and starts on an empty one.
+        let policy = crate::cold_resync::Policy::from(&crate::config::RecoveryConfig::default());
+        let data = fleet.nodes[light].dir.path().to_path_buf();
+        std::fs::write(data.join("noise.key"), b"identity").expect("identity file");
+        let eval = |fleet: &Fleet, now: u64| {
+            let node = &fleet.nodes[light];
+            let rig = node.dead_branch.as_ref().expect("rig");
+            let (app, storage, gadget) =
+                (node.app.clone(), node.storage.clone(), rig.gadget.clone());
+            let data = data.clone();
+            async move {
+                crate::cold_resync::evaluate(
+                    &app,
+                    &storage,
+                    Some(&gadget),
+                    &data,
+                    policy,
+                    false,
+                    &citrate_storage::signed_votes::Binding::default(),
+                    now,
+                )
+                .await
+                .expect("evaluate")
+            }
+        };
+        assert!(matches!(
+            eval(&fleet, w.since_unix + 1).await,
+            crate::cold_resync::Decision::Waiting { .. }
+        ));
+        let now_unix = w.since_unix + policy.after_secs;
+        assert!(matches!(
+            eval(&fleet, now_unix).await,
+            crate::cold_resync::Decision::Resync(_)
+        ));
+        assert!(data.join(crate::cold_resync::REQUEST_FILE).exists());
+        let aside = fleet.cold_resync_restart(light, now_unix).await;
+        assert!(aside.join("CURRENT").exists(), "moved, not deleted");
+        assert_eq!(
+            std::fs::read(data.join("noise.key")).expect("kept"),
+            b"identity",
+            "the node identity stays"
+        );
+        assert_eq!(
+            crate::cold_resync::read_state(&data)
+                .expect("state")
+                .resyncs,
+            1
+        );
+        assert_eq!(
+            wedged(&fleet),
+            None,
+            "the marker went with the old database"
+        );
+        assert_eq!(fleet.nodes[light].applied().1, 0, "an empty chain database");
+
+        // The fresh start syncs from genesis onto HEAVY. It comes back ARMED
+        // (Core respawns an armed member with `--mine` on the empty database):
+        // the producer's gates (initial sync, catch-up, network height) must
+        // hold its sealing until it is on HEAVY, and whatever it seals then
+        // builds on HEAVY.
+        fleet.quiet.remove(&light);
+        fleet.handshake().await;
+        let heavy_fork_child = fleet.nodes[heavy[0]]
+            .storage
+            .blocks
+            .get_canonical_block_by_height(fork + 1)
+            .expect("read");
+        let mut on_heavy = None;
+        let mut sealed_early = Vec::new();
+        let mut sealed_after = Vec::new();
+        for slot in 1..=6_000u64 {
+            let o = rng.order(n);
+            let produced = fleet.slot(&o).await;
+            let mine = fleet.nodes[light].applied().1;
+            let theirs = fleet.nodes[heavy[0]].applied().1;
+            let synced = mine > fork + 1 && mine + 8 >= theirs;
+            for (i, b) in produced {
+                if i == light {
+                    if on_heavy.is_none() && !synced {
+                        sealed_early.push(b.header.height);
+                    } else {
+                        sealed_after.push(b);
+                    }
+                }
+            }
+            if synced && on_heavy.is_none() {
+                on_heavy = Some(slot);
+            }
+            // A few more slots, so the armed node seals on HEAVY.
+            if on_heavy.is_some_and(|at| slot >= at + 20) {
+                break;
+            }
+        }
+        assert!(
+            sealed_early.is_empty(),
+            "the armed node sealed before it was on HEAVY, at heights {sealed_early:?}"
+        );
+        for b in &sealed_after {
+            // A HEAVY block (a sibling of p0's canonical one is fine): p0
+            // holds it, far above the fork.
+            let parent = b.header.selected_parent_hash;
+            assert!(
+                b.header.height > fork + 1
+                    && fleet.nodes[heavy[0]]
+                        .storage
+                        .blocks
+                        .has_block(&parent)
+                        .expect("read"),
+                "the armed node sealed {} @ {} on a parent not on HEAVY",
+                b.header.block_hash,
+                b.header.height
+            );
+        }
+        let at_fork_child = fleet.nodes[light]
+            .storage
+            .blocks
+            .get_canonical_block_by_height(fork + 1)
+            .expect("read");
+        assert!(
+            on_heavy.is_some(),
+            "the resynced node did not reach HEAVY's tip: {:?} ({})",
+            fleet.applied_heights().await,
+            fleet.describe().await
+        );
+        assert_eq!(at_fork_child, heavy_fork_child, "on HEAVY above the fork");
+        eprintln!(
+            "dead branch: resynced onto HEAVY in {} slots ({} block(s) sealed once on \
+             HEAVY, none before), {:.0}s in all",
+            on_heavy.unwrap_or(0),
+            sealed_after.len(),
+            t.elapsed().as_secs_f64()
         );
     }
 }
