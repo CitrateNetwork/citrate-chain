@@ -518,6 +518,11 @@ pub struct AncestorSync {
     /// peer -> resumable budget endings in a row that left the applied tip
     /// where the episode found it ([`MAX_IDLE_BUDGETS`]).
     idle_budgets: HashMap<String, u32>,
+    /// A peer the dead-branch evidence asked to be probed (`dead_branch.rs`
+    /// E8): the next episode is with it, whatever the ranking, the evidence
+    /// gate or its cooldown say. One at a time; the evidence path bounds the
+    /// rate.
+    forced: Option<String>,
 }
 
 impl AncestorSync {
@@ -640,6 +645,21 @@ impl AncestorSync {
             ),
             None => format!("idle ended[{}]", ended.join(" ")),
         }
+    }
+
+    /// Ask for the next episode to be with `peer` (dead-branch evidence E8:
+    /// every connected 1.3 peer must have answered conclusively, and the
+    /// ranked choice below can be monopolised by peers that advertise a
+    /// huge head). Ignored while another forced probe is waiting.
+    pub fn force_probe(&mut self, peer: &str) {
+        if self.forced.is_none() {
+            self.forced = Some(peer.to_string());
+        }
+    }
+
+    /// A forced probe is waiting for the episode slot.
+    pub fn probe_waiting(&self) -> bool {
+        self.forced.is_some()
     }
 
     /// The peer of the last episode that ended.
@@ -808,6 +828,13 @@ impl AncestorSync {
             // below the work this node already has.
             return (None, self.end(Outcome::Stalled, now));
         }
+        // A forced probe takes the free slot first, outside the ranking.
+        if let Some(id) = self.forced.take() {
+            if let Some(c) = candidates.iter().find(|c| c.id == id && c.speaks) {
+                let peer = c.id.clone();
+                return (Some(self.start(peer, now, view, lookup)), ended);
+            }
+        }
         let evidence = view.behind
             || self
                 .evidence_at
@@ -836,9 +863,20 @@ impl AncestorSync {
         else {
             return (None, ended);
         };
+        let peer = pick.id.clone();
+        (Some(self.start(peer, now, view, lookup)), ended)
+    }
+
+    /// Start an episode with `peer`: its first locate.
+    fn start(
+        &mut self,
+        peer: String,
+        now: Instant,
+        view: &View,
+        lookup: impl Fn(u64) -> Option<Hash>,
+    ) -> Request {
         let base = build_locator_with_heights(view.applied, view.finalized, view.genesis, lookup);
         let locator: Vec<Hash> = base.iter().map(|(h, _)| *h).collect();
-        let peer = pick.id.clone();
         self.episode = Some(Episode {
             peer: peer.clone(),
             asked: Some(Asked::Locate {
@@ -865,7 +903,7 @@ impl AncestorSync {
             body_answered: false,
             start_applied: view.applied.0,
         });
-        (Some(Request::Locate { peer, locator }), ended)
+        Request::Locate { peer, locator }
     }
 
     /// The next request of a running episode with nothing in flight.
@@ -2172,6 +2210,52 @@ mod tests {
         let (out, locates, bodies) = drive(&mut me, &peer, true);
         assert_eq!(out, Some(Outcome::Extends));
         assert_eq!((locates, bodies), (1, 0));
+    }
+
+    /// Dead-branch evidence E8: a forced probe takes the next free episode
+    /// slot whatever the ranking (a higher advertised head elsewhere), the
+    /// evidence gate (none here) or the peer's cooldown say; an unknown or
+    /// non-1.3 peer is dropped; one waits at a time.
+    #[test]
+    fn a_forced_probe_takes_the_next_slot_outside_the_ranking() {
+        let me = Me::new(500, 500, 4, 0);
+        let lookup = |h: u64| (h <= me.tip).then(|| me.hash_at(h));
+        let cand = |id: &str, height: u64, speaks: bool| Candidate {
+            id: id.into(),
+            speaks,
+            head_hash: hb(7, height),
+            head_height: height,
+            head_held: false,
+        };
+        let cands = [
+            cand("low", 501, true),
+            cand("huge", u64::MAX / 2, true),
+            cand("old", 9_000, false),
+        ];
+        let mut a = AncestorSync::new();
+        let t0 = Instant::now();
+        // No evidence: nothing starts by ranking.
+        assert_eq!(a.tick(t0, &me.view(), &cands, lookup).0, None);
+        a.force_probe("low");
+        a.force_probe("huge");
+        assert!(a.probe_waiting());
+        let (req, _) = a.tick(t0, &me.view(), &cands, lookup);
+        assert!(
+            matches!(&req, Some(Request::Locate { peer, .. }) if peer == "low"),
+            "{req:?}"
+        );
+        assert!(
+            !a.probe_waiting(),
+            "the second force was ignored while one waited"
+        );
+        // A peer that does not speak 1.3 is not probed.
+        let _ = a.unsent(t0);
+        let _ = a.unsent(t0);
+        let _ = a.unsent(t0);
+        let _ = a.unsent(t0);
+        a.force_probe("old");
+        assert_eq!(a.tick(t0, &me.view(), &cands, lookup).0, None);
+        assert!(!a.probe_waiting());
     }
 
     /// A peer level with us on our branch (whatever work it claims) holds

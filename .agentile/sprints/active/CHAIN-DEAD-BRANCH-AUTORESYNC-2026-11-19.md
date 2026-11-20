@@ -118,6 +118,33 @@ its tip are enough, because E4 and E5 (header age) held for every such node.
   `manual_ok_err` fix), and `cargo fmt --all --check` clean.
 - [ ] CodeQL on the pushed head: see the PR.
 
+## WP-7 Review round 2 (#486, CHANGES): Sybils starve the catch-up veto
+
+- [x] Red on c301fe0a (commit 4e40ff44): `hog_sybils_cannot_starve_the_catch_up_veto`.
+- [x] P1-1, E8: every connected 1.3 peer answered conclusively. The evidence
+  probes unanswered peers through `AncestorSync::force_probe`, round robin, at
+  most one per minute per peer, and fails closed. The tests cover hogs plus an
+  honest peer (vetoed), a stranded member with fleet peers only (marks), an
+  unanswered peer (blocks), and the probe rate.
+- [x] P2-1: `local_view` (the run_tick wiring) is tested with a fresh tip clock.
+- [x] P3: a tip time in the future restarts the clock.
+- [x] Follow-ups listed in the ADR and the PR body: a forward clock jump, a
+  self-sealing stranded node, one synced write per tip move.
+- [x] Mutants: 14 of 14 killed. These are the 7 from round 1 plus:
+  - the `tip_unmoved_secs` wiring replaced by u64::MAX;
+  - no Unprobed check;
+  - the forced probe ignored;
+  - `drive_probe` a no-op;
+  - NotHeavier not counted as conclusive;
+  - probing peers that already answered;
+  - a `since` in the future kept.
+- [x] `cargo test --workspace --no-fail-fast`: 6,263 passed, 0 failed, 23 ignored.
+  `--list` counts 6,286.
+- [x] Member end to end at twice the floor: passed in 1,230 s (resynced onto
+  HEAVY; the armed node sealed nothing before, 19 blocks after).
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` clean;
+  `cargo fmt --all --check` clean.
+
 ## Core integration (read-only, citrate-core origin/main f8e60b84)
 
 1. The supervisor (`kit/src/supervisor.rs`) restarts the node on any exit.

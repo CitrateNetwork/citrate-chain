@@ -3563,6 +3563,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                             app,
                             &storage_for_sync,
                             &manager_for_dead_branch,
+                            &ancestor_for_loop,
                             &handles,
                             finalized,
                             own_coinbase.as_ref(),

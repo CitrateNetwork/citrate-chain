@@ -1790,6 +1790,7 @@ impl Node {
                     &self.app,
                     &self.storage,
                     rig.gadget.manager(),
+                    &self.ancestor,
                     connected,
                     finalized,
                     None,

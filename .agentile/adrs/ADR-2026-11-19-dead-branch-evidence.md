@@ -85,6 +85,7 @@ holds (`dead_branch::DeadBranch::verdict`):
 | E5 | Our branch has stopped, by BOTH clocks: (i) the applied tip has not moved to a block another node sealed for 30 minutes of this node's own wall clock (`tip_unmoved_secs`; the tip and the time it was first seen are a synced record in `CF_METADATA`), and (ii) the newest block of our applied selected chain that this node did not seal is more than 30 minutes old by its header timestamp (`stall_age_secs`, walking at most 4,096 headers). Own blocks are found by the coinbase the v2 header commits to. | (i) is the rule that matters for a node that is catching up: replaying history, its blocks are always hours old by their timestamps, so (ii) alone held for every such node (review round 1). Its tip moves, so (i) does not. The record is durable, so Core's restarts (its stall watchdog restarts a frozen node up to three times) do not reset the clock; a database without it (a fresh install, or right after a cold resync) starts it, so such a node waits the full window. (ii) is kept as well: it is the stronger statement for the stranded case (no producer has extended the branch in 30 minutes), and it costs nothing. |
 | E6 | `[recovery] cold_resync` is on. When it is off, nothing is recorded and the verdict is logged at WARN. | The existing off switch covers this path too. |
 | E7 | The catch-up veto: no currently connected peer ended an ancestor episode with `Extends` in the last hour. `Extends` now means only that the peer's executed chain holds our applied tip AND goes above it; a peer level with us or behind us on our chain answers the new `Holds`. | The main defense (review round 1). A node that is catching up has an honest peer ahead of it on its own chain, which `Extends`; that peer is picked by the episode driver (its head is not held here) once the TooDeep peers are cooling (30 min). A stranded member has none: HEAVY peers answer TooDeep, and other stranded members are level with it (`Holds`). An attacker's `Extends` can only veto, never mark. With E7, marking a catching-up node needs a full eclipse of it. |
+| E8 | Everyone answered: every currently connected 1.3 peer ended an ancestor episode conclusively (`Extends`, `Holds`, `NotHeavier`, `TooDeep` or `Fetched`) within the last hour. While any deep-fork evidence is fresh, the evidence path asks the driver to probe each unanswered peer itself (`AncestorSync::force_probe`): one waiting at a time, round robin over the connected 1.3 peers, each at most once a minute, taking the next free episode slot whatever the ranking, the evidence gate or the peer's cooldown say. A peer that never answers conclusively blocks the verdict. | Review round 2. E7 alone depended on the driver's ranked choice (deliverers first, then the highest UNVERIFIED advertised head). About five Sybils that advertise a huge head and answer each locate after 14 s with zero work (`NotHeavier`, a 30 s cooldown, never a failure) kept the one episode slot busy, so the honest peer ahead was never asked and E7 never fired. With E8 the honest peer is probed within one episode slot (at most 15 s) of the evidence appearing, and its `Extends` vetoes. Fail closed: an unanswered peer can only delay a mark. A stranded member's fleet peers each answer TooDeep, so they never block it. Peers below 1.3 cannot answer ancestor sync and take no part (stranded 0.5.5 members run 1.2). |
 
 Then the existing guarded path runs unchanged: the monitor waits
 `[recovery] cold_resync_after_secs` (default 900 s) from the marker, applies
@@ -134,17 +135,37 @@ behind holds no recent certificate (servers keep 256 in memory, and r1007 has
 no certificate between 105,000 and 283,600). E5 held because historical blocks
 are old by timestamp. The first resync on a fresh install is not rate limited.
 
-The defense is E7 together with E5(i) and the decision-time re-check: a node
-catching up has a moving tip and an honest peer ahead of it, either of which
-vetoes. What is left is a node that is fully eclipsed AND whose tip is frozen
-for 30 minutes while it is behind a genuine certificate. Such a node can be
-made to resync needlessly. The damage is liveness only: the database is moved
-aside, not deleted, at most once per 6 h after the first, and the node
-resyncs toward the chain the committee finalized. An eclipsed node is already
-at its peers' mercy for liveness. A former validator set holding more than 2/3
-of a stale snapshot (the long-range case) has the same bound. `chain-aside/`
-accumulation, which this path makes reachable from peers, is #485 (acceptance:
-a free-disk check and a cap of 2 asides).
+The defense, after review round 2, is E7 and E8 together with E5(i) and the
+decision-time re-check. A node catching up has a moving tip, which vetoes on
+its own. If its tip is frozen, it still has at least one connected honest
+peer ahead of it on its chain. E8 probes that peer outside the ranking, so its
+`Extends` vetoes no matter how many Sybils hold the ranked slot or what head
+they advertise. Marking such a node therefore needs every one of its connected
+1.3 peers to be the attacker's: a full eclipse of its ancestor-sync peers.
+Against the stranded r1007 member that is the intended outcome: all of its
+peers are fleet nodes on HEAVY.
+
+What is left:
+- A node that is fully eclipsed AND whose tip is frozen for 30 minutes while it
+  is behind a genuine certificate can be made to resync needlessly. That is
+  liveness only. The database is moved aside, not deleted, at most once per
+  6 h after the first, and the node resyncs toward the chain the committee
+  finalized. An eclipsed node is already at its peers' mercy for liveness.
+- A peer that never answers conclusively delays a genuine recovery while it
+  stays connected (E8 fails closed). The operator re-seed remains available.
+- A former validator set holding more than 2/3 of a stale snapshot (the
+  long-range case) has the same bound.
+- `chain-aside/` accumulation, which this path makes reachable from peers, is
+  #485 (acceptance: a free-disk check and a cap of 2 asides).
+- Follow-ups, not fixed here:
+  - A forward jump of the local clock by 30 minutes or more satisfies E5(i).
+    It needs control of the clock.
+  - A stranded node that seals its own blocks never recovers: the marker is
+    cleared on any tip move. This does not affect r1007 members, which do not
+    seal on LIGHT.
+  - A node catching up makes one synced metadata write per tip move.
+- A recorded tip time in the future (the clock was set back) restarts the
+  clock at once (`tip_unmoved_secs`).
 
 ## Tests (mutations included)
 
@@ -170,6 +191,14 @@ a free-disk check and a cap of 2 asides).
     only `Extends`, not `Holds`, vetoes; the wall clock is durable across a
     restart and restarts only on another node's block; a certificate our
     chain has since applied is no evidence.
+- Review round 2:
+  - `hog_sybils_cannot_starve_the_catch_up_veto` (red on c301fe0a);
+  - `an_unanswered_peer_blocks_the_verdict_and_hogs_do_not`;
+  - `a_stranded_member_with_only_fleet_peers_still_marks`;
+  - `episode_probes_are_round_robin_and_bounded`;
+  - `a_forced_probe_takes_the_next_slot_outside_the_ranking`;
+  - `the_local_view_carries_the_tip_clock_into_the_verdict` (the E5(i) wiring);
+  - `a_tip_clock_from_the_future_restarts_now`.
 - Applicator guards and the decision-time re-check
   (`an_evidence_marker_is_withdrawn_when_the_tip_moves_and_never_resyncs`,
   red on 7b5d58a7; `only_an_evidence_marker_whose_tip_moved_is_cleared`).

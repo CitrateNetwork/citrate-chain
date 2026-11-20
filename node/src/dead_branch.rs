@@ -52,7 +52,17 @@
 //    always answers that way; a node stranded on a dead branch has none
 //    (peers level with it answer `Holds`). With this, the cheapest attack on a
 //    node that is catching up (two Sybil TooDeeps plus a genuine certificate
-//    relayed from the honest chain) needs a full eclipse.
+//    relayed from the honest chain) needs a full eclipse, together with E8.
+// E8 Everyone answered: every currently connected 1.3 peer ended an episode
+//    conclusively (Extends, Holds, NotHeavier, TooDeep or Fetched) within
+//    [`EVIDENCE_TTL`]. E7 alone depended on the driver's ranked choice, which
+//    peers that advertise a huge head can monopolise so that the honest peer
+//    ahead of us is never asked (review round 2). This module therefore asks
+//    the driver to probe each unanswered peer itself
+//    (`AncestorSync::force_probe`), one at a time, round robin, each peer at
+//    most once per [`PROBE_COOLDOWN`], outside the ranking. A peer that never
+//    answers conclusively blocks the verdict (fail closed). A stranded member
+//    is not blocked by its fleet peers: each of them answers TooDeep.
 //
 // The marker's reason starts with [`REASON_PREFIX`]; if the applied tip moves
 // before the resync fires, the branch was not dead and the marker is cleared
@@ -172,6 +182,8 @@ pub enum Missing {
     NotStalled { age_secs: u64, unmoved_secs: u64 },
     /// E7: connected peers are ahead of us on our own chain: catching up.
     CatchingUp { ahead: usize },
+    /// E8: connected peers have not answered an episode conclusively yet.
+    Unprobed { peers: usize },
 }
 
 /// The evidence collected so far (see the module docs).
@@ -181,6 +193,12 @@ pub struct DeadBranch {
     /// E7: peers whose latest episode ended `Extends` (ahead of us on our
     /// chain), and when.
     ahead: HashMap<String, Instant>,
+    /// E8: peers whose latest episode ended conclusively, and when.
+    conclusive: HashMap<String, Instant>,
+    /// E8: peer -> when the evidence last forced an episode with it.
+    forced_at: HashMap<String, Instant>,
+    /// E8: round-robin position over the connected peers.
+    rr: usize,
     cert: Option<Certified>,
     /// The certificate request in flight: (peer, sent at).
     probe: Option<(String, Instant)>,
@@ -195,6 +213,21 @@ impl DeadBranch {
 
     /// An ancestor-sync episode with `peer` ended with `outcome`.
     pub fn note_outcome(&mut self, peer: &str, outcome: &Outcome, now: Instant) {
+        if matches!(
+            outcome,
+            Outcome::Extends
+                | Outcome::Holds
+                | Outcome::NotHeavier { .. }
+                | Outcome::TooDeep { .. }
+                | Outcome::Fetched { .. }
+        ) {
+            if self.conclusive.len() >= MAX_PEERS_TRACKED && !self.conclusive.contains_key(peer) {
+                self.conclusive.retain(|_, at| fresh(*at, now));
+            }
+            if self.conclusive.len() < MAX_PEERS_TRACKED || self.conclusive.contains_key(peer) {
+                self.conclusive.insert(peer.to_string(), now);
+            }
+        }
         match outcome {
             Outcome::TooDeep {
                 fork,
@@ -279,6 +312,42 @@ impl DeadBranch {
         Some(pick)
     }
 
+    /// E8: the connected 1.3 peer to force an episode with now, if any: only
+    /// while some deep-fork evidence is fresh, a peer without a fresh
+    /// conclusive answer, not forced within [`PROBE_COOLDOWN`], taken round
+    /// robin over `connected` (sorted), whatever the driver's ranking says.
+    pub fn want_episode_probe(&mut self, connected: &[String], now: Instant) -> Option<String> {
+        if !self.deep.values().any(|d| fresh(d.at, now)) {
+            return None;
+        }
+        let mut ids: Vec<&String> = connected.iter().collect();
+        ids.sort();
+        ids.dedup();
+        let n = ids.len();
+        for k in 0..n {
+            let i = self.rr.wrapping_add(k).checked_rem(n)?;
+            let Some(p) = ids.get(i) else {
+                continue;
+            };
+            let answered = self.conclusive.get(*p).is_some_and(|at| fresh(*at, now));
+            let cooling = self
+                .forced_at
+                .get(*p)
+                .is_some_and(|at| now.saturating_duration_since(*at) < PROBE_COOLDOWN);
+            if answered || cooling {
+                continue;
+            }
+            self.rr = i.wrapping_add(1);
+            if self.forced_at.len() >= MAX_PEERS_TRACKED {
+                self.forced_at
+                    .retain(|_, at| now.saturating_duration_since(*at) < PROBE_COOLDOWN);
+            }
+            self.forced_at.insert((*p).clone(), now);
+            return Some((*p).clone());
+        }
+        None
+    }
+
     /// Whether a `CheckpointCertificate` from `peer` answers the request in
     /// flight; `true` consumes it.
     pub fn accept_probe_answer(&mut self, peer: &str, now: Instant) -> bool {
@@ -352,6 +421,14 @@ impl DeadBranch {
             .count();
         if ahead > 0 {
             return Err(Missing::CatchingUp { ahead });
+        }
+        // E8: every connected 1.3 peer answered conclusively.
+        let unprobed = connected
+            .iter()
+            .filter(|p| !self.conclusive.get(**p).is_some_and(|at| fresh(*at, now)))
+            .count();
+        if unprobed > 0 {
+            return Err(Missing::Unprobed { peers: unprobed });
         }
         let fork = (*fork_hash, *fork_h);
         if fork.1 >= local.floor || !on_chain(&fork.0, fork.1) {
@@ -442,10 +519,14 @@ pub fn tip_unmoved_secs(
         Err(_) => return 0,
     };
     if let Some((seen, since)) = record {
-        if seen == tip {
+        // A `since` in the future (the clock was set back): restart from now
+        // rather than wait for wall time to catch up with it.
+        if seen == tip && since <= now_secs {
             return now_secs.saturating_sub(since);
         }
-        let sealed_by_us = own.is_some()
+        let sealed_by_us = seen != tip
+            && since <= now_secs
+            && own.is_some()
             && matches!(storage.blocks.get_header(&tip), Ok(Some(h)) if Some(&h.coinbase) == own);
         if sealed_by_us {
             return now_secs.saturating_sub(since);
@@ -464,6 +545,44 @@ pub fn tip_unmoved_secs(
         return 0;
     }
     0
+}
+
+/// E8, as [`run_tick`] runs it each tick: unless a forced probe is already
+/// waiting for the driver's episode slot, ask the driver to probe the next
+/// connected 1.3 peer (`ids`) that has not answered conclusively
+/// ([`DeadBranch::want_episode_probe`]). Returns the peer asked for.
+pub fn drive_probe(
+    evidence: &mut DeadBranch,
+    ancestor: &mut crate::ancestor_sync::AncestorSync,
+    ids: &[String],
+    now: Instant,
+) -> Option<String> {
+    if ancestor.probe_waiting() {
+        return None;
+    }
+    let next = evidence.want_episode_probe(ids, now)?;
+    ancestor.force_probe(&next);
+    Some(next)
+}
+
+/// What [`run_tick`] judges against: this node's [`Local`] from its chain
+/// store (`ancestor_sync::read_view`), the finalized height it holds, and both
+/// E5 clocks.
+pub fn local_view(
+    storage: &citrate_storage::StorageManager,
+    finalized_for_floor: u64,
+    latest_finalized: u64,
+    own: Option<&[u8; 20]>,
+    now_secs: u64,
+) -> Local {
+    let view = crate::ancestor_sync::read_view(storage, finalized_for_floor, false);
+    Local {
+        applied: view.applied,
+        floor: view.reorg_floor(),
+        latest_finalized,
+        stall_age_secs: stall_age_secs(storage, own, now_secs),
+        tip_unmoved_secs: tip_unmoved_secs(storage, own, now_secs),
+    }
 }
 
 /// The wall clock in unix seconds, for [`run_tick`].
@@ -514,6 +633,7 @@ pub async fn run_tick(
     app: &crate::canonical_apply::CanonicalApplicator,
     storage: &citrate_storage::StorageManager,
     manager: &citrate_consensus::checkpoint::CheckpointManager,
+    ancestor: &parking_lot::Mutex<crate::ancestor_sync::AncestorSync>,
     peers: &[std::sync::Arc<citrate_network::peer::Peer>],
     finalized_for_floor: u64,
     own: Option<&[u8; 20]>,
@@ -544,7 +664,18 @@ pub async fn run_tick(
         {
             handles.insert(info.id.0.clone(), p.clone());
         }
-        ids.push(info.id.0.clone());
+        // Only 1.3 peers take part: they alone answer ancestor sync, so they
+        // alone can give a TooDeep, an Extends or a conclusive answer (E8).
+        if info.version.is_some_and(|v| v.understands_ancestor_sync()) {
+            ids.push(info.id.0.clone());
+        }
+    }
+    // E8: force an episode with the next unanswered peer. Lock order as in
+    // the `Blocks` handler of main.rs: the ancestor driver, then the evidence.
+    {
+        let mut anc = ancestor.lock();
+        let mut ev = evidence.lock();
+        let _ = drive_probe(&mut ev, &mut anc, &ids, now);
     }
     let latest_finalized = manager.latest_finalized_height().await;
     let probe = evidence.lock().want_probe(
@@ -566,15 +697,14 @@ pub async fn run_tick(
                 .await;
         }
     }
-    let view = crate::ancestor_sync::read_view(storage, finalized_for_floor, false);
-    let local = Local {
-        applied: view.applied,
-        floor: view.reorg_floor(),
+    let local = local_view(
+        storage,
+        finalized_for_floor,
         latest_finalized,
-        stall_age_secs: stall_age_secs(storage, own, now_secs),
-        tip_unmoved_secs: tip_unmoved_secs(storage, own, now_secs),
-    };
-    let applied_height = view.applied.1;
+        own,
+        now_secs,
+    );
+    let applied_height = local.applied.1;
     let verdict = evidence.lock().verdict(
         &local,
         &ids,
@@ -689,7 +819,7 @@ mod tests {
     fn an_honest_deep_split_is_a_verdict() {
         let now = Instant::now();
         let v = full(now)
-            .verdict(&member(), &peers(&["boot-1", "boot-2", "x"]), ours, now)
+            .verdict(&member(), &peers(&["boot-1", "boot-2"]), ours, now)
             .expect("all of E1 to E5 hold");
         assert_eq!(v.fork, (h(0x24), 105_024));
         assert_eq!(v.head, (h(0xC0), 283_600));
@@ -780,6 +910,7 @@ mod tests {
         d.note_outcome("a", &deep(105_024, h(0x24), Some(h(0x25))), now);
         d.note_outcome("b", &deep(105_024, h(0x24), Some(h(0x25))), now);
         d.note_certificate("stranger", &cert(283_600, h(0xC0)), now);
+        d.note_outcome("stranger", &Outcome::Holds, now);
         assert_eq!(
             d.verdict(&member(), &peers(&["a", "b", "stranger"]), ours, now),
             Err(Missing::Certificate)
@@ -1265,11 +1396,14 @@ mod tests {
     /// driver's tick every second over `cands`, and every peer answering a
     /// locate after 14 s as a "hog" does (our tip as the common block, zero
     /// work: NotHeavier), except "honest", which is ahead of us on our chain
-    /// (Extends). Returns how often "honest" was asked.
+    /// (Extends). The evidence's E8 probing runs as `run_tick` wires it
+    /// (`want_episode_probe` -> `AncestorSync::force_probe`) over `connected`.
+    /// Returns how often "honest" was asked.
     fn starve_run(
         a: &mut crate::ancestor_sync::AncestorSync,
         d: &mut DeadBranch,
         cands: &[crate::ancestor_sync::Candidate],
+        connected: &[String],
         t0: Instant,
         secs: u64,
     ) -> (usize, Instant) {
@@ -1312,6 +1446,7 @@ mod tests {
                     }
                 }
             }
+            let _ = drive_probe(d, a, connected, now);
             let (req, ended) = a.tick(now, &view, cands, |x| Some(ch(x)));
             if let Some(o) = &ended {
                 let p = a.last_peer().map(str::to_string).expect("peer");
@@ -1351,29 +1486,208 @@ mod tests {
         cands
     }
 
+    /// The attacker's evidence, renewed: two Sybil TooDeeps and a genuine
+    /// certificate relayed by one of them.
+    fn sybil_evidence(d: &mut DeadBranch, now: Instant) {
+        d.note_outcome("sybil-1", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_outcome("sybil-2", &deep(105_024, h(0x24), Some(h(0x25))), now);
+        d.note_certificate("sybil-1", &cert(283_600, h(0xC0)), now);
+    }
+
+    fn starve_connected(cands: &[crate::ancestor_sync::Candidate]) -> Vec<String> {
+        let mut connected: Vec<String> = cands.iter().map(|c| c.id.clone()).collect();
+        connected.push("sybil-1".into());
+        connected.push("sybil-2".into());
+        connected
+    }
+
     /// Round 2, P1-1 (adapted from the reviewer's PoC): five "hog" Sybils
     /// advertise a huge head and answer each locate after 14 s with zero work
     /// (NotHeavier: a 30 s cooldown, never a failure). They keep the driver's
-    /// one episode slot busy, so the honest peer ahead of us is never asked
-    /// and never vetoes. Together with two Sybil TooDeeps and a relayed
-    /// genuine certificate, the catching-up node must still never be marked.
+    /// one episode slot busy, so the ranked choice never asks the honest peer
+    /// ahead of us. Together with two Sybil TooDeeps and a relayed genuine
+    /// certificate, the catching-up node must still never be marked: E8
+    /// probes the honest peer itself, and its Extends vetoes.
     #[test]
     fn hog_sybils_cannot_starve_the_catch_up_veto() {
         let t0 = Instant::now();
         let cands = starve_cands(5);
+        let connected = starve_connected(&cands);
         let mut a = crate::ancestor_sync::AncestorSync::new();
         let mut d = DeadBranch::new();
         a.note_deferred("hog-0", t0);
-        let (_, now) = starve_run(&mut a, &mut d, &cands, t0, 4_000);
-        d.note_outcome("sybil-1", &deep(105_024, h(0x24), Some(h(0x25))), now);
-        d.note_outcome("sybil-2", &deep(105_024, h(0x24), Some(h(0x25))), now);
-        d.note_certificate("sybil-1", &cert(283_600, h(0xC0)), now);
-        let mut connected: Vec<String> = cands.iter().map(|c| c.id.clone()).collect();
-        connected.push("sybil-1".into());
-        connected.push("sybil-2".into());
+        // 4,000 s, the Sybils renewing their TooDeeps every 1,000 s as their
+        // own episodes would (TooDeep cooldown 30 min).
+        let mut now = t0;
+        let mut honest = 0;
+        for _ in 0..4 {
+            sybil_evidence(&mut d, now);
+            let (asked, end) = starve_run(&mut a, &mut d, &cands, &connected, now, 1_000);
+            honest += asked;
+            now = end;
+        }
+        sybil_evidence(&mut d, now);
+        let v = d.verdict(&member(), &connected, ours, now);
         assert!(
-            d.verdict(&member(), &connected, ours, now).is_err(),
+            v.is_err(),
             "five hogs starved the honest peer and the node was marked"
         );
+        assert!(honest >= 1, "the honest peer was never asked");
+        assert!(
+            matches!(v, Err(Missing::CatchingUp { ahead: 1 })),
+            "vetoed by the honest peer ahead of us: {v:?}"
+        );
+    }
+
+    /// E8 fails closed: a connected peer that has not answered conclusively
+    /// (a silent one, or one never asked) blocks the verdict. Hogs that
+    /// answered NotHeavier do not.
+    #[test]
+    fn an_unanswered_peer_blocks_the_verdict_and_hogs_do_not() {
+        let now = Instant::now();
+        let mut d = full(now);
+        assert_eq!(
+            d.verdict(
+                &member(),
+                &peers(&["boot-1", "boot-2", "silent"]),
+                ours,
+                now
+            ),
+            Err(Missing::Unprobed { peers: 1 })
+        );
+        d.note_outcome(
+            "hog",
+            &Outcome::NotHeavier {
+                fork: 274_810,
+                peer_tip: u64::MAX / 2,
+            },
+            now,
+        );
+        assert!(d
+            .verdict(&member(), &peers(&["boot-1", "boot-2", "hog"]), ours, now)
+            .is_ok());
+        // A timeout is not conclusive.
+        d.note_outcome("silent", &Outcome::Timeout, now);
+        assert_eq!(
+            d.verdict(
+                &member(),
+                &peers(&["boot-1", "boot-2", "silent"]),
+                ours,
+                now
+            ),
+            Err(Missing::Unprobed { peers: 1 })
+        );
+    }
+
+    /// The real stranded member: every connected peer is a fleet node that
+    /// answers TooDeep. Nothing is unanswered, nobody is ahead: it marks.
+    #[test]
+    fn a_stranded_member_with_only_fleet_peers_still_marks() {
+        let now = Instant::now();
+        let mut d = DeadBranch::new();
+        for p in ["boot-1", "boot-2", "boot-3", "rpc-1", "prod-5"] {
+            d.note_outcome(p, &deep(105_024, h(0x24), Some(h(0x25))), now);
+        }
+        d.note_certificate("boot-2", &cert(283_600, h(0xC0)), now);
+        let fleet = peers(&["boot-1", "boot-2", "boot-3", "rpc-1", "prod-5"]);
+        let v = d.verdict(&member(), &fleet, ours, now).expect("marks");
+        assert_eq!(v.peers.len(), 5);
+        // And E8 asks nobody: they all answered.
+        assert_eq!(d.want_episode_probe(&fleet, now), None);
+    }
+
+    /// E8 probing: only with deep-fork evidence, unanswered peers only, round
+    /// robin, each at most once per PROBE_COOLDOWN.
+    #[test]
+    fn episode_probes_are_round_robin_and_bounded() {
+        let t0 = Instant::now();
+        let mut d = DeadBranch::new();
+        let conn = peers(&["c", "a", "b", "deep"]);
+        assert_eq!(
+            d.want_episode_probe(&conn, t0),
+            None,
+            "no evidence, no probe"
+        );
+        d.note_outcome("deep", &deep(105_024, h(0x24), Some(h(0x25))), t0);
+        assert_eq!(d.want_episode_probe(&conn, t0), Some("a".into()));
+        assert_eq!(d.want_episode_probe(&conn, t0), Some("b".into()));
+        d.note_outcome("c", &Outcome::Holds, t0);
+        assert_eq!(
+            d.want_episode_probe(&conn, t0),
+            None,
+            "c answered, a and b cooling"
+        );
+        let t1 = t0 + PROBE_COOLDOWN;
+        assert_eq!(d.want_episode_probe(&conn, t1), Some("a".into()));
+    }
+    /// A chain of `n` blocks by another node (timestamps 1_000 + height),
+    /// applied to `n - 1`.
+    fn old_chain(dir: &std::path::Path, n: u64) -> citrate_storage::StorageManager {
+        use citrate_consensus::types::BlockBuilder;
+        use citrate_storage::pruning::PruningConfig;
+        let s =
+            citrate_storage::StorageManager::new(dir, PruningConfig::default()).expect("storage");
+        let mut parent = Hash::default();
+        for height in 0..n {
+            let mut hb = [0u8; 32];
+            hb[..8].copy_from_slice(&(height + 1).to_be_bytes());
+            let hash = Hash::new(hb);
+            let block = BlockBuilder::new()
+                .hash(hash)
+                .parent(parent)
+                .height(height)
+                .timestamp(1_000 + height)
+                .coinbase([8; 20])
+                .build_unhashed();
+            s.blocks.put_block(&block).expect("put");
+            s.blocks.put_applied_tip(&hash, height).expect("tip");
+            parent = hash;
+        }
+        s
+    }
+
+    /// Round 2, P2-1: E5(i) through the wiring `run_tick` uses
+    /// (`local_view`): a node whose tip was just reached (catching up) has
+    /// old blocks by timestamp but a fresh local clock, and the verdict on
+    /// that view is NotStalled.
+    #[test]
+    fn the_local_view_carries_the_tip_clock_into_the_verdict() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = old_chain(dir.path(), 5);
+        let now = Instant::now();
+        let mut local = local_view(&s, 0, 0, None, 100_000);
+        assert!(local.stall_age_secs >= STALL_SECS, "old by block time");
+        assert_eq!(local.tip_unmoved_secs, 0, "the tip was just seen");
+        // Judge the full attack evidence against that view (its other
+        // fields as the member's, so only E5 decides).
+        local.applied = member().applied;
+        local.floor = member().floor;
+        local.latest_finalized = member().latest_finalized;
+        assert_eq!(
+            full(now).verdict(&local, &peers(&["boot-1", "boot-2"]), ours, now),
+            Err(Missing::NotStalled {
+                age_secs: local.stall_age_secs,
+                unmoved_secs: 0
+            })
+        );
+        let later = local_view(&s, 0, 0, None, 100_000 + STALL_SECS);
+        assert_eq!(later.tip_unmoved_secs, STALL_SECS);
+    }
+
+    /// Round 2, P3: a recorded time in the future (the clock was set back)
+    /// restarts the clock now instead of blocking until wall time catches
+    /// up.
+    #[test]
+    fn a_tip_clock_from_the_future_restarts_now() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let s = old_chain(dir.path(), 3);
+        assert_eq!(
+            tip_unmoved_secs(&s, None, 150_000),
+            0,
+            "first seen at 150,000"
+        );
+        // The clock is set back by a day.
+        assert_eq!(tip_unmoved_secs(&s, None, 150_000 - 86_400), 0, "restarted");
+        assert_eq!(tip_unmoved_secs(&s, None, 150_000 - 86_400 + 100), 100);
     }
 }
