@@ -263,8 +263,9 @@ pub(crate) struct Fleet {
     genesis: Block,
     /// Simulated time, in slots, from `epoch`.
     epoch: std::time::Instant,
-    /// The same simulated time, in milliseconds, for the sync managers'
-    /// request clocks (`SyncManager::with_clock_offset`).
+    /// The same simulated time, in milliseconds: the sync managers' clock
+    /// (`SyncManager::with_virtual_clock`) and the offset of their block
+    /// timestamp bound (`with_clock_offset`).
     clock_ms: Arc<AtomicU64>,
     slot_no: u64,
     /// Messages lost on down links (diagnostics).
@@ -503,9 +504,25 @@ impl Node {
             Some(w) => producer.with_deferred_refuse_window(w),
             None => producer,
         };
+        // The sync manager runs on the SIMULATED clock only. On
+        // `with_clock_offset` alone its requests and pipeline windows aged by
+        // real elapsed time plus the simulated offset, so how long the host
+        // took to run a slot decided which requests timed out (pipeline
+        // timeouts start at 3 s). An unoptimized build ran slots slowly enough
+        // to time requests out inside one message pump; their retries fed the
+        // pump until `PUMP_CAP` ("message storm"): main's core-workspace run
+        // 44408488494, `two_groups_forked_past_the_walk_reconverge_on_the_
+        // heavier_branch`, after 15,582 s. The offset stays for the block
+        // timestamp bound, which compares header times with the wall clock.
+        let origin = clock
+            .checked_sub(std::time::Duration::from_millis(
+                clock_ms.load(Ordering::Relaxed),
+            ))
+            .unwrap_or(clock);
         let sync = SyncManager::new(SyncConfig::default())
             .with_local_height(app.applied_height_handle())
-            .with_clock_offset(clock_ms);
+            .with_clock_offset(clock_ms.clone())
+            .with_virtual_clock(origin, clock_ms);
         let pm = Arc::new(citrate_network::PeerManager::new(
             citrate_network::PeerManagerConfig::default(),
         ));
