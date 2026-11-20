@@ -177,3 +177,16 @@ overflow-checks = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+# The multi-node harness tests of citrate-node (split_heal_tests, sync_rejoin
+# and the other simulated-fleet tests) run here in CI (rust-ci.yml,
+# `node-harness`): optimized, but with debug assertions and overflow checks
+# kept, as on the cnv-build-2 test host. They are CPU-bound simulations of
+# thousands of slots; unoptimized they took over 5 hours on a CI runner.
+# `cargo test -p citrate-node --profile harness`.
+[profile.harness]
+inherits = "dev"
+opt-level = 2
+debug = false
+debug-assertions = true
+overflow-checks = true

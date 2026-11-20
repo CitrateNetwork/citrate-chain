@@ -74,10 +74,48 @@ jobs:
       # invocation runs `--locked` so a transient registry hiccup
       # (or a malicious lockfile-bumping action) can't silently
       # introduce a new dependency version.
+      # citrate-node's tests run in `node-harness` below, optimized: its
+      # multi-node harness tests are CPU-bound simulations that took over 5 h
+      # unoptimized here (run 44408488494). Every other package runs here.
       - name: Build tests (no run)
-        run: cargo test --workspace --no-run --locked
+        run: cargo test --workspace --exclude citrate-node --no-run --locked
       - name: Run core workspace tests
-        run: cargo test --workspace --quiet --locked
+        run: cargo test --workspace --exclude citrate-node --quiet --locked
+
+  # Every citrate-node test (unit, harness, integration), in the `harness`
+  # profile: opt-level 2 with debug assertions and overflow checks
+  # (Cargo.toml). Bounded under the merge gate's 120 min wait.
+  node-harness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev cmake libssl-dev pkg-config
+      - name: Show toolchain
+        run: rustc -Vv && cargo -V
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-ci-${{ runner.os }}-
+      - name: Build citrate-node tests (harness profile, no run)
+        run: cargo test -p citrate-node --profile harness --no-run --locked
+      - name: Run citrate-node tests (harness profile)
+        run: |
+          ulimit -n 65536 || ulimit -n 4096
+          cargo test -p citrate-node --profile harness --quiet --locked
 
   verifier-tests:
     runs-on: ubuntu-24.04
