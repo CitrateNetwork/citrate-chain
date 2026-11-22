@@ -1331,7 +1331,9 @@ mod tests {
                 builds += 1;
             }
         }
-        assert!(builds >= 4, "found {builds} genesis builds in main.rs");
+        // init_chain, ensure_genesis_block (node_main and run_devnet both build
+        // through it since chain#490) and the canonical-recovery scratch build.
+        assert!(builds >= 3, "found {builds} genesis builds in main.rs");
     }
 
     /// The canonical VRF encoding height is published in start_node before

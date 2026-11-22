@@ -118,7 +118,7 @@ use citrate_consensus::dag_store::DagStore;
 use citrate_consensus::ghostdag::GhostDag;
 use citrate_consensus::types::GhostDagParams;
 use config::NodeConfig;
-use genesis::{initialize_genesis_state, initialize_genesis_state_with_profile, GenesisConfig};
+use genesis::{initialize_genesis_state, GenesisConfig};
 use producer::BlockProducer;
 
 /// The canonical public testnet config, embedded at compile time so a fresh
@@ -936,81 +936,10 @@ async fn node_main() -> Result<()> {
         return Err(anyhow::anyhow!("{}", e));
     }
 
-    // Initialize chain if genesis block doesn't exist in storage
-    // C1 fix: Check for genesis block existence, not directory existence.
-    // Pre-created dirs or partial state no longer bypass genesis init.
-    std::fs::create_dir_all(&config.storage.data_dir)?;
-
-    // If a storage-at-rest key is supplied (CITRATE_STORAGE_KEY, from the parent
-    // process's OS keyring), the probe MUST open the DB with the same encryption
-    // config as the live `start_node` storage below — otherwise the genesis
-    // probe would open a plaintext handle over an encrypted DB (or vice-versa)
-    // and the mismatch guard in `open_encrypted` would reject it.
-    let probe_encryption = at_rest_encryption_from_env()?;
-    let probe_storage = Arc::new(StorageManager::with_config(
-        &config.storage.data_dir,
-        StorageConfig {
-            pruning: PruningConfig::default(),
-            encryption: probe_encryption,
-        },
-    )?);
-
-    if !stored_genesis_present(&probe_storage) {
-        ensure_genesis_block(
-            probe_storage,
-            config.chain.chain_id,
-            config.chain.genesis_profile.as_deref(),
-            config.chain.mpt_state_root_height,
-        )
-        .await?;
-    } else {
-        // WP-K.6: Verify state root consistency before proceeding.
-        // If persisted state diverges from genesis, the node would run with corrupted state.
-        info!("Genesis block found in storage, verifying state root...");
-        let genesis_block = probe_storage
-            .blocks
-            .get_block_by_height(0)
-            .ok()
-            .flatten()
-            .and_then(|hash| probe_storage.blocks.get_block(&hash).ok().flatten())
-            .ok_or_else(|| anyhow::anyhow!("Genesis block must exist (checked above)"))?;
-
-        let persisted_root = probe_storage
-            .state
-            .get_state_root(&genesis_block.header.block_hash)
-            .ok()
-            .flatten();
-
-        match persisted_root {
-            Some(root) if root != genesis_block.state_root => {
-                if config.validator.production_mode && !cli.force_start {
-                    error!(
-                        "FATAL: State root mismatch! Persisted: {}, Expected: {}",
-                        root, genesis_block.state_root
-                    );
-                    error!("Use --force-start to override (data may be corrupted)");
-                    return Err(anyhow::anyhow!("State root mismatch on startup"));
-                } else {
-                    warn!(
-                        "State root mismatch (devnet mode, continuing): Persisted: {}, Expected: {}",
-                        root, genesis_block.state_root
-                    );
-                }
-            }
-            Some(root) => {
-                info!("State root verified: {}", root);
-            }
-            None => {
-                // No persisted state root entry for genesis (pre-K.6 data) — skip check
-                info!("No persisted state root for genesis block (pre-K.6 data), skipping verification");
-            }
-        }
-
-        drop(probe_storage);
-    }
-
-    // Start node
-    start_node(config).await
+    // Start node: the chain database is prepared (a pending cold resync carried
+    // out, genesis written or loaded) and checked before anything else opens it.
+    let prepared = boot_chain_database(&config, cli.force_start).await?;
+    start_node(config, prepared).await
 }
 
 async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>) -> Result<()> {
@@ -1248,6 +1177,9 @@ async fn ensure_genesis_block(
 /// store), read from the chain store. Refuses a missing block 0 and the zero
 /// hash: a node that binds the zero genesis is refused by every peer and votes
 /// nothing the network can verify. Source: `BlockStore::get_block_by_height(0)`.
+///
+/// Always called after [`prepare_chain_database`] (run by `node_main` and
+/// `run_devnet` before `start_node`), which has written or loaded block 0.
 fn bound_genesis_hash(storage: &StorageManager) -> Result<citrate_consensus::types::Hash> {
     match storage.blocks.get_block_by_height(0) {
         Ok(Some(g)) if g != citrate_consensus::types::Hash::default() => Ok(g),
@@ -1348,56 +1280,13 @@ async fn run_devnet(
             .map_err(|e| anyhow::anyhow!("Invalid RPC address: {}", e))?;
     }
 
-    // Initialize chain if needed.
-    // An existing but empty temp dir should still bootstrap genesis.
+    // Initialize chain if needed (an existing but empty dir still bootstraps
+    // genesis), after any pending cold resync, as node_main does.
     std::fs::create_dir_all(&config.storage.data_dir)?;
-    {
-        let storage = Arc::new(StorageManager::new(
-            &config.storage.data_dir,
-            PruningConfig::default(),
-        )?);
-
-        let has_genesis = storage
-            .blocks
-            .get_block_by_height(0)
-            .ok()
-            .flatten()
-            .and_then(|hash| storage.blocks.get_block(&hash).ok().flatten())
-            .is_some();
-
-        if !has_genesis {
-            let state_db = Arc::new(StateDB::new());
-            let executor = Arc::new(Executor::with_storage_and_chain_id(
-                state_db,
-                Some(storage.state.clone()),
-                config.chain.chain_id,
-            ));
-
-            let genesis_config = GenesisConfig {
-                chain_id: config.chain.chain_id,
-                ..Default::default()
-            };
-
-            publish_mpt_rule_for_genesis_build(
-                config.chain.chain_id,
-                Some("default"),
-                config.chain.mpt_state_root_height,
-            )?;
-            initialize_genesis_state_with_profile(
-                storage,
-                executor,
-                &genesis_config,
-                Some("default"),
-            )
-            .await?;
-            info!("Devnet chain initialized");
-        } else {
-            info!("Existing devnet genesis found, reusing initialized chain");
-        }
-    }
+    let prepared = prepare_chain_database(&config).await?;
 
     // Start node with devnet config
-    start_node(config).await
+    start_node(config, prepared).await
 }
 
 fn generate_keypair(use_ed25519: bool) {
@@ -1698,6 +1587,89 @@ fn parse_storage_key_hex(hex_str: &str, source: &str) -> Result<zeroize::Zeroizi
     Ok(key)
 }
 
+/// `node_main`'s chain-database step: [`prepare_chain_database`] first (a
+/// pending or interrupted cold resync is carried out before anything opens the
+/// chain database), then the WP-K.6 genesis state-root check on the prepared
+/// database.
+///
+/// Before this, `node_main` opened the chain database (and built genesis into
+/// an empty one) BEFORE the resync ran. After a crash in the resync's `Moving`
+/// phase that either opened a half-moved RocksDB (the start failed every time:
+/// a crash loop) or, with every file already moved but the journal still at
+/// `Moving`, built a fresh genesis database that the resumed move then renamed
+/// over the moved-aside one, so the signed-vote carry read the new genesis
+/// database instead of the old chain.
+async fn boot_chain_database(config: &NodeConfig, force_start: bool) -> Result<PreparedChainDb> {
+    std::fs::create_dir_all(&config.storage.data_dir)?;
+    let prepared = prepare_chain_database(config).await?;
+    // If a storage-at-rest key is supplied (CITRATE_STORAGE_KEY, from the parent
+    // process's OS keyring), the probe MUST open the DB with the same encryption
+    // config as the live `start_node` storage, or the mismatch guard in
+    // `open_encrypted` would reject it.
+    let probe_storage = StorageManager::with_config(
+        &config.storage.data_dir,
+        StorageConfig {
+            pruning: PruningConfig::default(),
+            encryption: prepared.storage_encryption.clone(),
+        },
+    )?;
+    verify_genesis_state_root(
+        &probe_storage,
+        config.validator.production_mode,
+        force_start,
+    )?;
+    drop(probe_storage);
+    Ok(prepared)
+}
+
+/// WP-K.6: the persisted state root of block 0 must match the block's header
+/// (a node would otherwise run on corrupted state). Production refuses a
+/// mismatch unless `--force-start`; a devnet warns. Source: `CF_HEADERS` /
+/// `CF_BLOCKS` block 0 and `StateStore::get_state_root`.
+fn verify_genesis_state_root(
+    storage: &StorageManager,
+    production_mode: bool,
+    force_start: bool,
+) -> Result<()> {
+    info!("Genesis block found in storage, verifying state root...");
+    let genesis_block = storage
+        .blocks
+        .get_block_by_height(0)
+        .ok()
+        .flatten()
+        .and_then(|hash| storage.blocks.get_block(&hash).ok().flatten())
+        .ok_or_else(|| anyhow::anyhow!("Genesis block must exist (prepare_chain_database)"))?;
+    let persisted_root = storage
+        .state
+        .get_state_root(&genesis_block.header.block_hash)
+        .ok()
+        .flatten();
+    match persisted_root {
+        Some(root) if root != genesis_block.state_root => {
+            if production_mode && !force_start {
+                error!(
+                    "FATAL: State root mismatch! Persisted: {}, Expected: {}",
+                    root, genesis_block.state_root
+                );
+                error!("Use --force-start to override (data may be corrupted)");
+                return Err(anyhow::anyhow!("State root mismatch on startup"));
+            }
+            warn!(
+                "State root mismatch (devnet mode, continuing): Persisted: {}, Expected: {}",
+                root, genesis_block.state_root
+            );
+        }
+        Some(root) => info!("State root verified: {}", root),
+        None => {
+            // No persisted state root entry for genesis (pre-K.6 data) — skip check
+            info!(
+                "No persisted state root for genesis block (pre-K.6 data), skipping verification"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// What [`prepare_chain_database`] hands the rest of `start_node`.
 struct PreparedChainDb {
     /// Block 0 of the chain database `start_node` opens next: the genesis every
@@ -1782,14 +1754,17 @@ async fn prepare_chain_database(config: &NodeConfig) -> Result<PreparedChainDb> 
     })
 }
 
-async fn start_node(config: NodeConfig) -> Result<()> {
+/// Runs the node on a chain database [`prepare_chain_database`] prepared (the
+/// callers, `node_main` and `run_devnet`, run it before anything else opens the
+/// database).
+async fn start_node(config: NodeConfig, prepared: PreparedChainDb) -> Result<()> {
     info!("Starting Citrate node...");
     let PreparedChainDb {
         running_genesis,
         storage_encryption,
         recovery_policy,
         resync_binding,
-    } = prepare_chain_database(&config).await?;
+    } = prepared;
     let genesis_acts = running_genesis
         .and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
     genesis::r1006_boot_guard(
@@ -6499,12 +6474,33 @@ mod genesis_order_tests {
     fn start_node_binds_genesis_through_the_checked_read() {
         let main = include_str!("main.rs");
         let start = main
-            .find("async fn start_node(config: NodeConfig)")
-            .expect("start_node");
-        let prepare = main
-            .find("} = prepare_chain_database(&config).await?;")
-            .expect("start_node runs the start-up step first");
-        assert!(start < prepare);
+            .find("async fn start_node(config: NodeConfig, prepared: PreparedChainDb)")
+            .expect("start_node takes the prepared chain database");
+        // node_main and run_devnet prepare the chain database (the resync
+        // first) before anything opens it, then hand it to start_node.
+        let node_main = main.find("async fn node_main()").expect("node_main");
+        let boot = main
+            .find("let prepared = boot_chain_database(&config, cli.force_start).await?;")
+            .expect("node_main prepares the chain database");
+        let devnet = main.find("async fn run_devnet(").expect("run_devnet");
+        let devnet_prepare = main[devnet..]
+            .find("let prepared = prepare_chain_database(&config).await?;")
+            .expect("run_devnet prepares the chain database");
+        // After the subcommands (which return), nothing opens the chain
+        // database before the boot step.
+        let node_start = main[node_main..]
+            .find("startup_guards::check_rpc_exposure(")
+            .map(|i| node_main + i)
+            .expect("node_main's start path");
+        assert!(node_start < boot);
+        assert!(main[node_start..boot].find("StorageManager::").is_none());
+        assert!(main[devnet..devnet + devnet_prepare]
+            .find("StorageManager::")
+            .is_none());
+        assert_eq!(
+            main.matches(concat!("start_node(config, prepared)", ".await")).count(),
+            2
+        );
         assert!(!main.contains(concat!("genesis not readable", " at start-up")));
         assert!(
             main.matches(concat!("bound_genesis_hash(&storage)", "?"))
@@ -6520,5 +6516,223 @@ mod genesis_order_tests {
             .find("        if ensure_genesis_block(\n            probe.clone(),")
             .expect("ensure in the start-up step");
         assert!(apply < ensure && ensure < start);
+    }
+
+    /// The previous process crashed in the resync's `Moving` phase with the
+    /// chain database HALF moved (the journal says `Moving`, some files are in
+    /// the aside dir, some still in the data dir). RED on cc381059: node_main
+    /// opened the half-moved RocksDB before the resync ran and failed on every
+    /// start. The next start now completes the move and boots on a fresh genesis.
+    #[test]
+    fn a_crash_mid_move_with_a_half_moved_database_completes_the_move() {
+        child("genesis_order_tests::half_moved_child");
+    }
+
+    /// The chain DB of an r1007 node with a signed vote, a resync requested,
+    /// and the journal written at `Moving` (as `apply_pending` does before the
+    /// first file moves). Returns the aside dir.
+    async fn seed_chain_and_journal(
+        data: &std::path::Path,
+        config: &NodeConfig,
+    ) -> std::path::PathBuf {
+        {
+            let s = Arc::new(open(data));
+            assert!(ensure_genesis_block(
+                s.clone(),
+                40204,
+                config.chain.genesis_profile.as_deref(),
+                None
+            )
+            .await
+            .expect("genesis builds"));
+            s.db.put_cf("metadata", b"probe", b"old chain")
+                .expect("probe");
+            citrate_storage::signed_votes::import(
+                &s.db,
+                &[(
+                    citrate_consensus::checkpoint_gadget::signed_vote_key(40204, 93_050),
+                    vec![7u8; 32],
+                )],
+            )
+            .expect("seed vote");
+            s.db.flush().expect("flush");
+        }
+        cold_resync::request(data, &resync_request()).expect("request");
+        let aside = data.join(cold_resync::ASIDE_DIR).join("10000");
+        std::fs::create_dir_all(&aside).expect("aside");
+        let journal = serde_json::json!({
+            "aside": aside.display().to_string(),
+            "phase": "Moving",
+            "expected": null,
+        });
+        std::fs::write(
+            data.join(cold_resync::JOURNAL_FILE),
+            serde_json::to_vec(&journal).expect("journal json"),
+        )
+        .expect("journal");
+        aside
+    }
+
+    /// Chain-database files in `data`, sorted (the cold_resync move set).
+    fn chain_files(data: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(data)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| {
+                matches!(n.as_str(), "CURRENT" | "IDENTITY" | "LOCK" | "LOG")
+                    || n.starts_with("MANIFEST-")
+                    || n.starts_with("OPTIONS-")
+                    || n.ends_with(".sst")
+                    || n.ends_with(".log")
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The old chain in `aside`: its marker, and the signed vote it held.
+    fn assert_aside_is_the_old_chain(aside: &std::path::Path) {
+        let old = open(aside);
+        assert_eq!(
+            old.db.get_cf("metadata", b"probe").expect("read"),
+            Some(b"old chain".to_vec()),
+            "the moved-aside database must be the old chain"
+        );
+    }
+
+    #[test]
+    fn half_moved_child() {
+        if !in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path();
+        let config = r1007_config(data);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let aside = seed_chain_and_journal(data, &config).await;
+            // The crash: CURRENT, IDENTITY and the MANIFEST already moved, the rest not.
+            let files = chain_files(data);
+            for name in files.iter().filter(|n| {
+                matches!(n.as_str(), "CURRENT" | "IDENTITY") || n.starts_with("MANIFEST-")
+            }) {
+                std::fs::rename(data.join(name), aside.join(name)).expect("partial move");
+            }
+            assert!(!chain_files(data).is_empty(), "the fixture is half moved");
+            let prepared = boot_chain_database(&config, false)
+                .await
+                .expect("the next start completes the move and boots");
+            assert_eq!(prepared.running_genesis, Some(R1007_GENESIS));
+            let fresh = open(data);
+            assert_eq!(fresh.db.get_cf("metadata", b"probe").expect("read"), None);
+            assert_eq!(
+                *bound_genesis_hash(&fresh).expect("block 0").as_bytes(),
+                R1007_GENESIS
+            );
+            drop(fresh);
+            assert_aside_is_the_old_chain(&aside);
+        });
+    }
+
+    /// The previous process crashed after every chain file moved but before
+    /// the journal advanced past `Moving`. RED on cc381059: node_main found no
+    /// database, built a fresh genesis one, and the resumed move renamed those
+    /// files over the moved-aside database (CURRENT, IDENTITY, MANIFEST-*), so
+    /// the signed-vote carry read the new genesis database, not the old chain.
+    /// Now the resume moves nothing over the aside copy and the carry holds the
+    /// old chain's vote.
+    #[test]
+    fn a_crash_after_the_move_before_the_journal_never_overwrites_the_aside_copy() {
+        child("genesis_order_tests::fully_moved_child");
+    }
+
+    #[test]
+    fn fully_moved_child() {
+        if !in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path();
+        let config = r1007_config(data);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let aside = seed_chain_and_journal(data, &config).await;
+            for name in chain_files(data) {
+                std::fs::rename(data.join(&name), aside.join(&name)).expect("full move");
+            }
+            let aside_before = chain_files(&aside);
+            let prepared = boot_chain_database(&config, false)
+                .await
+                .expect("the next start finishes the resync");
+            assert_eq!(prepared.running_genesis, Some(R1007_GENESIS));
+            assert_eq!(
+                chain_files(&aside),
+                aside_before,
+                "nothing moved over the aside copy"
+            );
+            assert_aside_is_the_old_chain(&aside);
+            // The carry holds the old chain's vote, and imports into the new database.
+            let storage = open(data);
+            cold_resync::import_carried_votes_bound(&storage, data, &prepared.resync_binding)
+                .expect("import the carried record");
+            let held = citrate_storage::signed_votes::summarize(
+                &citrate_storage::signed_votes::export(&storage.db).expect("export"),
+            )
+            .expect("summary");
+            assert_eq!(held.votes, 1, "the old chain's signed vote was carried");
+            assert_eq!(held.vote_heights, Some((93_050, 93_050)));
+        });
+    }
+
+    /// node_main on a fresh install and on a normal (uninterrupted) cold resync:
+    /// unchanged, block 0 is the r1007 genesis and the old chain is kept aside.
+    #[test]
+    fn node_main_boot_is_unchanged_for_fresh_installs_and_normal_resyncs() {
+        child("genesis_order_tests::boot_unchanged_child");
+    }
+
+    #[test]
+    fn boot_unchanged_child() {
+        if !in_child() {
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = r1007_config(dir.path());
+            let p = boot_chain_database(&config, false)
+                .await
+                .expect("fresh install");
+            assert_eq!(p.running_genesis, Some(R1007_GENESIS));
+            let p = boot_chain_database(&config, false).await.expect("restart");
+            assert_eq!(p.running_genesis, Some(R1007_GENESIS));
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let data = dir.path();
+            let config = r1007_config(data);
+            boot_chain_database(&config, false)
+                .await
+                .expect("first start");
+            open(data)
+                .db
+                .put_cf("metadata", b"probe", b"old chain")
+                .expect("probe");
+            cold_resync::request(data, &resync_request()).expect("request");
+            let p = boot_chain_database(&config, false)
+                .await
+                .expect("resync start");
+            assert_eq!(p.running_genesis, Some(R1007_GENESIS));
+            assert_eq!(
+                open(data).db.get_cf("metadata", b"probe").expect("read"),
+                None
+            );
+            let asides: Vec<_> = std::fs::read_dir(data.join(cold_resync::ASIDE_DIR))
+                .expect("aside dir")
+                .filter_map(|e| e.ok())
+                .collect();
+            assert_eq!(asides.len(), 1);
+            assert_aside_is_the_old_chain(&asides[0].path());
+        });
     }
 }

@@ -169,6 +169,7 @@ The script aborts before touching the binary or the data dir unless the watchdog
 ### 6.3 Start the chain
 
 1. Start the first producer **alone**. Read block 0 and record the genesis hash. Compare it to the hash computed from the genesis profile at the release commit. They must match.
+   Start it with `--bootstrap` (an empty bootstrap list). A node that has bootstrap nodes never completes initial sync on an empty chain until it hears a peer (chain#489), so the first producer with a bootstrap list waits forever and seals nothing.
 2. Start the remaining producers and RPC nodes, one at a time.
 3. Each operator copies its node's `proposer.key` **public key** to the chain team for registration. The private key stays on the node.
 4. `FLEET_RPCS=<all endpoints> EXPECTED_GENESIS_HASH=<hash> bash scripts/genesis/fleet_agree.sh` must report `FLEET AGREE`.
