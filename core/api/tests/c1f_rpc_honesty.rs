@@ -203,6 +203,47 @@ fn node_identity_sync_state_reads_the_marker_and_the_sync_signal() {
     assert!(s["highestSeen"].is_null(), "{s}");
 }
 
+/// RED (0.5.6 cold-resync isolation, 2026-11-22): a node on an empty chain
+/// (genesis only, nothing applied) that has heard no network height reported
+/// `syncState: synced` while it sat isolated at height 0 with no peers. It now
+/// reports `catching_up` until it applies a block or hears a height.
+#[test]
+fn node_identity_sync_state_is_not_synced_on_an_empty_chain_with_nothing_heard() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (storage, _tmp, g) = storage_with_genesis();
+    let st = |io: &jsonrpc_core::IoHandler| {
+        call(io, "citrate_nodeIdentity", "[]")["result"]["syncState"].clone()
+    };
+    // No sync signal wired, nothing applied.
+    let s = st(&node_io(storage.clone(), None));
+    assert_eq!(s["state"], "catching_up", "{s}");
+    assert_eq!(s["appliedHeight"], 0, "{s}");
+    assert!(s["reason"].is_string(), "{s}");
+    // The sync signal wired, nothing heard (0).
+    let highest = Arc::new(AtomicU64::new(0));
+    let mut io = jsonrpc_core::IoHandler::new();
+    node_rpc::register_node_methods_with_sync(
+        &mut io,
+        storage.clone(),
+        40204,
+        None,
+        Some(highest.clone()),
+    );
+    let s = st(&io);
+    assert_eq!(s["state"], "catching_up", "{s}");
+    // Genesis applied as the tip, still nothing heard: not synced.
+    storage.blocks.put_applied_tip(&g, 0).expect("tip");
+    assert_eq!(st(&io)["state"], "catching_up");
+    // A height heard above the tip: catching up, for the usual reason.
+    highest.store(40, Ordering::Relaxed);
+    assert_eq!(st(&io)["state"], "catching_up");
+    // Applied above genesis and level with the network: synced.
+    let tip = put(&storage, [0x01; 32], g, 1, 1);
+    storage.blocks.put_applied_tip(&tip, 1).expect("tip");
+    highest.store(1, Ordering::Relaxed);
+    assert_eq!(st(&io)["state"], "synced");
+}
+
 #[test]
 fn node_identity_is_null_where_unknown() {
     // No genesis stored and no identity supplied: nothing is invented.

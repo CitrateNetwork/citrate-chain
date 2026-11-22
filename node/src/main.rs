@@ -955,52 +955,14 @@ async fn node_main() -> Result<()> {
         },
     )?);
 
-    let has_genesis = probe_storage
-        .blocks
-        .get_block_by_height(0)
-        .ok()
-        .flatten()
-        .and_then(|hash| probe_storage.blocks.get_block(&hash).ok().flatten())
-        .is_some();
-
-    if !has_genesis {
-        info!("No genesis block found, initializing genesis...");
-
-        let state_db = Arc::new(StateDB::new());
-        let executor = Arc::new(Executor::with_storage_and_chain_id(
-            state_db,
-            Some(probe_storage.state.clone()),
-            config.chain.chain_id,
-        ));
-
-        let genesis_config = genesis::GenesisConfig {
-            chain_id: config.chain.chain_id,
-            ..Default::default()
-        };
-
-        let genesis_profile = config.chain.genesis_profile.as_deref();
-        // r1007 is built from the r1006 ceremony state, so it is bootable exactly when r1006 is.
-        if genesis_profile == Some(genesis::R1006_PROFILE)
-            || genesis_profile == Some(genesis::R1007_PROFILE)
-        {
-            genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
-        }
-        publish_mpt_rule_for_genesis_build(
-            config.chain.chain_id,
-            genesis_profile,
-            config.chain.mpt_state_root_height,
-        )?;
-        genesis::initialize_genesis_state_with_profile(
+    if !stored_genesis_present(&probe_storage) {
+        ensure_genesis_block(
             probe_storage,
-            executor,
-            &genesis_config,
-            genesis_profile,
+            config.chain.chain_id,
+            config.chain.genesis_profile.as_deref(),
+            config.chain.mpt_state_root_height,
         )
         .await?;
-        info!(
-            "Genesis state initialized for chain ID {}",
-            config.chain.chain_id
-        );
     } else {
         // WP-K.6: Verify state root consistency before proceeding.
         // If persisted state diverges from genesis, the node would run with corrupted state.
@@ -1219,6 +1181,85 @@ async fn handle_model_command(command: ModelCommands, data_dir: Option<PathBuf>)
     }
 
     Ok(())
+}
+
+/// Whether `storage` holds a genesis: a block indexed at height 0 whose body
+/// is stored. Source: `BlockStore::get_block_by_height(0)`, `BlockStore::get_block`.
+fn stored_genesis_present(storage: &StorageManager) -> bool {
+    storage
+        .blocks
+        .get_block_by_height(0)
+        .ok()
+        .flatten()
+        .and_then(|hash| storage.blocks.get_block(&hash).ok().flatten())
+        .is_some()
+}
+
+/// Writes block 0 (and its world state) into `storage` when it holds none: a
+/// fresh data dir, or the empty chain database a cold resync leaves behind
+/// (`cold_resync::apply_pending`). Returns whether a genesis was built.
+///
+/// Every component that binds the genesis (the handshake, gossip, checkpoint
+/// votes, the DAG store, the genesis-pinned rules) reads block 0 from the chain
+/// store, so this runs before any of them is built. Before this, the cold resync
+/// moved the database aside inside `start_node` after `main` had built genesis,
+/// and the node started with no block 0: it handshook with the zero genesis
+/// hash, every peer refused it ("network mismatch"), and it sat isolated at
+/// height 0 until restarted.
+async fn ensure_genesis_block(
+    storage: Arc<StorageManager>,
+    chain_id: u64,
+    genesis_profile: Option<&str>,
+    mpt_state_root_height: Option<u64>,
+) -> Result<bool> {
+    if stored_genesis_present(&storage) {
+        return Ok(false);
+    }
+    info!("No genesis block found, initializing genesis...");
+    let state_db = Arc::new(StateDB::new());
+    let executor = Arc::new(Executor::with_storage_and_chain_id(
+        state_db,
+        Some(storage.state.clone()),
+        chain_id,
+    ));
+    let genesis_config = genesis::GenesisConfig {
+        chain_id,
+        ..Default::default()
+    };
+    // r1007 is built from the r1006 ceremony state, so it is bootable exactly when r1006 is.
+    if genesis_profile == Some(genesis::R1006_PROFILE)
+        || genesis_profile == Some(genesis::R1007_PROFILE)
+    {
+        genesis::check_r1006_bootable(genesis::r1006_rehearsal_from_env())?;
+    }
+    publish_mpt_rule_for_genesis_build(chain_id, genesis_profile, mpt_state_root_height)?;
+    genesis::initialize_genesis_state_with_profile(
+        storage,
+        executor,
+        &genesis_config,
+        genesis_profile,
+    )
+    .await?;
+    info!("Genesis state initialized for chain ID {}", chain_id);
+    Ok(true)
+}
+
+/// The genesis hash a component binds (handshake, gossip, checkpoint votes, DAG
+/// store), read from the chain store. Refuses a missing block 0 and the zero
+/// hash: a node that binds the zero genesis is refused by every peer and votes
+/// nothing the network can verify. Source: `BlockStore::get_block_by_height(0)`.
+fn bound_genesis_hash(storage: &StorageManager) -> Result<citrate_consensus::types::Hash> {
+    match storage.blocks.get_block_by_height(0) {
+        Ok(Some(g)) if g != citrate_consensus::types::Hash::default() => Ok(g),
+        Ok(Some(_)) => Err(anyhow::anyhow!(
+            "genesis at height 0 is the zero hash; refusing to start the network with it"
+        )),
+        Ok(None) => Err(anyhow::anyhow!(
+            "no genesis block at height 0 in the chain database; refusing to start the network \
+             with the zero genesis hash"
+        )),
+        Err(e) => Err(anyhow::anyhow!("genesis at height 0 unreadable: {e}")),
+    }
 }
 
 /// CV-14, r1007 genesis rule (lead decision 2026-11-09): activation 0 roots
@@ -1657,18 +1698,73 @@ fn parse_storage_key_hex(hex_str: &str, source: &str) -> Result<zeroize::Zeroizi
     Ok(key)
 }
 
-async fn start_node(config: NodeConfig) -> Result<()> {
-    info!("Starting Citrate node...");
+/// What [`prepare_chain_database`] hands the rest of `start_node`.
+struct PreparedChainDb {
+    /// Block 0 of the chain database `start_node` opens next: the genesis every
+    /// genesis-pinned rule and every genesis-bound component is resolved for.
+    running_genesis: Option<[u8; 32]>,
+    storage_encryption: Option<EncryptionAtRestConfig>,
+    recovery_policy: cold_resync::Policy,
+    resync_binding: citrate_storage::signed_votes::Binding,
+}
+
+/// Start-up, before any component exists: carry out a pending cold resync
+/// (move the chain database aside), then make sure the chain database holds
+/// block 0 (write it into the empty database a resync leaves), then read block 0.
+/// The order is the point: a genesis read before the move, or a move with no
+/// genesis written after it, leaves the node bound to the zero genesis.
+async fn prepare_chain_database(config: &NodeConfig) -> Result<PreparedChainDb> {
+    // Create storage. When CITRATE_STORAGE_KEY is set the data dir is opened
+    // encrypted-at-rest (AES-256-GCM per value) with the raw key from the parent
+    // process's OS keyring; absent, the default plaintext path is used.
+    let storage_encryption = at_rest_encryption_from_env()?;
+    // CV-7c: a cold resync the previous process requested (it was held on a
+    // dead branch it could not switch from) moves the chain database aside
+    // here, first, before anything reads it; genesis is then written into the
+    // empty database below and the node syncs from genesis via its peers.
+    let recovery_policy = cold_resync::Policy::from(&config.recovery);
+    // the resync reads the moved database's signed-vote record
+    // with this node's storage key, and binds the carry file to this chain,
+    // genesis and validator.
+    let resync_binding = citrate_storage::signed_votes::Binding {
+        chain_id: Some(config.chain.chain_id),
+        genesis: config
+            .chain
+            .genesis_hash
+            .as_deref()
+            .and_then(citrate_storage::signed_votes::Binding::normalize),
+        validator: citrate_storage::signed_votes::Binding::normalize(&config.mining.coinbase),
+    };
+    cold_resync::apply_pending(
+        &config.storage.data_dir,
+        recovery_policy,
+        &cold_resync::Carry {
+            encryption: storage_encryption.clone(),
+            binding: resync_binding.clone(),
+        },
+    )?;
     // Rules compiled for THIS chain's block 0 (keyed by genesis hash, not chain id: r1005
     // and r1006 share 40204). Read before any consensus or execution component exists.
+    // Block 0 is written first when the store has none (the empty database a cold
+    // resync leaves), so every component below binds the real genesis, never zero.
     let running_genesis: Option<[u8; 32]> = {
-        let probe = StorageManager::with_config(
+        let probe = Arc::new(StorageManager::with_config(
             &config.storage.data_dir,
             StorageConfig {
                 pruning: PruningConfig::default(),
-                encryption: at_rest_encryption_from_env()?,
+                encryption: storage_encryption.clone(),
             },
-        )?;
+        )?);
+        if ensure_genesis_block(
+            probe.clone(),
+            config.chain.chain_id,
+            config.chain.genesis_profile.as_deref(),
+            config.chain.mpt_state_root_height,
+        )
+        .await?
+        {
+            info!("Genesis written at start-up (empty chain database)");
+        }
         let g = probe
             .blocks
             .get_block_by_height(0)
@@ -1678,6 +1774,22 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         drop(probe);
         g
     };
+    Ok(PreparedChainDb {
+        running_genesis,
+        storage_encryption,
+        recovery_policy,
+        resync_binding,
+    })
+}
+
+async fn start_node(config: NodeConfig) -> Result<()> {
+    info!("Starting Citrate node...");
+    let PreparedChainDb {
+        running_genesis,
+        storage_encryption,
+        recovery_policy,
+        resync_binding,
+    } = prepare_chain_database(&config).await?;
     let genesis_acts = running_genesis
         .and_then(|g| citrate_consensus::hardening::rules_for_genesis(config.chain.chain_id, &g));
     genesis::r1006_boot_guard(
@@ -1951,34 +2063,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         }
     });
 
-    // Create storage. When CITRATE_STORAGE_KEY is set the data dir is opened
-    // encrypted-at-rest (AES-256-GCM per value) with the raw key from the parent
-    // process's OS keyring; absent, the default plaintext path is used.
-    let storage_encryption = at_rest_encryption_from_env()?;
-    // CV-7c: a cold resync the previous process requested (it was held on a
-    // dead branch it could not switch from) moves the chain database aside
-    // here, before it is opened; the node then syncs from genesis via peers.
-    let recovery_policy = cold_resync::Policy::from(&config.recovery);
-    // the resync reads the moved database's signed-vote record
-    // with this node's storage key, and binds the carry file to this chain,
-    // genesis and validator.
-    let resync_binding = citrate_storage::signed_votes::Binding {
-        chain_id: Some(config.chain.chain_id),
-        genesis: config
-            .chain
-            .genesis_hash
-            .as_deref()
-            .and_then(citrate_storage::signed_votes::Binding::normalize),
-        validator: citrate_storage::signed_votes::Binding::normalize(&config.mining.coinbase),
-    };
-    cold_resync::apply_pending(
-        &config.storage.data_dir,
-        recovery_policy,
-        &cold_resync::Carry {
-            encryption: storage_encryption.clone(),
-            binding: resync_binding.clone(),
-        },
-    )?;
+    // Create storage (the cold resync above already moved a dead branch's
+    // database aside and wrote genesis into the empty one).
     let storage = Arc::new(StorageManager::with_config(
         &config.storage.data_dir,
         StorageConfig {
@@ -1996,6 +2082,17 @@ async fn start_node(config: NodeConfig) -> Result<()> {
     // resync goes back into the new database now, before anything that can
     // sign is built. A record that cannot be imported stops the start.
     cold_resync::import_carried_votes_bound(&storage, &config.storage.data_dir, &resync_binding)?;
+    // The genesis every component below binds: the block 0 written or loaded at
+    // the top of start_node, the one the genesis-pinned rules were resolved for.
+    // Never the zero hash (a node bound to it is refused by every peer).
+    let stored_genesis = bound_genesis_hash(&storage)?;
+    if running_genesis != Some(*stored_genesis.as_bytes()) {
+        anyhow::bail!(
+            "genesis changed during start-up (rules resolved for {:?}, chain database holds {})",
+            running_genesis.map(hex::encode),
+            stored_genesis
+        );
+    }
 
     // A release network's genesis only runs under that network's chain id: the
     // genesis block does not commit to the chain id, so otherwise a node could
@@ -2413,17 +2510,8 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         // derive different committees); differing `[checkpoint]` values are
         // ignored with a warning. Votes bind the genesis this node loaded
         // (r1006 and r1007 share chain id 40204).
-        let genesis_hash = match storage.blocks.get_block_by_height(0) {
-            Ok(Some(g)) => g,
-            other => {
-                warn!(
-                    "checkpoint finality: genesis not readable at start-up ({:?}); votes \
-                     bind the zero genesis and will not verify on the network",
-                    other.err()
-                );
-                citrate_consensus::types::Hash::default()
-            }
-        };
+        // Refuses the zero genesis rather than signing votes no peer verifies.
+        let genesis_hash = bound_genesis_hash(&storage)?;
         let cp_config = finality_driver::node_checkpoint_config(
             &config.checkpoint,
             config.chain.chain_id,
@@ -2781,12 +2869,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let (head_hash, head_height) = cold_resync::advertised_head(&storage)
             .unwrap_or((citrate_consensus::types::Hash::default(), 0));
         max_seen_height.fetch_max(head_height, std::sync::atomic::Ordering::Relaxed);
-        let genesis_hash = storage
-            .blocks
-            .get_block_by_height(0)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        // The handshake, gossip and DAG store bind this; never the zero hash
+        // (every peer refuses that handshake: "network mismatch").
+        let genesis_hash = bound_genesis_hash(&storage)?;
         // SECREM-A001: bind the shared DAG store to this chain's canonical
         // genesis identity BEFORE any network block is admitted, so a block
         // merely shaped like genesis (parentless, arbitrary height) cannot
@@ -3256,6 +3341,9 @@ async fn start_node(config: NodeConfig) -> Result<()> {
         let deferred_for_loop = deferred_heights.clone();
         let tip_reask_for_loop = tip_reask.clone();
         let initial_sync_for_sync = initial_sync_done.clone();
+        // A node with bootstrap nodes is joining a network: on an empty chain it
+        // is never caught up before it hears a peer (sync_recovery).
+        let expects_peers = !config.network.bootstrap_nodes.is_empty();
         let attested_for_sync = attested_network_head.clone();
         tokio::spawn(async move {
             // #150: `attempt_counts` (an unpruned HashMap keyed by every anchor
@@ -3382,6 +3470,7 @@ async fn start_node(config: NodeConfig) -> Result<()> {
                         target,
                         heard_peers,
                         node_started_at.elapsed(),
+                        expects_peers,
                     )
                 {
                     initial_sync_for_sync.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -6170,5 +6259,266 @@ mod mempool_size_tests {
             mempool_max_size_from(Some("25000")),
             producer::MAX_BLOCK_CANDIDATES
         );
+    }
+}
+
+/// 0.5.6 cold-resync isolation (2026-11-22): the post-resync start-up order. A
+/// node that cold-resynced started on an empty chain database with no block 0
+/// (main built genesis before start_node moved the database aside), bound the
+/// zero genesis in its handshake, gossip and checkpoint votes, and was refused
+/// by every peer ("network mismatch") until restarted. These run the real
+/// start-up step (`prepare_chain_database`) on a data dir. They build the
+/// r1007 genesis, which publishes process-wide rules, so each runs in a child
+/// process (as genesis.rs does).
+#[cfg(test)]
+mod genesis_order_tests {
+    use super::*;
+    use citrate_consensus::hardening::R1007_GENESIS;
+    use citrate_consensus::types::Hash;
+
+    const CHILD_ENV: &str = "CITRATE_GENESIS_ORDER_CHILD";
+
+    fn child(test: &str) {
+        let exe = std::env::current_exe().expect("exe");
+        let out = std::process::Command::new(exe)
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .env_remove(citrate_execution::mpt_state_root::MPT_STATE_ROOT_ENV)
+            .env_remove(STORAGE_KEY_FILE_ENV)
+            .env_remove("CITRATE_STORAGE_KEY")
+            .output()
+            .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child {test} failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn in_child() -> bool {
+        std::env::var(CHILD_ENV).is_ok()
+    }
+
+    /// A member node's config: the r1007 network, this data dir.
+    fn r1007_config(data_dir: &std::path::Path) -> NodeConfig {
+        let mut c = NodeConfig::default();
+        c.chain.chain_id = 40204;
+        c.chain.genesis_profile = Some(genesis::R1007_PROFILE.to_string());
+        c.storage.data_dir = data_dir.to_path_buf();
+        c
+    }
+
+    fn open(data_dir: &std::path::Path) -> StorageManager {
+        StorageManager::new(data_dir, PruningConfig::default()).expect("open chain database")
+    }
+
+    fn resync_request() -> cold_resync::ResyncRequest {
+        cold_resync::ResyncRequest {
+            requested_unix: 1,
+            dead_tip: "0x01".into(),
+            dead_tip_height: 120_000,
+            fork_height: 100_000,
+            fork_depth: 20_000,
+            head: "0x02".into(),
+            head_height: 140_000,
+            reason: "test".into(),
+            carry_signed_votes: false,
+        }
+    }
+
+    struct Wire {
+        pm: Arc<citrate_network::PeerManager>,
+        transport: citrate_network::NetworkTransport,
+        id: citrate_network::PeerId,
+    }
+
+    /// A Noise transport bound to `genesis` on the r1007 network id, as
+    /// start_node builds it (`network_id` = chain id).
+    fn wire(genesis: Hash) -> Wire {
+        let keypair = citrate_network::NoiseKeypair::generate().expect("noise keypair");
+        let id = keypair.derive_peer_id();
+        let pm = Arc::new(citrate_network::PeerManager::new(
+            citrate_network::PeerManagerConfig::default(),
+        ));
+        let params = citrate_network::transport::HandshakeParams {
+            network_id: 40204,
+            genesis_hash: genesis,
+            head: Arc::new(tokio::sync::RwLock::new((0, genesis))),
+        };
+        let transport = citrate_network::NetworkTransport::new(pm.clone(), id.clone(), params)
+            .with_noise(keypair);
+        Wire { pm, transport, id }
+    }
+
+    /// Whether `client` completes a handshake with `server` within 5 s.
+    async fn handshakes(server: &Wire, client: &Wire) -> bool {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        server.transport.start_listener(addr).await.expect("listen");
+        if client.transport.connect_to(addr).await.is_err() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if server.pm.get_peer(&client.id).is_some() && client.pm.get_peer(&server.id).is_some()
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// RED on 7fb483e2: the start after a cold resync binds the real genesis.
+    /// The data dir holds a chain (built as main builds it) and a resync
+    /// request; the start-up step moves it aside, and the empty database must
+    /// then hold the r1007 block 0 and the step must return it, so the
+    /// handshake, gossip, checkpoint votes and DAG store bind R1007_GENESIS,
+    /// never the zero hash. The node then handshakes with an r1007 bootnode; a
+    /// node bound to the zero genesis (the bug) is refused.
+    #[test]
+    fn a_cold_resync_start_binds_the_real_genesis_and_handshakes() {
+        child("genesis_order_tests::cold_resync_child");
+    }
+
+    #[test]
+    fn cold_resync_child() {
+        if !in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path();
+        let config = r1007_config(data);
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            // The chain the node ran before: block 0 as main() builds it, and a
+            // marker that only the old database holds.
+            {
+                let s = Arc::new(open(data));
+                assert!(ensure_genesis_block(
+                    s.clone(),
+                    40204,
+                    config.chain.genesis_profile.as_deref(),
+                    None
+                )
+                .await
+                .expect("genesis builds"));
+                s.db.put_cf("metadata", b"probe", b"old chain")
+                    .expect("probe");
+                s.db.flush().expect("flush");
+            }
+            // The dead-branch monitor asked for a resync; the supervisor restarts.
+            cold_resync::request(data, &resync_request()).expect("request");
+            // As main() does: the old database still holds genesis, so main builds nothing.
+            assert!(stored_genesis_present(&open(data)));
+
+            let prepared = prepare_chain_database(&config)
+                .await
+                .expect("start-up step");
+            // The database moved aside: the old chain is gone from the data dir.
+            assert!(data.join(cold_resync::ASIDE_DIR).exists(), "moved aside");
+            let storage = open(data);
+            assert_eq!(
+                storage.db.get_cf("metadata", b"probe").expect("read"),
+                None,
+                "the old chain database was moved aside"
+            );
+            // The empty database holds the real block 0, and the step returns it.
+            let bound = bound_genesis_hash(&storage).expect("block 0 bound after the resync");
+            assert_eq!(*bound.as_bytes(), R1007_GENESIS);
+            assert_ne!(bound, Hash::default());
+            assert_eq!(prepared.running_genesis, Some(R1007_GENESIS));
+            drop(storage);
+
+            // The handshake start_node builds from that genesis is accepted by a
+            // bootnode on R1007_GENESIS.
+            let bootnode = wire(Hash::new(R1007_GENESIS));
+            let node = wire(bound);
+            assert!(
+                handshakes(&bootnode, &node).await,
+                "the resynced node handshakes with the bootnode"
+            );
+            // The bug: a node bound to the zero genesis is refused (network mismatch).
+            let bootnode = wire(Hash::new(R1007_GENESIS));
+            let isolated = wire(Hash::default());
+            assert!(
+                !handshakes(&bootnode, &isolated).await,
+                "a zero-genesis handshake must be refused"
+            );
+        });
+    }
+
+    /// A fresh install (empty data dir, no resync): the start-up step builds
+    /// the r1007 block 0 and returns it; a second start reuses it.
+    #[test]
+    fn a_fresh_install_start_binds_the_real_genesis() {
+        child("genesis_order_tests::fresh_install_child");
+    }
+
+    #[test]
+    fn fresh_install_child() {
+        if !in_child() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = r1007_config(dir.path());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let prepared = prepare_chain_database(&config)
+                .await
+                .expect("start-up step");
+            assert_eq!(prepared.running_genesis, Some(R1007_GENESIS));
+            assert_eq!(
+                *bound_genesis_hash(&open(dir.path()))
+                    .expect("block 0")
+                    .as_bytes(),
+                R1007_GENESIS
+            );
+            let again = prepare_chain_database(&config).await.expect("restart");
+            assert_eq!(again.running_genesis, Some(R1007_GENESIS));
+            assert!(!dir.path().join(cold_resync::ASIDE_DIR).exists());
+        });
+    }
+
+    /// The bound genesis refuses a database with no block 0 rather than
+    /// returning the zero hash.
+    #[test]
+    fn the_bound_genesis_is_never_the_zero_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let e = bound_genesis_hash(&open(dir.path())).expect_err("no block 0");
+        assert!(e.to_string().contains("zero genesis"), "{e}");
+    }
+
+    /// Tripwire: every genesis-bound component in start_node reads block 0
+    /// through `bound_genesis_hash`, after `prepare_chain_database`, and the
+    /// initial-sync condition is told whether the node expects peers.
+    #[test]
+    fn start_node_binds_genesis_through_the_checked_read() {
+        let main = include_str!("main.rs");
+        let start = main
+            .find("async fn start_node(config: NodeConfig)")
+            .expect("start_node");
+        let prepare = main
+            .find("} = prepare_chain_database(&config).await?;")
+            .expect("start_node runs the start-up step first");
+        assert!(start < prepare);
+        assert!(!main.contains(concat!("genesis not readable", " at start-up")));
+        assert!(
+            main.matches(concat!("bound_genesis_hash(&storage)", "?"))
+                .count()
+                >= 3
+        );
+        assert!(main.contains("expects_peers,\n"));
+        // Inside prepare_chain_database the resync runs before genesis is ensured.
+        let apply = main
+            .find("cold_resync::apply_pending(\n        &config.storage.data_dir,")
+            .expect("apply_pending");
+        let ensure = main
+            .find("        if ensure_genesis_block(\n            probe.clone(),")
+            .expect("ensure in the start-up step");
+        assert!(apply < ensure && ensure < start);
     }
 }

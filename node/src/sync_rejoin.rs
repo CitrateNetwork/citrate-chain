@@ -3978,6 +3978,7 @@ mod tests {
             target,
             1,
             std::time::Duration::from_secs(1),
+            true,
         ) {
             return None;
         }

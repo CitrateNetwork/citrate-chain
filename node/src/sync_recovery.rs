@@ -883,12 +883,26 @@ impl TipReask {
 /// restored ~23 behind declared initial sync complete with one connected peer
 /// it had not heard and sealed on its stale tip). With no heard peer the node
 /// waits as a solo node does: until it hears one, or the solo grace runs out.
+///
+/// `expects_peers` is whether this node is configured to join a network (it
+/// has bootstrap nodes). Such a node with nothing applied above genesis and no
+/// peer heard knows nothing about the network: it is never caught up, whatever
+/// the time since start (no solo grace, no max wait). Before this, a node that
+/// cold-resynced onto an empty database and could reach no peer declared
+/// "Initial sync complete (applied=0 target=0 peers=0 heard=0)" after the solo
+/// grace, and an armed producer could seal a branch of its own from genesis.
+/// A node with no bootstrap nodes (a solo devnet, the first bootnode) keeps the
+/// solo grace: it must be able to produce from genesis.
 pub fn initial_sync_complete(
     applied: u64,
     target: u64,
     heard_peers: usize,
     since_start: Duration,
+    expects_peers: bool,
 ) -> bool {
+    if expects_peers && applied == 0 && heard_peers == 0 {
+        return false;
+    }
     if since_start >= INITIAL_SYNC_MAX_WAIT {
         return true;
     }
@@ -1059,15 +1073,68 @@ mod tests {
     #[test]
     fn initial_sync_condition() {
         let s = Duration::from_secs(1);
-        assert!(!initial_sync_complete(39, 46, 3, s));
-        assert!(initial_sync_complete(43, 46, 3, s));
-        assert!(!initial_sync_complete(0, 0, 0, s));
-        assert!(initial_sync_complete(0, 0, 0, INITIAL_SYNC_SOLO_GRACE));
+        assert!(!initial_sync_complete(39, 46, 3, s, true));
+        assert!(initial_sync_complete(43, 46, 3, s, true));
+        assert!(!initial_sync_complete(0, 0, 0, s, false));
+        assert!(initial_sync_complete(
+            0,
+            0,
+            0,
+            INITIAL_SYNC_SOLO_GRACE,
+            false
+        ));
         assert!(initial_sync_complete(
             39,
             1_000_000,
             3,
-            INITIAL_SYNC_MAX_WAIT
+            INITIAL_SYNC_MAX_WAIT,
+            true
+        ));
+    }
+
+    /// RED (0.5.6 cold-resync isolation, 2026-11-22): a node with bootstrap
+    /// nodes that cold-resynced onto an empty database and reached no peer
+    /// declared "Initial sync complete (applied=0 target=0 peers=0 heard=0)"
+    /// after the solo grace, opening the producer's initial-sync gate on an
+    /// empty chain. It now never completes until it hears a peer; a solo node
+    /// (no bootstrap nodes) still completes after the grace.
+    #[test]
+    fn a_node_that_expects_peers_never_completes_on_an_empty_chain_without_one() {
+        for t in [
+            Duration::from_secs(1),
+            INITIAL_SYNC_SOLO_GRACE,
+            INITIAL_SYNC_MAX_WAIT,
+            INITIAL_SYNC_MAX_WAIT.saturating_mul(10),
+        ] {
+            assert!(!initial_sync_complete(0, 0, 0, t, true), "{t:?}");
+            // A target heard only through gossip/Hello is not a heard peer either.
+            assert!(!initial_sync_complete(0, 500, 0, t, true), "{t:?}");
+        }
+        // A solo node (no bootstrap nodes) produces from genesis after the grace.
+        assert!(initial_sync_complete(
+            0,
+            0,
+            0,
+            INITIAL_SYNC_SOLO_GRACE,
+            false
+        ));
+        // A heard peer at genesis (a network launch): caught up.
+        assert!(initial_sync_complete(0, 0, 1, Duration::from_secs(1), true));
+        // A heard peer far ahead: still syncing.
+        assert!(!initial_sync_complete(
+            0,
+            23_271,
+            1,
+            Duration::from_secs(1),
+            true
+        ));
+        // Above genesis the existing solo grace is unchanged.
+        assert!(initial_sync_complete(
+            23_271,
+            23_271,
+            0,
+            INITIAL_SYNC_SOLO_GRACE,
+            true
         ));
     }
 
@@ -1079,15 +1146,16 @@ mod tests {
     fn initial_sync_counts_only_peers_whose_head_was_heard() {
         let s = Duration::from_secs(1);
         // Applied 23,271, target 23,271 (nothing above the tip heard), no heard peer.
-        assert!(!initial_sync_complete(23_271, 23_271, 0, s));
+        assert!(!initial_sync_complete(23_271, 23_271, 0, s, true));
         assert!(initial_sync_complete(
             23_271,
             23_271,
             0,
-            INITIAL_SYNC_SOLO_GRACE
+            INITIAL_SYNC_SOLO_GRACE,
+            true
         ));
         // One heard peer at the same height: caught up.
-        assert!(initial_sync_complete(23_271, 23_271, 1, s));
+        assert!(initial_sync_complete(23_271, 23_271, 1, s, true));
         assert!(!peer_head_heard(&citrate_consensus::types::Hash::default()));
         assert!(peer_head_heard(&citrate_consensus::types::Hash::new(
             [1; 32]
