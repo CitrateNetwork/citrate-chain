@@ -498,7 +498,13 @@ fn resolve_config_path(cli_config: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    // The panic hook first, before the runtime and its worker threads exist, so
+    // The open-file limit before anything opens a file: a node launched from a
+    // macOS GUI app inherits a soft RLIMIT_NOFILE of 256, below the SST count of
+    // a synced chain database. Raised toward 65536 within the hard limit and
+    // kern.maxfilesperproc; never fails start-up (fd_limit.rs). Logged in
+    // node_main once logging is up.
+    citrate_storage::fd_limit::raise_nofile_limit();
+    // The panic hook next, before the runtime and its worker threads exist, so
     // every panic in any task leaves a timestamped PANIC line in the node log
     // (panic_hook.rs; it logs and runs the default hook, it does not abort).
     panic_hook::install();
@@ -531,6 +537,9 @@ async fn node_main() -> Result<()> {
             None
         }
     };
+
+    // The open-file limit `main` raised: before and after, and any refusal.
+    citrate_storage::fd_limit::raise_nofile_limit().log();
 
     let cli = Cli::parse();
 
@@ -6498,7 +6507,8 @@ mod genesis_order_tests {
             .find("StorageManager::")
             .is_none());
         assert_eq!(
-            main.matches(concat!("start_node(config, prepared)", ".await")).count(),
+            main.matches(concat!("start_node(config, prepared)", ".await"))
+                .count(),
             2
         );
         assert!(!main.contains(concat!("genesis not readable", " at start-up")));

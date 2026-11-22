@@ -30,6 +30,7 @@ pub mod cache;
 pub mod chain;
 pub mod crypto;
 pub mod db;
+pub mod fd_limit;
 pub mod ipfs;
 pub mod pruning;
 pub mod signed_votes;
