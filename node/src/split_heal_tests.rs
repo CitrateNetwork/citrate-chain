@@ -1734,7 +1734,13 @@ impl Node {
             self.sync.set_target(target).await;
         }
         if !self.initial_sync.load(Ordering::Relaxed)
-            && sync_recovery::initial_sync_complete(applied_height, target, heard, since_start)
+            && sync_recovery::initial_sync_complete(
+                applied_height,
+                target,
+                heard,
+                since_start,
+                true,
+            )
         {
             self.initial_sync.store(true, Ordering::Relaxed);
         }

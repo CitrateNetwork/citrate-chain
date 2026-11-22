@@ -96,6 +96,9 @@ fn genesis_hash(storage: &StorageManager) -> Result<Option<String>, jsonrpc_core
 /// - `catching_up`: not wedged, and the highest network height the node's
 ///   sync driver has seen (`highest_seen`, the same signal `eth_syncing`
 ///   reads) is above the applied tip (`BlockStore::get_applied_tip`).
+///   Also `catching_up` while nothing above genesis is applied and no network
+///   height has been heard (`highest_seen` 0 or unknown): an empty chain with no
+///   peer heard is not synced.
 /// - `synced`: neither.
 ///
 /// `highestSeen` is `null` when no sync signal is wired. `appliedBlueScore`
@@ -143,6 +146,13 @@ pub fn sync_state_json(
             Some(format!(
                 "applied tip {applied} is below the highest network height seen {h}"
             )),
+        ),
+        // Nothing applied above genesis and no network height heard: the node
+        // knows nothing about where the network is (no peer heard yet, e.g. just
+        // after a cold resync), so it cannot say it is synced.
+        Some(0) | None if applied == 0 => (
+            "catching_up",
+            Some("no block above genesis applied and no network height heard yet".to_string()),
         ),
         _ => ("synced", None),
     };
