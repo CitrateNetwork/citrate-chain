@@ -82,6 +82,42 @@ mod tests {
         );
     }
 
+    /// `main` raises the open-file limit as its first statement, before the
+    /// runtime and before anything opens the chain database or a socket, and
+    /// `node_main` logs the result once logging is up.
+    #[test]
+    fn main_raises_the_fd_limit_before_anything_else() {
+        let main = include_str!("main.rs");
+        let entry = main.find("fn main() -> Result<()> {").expect("main");
+        let raise = main
+            .find("citrate_storage::fd_limit::raise_nofile_limit();")
+            .expect("main raises the open-file limit");
+        let install = main.find("panic_hook::install();").expect("hook");
+        let runtime = main
+            .find("tokio::runtime::Builder::new_multi_thread()")
+            .expect("runtime");
+        assert!(entry < raise && raise < install && raise < runtime);
+        let first_stmt = main[entry..]
+            .lines()
+            .skip(1)
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .expect("main has a body");
+        assert_eq!(
+            first_stmt,
+            "citrate_storage::fd_limit::raise_nofile_limit();"
+        );
+        let node_main = main.find("async fn node_main()").expect("node_main");
+        let logged = main
+            .find("citrate_storage::fd_limit::raise_nofile_limit().log();")
+            .expect("node_main logs the raise");
+        let first_open = main[node_main..]
+            .find("StorageManager::")
+            .map(|i| node_main + i)
+            .expect("node_main opens storage");
+        assert!(node_main < logged && logged < first_open);
+    }
+
     const CAUGHT_CHILD: &str = "CITRATE_PANIC_HOOK_CAUGHT_CHILD";
 
     /// Lead decision 2026-11-10 (log only): a panic that a deliberate barrier

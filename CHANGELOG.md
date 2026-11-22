@@ -4,6 +4,21 @@ All notable changes in this PR are documented here. This follows a Keep‑a‑Ch
 
 ## Unreleased
 
+### Fixed (node, storage)
+- **A node with more SST files than its open-file limit no longer crash-loops at start.** A node
+  launched from a macOS GUI app inherits a soft `RLIMIT_NOFILE` of 256, and RocksDB's default
+  `max_open_files = -1` opened every table file at `DB::Open`. A chain database past about 250
+  SSTs therefore failed every start with `While open a file for random read: …sst: Too many open
+  files`. Two changes fix this:
+  - `main` now raises the soft limit first, toward 65536. It stays within the hard limit and, on
+    macOS, within `kern.maxfilesperproc`, falling back to `OPEN_MAX`. The before and after values
+    are logged, and a refused raise never fails start-up.
+  - Every RocksDB open (read-write and read-only) bounds its LRU table cache from the limit in
+    effect. A quarter of the limit, at least 128 descriptors, is kept for sockets, logs and
+    pipes. The rest is split across the 2 databases the node can hold open at once, then clamped
+    to 64..8192 per database.
+  - New override: `CITRATE_ROCKSDB_MAX_OPEN_FILES`.
+
 ### Changed (sync, node)
 - **Pipelined, peer-parallel block download for catch-up sync (#477).** A node more than 64
   heights behind keeps up to 8 `GetBlocks` windows in flight across every connected peer it may

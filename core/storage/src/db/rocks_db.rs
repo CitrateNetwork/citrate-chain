@@ -151,7 +151,7 @@ impl RocksDB {
                 AtRestError::EncryptedDbWithoutEncryption(path.display().to_string()).into(),
             );
         }
-        let opts = Options::default();
+        let opts = Self::read_only_options();
         let cfs = DB::list_cf(&opts, path)?;
         let db = DB::open_cf_for_read_only(&opts, path, cfs, false)?;
         let db = Self {
@@ -185,7 +185,7 @@ impl RocksDB {
             );
         }
         let cipher = AtRestCipher::open_or_init(path, config)?;
-        let opts = Options::default();
+        let opts = Self::read_only_options();
         let cfs = DB::list_cf(&opts, path)?;
         let db = DB::open_cf_for_read_only(&opts, path, cfs, false)?;
         Ok(Self {
@@ -211,10 +211,33 @@ impl RocksDB {
         Ok(db)
     }
 
+    /// Bound the table files RocksDB keeps open (see `crate::fd_limit`). The
+    /// default `max_open_files = -1` opens every SST at DB::Open and holds it,
+    /// so a database with more SSTs than the process's open-file limit (256 for
+    /// a macOS GUI-launched node) failed every open with EMFILE. Bounded, the
+    /// table cache is an LRU over at most `max_open_files` table readers.
+    fn bound_open_files(opts: &mut Options) -> i32 {
+        let max_open_files = crate::fd_limit::rocksdb_max_open_files();
+        opts.set_max_open_files(max_open_files);
+        // Fewer cache shards for a small budget, so each shard holds several
+        // table readers instead of one.
+        if max_open_files < 1024 {
+            opts.set_table_cache_num_shard_bits(4);
+        }
+        max_open_files
+    }
+
+    fn read_only_options() -> Options {
+        let mut opts = Options::default();
+        Self::bound_open_files(&mut opts);
+        opts
+    }
+
     fn open_inner(path: &Path, cipher: Option<Arc<AtRestCipher>>) -> Result<Self> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        let max_open_files = Self::bound_open_files(&mut db_opts);
         // Use compression in prod; disable in tests or when feature
         // `no-compression` is set. Encrypted values are high-entropy and
         // incompressible, so encryption also disables RocksDB compression.
@@ -262,9 +285,10 @@ impl RocksDB {
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)?;
 
         info!(
-            "RocksDB opened successfully (memtable budget {} MiB, shared block cache {} MiB)",
+            "RocksDB opened successfully (memtable budget {} MiB, shared block cache {} MiB, max open files {})",
             budget.memtable_bytes / (1024 * 1024),
-            budget.block_cache_bytes / (1024 * 1024)
+            budget.block_cache_bytes / (1024 * 1024),
+            max_open_files
         );
         Ok(Self {
             db: Arc::new(db),
@@ -689,6 +713,149 @@ mod tests {
         assert!(
             RocksDB::open_read_only(dir.path().join("missing")).is_err(),
             "nothing is created"
+        );
+    }
+
+    const MANY_SST_CHILD: &str = "CITRATE_MANY_SST_CHILD_DIR";
+    const MANY_SST_KEYS: u64 = 20_000;
+    const MANY_SST_EXTRA: u64 = 2_000;
+
+    fn many_sst_key(i: u64) -> Vec<u8> {
+        format!("k{i:010}").into_bytes()
+    }
+
+    fn many_sst_value(i: u64) -> Vec<u8> {
+        let h = blake3::hash(&i.to_le_bytes());
+        h.as_bytes().repeat(32)
+    }
+
+    fn sst_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .expect("read db dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sst"))
+            .count()
+    }
+
+    /// A chain database with well over 300 SST files (tiny write buffer and
+    /// target file size), spread over the levels as a long-running node's is.
+    /// Built with a bounded table cache so the build itself works under any
+    /// fd limit.
+    fn build_many_sst_db(path: &Path) -> usize {
+        let small = || {
+            let mut o = Options::default();
+            o.set_write_buffer_size(128 * 1024);
+            o.set_target_file_size_base(32 * 1024);
+            o.set_max_bytes_for_level_base(256 * 1024);
+            o.set_compression_type(rocksdb::DBCompressionType::None);
+            o
+        };
+        let mut db_opts = small();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+        db_opts.set_max_open_files(64);
+        let cfs = vec![
+            ColumnFamilyDescriptor::new("default", small()),
+            ColumnFamilyDescriptor::new("state", small()),
+        ];
+        let db = DB::open_cf_descriptors(&db_opts, path, cfs).expect("build db");
+        let cf = db.cf_handle("state").expect("state cf");
+        // Keys in a scattered order (7919 is prime to the key count), so
+        // flushed files overlap and compaction rewrites them into
+        // target-size files instead of moving whole memtables down a level.
+        let order: Vec<u64> = (0..MANY_SST_KEYS)
+            .map(|i| (i * 7919) % MANY_SST_KEYS)
+            .collect();
+        for chunk in order.chunks(50) {
+            let mut batch = WriteBatch::default();
+            for &i in chunk {
+                batch.put_cf(cf, many_sst_key(i), many_sst_value(i));
+            }
+            db.write(batch).expect("write");
+        }
+        db.flush_cf(cf).expect("flush");
+        db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+        drop(db);
+        sst_count(path)
+    }
+
+    /// Production crash loop (Citrate Core 0.5.7, macOS): a node launched with
+    /// the GUI soft fd limit of 256 and a chain database of 282 SSTs failed
+    /// every start with "While open a file for random read: …sst: Too many
+    /// open files", because RocksDB kept every table file open
+    /// (`max_open_files = -1`). With the table cache bounded from the fd
+    /// limit, a child process held to a soft limit of 256 opens a 300+ SST
+    /// database, reads across every file, writes more, and reopens after a
+    /// restart, read-write and read-only.
+    #[test]
+    fn many_ssts_open_read_write_and_reopen_under_a_256_fd_limit() {
+        if let Ok(dir) = std::env::var(MANY_SST_CHILD) {
+            let path = Path::new(&dir);
+            crate::fd_limit::set_soft(256).expect("lower soft limit to 256");
+            assert_eq!(crate::fd_limit::current().map(|l| l.soft), Some(256));
+            assert_eq!(crate::fd_limit::rocksdb_max_open_files(), 64);
+            {
+                let db = RocksDB::open(path).expect("open a 300+ SST db under a 256 fd limit");
+                for i in (0..MANY_SST_KEYS).step_by(7) {
+                    assert_eq!(
+                        db.get_cf("state", &many_sst_key(i)).expect("read"),
+                        Some(many_sst_value(i)),
+                        "key {i}"
+                    );
+                }
+                assert_eq!(
+                    db.iter_cf("state").expect("iter").count() as u64,
+                    MANY_SST_KEYS
+                );
+                let mut batch = db.batch();
+                for i in MANY_SST_KEYS..MANY_SST_KEYS + MANY_SST_EXTRA {
+                    db.batch_put_cf(&mut batch, "state", &many_sst_key(i), &many_sst_value(i))
+                        .expect("batch put");
+                }
+                db.write_batch_sync(batch).expect("write more");
+                db.flush().expect("flush");
+            }
+            // Restart.
+            let db = RocksDB::open(path).expect("reopen after restart");
+            for i in (0..MANY_SST_KEYS + MANY_SST_EXTRA).step_by(11) {
+                assert_eq!(
+                    db.get_cf("state", &many_sst_key(i))
+                        .expect("read after reopen"),
+                    Some(many_sst_value(i)),
+                    "key {i} after reopen"
+                );
+            }
+            drop(db);
+            let ro = RocksDB::open_read_only(path).expect("read-only open under 256");
+            assert_eq!(
+                ro.iter_cf("state").expect("iter").count() as u64,
+                MANY_SST_KEYS + MANY_SST_EXTRA
+            );
+            return;
+        }
+        let dir = TempDir::new().expect("tempdir");
+        let ssts = build_many_sst_db(dir.path());
+        assert!(ssts > 300, "built only {ssts} SST files");
+        let exe = std::env::current_exe().expect("test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "db::rocks_db::tests::many_ssts_open_read_write_and_reopen_under_a_256_fd_limit",
+                "--nocapture",
+            ])
+            .env(MANY_SST_CHILD, dir.path())
+            .env_remove(crate::fd_limit::MAX_OPEN_FILES_ENV)
+            .output()
+            .expect("run child");
+        assert!(
+            out.status.success(),
+            "child failed ({ssts} SSTs):\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the child ran the test"
         );
     }
 
