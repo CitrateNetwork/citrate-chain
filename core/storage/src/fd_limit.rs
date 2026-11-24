@@ -17,6 +17,12 @@
 // 2. `rocksdb_max_open_files`: every RocksDB open bounds its table cache from
 //    the limit in effect, so the database opens and runs even when the raise
 //    was refused and the limit is still 256.
+//
+// RLIMIT_NOFILE is a Unix limit. On Windows (no getrlimit/setrlimit) there is
+// nothing to raise: `current` is None, `set_soft` refuses, and RocksDB keeps
+// its table cache unbounded (`max_open_files = -1`, as before this module),
+// because it opens table files as Win32 handles, which have no per-process
+// soft limit of that kind. CITRATE_ROCKSDB_MAX_OPEN_FILES still bounds it.
 
 use std::sync::OnceLock;
 use tracing::{info, warn};
@@ -89,7 +95,16 @@ impl RaiseReport {
                 self.per_process_cap.map(render).unwrap_or_else(|| "none".into()),
                 TARGET_NOFILE
             ),
+            #[cfg(unix)]
             _ => warn!("open-file limit (RLIMIT_NOFILE): getrlimit failed, limit left unchanged"),
+            #[cfg(not(unix))]
+            _ => info!(
+                "open-file limit: no RLIMIT_NOFILE on this platform; RocksDB table cache {}",
+                match rocksdb_max_open_files() {
+                    -1 => "unbounded".to_string(),
+                    n => format!("bounded to {n} files per database"),
+                }
+            ),
         }
         for (asked, err) in &self.refused {
             warn!(
@@ -187,13 +202,32 @@ pub fn max_open_files_from(env: Option<&str>, soft: u64) -> i32 {
 /// The `max_open_files` every RocksDB open in this process uses: the
 /// `CITRATE_ROCKSDB_MAX_OPEN_FILES` override, else derived from the soft limit
 /// in effect now (after `raise_nofile_limit` in the node).
+#[cfg(unix)]
 pub fn rocksdb_max_open_files() -> i32 {
     let soft = current().map(|l| l.soft).unwrap_or(FALLBACK_SOFT);
     max_open_files_from(std::env::var(MAX_OPEN_FILES_ENV).ok().as_deref(), soft)
 }
 
+/// Windows: no RLIMIT_NOFILE, so the table cache stays unbounded (-1, the
+/// RocksDB default) unless `CITRATE_ROCKSDB_MAX_OPEN_FILES` sets a bound.
+#[cfg(not(unix))]
+pub fn rocksdb_max_open_files() -> i32 {
+    unbounded_unless(std::env::var(MAX_OPEN_FILES_ENV).ok().as_deref())
+}
+
+/// The non-Unix rule: the env override (as on Unix: a positive integer, raised
+/// to the floor), else -1 (unbounded). Pure, so it is tested on every platform.
+#[cfg_attr(unix, allow(dead_code))]
+fn unbounded_unless(env: Option<&str>) -> i32 {
+    match env.and_then(|raw| raw.trim().parse::<i32>().ok()) {
+        Some(v) if v > 0 => v.max(MIN_MAX_OPEN_FILES),
+        _ => -1,
+    }
+}
+
 // rlim_t is u64 on every target the node ships for; the conversion keeps a
 // 32-bit build compiling.
+#[cfg(unix)]
 #[allow(clippy::useless_conversion)]
 fn from_rlim(v: libc::rlim_t) -> u64 {
     if v == libc::RLIM_INFINITY {
@@ -204,6 +238,7 @@ fn from_rlim(v: libc::rlim_t) -> u64 {
 }
 
 /// The current RLIMIT_NOFILE, None when getrlimit fails.
+#[cfg(unix)]
 pub fn current() -> Option<NofileLimit> {
     let mut rl = libc::rlimit {
         rlim_cur: 0,
@@ -218,6 +253,7 @@ pub fn current() -> Option<NofileLimit> {
 }
 
 /// Set the soft RLIMIT_NOFILE to `soft`, keeping the hard limit.
+#[cfg(unix)]
 #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
 pub fn set_soft(soft: u64) -> Result<(), String> {
     let mut rl = libc::rlimit {
@@ -234,6 +270,18 @@ pub fn set_soft(soft: u64) -> Result<(), String> {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
+}
+
+/// No RLIMIT_NOFILE on this platform (Windows).
+#[cfg(not(unix))]
+pub fn current() -> Option<NofileLimit> {
+    None
+}
+
+/// No RLIMIT_NOFILE on this platform (Windows): nothing to set.
+#[cfg(not(unix))]
+pub fn set_soft(_soft: u64) -> Result<(), String> {
+    Err("no RLIMIT_NOFILE on this platform".into())
 }
 
 /// macOS `kern.maxfilesperproc`: setrlimit refuses a soft limit above it
@@ -438,11 +486,40 @@ mod tests {
         assert_eq!(max_open_files_from(Some("lots"), 10_240), 3840);
     }
 
+    #[cfg(unix)]
     const RAISE_CHILD: &str = "CITRATE_FD_LIMIT_RAISE_CHILD";
+
+    /// The non-Unix table-cache rule: unbounded unless the env sets a bound
+    /// (pure, so it runs on every platform).
+    #[test]
+    fn without_rlimit_the_table_cache_is_unbounded_unless_the_env_bounds_it() {
+        assert_eq!(unbounded_unless(None), -1);
+        assert_eq!(unbounded_unless(Some("")), -1);
+        assert_eq!(unbounded_unless(Some("not-a-number")), -1);
+        assert_eq!(unbounded_unless(Some("0")), -1);
+        assert_eq!(unbounded_unless(Some("-5")), -1);
+        assert_eq!(unbounded_unless(Some("10")), MIN_MAX_OPEN_FILES);
+        assert_eq!(unbounded_unless(Some(" 500 ")), 500);
+    }
+
+    /// Windows: there is no limit to read or set, and the table cache is unbounded.
+    #[cfg(not(unix))]
+    #[test]
+    fn windows_has_no_rlimit_and_an_unbounded_table_cache() {
+        assert_eq!(current(), None);
+        assert!(set_soft(256).is_err());
+        if std::env::var(MAX_OPEN_FILES_ENV).is_err() {
+            assert_eq!(rocksdb_max_open_files(), -1);
+        }
+        let report = raise_nofile_limit();
+        assert_eq!(report.before, None);
+        assert!(report.refused.is_empty());
+    }
 
     /// The real raise, in a child process started at the macOS GUI soft limit
     /// of 256: the soft limit goes up (within the hard limit), the report
     /// carries before/after, and a second call returns the same report.
+    #[cfg(unix)]
     #[test]
     fn raise_lifts_a_256_soft_limit() {
         if std::env::var(RAISE_CHILD).is_ok() {

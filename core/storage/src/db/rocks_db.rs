@@ -716,19 +716,25 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     const MANY_SST_CHILD: &str = "CITRATE_MANY_SST_CHILD_DIR";
+    #[cfg(unix)]
     const MANY_SST_KEYS: u64 = 20_000;
+    #[cfg(unix)]
     const MANY_SST_EXTRA: u64 = 2_000;
 
+    #[cfg(unix)]
     fn many_sst_key(i: u64) -> Vec<u8> {
         format!("k{i:010}").into_bytes()
     }
 
+    #[cfg(unix)]
     fn many_sst_value(i: u64) -> Vec<u8> {
         let h = blake3::hash(&i.to_le_bytes());
         h.as_bytes().repeat(32)
     }
 
+    #[cfg(unix)]
     fn sst_count(dir: &Path) -> usize {
         std::fs::read_dir(dir)
             .expect("read db dir")
@@ -737,6 +743,7 @@ mod tests {
             .count()
     }
 
+    #[cfg(unix)]
     /// A chain database with well over 300 SST files (tiny write buffer and
     /// target file size), spread over the levels as a long-running node's is.
     /// Built with a bounded table cache so the build itself works under any
@@ -787,6 +794,8 @@ mod tests {
     /// limit, a child process held to a soft limit of 256 opens a 300+ SST
     /// database, reads across every file, writes more, and reopens after a
     /// restart, read-write and read-only.
+    // RLIMIT_NOFILE is Unix-only (fd_limit: no limit to lower on Windows).
+    #[cfg(unix)]
     #[test]
     fn many_ssts_open_read_write_and_reopen_under_a_256_fd_limit() {
         if let Ok(dir) = std::env::var(MANY_SST_CHILD) {

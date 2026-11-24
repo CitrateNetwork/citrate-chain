@@ -1,0 +1,58 @@
+# created: 2026-11-24 | branch: fix/windows-fd-limit-cfg
+# author: Larry Klosowski + Claude Opus 5.5 (Windows lane, Citrate Core 0.5.9)
+# status: active
+#
+# The node must compile for Windows (x86_64-pc-windows-msvc): Citrate Core bundles it there. Unix-only
+# code (libc rlimit, std::os::unix) has to stay behind cfg(unix), or the Windows build breaks, as
+# #492's fd_limit did. This job checks the node crate on a hosted Windows runner and runs the
+# storage fd-limit tests, whose Windows path (no RLIMIT_NOFILE, unbounded table cache) only runs there.
+name: windows-node
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-node-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: windows node (cargo check -p citrate-node)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - name: Git for a byte-exact checkout
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # rust-toolchain.toml pins 1.96.0; rustup installs it on first use.
+      - name: Toolchain, Perl and NASM for vendored OpenSSL and RocksDB
+        shell: pwsh
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+          $sp = 'C:\Strawberry\perl\bin\perl.exe'
+          if (-not (Test-Path $sp)) { throw "Strawberry Perl not found at $sp" }
+          "OPENSSL_SRC_PERL=$sp" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $llvm = "${env:ProgramFiles}\LLVM\bin"
+          if (Test-Path "$llvm\libclang.dll") { "LIBCLANG_PATH=$llvm" | Out-File $env:GITHUB_ENV -Append -Encoding utf8 }
+          choco install nasm -y --no-progress
+          "${env:ProgramFiles}\NASM" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+      - name: cargo check -p citrate-node
+        shell: bash
+        run: cargo check --locked -p citrate-node --bin citrate
+      - name: storage fd-limit tests (the Windows path)
+        shell: bash
+        run: cargo test --locked -p citrate-storage --lib fd_limit
