@@ -276,11 +276,20 @@ abstract contract GenesisProfile is Script, AdminChecks {
     ///         keys tagged GRD_OWNERS. Other roles are P0's to check (phase_inputs.py, which also
     ///         refuses unknown roles). Empty input gives two empty lists; malformed JSON reverts.
     function inventoryRoles(string memory json) public view returns (address[] memory gov, address[] memory grd) {
-        if (bytes(json).length == 0) return (gov, grd);
+        gov = inventoryRole(json, "GOV_OWNERS");
+        grd = inventoryRole(json, "GRD_OWNERS");
+    }
+
+    /// @notice The keys of the role-tagged inventory that carry `role`. Empty input gives an
+    ///         empty list; malformed JSON reverts; a repeated address (the quoted key occurs
+    ///         twice in the text, or two keys parse to one address) is refused.
+    function inventoryRole(string memory json, string memory role) public view returns (address[] memory out) {
+        if (bytes(json).length == 0) return out;
         string[] memory keys = vm.parseJsonKeys(json, "$");
-        // A JSON parser keeps one of two equal keys; refuse a repeated address instead, both
-        // spelled exactly the same (the quoted key occurs twice in the text) and in two cases.
         address[] memory seen = new address[](keys.length);
+        bool[] memory tagged = new bool[](keys.length);
+        uint256 n;
+        bytes32 want = keccak256(bytes(role));
         for (uint256 i = 0; i < keys.length; i++) {
             seen[i] = vm.parseAddress(keys[i]);
             require(
@@ -293,25 +302,41 @@ abstract contract GenesisProfile is Script, AdminChecks {
                     string.concat("GENESIS_KEY_INVENTORY: ", vm.toString(seen[i]), " appears more than once")
                 );
             }
-        }
-        bool[] memory g = new bool[](keys.length);
-        bool[] memory r = new bool[](keys.length);
-        (uint256 ng, uint256 nr) = (0, 0);
-        for (uint256 i = 0; i < keys.length; i++) {
             string[] memory roles = vm.parseJsonStringArray(json, string.concat("$['", keys[i], "']"));
-            for (uint256 j = 0; j < roles.length; j++) {
-                bytes32 h = keccak256(bytes(roles[j]));
-                if (h == keccak256("GOV_OWNERS") && !g[i]) (g[i], ng) = (true, ng + 1);
-                if (h == keccak256("GRD_OWNERS") && !r[i]) (r[i], nr) = (true, nr + 1);
+            for (uint256 r = 0; r < roles.length; r++) {
+                if (keccak256(bytes(roles[r])) == want && !tagged[i]) (tagged[i], n) = (true, n + 1);
             }
         }
-        (gov, grd) = (new address[](ng), new address[](nr));
-        (ng, nr) = (0, 0);
+        out = new address[](n);
+        n = 0;
         for (uint256 i = 0; i < keys.length; i++) {
-            address who = vm.parseAddress(keys[i]);
-            if (g[i]) gov[ng++] = who;
-            if (r[i]) grd[nr++] = who;
+            if (tagged[i]) out[n++] = seen[i];
         }
+    }
+
+    /// @notice The keys whose ONLY tag is `role` (for a post-genesis key: no ceremony role beside it).
+    function inventoryOnlyRole(string memory json, string memory role) public view returns (address[] memory out) {
+        address[] memory tagged = inventoryRole(json, role);
+        bool[] memory pure_ = new bool[](tagged.length);
+        uint256 n;
+        for (uint256 i = 0; i < tagged.length; i++) {
+            string[] memory roles = vm.parseJsonStringArray(json, string.concat("$['", _inventoryKeyOf(json, tagged[i]), "']"));
+            if (roles.length == 1) (pure_[i], n) = (true, n + 1);
+        }
+        out = new address[](n);
+        n = 0;
+        for (uint256 i = 0; i < tagged.length; i++) {
+            if (pure_[i]) out[n++] = tagged[i];
+        }
+    }
+
+    /// @notice The JSON key (as spelled in the inventory) of address `who`.
+    function _inventoryKeyOf(string memory json, address who) internal view returns (string memory) {
+        string[] memory keys = vm.parseJsonKeys(json, "$");
+        for (uint256 i = 0; i < keys.length; i++) {
+            if (vm.parseAddress(keys[i]) == who) return keys[i];
+        }
+        revert("GENESIS_KEY_INVENTORY: address not found");
     }
 
     /// @notice How many times `needle` occurs in `hay` (non-overlapping).
