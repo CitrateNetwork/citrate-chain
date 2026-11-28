@@ -48,8 +48,8 @@ use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash, Public
 use citrate_consensus::vrf::VrfProposerSelector;
 use citrate_execution::{Executor, StateDB};
 use citrate_network::peer::{Direction, Peer, PeerInfo, PeerState};
-use citrate_network::sync::{SyncConfig, SyncManager};
-use citrate_network::{NetworkMessage, PeerId};
+use citrate_network::sync::{BlocksReceipt, SyncConfig, SyncManager};
+use citrate_network::{NetworkError, NetworkMessage, PeerId};
 use citrate_sequencer::mempool::{Mempool, MempoolConfig};
 use citrate_storage::pruning::PruningConfig;
 use citrate_storage::StorageManager;
@@ -959,13 +959,18 @@ impl Fleet {
                 handled < PUMP_CAP,
                 "message storm: {handled} messages in one pump"
             );
-            self.receive(to, from, msg).await;
+            let _ = self.receive(to, from, msg).await;
             queue.extend(self.outbox());
         }
     }
 
     /// One message, through the steps `start_node`'s receive loop runs for it.
-    async fn receive(&mut self, at: usize, from: usize, msg: NetworkMessage) {
+    async fn receive(
+        &mut self,
+        at: usize,
+        from: usize,
+        msg: NetworkMessage,
+    ) -> Option<Result<BlocksReceipt, NetworkError>> {
         // A node on the 1.2 binary cannot decode the 1.3 messages and would
         // drop the connection: none may ever reach it (`Peer::send` gates).
         assert!(
@@ -988,7 +993,7 @@ impl Fleet {
                         use citrate_network::inbound::ServeAdmit;
                         if node.serve_q.push(sender, request) != ServeAdmit::Queued {
                             self.shed += 1;
-                            return;
+                            return None;
                         }
                         let peer = self.peer(at, from);
                         let legacy = self.legacy_serve.contains(&at);
@@ -1006,17 +1011,18 @@ impl Fleet {
                             }
                             node.serve_q.done(&asker);
                         }
-                        return;
+                        return None;
                     }
                     Err(_) => {
                         self.shed += 1;
-                        return;
+                        return None;
                     }
                 },
             }
         };
         let peer = self.peer(at, from);
         let node = &mut self.nodes[at];
+        let mut blocks_result = None;
         match msg {
             NetworkMessage::Headers { headers } => {
                 let _ = node.sync.handle_headers(&pid, headers).await;
@@ -1053,7 +1059,7 @@ impl Fleet {
                 }
             }
             NetworkMessage::Blocks { blocks } => {
-                node.on_blocks(&peer, &pid, blocks).await;
+                blocks_result = Some(node.on_blocks(&peer, &pid, blocks).await);
                 node.run_woken_drain().await;
             }
             // main.rs `NetworkMessage::Ancestor` arm.
@@ -1135,6 +1141,7 @@ impl Fleet {
             }
             _ => {}
         }
+        blocks_result
     }
 
     /// One slot: every running producer tries to seal (random order), then
@@ -1529,13 +1536,15 @@ impl Node {
     }
 
     /// main.rs `NetworkMessage::Blocks` arm.
-    async fn on_blocks(&mut self, peer: &Arc<Peer>, pid: &PeerId, blocks: Vec<Block>) {
+    async fn on_blocks(
+        &mut self,
+        peer: &Arc<Peer>,
+        pid: &PeerId,
+        blocks: Vec<Block>,
+    ) -> Result<BlocksReceipt, NetworkError> {
         let answer_hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash).collect();
-        let receipt = self
-            .sync
-            .handle_blocks(pid, blocks)
-            .await
-            .unwrap_or_default();
+        let handled = self.sync.handle_blocks(pid, blocks).await;
+        let receipt = handled.as_ref().copied().unwrap_or_default();
         let mut pending = self.sync.drain_validated_blocks().await;
         let answer_top = pending.iter().map(|b| b.header.height).max();
         let answer_highest = pending
@@ -1682,6 +1691,7 @@ impl Node {
         for p in &round.timed_out {
             self.sel.record_timeout(&p.0);
         }
+        handled
     }
 
     /// main.rs periodic sync tick, over the peers this node is connected to;
@@ -2091,7 +2101,7 @@ async fn long_running_history(fleet: &mut Fleet) {
         b.signature = citrate_consensus::crypto::sign_block(&b.header.block_hash, &key(from));
         let peer = fleet.peer(i, from);
         let pid = PeerId::new(fleet.nodes[from].name.clone());
-        fleet.nodes[i].on_blocks(&peer, &pid, vec![b]).await;
+        let _ = fleet.nodes[i].on_blocks(&peer, &pid, vec![b]).await;
         fleet.pump().await;
         assert!(
             !fleet.nodes[i].orphans.is_empty(),
@@ -2659,7 +2669,7 @@ impl Fleet {
                 v = v.max(t);
                 set_clock(self, v);
                 let w = std::time::Instant::now();
-                self.receive(to, from, msg).await;
+                let _ = self.receive(to, from, msg).await;
                 if spec.count_cpu {
                     v += w.elapsed().as_micros() as u64;
                 }
@@ -2668,7 +2678,7 @@ impl Fleet {
                 let free = server_free.entry(to).or_default();
                 let start = t.max(*free);
                 let w = std::time::Instant::now();
-                self.receive(to, from, msg).await;
+                let _ = self.receive(to, from, msg).await;
                 let spent = if spec.count_cpu {
                     w.elapsed().as_micros() as u64
                 } else {
@@ -4792,7 +4802,7 @@ mod tests {
             "partial leader range",
         );
 
-        fleet
+        let _ = fleet
             .receive(
                 FOLLOWER,
                 LEADER,
@@ -4842,7 +4852,8 @@ mod tests {
             &tx.hash,
             "pre-replay follower",
         );
-        fleet
+        let replay_len = received_range.len();
+        let replay_receipt = fleet
             .receive(
                 FOLLOWER,
                 LEADER,
@@ -4850,7 +4861,13 @@ mod tests {
                     blocks: received_range,
                 },
             )
-            .await;
+            .await
+            .expect("duplicate replay dispatched to the Blocks handler")
+            .expect("duplicate replay handle_blocks succeeded");
+        assert_eq!(
+            replay_receipt.received, replay_len,
+            "duplicate replay receipt reports the submitted range length"
+        );
         assert_receive_acceptance_checkpoint(
             &fleet.nodes[FOLLOWER],
             &sender,
@@ -4882,7 +4899,7 @@ mod tests {
             "remaining leader range",
         );
         assert!(!remaining.is_empty(), "fixture: a remaining range exists");
-        fleet
+        let _ = fleet
             .receive(
                 FOLLOWER,
                 LEADER,
