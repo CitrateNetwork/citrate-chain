@@ -48,8 +48,8 @@ use citrate_consensus::types::{Block, BlockBuilder, GhostDagParams, Hash, Public
 use citrate_consensus::vrf::VrfProposerSelector;
 use citrate_execution::{Executor, StateDB};
 use citrate_network::peer::{Direction, Peer, PeerInfo, PeerState};
-use citrate_network::sync::{SyncConfig, SyncManager};
-use citrate_network::{NetworkMessage, PeerId};
+use citrate_network::sync::{BlocksReceipt, SyncConfig, SyncManager};
+use citrate_network::{NetworkError, NetworkMessage, PeerId};
 use citrate_sequencer::mempool::{Mempool, MempoolConfig};
 use citrate_storage::pruning::PruningConfig;
 use citrate_storage::StorageManager;
@@ -959,13 +959,18 @@ impl Fleet {
                 handled < PUMP_CAP,
                 "message storm: {handled} messages in one pump"
             );
-            self.receive(to, from, msg).await;
+            let _ = self.receive(to, from, msg).await;
             queue.extend(self.outbox());
         }
     }
 
     /// One message, through the steps `start_node`'s receive loop runs for it.
-    async fn receive(&mut self, at: usize, from: usize, msg: NetworkMessage) {
+    async fn receive(
+        &mut self,
+        at: usize,
+        from: usize,
+        msg: NetworkMessage,
+    ) -> Option<Result<BlocksReceipt, NetworkError>> {
         // A node on the 1.2 binary cannot decode the 1.3 messages and would
         // drop the connection: none may ever reach it (`Peer::send` gates).
         assert!(
@@ -988,7 +993,7 @@ impl Fleet {
                         use citrate_network::inbound::ServeAdmit;
                         if node.serve_q.push(sender, request) != ServeAdmit::Queued {
                             self.shed += 1;
-                            return;
+                            return None;
                         }
                         let peer = self.peer(at, from);
                         let legacy = self.legacy_serve.contains(&at);
@@ -1006,17 +1011,18 @@ impl Fleet {
                             }
                             node.serve_q.done(&asker);
                         }
-                        return;
+                        return None;
                     }
                     Err(_) => {
                         self.shed += 1;
-                        return;
+                        return None;
                     }
                 },
             }
         };
         let peer = self.peer(at, from);
         let node = &mut self.nodes[at];
+        let mut blocks_result = None;
         match msg {
             NetworkMessage::Headers { headers } => {
                 let _ = node.sync.handle_headers(&pid, headers).await;
@@ -1053,7 +1059,7 @@ impl Fleet {
                 }
             }
             NetworkMessage::Blocks { blocks } => {
-                node.on_blocks(&peer, &pid, blocks).await;
+                blocks_result = Some(node.on_blocks(&peer, &pid, blocks).await);
                 node.run_woken_drain().await;
             }
             // main.rs `NetworkMessage::Ancestor` arm.
@@ -1135,6 +1141,7 @@ impl Fleet {
             }
             _ => {}
         }
+        blocks_result
     }
 
     /// One slot: every running producer tries to seal (random order), then
@@ -1529,13 +1536,15 @@ impl Node {
     }
 
     /// main.rs `NetworkMessage::Blocks` arm.
-    async fn on_blocks(&mut self, peer: &Arc<Peer>, pid: &PeerId, blocks: Vec<Block>) {
+    async fn on_blocks(
+        &mut self,
+        peer: &Arc<Peer>,
+        pid: &PeerId,
+        blocks: Vec<Block>,
+    ) -> Result<BlocksReceipt, NetworkError> {
         let answer_hashes: Vec<Hash> = blocks.iter().map(|b| b.header.block_hash).collect();
-        let receipt = self
-            .sync
-            .handle_blocks(pid, blocks)
-            .await
-            .unwrap_or_default();
+        let handled = self.sync.handle_blocks(pid, blocks).await;
+        let receipt = handled.as_ref().copied().unwrap_or_default();
         let mut pending = self.sync.drain_validated_blocks().await;
         let answer_top = pending.iter().map(|b| b.header.height).max();
         let answer_highest = pending
@@ -1682,6 +1691,7 @@ impl Node {
         for p in &round.timed_out {
             self.sel.record_timeout(&p.0);
         }
+        handled
     }
 
     /// main.rs periodic sync tick, over the peers this node is connected to;
@@ -2091,7 +2101,7 @@ async fn long_running_history(fleet: &mut Fleet) {
         b.signature = citrate_consensus::crypto::sign_block(&b.header.block_hash, &key(from));
         let peer = fleet.peer(i, from);
         let pid = PeerId::new(fleet.nodes[from].name.clone());
-        fleet.nodes[i].on_blocks(&peer, &pid, vec![b]).await;
+        let _ = fleet.nodes[i].on_blocks(&peer, &pid, vec![b]).await;
         fleet.pump().await;
         assert!(
             !fleet.nodes[i].orphans.is_empty(),
@@ -2659,7 +2669,7 @@ impl Fleet {
                 v = v.max(t);
                 set_clock(self, v);
                 let w = std::time::Instant::now();
-                self.receive(to, from, msg).await;
+                let _ = self.receive(to, from, msg).await;
                 if spec.count_cpu {
                     v += w.elapsed().as_micros() as u64;
                 }
@@ -2668,7 +2678,7 @@ impl Fleet {
                 let free = server_free.entry(to).or_default();
                 let start = t.max(*free);
                 let w = std::time::Instant::now();
-                self.receive(to, from, msg).await;
+                let _ = self.receive(to, from, msg).await;
                 let spent = if spec.count_cpu {
                     w.elapsed().as_micros() as u64
                 } else {
@@ -4551,6 +4561,367 @@ mod tests {
             "the 1.2 recovery rejoined it within {} slots: the scenario no longer shows the \
              driver's speed-up ({})",
             HEAVIER_BELOW_HEAL, r.detail
+        );
+    }
+
+    const RECEIVE_ACCEPTANCE_PRODUCTION_ATTEMPTS: usize = 64;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ReceiveAcceptanceCheckpoint {
+        applied: (Hash, u64),
+        canonical_hash: Hash,
+        state_root: Hash,
+        nonce: u64,
+        receipt: Vec<u8>,
+    }
+
+    fn receive_acceptance_canonical_block(node: &Node, height: u64, phase: &str) -> Block {
+        let hash = node
+            .storage
+            .blocks
+            .get_canonical_block_by_height(height)
+            .expect("read a canonical block hash for receive acceptance")
+            .unwrap_or_else(|| panic!("{phase}: no canonical block at height {height}"));
+        node.storage
+            .blocks
+            .get_block(&hash)
+            .expect("read a canonical block for receive acceptance")
+            .unwrap_or_else(|| panic!("{phase}: canonical block {hash} at height {height} missing"))
+    }
+
+    fn receive_acceptance_canonical_range(
+        node: &Node,
+        first: u64,
+        last: u64,
+        phase: &str,
+    ) -> Vec<Block> {
+        (first..=last)
+            .map(|height| receive_acceptance_canonical_block(node, height, phase))
+            .collect()
+    }
+
+    fn receive_acceptance_receipt_state(node: &Node, tx_hash: &Hash) -> Option<(u64, bool)> {
+        node.storage
+            .transactions
+            .get_receipt(tx_hash)
+            .expect("read receipt state for receive acceptance")
+            .map(|receipt| (receipt.block_number, receipt.status))
+    }
+
+    fn receive_acceptance_checkpoint(
+        node: &Node,
+        sender: &citrate_execution::types::Address,
+        tx_hash: &Hash,
+        phase: &str,
+    ) -> ReceiveAcceptanceCheckpoint {
+        let applied = node.applied();
+        let canonical_hash = node
+            .storage
+            .blocks
+            .get_canonical_block_by_height(applied.1)
+            .expect("read canonical checkpoint hash for receive acceptance")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{phase}: no canonical block at applied height {}",
+                    applied.1
+                )
+            });
+        assert_eq!(
+            applied.0, canonical_hash,
+            "{phase}: the applied tip must be canonical"
+        );
+        let receipt = node
+            .storage
+            .transactions
+            .get_receipt(tx_hash)
+            .expect("read checkpoint receipt for receive acceptance")
+            .unwrap_or_else(|| panic!("{phase}: transaction receipt {tx_hash} missing"));
+        ReceiveAcceptanceCheckpoint {
+            applied,
+            canonical_hash,
+            state_root: node.executor.calculate_state_root(),
+            nonce: node.executor.get_nonce(sender),
+            receipt: bincode::serialize(&receipt)
+                .expect("serialize checkpoint receipt for receive acceptance"),
+        }
+    }
+
+    fn assert_receive_acceptance_checkpoint(
+        node: &Node,
+        sender: &citrate_execution::types::Address,
+        tx_hash: &Hash,
+        expected: &ReceiveAcceptanceCheckpoint,
+        phase: &str,
+    ) {
+        let observed = receive_acceptance_checkpoint(node, sender, tx_hash, phase);
+        assert_eq!(
+            observed.applied, expected.applied,
+            "{phase}: applied height and hash changed"
+        );
+        assert_eq!(
+            observed.canonical_hash, expected.canonical_hash,
+            "{phase}: canonical hash changed"
+        );
+        assert_eq!(
+            observed.state_root, expected.state_root,
+            "{phase}: MPT root changed"
+        );
+        assert_eq!(
+            observed.nonce, expected.nonce,
+            "{phase}: transaction nonce effect changed"
+        );
+        assert_eq!(
+            observed.receipt, expected.receipt,
+            "{phase}: transaction receipt changed"
+        );
+    }
+
+    fn assert_receive_acceptance_blocks_stored(node: &Node, blocks: &[Block], phase: &str) {
+        for block in blocks {
+            let stored = node
+                .storage
+                .blocks
+                .get_block(&block.header.block_hash)
+                .expect("read stored block for receive acceptance")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{phase}: received block {} at height {} missing",
+                        block.header.block_hash, block.header.height
+                    )
+                });
+            assert_eq!(
+                bincode::serialize(&stored)
+                    .expect("serialize stored block for receive acceptance comparison"),
+                bincode::serialize(block)
+                    .expect("serialize received block for receive acceptance comparison"),
+                "{phase}: stored block {} at height {} differs from the received block",
+                block.header.block_hash,
+                block.header.height
+            );
+        }
+    }
+
+    /// #498, test-only first slice: a lagged follower receives a partial chain
+    /// through the harness mirror using production PeerManager/SyncManager,
+    /// admission, and applicator components; executes and persists it; restarts
+    /// from the same data directory; accepts an idempotent replay; and then
+    /// receives the rest. This is in-process node-harness acceptance evidence,
+    /// not packaged or process-level evidence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lagged_follower_received_blocks_execute_persist_restart_and_converge() {
+        if !in_child() {
+            return run_in_child(
+                "split_heal_tests::tests::lagged_follower_received_blocks_execute_persist_restart_and_converge",
+            );
+        }
+
+        const LEADER: usize = 0;
+        const FOLLOWER: usize = 1;
+        let sender_key = fat_sender(0);
+        let sender_key = PublicKey::new(sender_key.verifying_key().to_bytes());
+        let sender = citrate_execution::address_utils::normalize_address(&sender_key);
+        let alloc = vec![(sender, U256::from(10u128.pow(21)))];
+        let mut fleet = Fleet::with_genesis(2, None, alloc).await;
+        fleet.quiet.insert(FOLLOWER);
+        // Give both nodes one production-free connected tick so the ordinary
+        // initial-sync gate observes their shared genesis before the follower
+        // is isolated.
+        fleet.slot(&[]).await;
+        fleet.set_links(|_, _| false);
+
+        let warmup_target = ACT + 2;
+        for _ in 0..RECEIVE_ACCEPTANCE_PRODUCTION_ATTEMPTS {
+            fleet.slot(&[LEADER]).await;
+            if fleet.nodes[LEADER].applied().1 >= warmup_target {
+                break;
+            }
+        }
+        let warmup_observed = fleet.nodes[LEADER].applied().1;
+        assert!(
+            warmup_observed >= warmup_target,
+            "fixture: leader warmup observed height {warmup_observed}, target height \
+             {warmup_target}; receipt state not applicable before transaction submission"
+        );
+        assert_eq!(
+            fleet.nodes[FOLLOWER].applied(),
+            (fleet.genesis.header.block_hash, 0),
+            "fixture: the isolated follower remains at common genesis"
+        );
+
+        let tx = fat_tx(0);
+        fleet.nodes[LEADER]
+            .mempool
+            .add_transaction(tx.clone(), citrate_sequencer::mempool::TxClass::Standard)
+            .await
+            .expect("fixture: the leader pool accepts the funded transaction");
+        let receipt_target_floor = warmup_observed + 3;
+        for _ in 0..RECEIVE_ACCEPTANCE_PRODUCTION_ATTEMPTS {
+            fleet.slot(&[LEADER]).await;
+            let receipt_state = receive_acceptance_receipt_state(&fleet.nodes[LEADER], &tx.hash);
+            if receipt_state.is_some_and(|(height, status)| {
+                status && fleet.nodes[LEADER].applied().1 >= height + 2
+            }) {
+                break;
+            }
+        }
+        let receipt_observed_height = fleet.nodes[LEADER].applied().1;
+        let receipt_state = receive_acceptance_receipt_state(&fleet.nodes[LEADER], &tx.hash);
+        let receipt_target = receipt_state
+            .map(|(height, _)| height + 2)
+            .unwrap_or(receipt_target_floor);
+        assert!(
+            receipt_state.is_some_and(|(height, status)| {
+                status && receipt_observed_height >= height + 2
+            }),
+            "fixture: transaction catch-up observed height {receipt_observed_height}, target height \
+             {receipt_target}, receipt state {receipt_state:?}"
+        );
+        let intermediate = receive_acceptance_checkpoint(
+            &fleet.nodes[LEADER],
+            &sender,
+            &tx.hash,
+            "intermediate leader",
+        );
+        let intermediate_block = receive_acceptance_canonical_block(
+            &fleet.nodes[LEADER],
+            intermediate.applied.1,
+            "intermediate leader",
+        );
+        assert_eq!(
+            intermediate.state_root, intermediate_block.state_root,
+            "fixture: the leader's MPT root matches its canonical header"
+        );
+        assert_eq!(
+            intermediate.nonce, 1,
+            "fixture: the transaction advances its sender nonce"
+        );
+        let received_range = receive_acceptance_canonical_range(
+            &fleet.nodes[LEADER],
+            1,
+            intermediate.applied.1,
+            "partial leader range",
+        );
+
+        let _ = fleet
+            .receive(
+                FOLLOWER,
+                LEADER,
+                NetworkMessage::Blocks {
+                    blocks: received_range.clone(),
+                },
+            )
+            .await;
+
+        assert_receive_acceptance_checkpoint(
+            &fleet.nodes[FOLLOWER],
+            &sender,
+            &tx.hash,
+            &intermediate,
+            "partial follower catch-up",
+        );
+        assert_receive_acceptance_blocks_stored(
+            &fleet.nodes[FOLLOWER],
+            &received_range,
+            "partial follower catch-up",
+        );
+
+        let follower_data_dir = fleet.nodes[FOLLOWER].dir.path().to_path_buf();
+        fleet.restart_mode = RestartMode::Disk;
+        fleet.restart(FOLLOWER).await;
+        assert_eq!(
+            fleet.nodes[FOLLOWER].dir.path(),
+            follower_data_dir.as_path(),
+            "the follower reopens the same filesystem data directory"
+        );
+        assert_receive_acceptance_checkpoint(
+            &fleet.nodes[FOLLOWER],
+            &sender,
+            &tx.hash,
+            &intermediate,
+            "reopened follower",
+        );
+        assert_receive_acceptance_blocks_stored(
+            &fleet.nodes[FOLLOWER],
+            &received_range,
+            "reopened follower",
+        );
+
+        let before_replay = receive_acceptance_checkpoint(
+            &fleet.nodes[FOLLOWER],
+            &sender,
+            &tx.hash,
+            "pre-replay follower",
+        );
+        let replay_len = received_range.len();
+        let replay_receipt = fleet
+            .receive(
+                FOLLOWER,
+                LEADER,
+                NetworkMessage::Blocks {
+                    blocks: received_range,
+                },
+            )
+            .await
+            .expect("duplicate replay dispatched to the Blocks handler")
+            .expect("duplicate replay handle_blocks succeeded");
+        assert_eq!(
+            replay_receipt.received, replay_len,
+            "duplicate replay receipt reports the submitted range length"
+        );
+        assert_receive_acceptance_checkpoint(
+            &fleet.nodes[FOLLOWER],
+            &sender,
+            &tx.hash,
+            &before_replay,
+            "replayed follower",
+        );
+
+        let final_target = intermediate.applied.1 + 4;
+        for _ in 0..RECEIVE_ACCEPTANCE_PRODUCTION_ATTEMPTS {
+            fleet.slot(&[LEADER]).await;
+            if fleet.nodes[LEADER].applied().1 >= final_target {
+                break;
+            }
+        }
+        let final_observed = fleet.nodes[LEADER].applied().1;
+        let final_receipt_state = receive_acceptance_receipt_state(&fleet.nodes[LEADER], &tx.hash);
+        assert!(
+            final_observed >= final_target,
+            "fixture: final extension observed height {final_observed}, target height \
+             {final_target}, receipt state {final_receipt_state:?}"
+        );
+        let final_leader =
+            receive_acceptance_checkpoint(&fleet.nodes[LEADER], &sender, &tx.hash, "final leader");
+        let remaining = receive_acceptance_canonical_range(
+            &fleet.nodes[LEADER],
+            intermediate.applied.1 + 1,
+            final_leader.applied.1,
+            "remaining leader range",
+        );
+        assert!(!remaining.is_empty(), "fixture: a remaining range exists");
+        let _ = fleet
+            .receive(
+                FOLLOWER,
+                LEADER,
+                NetworkMessage::Blocks { blocks: remaining },
+            )
+            .await;
+
+        let final_block = receive_acceptance_canonical_block(
+            &fleet.nodes[LEADER],
+            final_leader.applied.1,
+            "final leader",
+        );
+        assert_eq!(
+            final_leader.state_root, final_block.state_root,
+            "the leader's final MPT root matches its canonical header"
+        );
+        assert_receive_acceptance_checkpoint(
+            &fleet.nodes[FOLLOWER],
+            &sender,
+            &tx.hash,
+            &final_leader,
+            "final follower convergence",
         );
     }
 
